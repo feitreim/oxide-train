@@ -195,7 +195,7 @@ Each gated on tests; correctness before speed at every step.
 1. ✅ Scaffold: workspace, tensor-core/tensor-cpu, Module/Chain/Linear +
    gradcheck, Modal harness, vecadd smoke crate
 2. ✅ Data: shard format, tokenizer, batcher, prepare-wiki binary
-3. CPU model forward+backward: RMSNorm, RoPE attention, SwiGLU, embedding,
+3. ✅ CPU model forward+backward: RMSNorm, RoPE attention, SwiGLU, embedding,
    fused softmax-cross-entropy — all gradchecked; overfit a tiny batch on CPU
 4. GPU foundation: tensor-gpu (GpuTensor), elementwise/reduction kernels,
    naive-then-tiled GEMM — all parity-tested vs CPU
