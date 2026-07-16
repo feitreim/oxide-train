@@ -32,9 +32,16 @@ fn linear_backward_matches_finite_differences() {
     assert_close(&dx, &ndx, ATOL, RTOL);
 
     // Numeric dL/dW: rebuild the layer around each perturbed W.
-    let ndw = numeric_grad(&lin.w, |w| {
-        Linear::<4, 3, 2>::new(w.clone()).forward(x.clone()).0.dot(&r)
-    }, EPS);
+    let ndw = numeric_grad(
+        &lin.w,
+        |w| {
+            Linear::<4, 3, 2>::new(w.clone())
+                .forward(x.clone())
+                .0
+                .dot(&r)
+        },
+        EPS,
+    );
     assert_close(&lin.dw, &ndw, ATOL, RTOL);
 }
 
@@ -77,13 +84,17 @@ fn chained_linears_backprop_through_composition() {
 
     // Innermost weight gradient, through two downstream layers.
     let w0 = net.a.w.clone();
-    let ndw0 = numeric_grad(&w0, |w| {
-        let probe: Chain<_, _> = chain!(
-            Linear::<4, 3, 6>::new(w.clone()),
-            Linear::<4, 6, 2>::new(net.b.a.w.clone()),
-            Linear::<4, 2, 5>::new(net.b.b.w.clone()),
-        );
-        probe.forward(x.clone()).0.dot(&r)
-    }, EPS);
+    let ndw0 = numeric_grad(
+        &w0,
+        |w| {
+            let probe: Chain<_, _> = chain!(
+                Linear::<4, 3, 6>::new(w.clone()),
+                Linear::<4, 6, 2>::new(net.b.a.w.clone()),
+                Linear::<4, 2, 5>::new(net.b.b.w.clone()),
+            );
+            probe.forward(x.clone()).0.dot(&r)
+        },
+        EPS,
+    );
     assert_close(&net.a.dw, &ndw0, ATOL, RTOL);
 }
