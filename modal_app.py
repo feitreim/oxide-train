@@ -121,6 +121,14 @@ image = (
     # RNG for CPU/GPU parity).
     .add_local_dir(str(Path(__file__).parent / "gpu"), f"{PROJECT_DIR}/gpu")
     .add_local_dir(str(Path(__file__).parent / "crates"), f"{PROJECT_DIR}/crates")
+    # CPU reference crates inherit package metadata and workspace dependencies
+    # from the root manifest. Mount it so GPU correctness binaries can depend
+    # on `nn`/`tensor-cpu` while retaining standalone workspaces under gpu/.
+    .add_local_file(str(Path(__file__).parent / "Cargo.toml"), f"{PROJECT_DIR}/Cargo.toml")
+    .add_local_file(
+        str(Path(__file__).parent / "rust-toolchain.toml"),
+        f"{PROJECT_DIR}/rust-toolchain.toml",
+    )
 )
 
 app = modal.App("rust-trainer", image=image)

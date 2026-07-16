@@ -1,0 +1,293 @@
+//! CPU/GPU parity checks for the reference Llama kernels.
+
+use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use nn::{Embedding, Module, RmsNorm, SoftmaxCrossEntropy, SoftmaxCrossEntropyInput, SwiGlu};
+use tensor_core::{Rank1, Rank2};
+use tensor_cpu::CpuTensor;
+
+use llama_ops::kernels;
+
+fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
+    assert_eq!(actual.len(), expected.len());
+    for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+        let tolerance = atol + rtol * e.abs();
+        assert!(
+            (a - e).abs() <= tolerance,
+            "{name} mismatch at {i}: gpu={a}, cpu={e}, tolerance={tolerance}"
+        );
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let module = kernels::from_module(ctx.load_module_from_file("llama_ops.ptx")?)?;
+
+    check_rms_norm(&stream, &module)?;
+    check_swiglu(&stream, &module)?;
+    check_embedding(&stream, &module)?;
+    check_cross_entropy(&stream, &module)?;
+
+    println!("✓ llama-ops forward/backward parity checks passed");
+    Ok(())
+}
+
+fn check_rms_norm(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::Module,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 5;
+    const D: usize = 7;
+    let x = CpuTensor::<f32, Rank2<N, D>>::uniform(1);
+    let weight = CpuTensor::<f32, Rank1<D>>::uniform(2).map(|v| v + 1.25);
+    let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(3);
+    let mut cpu = RmsNorm::<N, D>::new(weight.clone(), 1e-5);
+    let (cpu_y, cpu_ctx) = cpu.forward(x.clone());
+    let cpu_dx = cpu.backward(cpu_ctx, dy.clone());
+
+    let x_dev = DeviceBuffer::from_host(stream, x.as_slice())?;
+    let weight_dev = DeviceBuffer::from_host(stream, weight.as_slice())?;
+    let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+    let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    let mut dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    let mut dw_dev = DeviceBuffer::<f32>::zeroed(stream, D)?;
+
+    module.rms_norm_forward(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &x_dev,
+        &weight_dev,
+        1e-5,
+        D as u32,
+        &mut y_dev,
+    )?;
+    module.rms_norm_backward_x(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &x_dev,
+        &weight_dev,
+        &dy_dev,
+        1e-5,
+        D as u32,
+        &mut dx_dev,
+    )?;
+    module.rms_norm_backward_weight(
+        stream,
+        LaunchConfig::for_num_elems(D as u32),
+        &x_dev,
+        &dy_dev,
+        1e-5,
+        N as u32,
+        D as u32,
+        &mut dw_dev,
+    )?;
+
+    assert_close(
+        "rmsnorm y",
+        &y_dev.to_host_vec(stream)?,
+        cpu_y.as_slice(),
+        2e-5,
+        2e-5,
+    );
+    assert_close(
+        "rmsnorm dx",
+        &dx_dev.to_host_vec(stream)?,
+        cpu_dx.as_slice(),
+        3e-5,
+        3e-5,
+    );
+    assert_close(
+        "rmsnorm dw",
+        &dw_dev.to_host_vec(stream)?,
+        cpu.dw.as_slice(),
+        3e-5,
+        3e-5,
+    );
+    Ok(())
+}
+
+fn check_swiglu(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::Module,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const LEN: usize = 33;
+    let gate = CpuTensor::<f32, Rank2<3, 11>>::uniform(4);
+    let up = CpuTensor::<f32, Rank2<3, 11>>::uniform(5);
+    let dy = CpuTensor::<f32, Rank2<3, 11>>::uniform(6);
+    let mut cpu = SwiGlu::<3, 11>;
+    let (cpu_y, cpu_ctx) = cpu.forward((gate.clone(), up.clone()));
+    let (cpu_dgate, cpu_dup) = cpu.backward(cpu_ctx, dy.clone());
+
+    let gate_dev = DeviceBuffer::from_host(stream, gate.as_slice())?;
+    let up_dev = DeviceBuffer::from_host(stream, up.as_slice())?;
+    let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+    let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+    let mut dgate_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+    let mut dup_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+    module.swiglu_forward(
+        stream,
+        LaunchConfig::for_num_elems(LEN as u32),
+        &gate_dev,
+        &up_dev,
+        &mut y_dev,
+    )?;
+    module.swiglu_backward_gate(
+        stream,
+        LaunchConfig::for_num_elems(LEN as u32),
+        &gate_dev,
+        &up_dev,
+        &dy_dev,
+        &mut dgate_dev,
+    )?;
+    module.swiglu_backward_up(
+        stream,
+        LaunchConfig::for_num_elems(LEN as u32),
+        &gate_dev,
+        &dy_dev,
+        &mut dup_dev,
+    )?;
+
+    assert_close(
+        "swiglu y",
+        &y_dev.to_host_vec(stream)?,
+        cpu_y.as_slice(),
+        1e-6,
+        1e-5,
+    );
+    assert_close(
+        "swiglu dgate",
+        &dgate_dev.to_host_vec(stream)?,
+        cpu_dgate.as_slice(),
+        2e-6,
+        1e-5,
+    );
+    assert_close(
+        "swiglu dup",
+        &dup_dev.to_host_vec(stream)?,
+        cpu_dup.as_slice(),
+        2e-6,
+        1e-5,
+    );
+    Ok(())
+}
+
+fn check_embedding(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::Module,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 6;
+    const V: usize = 9;
+    const D: usize = 5;
+    let tokens_usize = [2, 7, 2, 0, 7, 4];
+    let tokens = tokens_usize.map(|v| v as u32);
+    let weight = CpuTensor::<f32, Rank2<V, D>>::uniform(7);
+    let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(8);
+    let mut cpu = Embedding::<N, V, D>::new(weight.clone());
+    let (cpu_y, cpu_ctx) = cpu.forward(tokens_usize);
+    cpu.backward(cpu_ctx, dy.clone());
+
+    let weight_dev = DeviceBuffer::from_host(stream, weight.as_slice())?;
+    let tokens_dev = DeviceBuffer::from_host(stream, &tokens)?;
+    let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+    let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    let mut dw_dev = DeviceBuffer::<f32>::zeroed(stream, V * D)?;
+    module.embedding_forward(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &weight_dev,
+        &tokens_dev,
+        D as u32,
+        &mut y_dev,
+    )?;
+    module.embedding_backward(
+        stream,
+        LaunchConfig::for_num_elems((V * D) as u32),
+        &tokens_dev,
+        &dy_dev,
+        N as u32,
+        D as u32,
+        &mut dw_dev,
+    )?;
+
+    assert_close(
+        "embedding y",
+        &y_dev.to_host_vec(stream)?,
+        cpu_y.as_slice(),
+        0.0,
+        0.0,
+    );
+    assert_close(
+        "embedding dw",
+        &dw_dev.to_host_vec(stream)?,
+        cpu.dw.as_slice(),
+        1e-6,
+        1e-6,
+    );
+    Ok(())
+}
+
+fn check_cross_entropy(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::Module,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 5;
+    const C: usize = 13;
+    let logits = CpuTensor::<f32, Rank2<N, C>>::uniform(9).scale(5.0);
+    let targets_usize = [0, 7, 12, 3, 7];
+    let targets = targets_usize.map(|v| v as u32);
+    let mut cpu = SoftmaxCrossEntropy::<N, C>;
+    let (cpu_loss, cpu_ctx) = cpu.forward(SoftmaxCrossEntropyInput {
+        logits: logits.clone(),
+        targets: targets_usize,
+    });
+    let cpu_dx = cpu.backward(cpu_ctx, CpuTensor::from_slice(&[1.0])).logits;
+
+    let logits_dev = DeviceBuffer::from_host(stream, logits.as_slice())?;
+    let targets_dev = DeviceBuffer::from_host(stream, &targets)?;
+    let mut probabilities_dev = DeviceBuffer::<f32>::zeroed(stream, N * C)?;
+    let mut losses_dev = DeviceBuffer::<f32>::zeroed(stream, N)?;
+    let mut dlogits_dev = DeviceBuffer::<f32>::zeroed(stream, N * C)?;
+    module.softmax_forward(
+        stream,
+        LaunchConfig::for_num_elems((N * C) as u32),
+        &logits_dev,
+        C as u32,
+        &mut probabilities_dev,
+    )?;
+    module.cross_entropy_loss(
+        stream,
+        LaunchConfig::for_num_elems(N as u32),
+        &logits_dev,
+        &targets_dev,
+        N as u32,
+        C as u32,
+        &mut losses_dev,
+    )?;
+    module.softmax_cross_entropy_backward(
+        stream,
+        LaunchConfig::for_num_elems((N * C) as u32),
+        &probabilities_dev,
+        &targets_dev,
+        1.0,
+        N as u32,
+        C as u32,
+        &mut dlogits_dev,
+    )?;
+
+    let gpu_loss = losses_dev.to_host_vec(stream)?.iter().sum::<f32>() / N as f32;
+    assert_close(
+        "cross entropy loss",
+        &[gpu_loss],
+        cpu_loss.as_slice(),
+        2e-5,
+        2e-5,
+    );
+    assert_close(
+        "cross entropy dx",
+        &dlogits_dev.to_host_vec(stream)?,
+        cpu_dx.as_slice(),
+        2e-6,
+        2e-5,
+    );
+    Ok(())
+}

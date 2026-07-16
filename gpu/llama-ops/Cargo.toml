@@ -1,0 +1,20 @@
+[package]
+name = "llama-ops"
+version = "0.1.0"
+edition = "2024"
+default-run = "llama-ops"
+
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+bench-util = { path = "../bench-util" }
+tensor-core = { path = "../../crates/tensor-core" }
+tensor-cpu = { path = "../../crates/tensor-cpu" }
+nn = { path = "../../crates/nn" }
+
+[profile.release]
+debug = false
+lto = true
