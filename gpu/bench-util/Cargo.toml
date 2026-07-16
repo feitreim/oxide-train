@@ -1,0 +1,13 @@
+[package]
+name = "bench-util"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone crate: not part of the root (CPU) workspace.
+[workspace]
+
+[dependencies]
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+# Same RNG as the CPU reference tensors, so parity tests reproduce identical
+# inputs on both sides from a seed.
+tensor-core = { path = "../../crates/tensor-core" }

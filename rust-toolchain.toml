@@ -1,0 +1,6 @@
+# Pin the same nightly the Modal image uses (RUST_TOOLCHAIN in modal_app.py) so
+# local tooling and the GPU builds agree. cuda-oxide's proc macros need nightly
+# features, and the codegen backend is built against exactly this toolchain.
+[toolchain]
+channel = "nightly-2026-04-03"
+components = ["rust-src", "rust-analyzer", "clippy"]

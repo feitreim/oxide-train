@@ -1,0 +1,7 @@
+[package]
+name = "tensor-cpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tensor-core.workspace = true

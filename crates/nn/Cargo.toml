@@ -1,0 +1,8 @@
+[package]
+name = "nn"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tensor-core.workspace = true
+tensor-cpu.workspace = true

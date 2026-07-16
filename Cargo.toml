@@ -1,0 +1,22 @@
+# CPU-side workspace: everything here builds and tests on any machine (no CUDA).
+#
+# GPU code lives under gpu/ as standalone crates (each with its own `[workspace]`
+# stanza) because they are built by `cargo oxide` inside the Modal image, not by
+# a plain `cargo build` — see gpu/README.md and modal_app.py.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/tensor-core",
+    "crates/tensor-cpu",
+    "crates/nn",
+]
+exclude = ["gpu"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+tensor-core = { path = "crates/tensor-core" }
+tensor-cpu = { path = "crates/tensor-cpu" }

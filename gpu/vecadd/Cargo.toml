@@ -1,0 +1,23 @@
+[package]
+name = "vecadd"
+version = "0.1.0"
+edition = "2024"
+default-run = "vecadd"
+
+# Standalone crate: not part of the root (CPU) workspace — built by
+# `cargo oxide` inside the Modal image.
+[workspace]
+
+# cuda-oxide is not published to crates.io, so we pull the device/host/core
+# crates straight from the repo, pinned to the same tag the Modal image builds
+# its codegen backend from. Keep this tag in sync with CUDA_OXIDE_REF in
+# ../../modal_app.py.
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+bench-util = { path = "../bench-util" }
+
+[profile.release]
+debug = false
+lto = true
