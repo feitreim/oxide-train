@@ -12,17 +12,23 @@
 //! must be used twice (e.g. residual streams) are duplicated by an explicit
 //! combinator that owns that policy.
 
+pub mod attention;
 pub mod cross_entropy;
 pub mod embedding;
 pub mod gradcheck;
 pub mod linear;
+pub mod llama;
 pub mod module;
 pub mod rms_norm;
+pub mod rope;
 pub mod swiglu;
 
+pub use attention::{AttentionInput, CausalAttention};
 pub use cross_entropy::{SoftmaxCrossEntropy, SoftmaxCrossEntropyInput};
 pub use embedding::{Embedding, TokenIds};
 pub use linear::Linear;
+pub use llama::{Llama, LlamaCtx};
 pub use module::{Chain, Module};
 pub use rms_norm::RmsNorm;
+pub use rope::Rope;
 pub use swiglu::SwiGlu;
