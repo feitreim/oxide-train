@@ -25,6 +25,9 @@ Plan: Llama-style model (RMSNorm, RoPE, SwiGLU, untied embeddings) at
 then Muon, trained on English Wikipedia tokenized with tiktoken `r50k_base`
 (ids fit `u16`). MoE later.
 
+**See [SPEC.md](SPEC.md) for the full architecture, every design decision and
+its rationale, and the milestone plan.**
+
 ## Layout
 
 ```
@@ -32,6 +35,8 @@ crates/                 CPU-side cargo workspace -- builds/tests on any machine
   tensor-core/          Shape (const-generic markers), Element, shared RNG
   tensor-cpu/           CpuTensor + naive reference ops
   nn/                   Module trait, Chain combinator, layers, gradcheck
+  data/                 tiktoken r50k tokenizer, u16 token shards, mmap loader,
+                        [B,T] batcher, prepare-wiki preprocessing binary
 gpu/                    standalone cuda-oxide crates -- built on Modal GPUs
   bench-util/           CUDA-event timing; re-exports the shared RNG
   vecadd/               toolchain smoke test (lib.rs kernel, main.rs check,
@@ -44,8 +49,20 @@ run.sh                  thin wrapper over `modal run`
 ## CPU-side development (local)
 
 ```bash
-cargo test          # tensor ops + gradchecks; no GPU or CUDA needed
+cargo test          # tensor ops, gradchecks, shard/batcher/tokenizer; no GPU needed
 ```
+
+## Data preparation (offline, once)
+
+```bash
+cargo run --release -p data --bin prepare_wiki -- --limit-files 1   # smoke test
+cargo run --release -p data --bin prepare_wiki                      # full run
+```
+
+Downloads `wikimedia/wikipedia` `20231101.en` parquet from the HF hub (cached
+in `~/.cache/huggingface`), tokenizes with tiktoken `r50k_base` in parallel,
+and writes `u16` token shards to `data/wiki/` (first 10M tokens to `wiki-val`,
+the rest to 250M-token `wiki-train-*` shards).
 
 The pinned nightly in `rust-toolchain.toml` matches the Modal image so local
 tooling and GPU builds agree.

@@ -1,0 +1,14 @@
+[package]
+name = "data"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1.0.103"
+hf-hub = { version = "0.4", default-features = false, features = ["default-tls", "ureq"] }
+memmap2 = "0.9.11"
+parquet = "59.1.0"
+rayon = "1.12.0"
+tensor-core.workspace = true
+tensor-cpu.workspace = true
+tiktoken-rs = "0.12.0"
