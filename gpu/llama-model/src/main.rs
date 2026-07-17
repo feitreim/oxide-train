@@ -210,7 +210,12 @@ fn overfit_tiny_batch(
     let mut workspace = GpuLlamaWorkspace::<4, 128, 4, 4, 128, 128, 2, 12>::new(stream)?;
     let mut initial_loss = None;
 
-    for _ in 0..200 {
+    // More steps than the fp32 gate needed: the bf16 head plateaus for a few
+    // hundred steps with two competing logits tied at bf16 resolution until
+    // the fp32 master accumulates enough sub-ulp progress to break the tie
+    // (reproduced on CPU in crates/optim/examples/overfit_probe.rs, which
+    // escapes by step ~300 and reaches ~5e-6 by step 360).
+    for _ in 0..600 {
         gpu.zero_grad(stream, tensor)?;
         gpu.forward(
             tokens,
