@@ -284,4 +284,3 @@ pub mod kernels {
         unsafe { gemm_tcgen05_bf16_impl::<true>(a_tma, b_tma, output, n, k) }
     }
 }
-

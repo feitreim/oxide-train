@@ -686,8 +686,7 @@ pub mod kernels {
             let word = logits[base + target / 2];
             let bits = (if target % 2 == 0 { word } else { word >> 16 }) as u16;
             unsafe {
-                *losses.get_unchecked_mut(row) =
-                    MAXIMA[0] + SUMS[0].ln() - bf16_bits_to_f32(bits);
+                *losses.get_unchecked_mut(row) = MAXIMA[0] + SUMS[0].ln() - bf16_bits_to_f32(bits);
             }
         }
     }

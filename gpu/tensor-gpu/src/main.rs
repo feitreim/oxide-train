@@ -85,7 +85,10 @@ fn check_bf16_pairs(
         &mut packed,
     )?;
     let packed_host = packed.to_host_vec(stream)?;
-    assert_eq!(&packed_host[..ROWS * COLS / 2], pack_bf16(source.as_slice()));
+    assert_eq!(
+        &packed_host[..ROWS * COLS / 2],
+        pack_bf16(source.as_slice())
+    );
     assert!(packed_host[ROWS * COLS / 2..].iter().all(|&word| word == 0));
 
     // packed pairs -> f32 round-trips the rounded values exactly.
@@ -175,7 +178,13 @@ fn check_adamw_master(
         })
         .collect();
     let master_host = master.to_host_vec(stream)?;
-    assert_close("adamw_master_bf16 master", &master_host, &expected, 2e-6, 2e-6);
+    assert_close(
+        "adamw_master_bf16 master",
+        &master_host,
+        &expected,
+        2e-6,
+        2e-6,
+    );
     assert_eq!(
         compute.to_host_vec(stream)?,
         pack_bf16(&master_host),

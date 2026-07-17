@@ -160,10 +160,7 @@ pub struct Tcgen05Gemm {
 }
 
 impl Tcgen05Gemm {
-    pub fn load_from_ptx(
-        ctx: &Arc<CudaContext>,
-        path: &str,
-    ) -> Result<Self, Box<dyn Error>> {
+    pub fn load_from_ptx(ctx: &Arc<CudaContext>, path: &str) -> Result<Self, Box<dyn Error>> {
         let module = ctx.load_module_from_file(path).map_err(|error| {
             format!(
                 "loading {path} failed ({error:?}); build gpu/gemm first so its \

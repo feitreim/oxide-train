@@ -187,8 +187,7 @@ pub mod kernels {
         while local < TRANSPOSE_WORDS {
             let row = local / TILE_WORDS_WIDE;
             let word_column = local % TILE_WORDS_WIDE;
-            let word =
-                input[(tile_row + row) * source_words_per_row + tile_col / 2 + word_column];
+            let word = input[(tile_row + row) * source_words_per_row + tile_col / 2 + word_column];
             unsafe {
                 VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column] = word & 0xffff;
                 VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column + 1] = word >> 16;
@@ -260,8 +259,7 @@ pub mod kernels {
                 *second = beta2 * *second + (1.0 - beta2) * g * g;
                 let first_hat = *first * first_correction;
                 let second_hat = *second * second_correction;
-                let update =
-                    first_hat / (second_hat.sqrt() + epsilon) + weight_decay * *master;
+                let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * *master;
                 *master -= learning_rate * update;
                 packed |= (f32_to_bf16_bits(*master) as u32) << (16 * half);
             }

@@ -231,7 +231,15 @@ fn overfit_tiny_batch(
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
         }
-        gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama)?;
+        gpu.backward(
+            &mut workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
+        )?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
 

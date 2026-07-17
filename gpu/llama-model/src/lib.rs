@@ -22,9 +22,7 @@
 use std::error::Error;
 
 use bench_util::{KernelProfiler, NoopProfiler};
-use cuda_core::{
-    CudaEvent, CudaStream, DeviceBuffer, DriverError, LaunchConfig, PinnedHostBuffer,
-};
+use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, DriverError, LaunchConfig, PinnedHostBuffer};
 use nn::Llama;
 use optim::AdamWConfig;
 use tensor_core::{Rank1, Rank2, Rank3, Shape, bf16};
@@ -595,8 +593,10 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         let mut transposed = vec![0u32; VP * D / 2];
         for column in 0..VP {
             for pair in 0..D / 2 {
-                transposed[column * D / 2 + pair] =
-                    pack(values[2 * pair * VP + column], values[(2 * pair + 1) * VP + column]);
+                transposed[column * D / 2 + pair] = pack(
+                    values[2 * pair * VP + column],
+                    values[(2 * pair + 1) * VP + column],
+                );
             }
         }
 
@@ -838,7 +838,13 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         self.step = step;
     }
 
-    pub fn update<const N: usize, const NP: usize, const T: usize, const H: usize, const HD: usize>(
+    pub fn update<
+        const N: usize,
+        const NP: usize,
+        const T: usize,
+        const H: usize,
+        const HD: usize,
+    >(
         &mut self,
         model: &mut GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
         stream: &CudaStream,
@@ -1016,8 +1022,7 @@ impl<
         // SAFETY: the mapped buffers live in this workspace beside their maps
         // and are never reallocated.
         let head_input_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input, D, NP)? };
-        let head_input_t_tma =
-            unsafe { create_bf16_pairs_tma_map(stream, &head_input_t, NP, D)? };
+        let head_input_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input_t, NP, D)? };
         let logits_tma = unsafe { create_bf16_pairs_tma_map(stream, &logits, VP, NP)? };
         let dlogits_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &dlogits_t, NP, VP)? };
         Ok(Self {
@@ -1170,7 +1175,15 @@ impl<
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
         self.forward_profiled(
-            tokens, targets, workspace, stream, tensor, gemm, gemm_bf16, flash, llama,
+            tokens,
+            targets,
+            workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
             &mut profiler,
         )
     }
