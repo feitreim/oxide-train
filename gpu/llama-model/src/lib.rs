@@ -531,13 +531,12 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
-        profiler.measure(stream, name, || {
-            kernels.embedding_backward(
+        profiler.measure(stream, name, || unsafe {
+            kernels.embedding_backward_scatter(
                 stream,
-                LaunchConfig::for_num_elems((VOCAB * D) as u32),
+                LaunchConfig::for_num_elems((N * D) as u32),
                 tokens.as_device_buffer(),
                 dy.as_device_buffer(),
-                N as u32,
                 D as u32,
                 self.dw.as_device_buffer_mut(),
             )
