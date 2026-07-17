@@ -213,6 +213,8 @@ gpu/               standalone cuda-oxide kernel crates (Modal-built)
   vecadd/          toolchain smoke test; template for new kernels
   llama-ops/       direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
                    RoPE, causal attention, SwiGLU, embedding, and loss
+  gemm/            register-tiled fp32 + Blackwell tcgen05 bf16 GEMMs,
+                   including store/accumulate epilogues and sweep benchmarks
   tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled GEMM
   llama-model/     full fp32 GPU Llama forward/backward + CPU parity
 modal_app.py       Modal image + run/bench/sweep/sanitize/baseline/ptx
@@ -236,7 +238,7 @@ Each gated on tests; correctness before speed at every step.
    - **7a step profiler** (bench-util + train): per-kernel CUDA-event
      breakdown of one full training step. Lands first — it gates every other
      7.x perf claim (see §11 measurement gate).
-   - **7b GEMM ladder** (`gpu/gemm`, starting from cuda-oxide
+   - ✅ **7b GEMM ladder** (`gpu/gemm`, starting from cuda-oxide
      `gemm_sol_final`): register-tiled fp32 → tcgen05 bf16; store +
      accumulate variants; tuned via SWEEP.
    - **7c flash attention** (`gpu/flash-attn`): fp32 forward/backward,
