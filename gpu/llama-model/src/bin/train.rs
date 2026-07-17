@@ -1,9 +1,7 @@
 //! Minimal Wikipedia training loop.
 //!
-//! This is the milestone-6 correctness runner, not the eventual performance
-//! configuration. It intentionally uses the auditable reference kernels and a
-//! small single-block model while exercising real `TOK1` shards end to end.
-//! `D` is the one-tile minimum the bf16 tcgen05 lm-head requires.
+//! Runs the canonical 182.7M-parameter single-block profile configuration
+//! (matching bin/profile.rs) on real `TOK1` shards end to end.
 
 use std::env;
 
@@ -22,10 +20,10 @@ const N: usize = 64;
 const NP: usize = 128;
 const VOCAB: usize = 50_257;
 const VP: usize = 50_304;
-const D: usize = 128;
-const H: usize = 4;
-const HD: usize = 32;
-const FF: usize = 192;
+const D: usize = 1_536;
+const H: usize = 24;
+const HD: usize = 64;
+const FF: usize = 4_096;
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
     env::var(name)
