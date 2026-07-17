@@ -41,6 +41,8 @@ gpu/                    standalone cuda-oxide crates -- built on Modal GPUs
   bench-util/           CUDA-event timing; re-exports the shared RNG
   vecadd/               toolchain smoke test (lib.rs kernel, main.rs check,
                         bin/bench.rs benchmark) -- the template for new kernels
+  llama-ops/            auditable fp32 RMSNorm, SwiGLU, embedding, and fused
+                        softmax-cross-entropy forward/backward parity kernels
 modal_app.py            Modal image (CUDA 13 + LLVM 21 + pinned nightly +
                         cuda-oxide backend) and run/bench/sweep/sanitize entrypoints
 run.sh                  thin wrapper over `modal run`
@@ -74,6 +76,7 @@ pip install modal && modal setup        # once
 modal run modal_app.py::doctor          # toolchain + GPU sanity check
 ./run.sh vecadd                         # correctness
 ./run.sh vecadd bench                   # throughput
+./run.sh llama-ops                      # Llama leaf-op CPU/GPU parity
 SWEEP="BM=128 BN=128,BM=256 BN=64" ./run.sh gemm   # tuning sweep (one container)
 ```
 

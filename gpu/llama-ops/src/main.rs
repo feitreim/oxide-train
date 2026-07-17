@@ -5,7 +5,12 @@ use nn::{Embedding, Module, RmsNorm, SoftmaxCrossEntropy, SoftmaxCrossEntropyInp
 use tensor_core::{Rank1, Rank2};
 use tensor_cpu::CpuTensor;
 
-use llama_ops::kernels;
+// `cargo oxide` collects kernels from the selected binary target, not from a
+// separately compiled library dependency. Reuse the canonical library source
+// as a module so this binary's embedded artifact contains the kernels.
+#[path = "lib.rs"]
+mod device;
+use device::kernels;
 
 fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
     assert_eq!(actual.len(), expected.len());
@@ -21,7 +26,7 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
-    let module = kernels::from_module(ctx.load_module_from_file("llama_ops.ptx")?)?;
+    let module = kernels::load(&ctx)?;
 
     check_rms_norm(&stream, &module)?;
     check_swiglu(&stream, &module)?;
@@ -34,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn check_rms_norm(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
-    module: &kernels::Module,
+    module: &kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const N: usize = 5;
     const D: usize = 7;
@@ -108,7 +113,7 @@ fn check_rms_norm(
 
 fn check_swiglu(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
-    module: &kernels::Module,
+    module: &kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const LEN: usize = 33;
     let gate = CpuTensor::<f32, Rank2<3, 11>>::uniform(4);
@@ -173,7 +178,7 @@ fn check_swiglu(
 
 fn check_embedding(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
-    module: &kernels::Module,
+    module: &kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const N: usize = 6;
     const V: usize = 9;
@@ -228,7 +233,7 @@ fn check_embedding(
 
 fn check_cross_entropy(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
-    module: &kernels::Module,
+    module: &kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const N: usize = 5;
     const C: usize = 13;

@@ -184,6 +184,8 @@ crates/            CPU-side workspace (builds/tests anywhere, no CUDA)
 gpu/               standalone cuda-oxide kernel crates (Modal-built)
   bench-util/      CUDA-event timing + shared-RNG re-export
   vecadd/          toolchain smoke test; template for new kernels
+  llama-ops/       direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
+                   SwiGLU, embedding, and fused softmax-cross-entropy
   (planned) tensor-gpu host-side GpuTensor wrapping DeviceBuffer + kernel launches
 modal_app.py       Modal image + run/bench/sweep/sanitize/baseline/ptx
 ```
