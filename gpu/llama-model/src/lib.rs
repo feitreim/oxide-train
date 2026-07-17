@@ -1082,6 +1082,28 @@ impl<
         &self.loss
     }
 
+    /// Host readback of one packed-bf16 logits row, widened to f32.
+    ///
+    /// Sampling and debugging only: this copies the whole logits buffer.
+    pub fn logits_row(
+        &self,
+        row: usize,
+        stream: &CudaStream,
+    ) -> Result<Vec<f32>, DriverError> {
+        assert!(row < NP);
+        let words = self.logits.to_host_vec(stream)?;
+        let stride = VP / 2;
+        Ok(words[row * stride..(row + 1) * stride]
+            .iter()
+            .flat_map(|&word| {
+                [
+                    f32::from_bits((word & 0xFFFF) << 16),
+                    f32::from_bits((word >> 16) << 16),
+                ]
+            })
+            .collect())
+    }
+
     fn upload_inputs(
         &mut self,
         tokens: [usize; N],
