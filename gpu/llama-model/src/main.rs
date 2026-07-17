@@ -130,7 +130,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // between steps via reused buffers, which single-pass parity cannot.
     gpu.zero_grad(&stream, &tensor)?;
     gpu.forward(tokens, targets, &mut workspace, &stream, &tensor, &llama)?;
-    assert_close("loss (pass 2)", workspace.loss(), &cpu_loss, &stream, 5e-5, 5e-5)?;
+    assert_close(
+        "loss (pass 2)",
+        workspace.loss(),
+        &cpu_loss,
+        &stream,
+        5e-5,
+        5e-5,
+    )?;
     gpu.backward(&mut workspace, &stream, &tensor, &llama)?;
     grad!(embedding, 2e-4);
     grad!(attention_norm, 2e-4);
