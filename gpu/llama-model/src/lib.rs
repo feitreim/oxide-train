@@ -1770,22 +1770,15 @@ fn flash_attention_forward_into<
     kernels: &flash_kernels::LoadedModule,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
-    // TEMPORARY EXPERIMENT: per-row oracle kernels in place of tiled, to
-    // isolate whether the overfit-gate stall follows the tiled kernels.
     profiler.measure(stream, "forward.attention.flash", || {
-        kernels.flash_attention_forward(
+        kernels.flash_attention_forward_tiled(
             stream,
-            LaunchConfig {
-                grid_dim: ((N * H) as u32, 1, 1),
-                block_dim: (HD as u32, 1, 1),
-                shared_mem_bytes: 0,
-            },
+            flash_forward_config::<N, T, H, HD>(),
             q.as_device_buffer(),
             k.as_device_buffer(),
             v.as_device_buffer(),
             T as u32,
             H as u32,
-            HD as u32,
             output.as_device_buffer_mut(),
             logsumexp.as_device_buffer_mut(),
         )
@@ -1825,41 +1818,33 @@ fn flash_attention_backward_into<
             softmax_dot.as_device_buffer_mut(),
         )
     })?;
-    // TEMPORARY EXPERIMENT: per-row oracle backward kernels (see forward).
-    let per_row = LaunchConfig {
-        grid_dim: ((N * H) as u32, 1, 1),
-        block_dim: (HD as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
     profiler.measure(stream, "backward.attention.flash_q", || {
-        kernels.flash_attention_backward_q(
+        kernels.flash_attention_backward_q_tiled(
             stream,
-            per_row,
+            flash_backward_q_config::<N, T, H, HD>(),
             q.as_device_buffer(),
             k.as_device_buffer(),
             v.as_device_buffer(),
-            output.as_device_buffer(),
             dy.as_device_buffer(),
             logsumexp.as_device_buffer(),
+            softmax_dot.as_device_buffer(),
             T as u32,
             H as u32,
-            HD as u32,
             dq.as_device_buffer_mut(),
         )
     })?;
     profiler.measure(stream, "backward.attention.flash_kv", || {
-        kernels.flash_attention_backward_kv(
+        kernels.flash_attention_backward_kv_tiled(
             stream,
-            per_row,
+            flash_backward_kv_config::<N, T, H, HD>(),
             q.as_device_buffer(),
             k.as_device_buffer(),
             v.as_device_buffer(),
-            output.as_device_buffer(),
             dy.as_device_buffer(),
             logsumexp.as_device_buffer(),
+            softmax_dot.as_device_buffer(),
             T as u32,
             H as u32,
-            HD as u32,
             dk.as_device_buffer_mut(),
             dv.as_device_buffer_mut(),
         )
