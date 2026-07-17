@@ -1,7 +1,8 @@
 [package]
-name = "tensor-core"
+name = "optim"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-half.workspace = true
+tensor-core.workspace = true
+tensor-cpu.workspace = true
