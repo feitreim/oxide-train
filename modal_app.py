@@ -80,7 +80,7 @@ image = (
     )
     .apt_install(
         "ca-certificates", "curl", "g++", "gcc", "git", "gnupg",
-        "libc6-dev", "make", "pkg-config", "xz-utils",
+        "libc6-dev", "libssl-dev", "make", "pkg-config", "xz-utils",
     )
     # LLVM 21 toolchain (NVPTX target + clang headers for bindgen).
     .run_commands(
@@ -299,6 +299,39 @@ def dump_ptx(kernel: str) -> str:
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
     _run(["cargo", "oxide", "doctor"], cwd="/opt/warmup")
+
+
+@app.function(
+    cpu=32,
+    memory=64 * 1024,
+    timeout=20 * 3600,
+    volumes={"/data": wiki_volume},
+)
+def prepare_data(limit_files: int = 0, limit_articles: int = 0) -> None:
+    """Tokenize wikimedia/wikipedia into u16 shards directly on the volume."""
+    cmd = [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "data",
+        "--bin",
+        "prepare_wiki",
+        "--",
+        "--out",
+        "/data",
+    ]
+    if limit_files:
+        cmd += ["--limit-files", str(limit_files)]
+    if limit_articles:
+        cmd += ["--limit-articles", str(limit_articles)]
+    _run(cmd, f"{PROJECT_DIR}/crates")
+    wiki_volume.commit()
+
+
+@app.local_entrypoint()
+def prepare(limit_files: int = 0, limit_articles: int = 0) -> None:
+    prepare_data.remote(limit_files, limit_articles)
 
 
 @app.local_entrypoint()
