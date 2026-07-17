@@ -132,6 +132,7 @@ image = (
 )
 
 app = modal.App("rust-trainer", image=image)
+wiki_volume = modal.Volume.from_name("rust-trainer-wiki", create_if_missing=True)
 
 
 def _run(cmd: list[str], cwd: str) -> None:
@@ -148,13 +149,47 @@ def _proj(kernel: str) -> str:
     return proj
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=3600)
-def run_kernel(kernel: str, bin: str | None = None) -> None:
+@app.function(
+    gpu=DEFAULT_GPU,
+    timeout=3600,
+    volumes={"/data": wiki_volume},
+)
+def run_kernel(
+    kernel: str,
+    bin: str | None = None,
+    shard: str | None = None,
+    steps: int | None = None,
+    learning_rate: float | None = None,
+    weight_decay: float | None = None,
+    log_every: int | None = None,
+    checkpoint: str | None = None,
+    checkpoint_every: int | None = None,
+    resume: bool = False,
+) -> None:
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     proj = _proj(kernel)
     cmd = ["cargo", "oxide", "run", kernel]
     if bin:
         cmd += ["--bin", bin]
+    env = []
+    if shard:
+        env.append(f"TRAIN_SHARD={shard}")
+    if steps:
+        env.append(f"TRAIN_STEPS={steps}")
+    if learning_rate is not None:
+        env.append(f"TRAIN_LEARNING_RATE={learning_rate}")
+    if weight_decay is not None:
+        env.append(f"TRAIN_WEIGHT_DECAY={weight_decay}")
+    if log_every:
+        env.append(f"TRAIN_LOG_EVERY={log_every}")
+    if checkpoint:
+        env.append(f"TRAIN_CHECKPOINT={checkpoint}")
+    if checkpoint_every:
+        env.append(f"TRAIN_CHECKPOINT_EVERY={checkpoint_every}")
+    if resume:
+        env.append("TRAIN_RESUME=1")
+    if env:
+        cmd = ["env", *env, *cmd]
     _run(cmd, cwd=proj)
 
 
@@ -275,6 +310,14 @@ def main(
     sweep: str = "",
     sanitize: str = "",
     baseline: str = "",
+    shard: str = "",
+    steps: int = 0,
+    learning_rate: float = 0.0,
+    weight_decay: float = -1.0,
+    log_every: int = 0,
+    checkpoint: str = "",
+    checkpoint_every: int = 0,
+    resume: bool = False,
 ) -> None:
     if sanitize:
         fn = run_sanitizer.with_options(gpu=gpu) if gpu else run_sanitizer
@@ -293,4 +336,15 @@ def main(
         fn.remote(kernel, sweep)
         return
     fn = run_kernel.with_options(gpu=gpu) if gpu else run_kernel
-    fn.remote(kernel, bin or None)
+    fn.remote(
+        kernel,
+        bin or None,
+        shard or None,
+        steps or None,
+        learning_rate or None,
+        weight_decay if weight_decay >= 0.0 else None,
+        log_every or None,
+        checkpoint or None,
+        checkpoint_every or None,
+        resume,
+    )

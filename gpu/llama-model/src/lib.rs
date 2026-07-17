@@ -7,6 +7,7 @@
 use bench_util::{KernelProfiler, NoopProfiler};
 use cuda_core::{CudaStream, DriverError, LaunchConfig};
 use nn::Llama;
+use optim::AdamWConfig;
 use tensor_core::{Rank1, Rank2, Rank3, Shape};
 
 // cuda-oxide collects kernels from the selected binary target. The binary
@@ -19,8 +20,10 @@ mod llama_device;
 pub mod tensor_device;
 
 pub use llama_device::kernels as llama_kernels;
-use tensor_device::GpuTensor;
 pub use tensor_device::kernels as tensor_kernels;
+use tensor_device::{GpuAdamWMoments, GpuTensor};
+
+pub mod checkpoint;
 
 fn elementwise_config<S: Shape>() -> LaunchConfig {
     assert!(S::NUM_ELEMENTS <= u32::MAX as usize);
@@ -405,6 +408,100 @@ pub struct GpuLlama<
     pub down_proj: GpuLinear<FF, D>,
     pub final_norm: GpuRmsNorm<D>,
     pub lm_head: GpuLinear<D, VOCAB>,
+}
+
+/// GPU-resident AdamW state mirroring every model parameter.
+pub struct GpuLlamaAdamW<const VOCAB: usize, const D: usize, const FF: usize> {
+    config: AdamWConfig,
+    step: u64,
+    pub embedding: GpuAdamWMoments<Rank2<VOCAB, D>>,
+    pub attention_norm: GpuAdamWMoments<Rank1<D>>,
+    pub q_proj: GpuAdamWMoments<Rank2<D, D>>,
+    pub k_proj: GpuAdamWMoments<Rank2<D, D>>,
+    pub v_proj: GpuAdamWMoments<Rank2<D, D>>,
+    pub o_proj: GpuAdamWMoments<Rank2<D, D>>,
+    pub ffn_norm: GpuAdamWMoments<Rank1<D>>,
+    pub gate_proj: GpuAdamWMoments<Rank2<D, FF>>,
+    pub up_proj: GpuAdamWMoments<Rank2<D, FF>>,
+    pub down_proj: GpuAdamWMoments<Rank2<FF, D>>,
+    pub final_norm: GpuAdamWMoments<Rank1<D>>,
+    pub lm_head: GpuAdamWMoments<Rank2<D, VOCAB>>,
+}
+
+impl<const VOCAB: usize, const D: usize, const FF: usize> GpuLlamaAdamW<VOCAB, D, FF> {
+    pub fn new(stream: &CudaStream, config: AdamWConfig) -> Result<Self, DriverError> {
+        config.validate();
+        Ok(Self {
+            config,
+            step: 0,
+            embedding: GpuAdamWMoments::zeros(stream)?,
+            attention_norm: GpuAdamWMoments::zeros(stream)?,
+            q_proj: GpuAdamWMoments::zeros(stream)?,
+            k_proj: GpuAdamWMoments::zeros(stream)?,
+            v_proj: GpuAdamWMoments::zeros(stream)?,
+            o_proj: GpuAdamWMoments::zeros(stream)?,
+            ffn_norm: GpuAdamWMoments::zeros(stream)?,
+            gate_proj: GpuAdamWMoments::zeros(stream)?,
+            up_proj: GpuAdamWMoments::zeros(stream)?,
+            down_proj: GpuAdamWMoments::zeros(stream)?,
+            final_norm: GpuAdamWMoments::zeros(stream)?,
+            lm_head: GpuAdamWMoments::zeros(stream)?,
+        })
+    }
+
+    pub fn step(&self) -> u64 {
+        self.step
+    }
+
+    pub fn config(&self) -> AdamWConfig {
+        self.config
+    }
+
+    pub(crate) fn restore_step(&mut self, step: u64) {
+        self.step = step;
+    }
+
+    pub fn update<const N: usize, const T: usize, const H: usize, const HD: usize>(
+        &mut self,
+        model: &mut GpuLlama<N, T, VOCAB, D, H, HD, FF>,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        self.step = self.step.checked_add(1).expect("AdamW step overflow");
+        let (first_correction, second_correction) = self.config.bias_correction(self.step);
+
+        macro_rules! update {
+            ($field:ident, $weight_decay:expr) => {
+                model.$field.w.adamw_step(
+                    &model.$field.dw,
+                    &mut self.$field,
+                    self.config.learning_rate,
+                    self.config.beta1,
+                    self.config.beta2,
+                    self.config.epsilon,
+                    $weight_decay,
+                    first_correction,
+                    second_correction,
+                    stream,
+                    kernels,
+                )?;
+            };
+        }
+
+        update!(embedding, self.config.weight_decay);
+        update!(attention_norm, 0.0);
+        update!(q_proj, self.config.weight_decay);
+        update!(k_proj, self.config.weight_decay);
+        update!(v_proj, self.config.weight_decay);
+        update!(o_proj, self.config.weight_decay);
+        update!(ffn_norm, 0.0);
+        update!(gate_proj, self.config.weight_decay);
+        update!(up_proj, self.config.weight_decay);
+        update!(down_proj, self.config.weight_decay);
+        update!(final_norm, 0.0);
+        update!(lm_head, self.config.weight_decay);
+        Ok(())
+    }
 }
 
 pub struct GpuLlamaCtx<

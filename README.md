@@ -37,12 +37,15 @@ crates/                 CPU-side cargo workspace -- builds/tests on any machine
   nn/                   Module trait, Chain combinator, layers, gradcheck
   data/                 tiktoken r50k tokenizer, u16 token shards, mmap loader,
                         [B,T] batcher, prepare-wiki preprocessing binary
+  optim/                AdamW CPU reference, typed Llama state, param visitor
 gpu/                    standalone cuda-oxide crates -- built on Modal GPUs
   bench-util/           CUDA-event timing; re-exports the shared RNG
   vecadd/               toolchain smoke test (lib.rs kernel, main.rs check,
                         bin/bench.rs benchmark) -- the template for new kernels
   llama-ops/            auditable fp32 RMSNorm, SwiGLU, embedding, and fused
                         softmax-cross-entropy forward/backward parity kernels
+  tensor-gpu/           GpuTensor, elementwise/reduction/GEMM, fused AdamW
+  llama-model/          full fp32 model parity, tiny overfit gate, shard trainer
 modal_app.py            Modal image (CUDA 13 + LLVM 21 + pinned nightly +
                         cuda-oxide backend) and run/bench/sweep/sanitize entrypoints
 run.sh                  thin wrapper over `modal run`
@@ -58,6 +61,8 @@ cargo test          # tensor ops, gradchecks, shard/batcher/tokenizer; no GPU ne
 
 ```bash
 cargo run --release -p data --bin prepare_wiki -- --limit-files 1   # smoke test
+cargo run --release -p data --bin prepare_wiki -- \
+  --limit-files 1 --limit-articles 1000                             # bounded smoke shard
 cargo run --release -p data --bin prepare_wiki                      # full run
 ```
 
@@ -90,3 +95,32 @@ To add a kernel: copy `gpu/vecadd` to `gpu/<name>`, set `name` in its
 `bench.rs` figure of merit (GB/s if bandwidth-bound, TFLOP/s if compute-bound).
 Expose tuning knobs as `pub const NAME: usize` in `lib.rs` so `SWEEP` can
 rewrite them.
+
+## GPU training smoke run
+
+The milestone-6 trainer reads `TOK1` shards from the `rust-trainer-wiki` Modal
+volume. Upload a prepared shard once, then launch the small fp32 reference
+configuration:
+
+```bash
+modal volume create rust-trainer-wiki
+modal volume put rust-trainer-wiki \
+  data/wiki/wiki-val-00000.tok /wiki-val-00000.tok
+
+SHARD=/data/wiki-val-00000.tok STEPS=100 ./run.sh llama-model train
+LR=0.0003 WEIGHT_DECAY=0.1 LOG_EVERY=10 \
+  SHARD=/data/wiki-val-00000.tok STEPS=1000 \
+  CHECKPOINT=/data/checkpoints/wiki.ckpt CHECKPOINT_EVERY=100 \
+  ./run.sh llama-model train
+
+# TRAIN_STEPS is the target global step when resuming.
+SHARD=/data/wiki-val-00000.tok STEPS=2000 \
+  CHECKPOINT=/data/checkpoints/wiki.ckpt RESUME=1 \
+  ./run.sh llama-model train
+```
+
+Model and batch shapes remain compile-time constants in
+`gpu/llama-model/src/bin/train.rs`. Runtime settings are limited to the shard,
+step count, logging/checkpoint intervals, and AdamW scalars. Checkpoints include
+all parameters, AdamW moments/configuration, the global step, static shape
+metadata, and the next batch position; saves use atomic replacement.

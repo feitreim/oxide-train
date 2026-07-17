@@ -17,8 +17,10 @@
 
 pub mod batch;
 pub mod shard;
+#[cfg(feature = "offline")]
 pub mod tokenizer;
 
 pub use batch::Batches;
 pub use shard::{ShardWriter, TokenFile};
+#[cfg(feature = "offline")]
 pub use tokenizer::Tokenizer;

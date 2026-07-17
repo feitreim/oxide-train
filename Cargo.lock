@@ -1181,6 +1181,7 @@ dependencies = [
 name = "optim"
 version = "0.1.0"
 dependencies = [
+ "nn",
  "tensor-core",
  "tensor-cpu",
 ]

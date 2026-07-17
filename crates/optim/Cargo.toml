@@ -4,5 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+nn.workspace = true
 tensor-core.workspace = true
 tensor-cpu.workspace = true

@@ -3,7 +3,7 @@
 //! Layout (all little-endian):
 //! ```text
 //! offset  size  field
-//! 0       4     magic   = 0x544F4B31 ("TOK1")
+//! 0       4     magic   = "TOK1" (0x314B4F54 when read as little-endian u32)
 //! 4       4     version = 1
 //! 8       4     dtype   = 1 (u16)
 //! 12      4     reserved (0)
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
 
-pub const MAGIC: u32 = 0x544F_4B31; // "TOK1"
+pub const MAGIC: u32 = u32::from_le_bytes(*b"TOK1");
 pub const VERSION: u32 = 1;
 pub const DTYPE_U16: u32 = 1;
 pub const HEADER_BYTES: usize = 24;
@@ -216,9 +216,24 @@ mod tests {
         w.write_tokens(&tokens[..7000]).unwrap();
         w.write_tokens(&tokens[7000..]).unwrap();
         assert_eq!(w.finish().unwrap(), 10_000);
+        assert_eq!(&std::fs::read(&path).unwrap()[..4], b"TOK1");
 
         let f = TokenFile::open(&path).unwrap();
         assert_eq!(f.tokens(), &tokens[..]);
+    }
+
+    #[test]
+    fn legacy_reversed_magic_is_rejected() {
+        let path = std::env::temp_dir().join("rust-trainer-legacy-magic-test.tok");
+        let mut w = ShardWriter::create(&path).unwrap();
+        w.write_tokens(&[1, 2, 3]).unwrap();
+        w.finish().unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[..4].copy_from_slice(&0x544F_4B31u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(TokenFile::open(path).is_err());
     }
 
     #[test]

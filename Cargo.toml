@@ -23,3 +23,4 @@ edition = "2024"
 half = { version = "2.7.1", default-features = false }
 tensor-core = { path = "crates/tensor-core" }
 tensor-cpu = { path = "crates/tensor-cpu" }
+nn = { path = "crates/nn" }
