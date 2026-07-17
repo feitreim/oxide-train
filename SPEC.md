@@ -430,11 +430,16 @@ Each gated on tests; correctness before speed at every step.
        operands and the two transposes required by weight gradients.
        Non-tile-aligned correctness shapes retain the fp32 register-tiled
        oracle; the aligned tcgen05 path is gated end-to-end by a second
-       tile-aligned parity/overfit configuration in gpu/llama-model.
-       Against pre-7e8 main the twelve block-linear GEMM rows, including
-       conversion/transpose work, fell 355.84 → 24.07 ms (14.8×).
-       B200 same-container result vs post-7e8 main at B=32 T=1024:
-       (measured below).
+       tile-aligned parity/overfit configuration in gpu/llama-model
+       (128-aligned CPU parity at bf16 tolerances plus an overfit run,
+       3.080031 → 0.000008). B200 same-container result vs post-7e8 main
+       at B=32 T=1024: 484.21 → 152.14 ms full step (-68.6%, 3.18×); the
+       twelve block-linear GEMM rows, including conversion/transpose work,
+       fell 355.89 → 23.81 ms (14.9×), and the four post-AdamW
+       sync_compute rows total 0.11 ms. Combined with 7e8, the step is
+       751.9 → 152.1 ms (~4.9×) since the post-7e7 profile. The measured
+       tail is now flash attention (57.5 ms combined, 37.8%) and the
+       lm-head GEMM trio (54.2 ms, 35.6%).
    - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
      time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 
