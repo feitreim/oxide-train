@@ -12,7 +12,7 @@ pub mod element;
 pub mod rng;
 pub mod shape;
 
-pub use element::{DType, Element};
+pub use element::{DType, Element, bf16};
 pub use shape::{Rank1, Rank2, Rank3, Rank4, Shape};
 
 /// The common surface shared by `CpuTensor` and `GpuTensor`.

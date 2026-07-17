@@ -65,8 +65,7 @@ generics. Fixed `T` with packed/padded sequences, standard for pretraining.
 - **Parity via shared RNG**: one splitmix64 (top-24-bit f32 draws, exactly
   representable) lives in tensor-core and is re-exported by gpu/bench-util,
   so CPU and GPU tests reproduce identical inputs from a seed, bit-for-bit.
-- Element types: `f32`, `u16` (token ids), `u32`. `bf16` joins with the
-  mixed-precision phase (§7).
+- Element types: `f32`, `bf16`, `u16` (token ids), `u32`.
 
 ## 5. Differentiation: typed module-level reverse mode (no tape)
 
@@ -178,7 +177,34 @@ the thing it checks.
   modal_app.py. GEMM work starts from cuda-oxide's `gemm_sol_final`
   (Blackwell SoL example) rather than from scratch.
 
-## 11. Repo layout
+## 11. Kernel fusion
+
+- **Fusion is explicit substitution, never a compiler.** A fused kernel is a
+  new typed module (or a new GEMM variant) with the *same* Input/Output types
+  as the composition it replaces; adopting it is a type substitution — the
+  same mechanism reserved for SwiGLU → MoE. No graph, no scheduler, no tape.
+- **Three-tier oracle chain**: CPU reference (gradchecked) ← naive GPU
+  kernels (parity vs CPU; milestones 4–5) ← fused/optimized kernels (parity
+  vs naive). The naive kernels are never deleted — they are the spec the
+  fused ones are tested against.
+- **No epilogue framework.** GEMM fusion ships as hand-written variants:
+  plain store, `+=` accumulate (for `dw`), `+residual` if a profile demands
+  it. On Blackwell the epilogue is a pipeline stage (TMEM drain → smem
+  swizzle → TMA store), not a scalar hook, so a shared epilogue abstraction
+  may be *extracted* from ≥3 working variants but is never designed up front.
+  Elementwise tails (e.g. the SwiGLU pair) stay separate kernels: after
+  horizontal fusion, gate and up land in different output tiles, so a
+  per-element hook couldn't fuse them anyway.
+- **Horizontal fusion** (Q/K/V → one `[D,3D]` GEMM, gate+up → `[D,2FF]`) is a
+  type-level shape change to existing modules — no new kernel machinery.
+- **Measurement gate**: every perf/fusion PR must show full-step
+  before/after numbers *from the same container* (~3× cross-container
+  variance was observed on identical code). The step profiler (7a) exists to
+  make this cheap.
+- Activation checkpointing/recomputation: deferred to the scale milestone.
+  Typed `Ctx` already makes each module's save-vs-recompute policy visible.
+
+## 12. Repo layout
 
 ```
 crates/            CPU-side workspace (builds/tests anywhere, no CUDA)
@@ -186,19 +212,24 @@ crates/            CPU-side workspace (builds/tests anywhere, no CUDA)
   tensor-cpu/      CpuTensor + naive reference ops
   nn/              Module trait, combinators, layers, gradcheck
   data/            tokenizer, shard format, mmap loader, prepare-wiki binary
-  optim/           AdamW CPU reference, typed Llama state, param visitor
+  optim/           AdamW CPU reference, typed Llama state, param visitor,
+                   fp32 master weights (Muon planned)
 gpu/               standalone cuda-oxide kernel crates (Modal-built)
   bench-util/      CUDA-event timing + shared-RNG re-export
   vecadd/          toolchain smoke test; template for new kernels
   llama-ops/       direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
                    RoPE, causal attention, SwiGLU, embedding, and loss
+  gemm/            register-tiled fp32 + Blackwell tcgen05 bf16 GEMMs,
+                   store/accumulate variants, sweep benchmarks
+  flash-attn/      fused fp32 causal attention forward/backward, parity-tested
+                   against llama-ops without materialized probabilities
   tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled GEMM
   llama-model/     full fp32 GPU Llama forward/backward + CPU parity, fused
                    AdamW, tiny overfit gate, TOK1 shard trainer, checkpoints
 modal_app.py       Modal image + run/bench/sweep/sanitize/baseline/ptx
 ```
 
-## 12. Milestones
+## 13. Milestones
 
 Each gated on tests; correctness before speed at every step.
 
@@ -212,11 +243,32 @@ Each gated on tests; correctness before speed at every step.
 5. ✅ GPU forward+backward of the full model; parity vs CPU at fp32
 6. ✅ AdamW + GPU training loop; CPU/GPU update parity, tiny-batch overfit,
    deterministic checkpoint/resume, and a 100-step real-Wikipedia run
-7. Perf: bf16 + fp32 master, kernel fusion, tcgen05 GEMM, flash-style
-   attention, sweeps; Muon
-8. Scale/stretch: bigger model, MoE, (much later) multi-GPU
+7. Perf — parallel tracks, each owning disjoint crates so PRs don't collide;
+   integration is the one serialized step:
+   - **7a step profiler** (bench-util + train): per-kernel CUDA-event
+     breakdown of one full training step. Lands first — it gates every other
+     7.x perf claim (see §11 measurement gate).
+   - ✅ **7b GEMM ladder** (`gpu/gemm`, starting from cuda-oxide
+     `gemm_sol_final`): register-tiled fp32 → tcgen05 bf16; store +
+     accumulate variants; tuned via SWEEP.
+   - **7c flash attention ✅** (`gpu/flash-attn`): fused online-softmax fp32
+     forward and recompute-softmax backward, parity-tested against llama-ops'
+     naive attention kernels without materializing the probability matrix.
+   - ✅ **7d bf16 plumbing** (crates/tensor-core, tensor-cpu, optim): bf16
+     `Element`, conversions, fp32 master weights — feeds 7b's tcgen05 phase.
+   - **7e integration/fusion pass** (gpu/llama-model): horizontal QKV and
+     gate+up, accumulate-GEMM in backward, residual+RMSNorm fusion. Small
+     serialized PRs after 7b/7c merge, each gated on same-container step
+     time.
+   - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
+     time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 
-## 13. Decision log
+   Dependency shape: 7a/7b/7c/7d/7f can all run in parallel; 7e integrates
+   their results into the model.
+8. Scale/stretch: bigger model, MoE, activation checkpointing, (much later)
+   multi-GPU
+
+## 14. Decision log
 
 | # | Decision | Why |
 |---|----------|-----|
@@ -234,3 +286,5 @@ Each gated on tests; correctness before speed at every step.
 | 12 | Per-kernel crates + const sweeps on Modal | Kernels tuned/benched in isolation, outside training; sweep = same mechanism as compile-time shapes |
 | 13 | Shared splitmix64 for CPU/GPU parity | Bit-identical test inputs from a seed on both sides |
 | 14 | B200 on Modal; Blackwell-only paths OK | The one real target; dev machines have no GPU |
+| 15 | Fusion = typed substitution; no graph, no epilogue framework | Fused kernel = new module with identical types, parity vs the unfused path; Blackwell epilogues are pipeline stages, not scalar hooks — abstractions get extracted from ≥3 working variants, never designed first |
+| 16 | Perf claims need same-container before/after | ~3× variance observed across Modal containers on identical code; sweeps already share one container for exactly this reason |
