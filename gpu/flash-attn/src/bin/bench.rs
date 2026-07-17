@@ -27,7 +27,7 @@ fn forward_config() -> LaunchConfig {
 
 fn backward_config() -> LaunchConfig {
     LaunchConfig {
-        grid_dim: ((B * H) as u32, 1, 1),
+        grid_dim: ((N * H) as u32, 1, 1),
         block_dim: (HD as u32, 1, 1),
         shared_mem_bytes: 0,
     }
@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dy = DeviceBuffer::from_host(&stream, &uniform_vec(N * D, 84))?;
     let mut probabilities = DeviceBuffer::<f32>::zeroed(&stream, N * H * T)?;
     let mut y = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
+    let mut logsumexp = DeviceBuffer::<f32>::zeroed(&stream, N * H)?;
     let mut dq = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
     let mut dk = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
     let mut dv = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
@@ -85,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             H as u32,
             HD as u32,
             &mut y,
+            &mut logsumexp,
         )?;
         Ok(())
     })?;
@@ -128,17 +130,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })?;
     let flash_backward_ms = time_gpu_iters(&stream, 2, 10, || {
-        flash_module.flash_attention_backward(
+        flash_module.flash_attention_backward_q(
             &stream,
             backward_config(),
             &q,
             &k,
             &v,
+            &y,
             &dy,
+            &logsumexp,
             T as u32,
             H as u32,
             HD as u32,
             &mut dq,
+        )?;
+        flash_module.flash_attention_backward_kv(
+            &stream,
+            backward_config(),
+            &q,
+            &k,
+            &v,
+            &y,
+            &dy,
+            &logsumexp,
+            T as u32,
+            H as u32,
+            HD as u32,
             &mut dk,
             &mut dv,
         )?;

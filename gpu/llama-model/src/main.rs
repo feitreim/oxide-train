@@ -74,6 +74,7 @@ fn overfit_tiny_batch(
     stream: &cuda_core::CudaStream,
     tensor: &model::tensor_kernels::LoadedModule,
     gemm: &model::gemm_kernels::LoadedModule,
+    flash: &model::flash_kernels::LoadedModule,
     llama: &model::llama_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     type TinyLlama = Llama<4, 4, 4, 8, 2, 4, 12>;
@@ -92,15 +93,33 @@ fn overfit_tiny_batch(
 
     for _ in 0..200 {
         gpu.zero_grad(stream, tensor)?;
-        gpu.forward(tokens, targets, &mut workspace, stream, tensor, gemm, llama)?;
+        gpu.forward(
+            tokens,
+            targets,
+            &mut workspace,
+            stream,
+            tensor,
+            gemm,
+            flash,
+            llama,
+        )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
         }
-        gpu.backward(&mut workspace, stream, tensor, gemm, llama)?;
+        gpu.backward(&mut workspace, stream, tensor, gemm, flash, llama)?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
 
-    gpu.forward(tokens, targets, &mut workspace, stream, tensor, gemm, llama)?;
+    gpu.forward(
+        tokens,
+        targets,
+        &mut workspace,
+        stream,
+        tensor,
+        gemm,
+        flash,
+        llama,
+    )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
     assert!(
@@ -128,6 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
     let tensor = model::tensor_kernels::load(&ctx)?;
     let gemm = model::gemm_kernels::load(&ctx)?;
+    let flash = model::flash_kernels::load(&ctx)?;
     let llama = model::llama_kernels::load(&ctx)?;
 
     let mut cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
@@ -144,12 +164,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &stream,
         &tensor,
         &gemm,
+        &flash,
         &llama,
     )?;
     assert_close("loss", workspace.loss(), &cpu_loss, &stream, 5e-5, 5e-5)?;
 
     cpu.backward(cpu_ctx);
-    gpu.backward(&mut workspace, &stream, &tensor, &gemm, &llama)?;
+    gpu.backward(&mut workspace, &stream, &tensor, &gemm, &flash, &llama)?;
 
     macro_rules! grad {
         ($field:ident, $tol:expr) => {
@@ -198,6 +219,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &stream,
         &tensor,
         &gemm,
+        &flash,
         &llama,
     )?;
     assert_close(
@@ -208,7 +230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         5e-5,
         5e-5,
     )?;
-    gpu.backward(&mut workspace, &stream, &tensor, &gemm, &llama)?;
+    gpu.backward(&mut workspace, &stream, &tensor, &gemm, &flash, &llama)?;
     grad!(embedding, 2e-4);
     grad!(attention_norm, 2e-4);
     assert_grouped_close(
@@ -303,6 +325,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     gpu.zero_grad(&stream, &tensor)?;
 
     println!("✓ full fp32 GPU Llama forward/backward and AdamW match CPU");
-    overfit_tiny_batch(&stream, &tensor, &gemm, &llama)?;
+    overfit_tiny_batch(&stream, &tensor, &gemm, &flash, &llama)?;
     Ok(())
 }

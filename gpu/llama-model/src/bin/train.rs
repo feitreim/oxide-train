@@ -67,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = cuda.default_stream();
     let tensor = model::tensor_kernels::load(&cuda)?;
     let gemm = model::gemm_kernels::load(&cuda)?;
+    let flash = model::flash_kernels::load(&cuda)?;
     let llama = model::llama_kernels::load(&cuda)?;
     let config = AdamWConfig {
         learning_rate: env_parse("TRAIN_LEARNING_RATE", 3e-4),
@@ -141,6 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &stream,
             &tensor,
             &gemm,
+            &flash,
             &llama,
         )?;
         let should_log = step == 1 || step % log_every == 0 || step == max_steps;
@@ -151,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("non-finite loss at step {step}").into());
             }
         }
-        gpu.backward(&mut workspace, &stream, &tensor, &gemm, &llama)?;
+        gpu.backward(&mut workspace, &stream, &tensor, &gemm, &flash, &llama)?;
         optimizer.update(&mut gpu, &stream, &tensor)?;
 
         let periodic_checkpoint = checkpoint_every > 0 && step % checkpoint_every == 0;
