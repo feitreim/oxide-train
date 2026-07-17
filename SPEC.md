@@ -313,10 +313,15 @@ Each gated on tests; correctness before speed at every step.
        full step (-4.5%); the same ~1.7 ms GEMM-row win measured 0.88%
        against the pre-7e1 196 ms step, before the fused classifier
        removed the softmax that buried it.
-     - **7e4 flash-attention integration**: swap the naive attention
+     - ✅ **7e4 flash-attention integration**: swap the naive attention
        kernels for gpu/flash-attn; re-tile its backward (key-block
        parallel, flash-2 style) if the profile shows the B·H-block launch
-       becoming the tail at real T.
+       becoming the tail at real T. The first integrated profile put the
+       B·H-block backward at 4.29 ms, so backward was split into query-parallel
+       dQ and key-parallel dK/dV using saved `[N,H]` log-sum-exp scalars. B200
+       same-process result after 7e3: 36.35 → 29.79 ms full step (-18.0%);
+       attention forward+backward 6.789 → 0.243 ms (27.9×), with no `[N,H,T]`
+       probability matrix.
      - **7e5 bf16 compute**: tcgen05 GEMMs + fp32 master weights/optimizer
        states (§7 phase 2, plumbing from 7d); pad vocab 50,257 → 50,304
        (393×128) so the lm-head satisfies tcgen05's M,N ≡ 0 (mod 128)

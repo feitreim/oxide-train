@@ -7,7 +7,7 @@ use optim::AdamWConfig;
 
 #[path = "../lib.rs"]
 mod model;
-use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace, NaiveClassifierWorkspace};
+use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace, NaiveAttentionWorkspace};
 
 const B: usize = 1;
 const T: usize = 64;
@@ -45,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
     let tensor = model::tensor_kernels::load(&ctx)?;
     let gemm = model::gemm_kernels::load(&ctx)?;
+    let flash = model::flash_kernels::load(&ctx)?;
     let llama = model::llama_kernels::load(&ctx)?;
 
     let cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
@@ -52,30 +53,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(cpu);
     let mut optimizer = GpuLlamaAdamW::new(&stream, AdamWConfig::default())?;
     let mut workspace = GpuLlamaWorkspace::<N, T, VOCAB, D, H, FF>::new(&stream)?;
-    let mut naive_classifier = NaiveClassifierWorkspace::<N, VOCAB>::new(&stream)?;
+    let mut naive_attention = NaiveAttentionWorkspace::<N, H, T>::new(&stream)?;
     let tokens = std::array::from_fn(|i| (i * 7919 + 17) % VOCAB);
     let targets = std::array::from_fn(|i| tokens[(i + 1) % N]);
 
     for _ in 0..WARMUP_STEPS {
         gpu.zero_grad(&stream, &tensor)?;
         let mut profiler = bench_util::NoopProfiler;
-        gpu.forward_naive_profiled(
+        gpu.forward_naive_attention_profiled(
             tokens,
             targets,
             &mut workspace,
-            &mut naive_classifier,
+            &mut naive_attention,
             &stream,
             &tensor,
             &gemm,
+            &flash,
             &llama,
             &mut profiler,
         )?;
-        gpu.backward_naive_profiled(
+        gpu.backward_naive_attention_profiled(
             &mut workspace,
-            &naive_classifier,
+            &naive_attention,
             &stream,
             &tensor,
             &gemm,
+            &flash,
             &llama,
             &mut profiler,
         )?;
@@ -88,23 +91,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deliberately inside the full-step interval and appear as unattributed
     // device time rather than being mislabeled as kernels.
     gpu.zero_grad_profiled(&stream, &tensor, &mut profiler)?;
-    gpu.forward_naive_profiled(
+    gpu.forward_naive_attention_profiled(
         tokens,
         targets,
         &mut workspace,
-        &mut naive_classifier,
+        &mut naive_attention,
         &stream,
         &tensor,
         &gemm,
+        &flash,
         &llama,
         &mut profiler,
     )?;
-    gpu.backward_naive_profiled(
+    gpu.backward_naive_attention_profiled(
         &mut workspace,
-        &naive_classifier,
+        &naive_attention,
         &stream,
         &tensor,
         &gemm,
+        &flash,
         &llama,
         &mut profiler,
     )?;
@@ -120,9 +125,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &stream,
             &tensor,
             &gemm,
+            &flash,
             &llama,
         )?;
-        gpu.backward(&mut workspace, &stream, &tensor, &gemm, &llama)?;
+        gpu.backward(&mut workspace, &stream, &tensor, &gemm, &flash, &llama)?;
         optimizer.update(&mut gpu, &stream, &tensor)?;
     }
     stream.synchronize()?;
@@ -136,6 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &stream,
         &tensor,
         &gemm,
+        &flash,
         &llama,
         &mut profiler,
     )?;
@@ -144,16 +151,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &stream,
         &tensor,
         &gemm,
+        &flash,
         &llama,
         &mut profiler,
     )?;
     optimizer.update_profiled(&mut gpu, &stream, &tensor, &mut profiler)?;
     let candidate = profiler.finish(&stream)?;
 
-    println!("baseline: naive classifier");
+    println!("baseline: naive materialized-probability attention");
     println!("{baseline}");
     println!();
-    println!("candidate: fused classifier");
+    println!("candidate: flash attention");
     println!("{candidate}");
     println!();
     println!("scope: in-place zero_grad + forward + backward + AdamW");

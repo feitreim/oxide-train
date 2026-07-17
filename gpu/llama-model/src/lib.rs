@@ -16,6 +16,8 @@ use tensor_core::{Rank1, Rank2, Rank3, Shape};
 // cuda-oxide collects kernels from the selected binary target. The binary
 // includes this file as a module, which in turn includes each canonical kernel
 // source here instead of copying definitions or relying on dependency PTX.
+#[path = "../../flash-attn/src/lib.rs"]
+mod flash_device;
 #[path = "../../gemm/src/fp32.rs"]
 mod gemm_device;
 #[path = "../../llama-ops/src/lib.rs"]
@@ -24,6 +26,7 @@ mod llama_device;
 #[allow(dead_code)]
 pub mod tensor_device;
 
+pub use flash_device::kernels as flash_kernels;
 pub use gemm_device::kernels as gemm_kernels;
 pub use llama_device::kernels as llama_kernels;
 pub use tensor_device::kernels as tensor_kernels;
@@ -55,6 +58,29 @@ fn classifier_config<const N: usize>() -> LaunchConfig {
     }
 }
 
+fn flash_forward_config<const N: usize, const H: usize, const HD: usize>() -> LaunchConfig {
+    assert!(HD.is_power_of_two());
+    assert!(HD <= flash_device::MAX_HEAD_DIM);
+    assert!(N * H <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: ((N * H) as u32, 1, 1),
+        block_dim: (HD as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn flash_backward_config<const N: usize, const T: usize, const H: usize, const HD: usize>()
+-> LaunchConfig {
+    assert_eq!(N % T, 0);
+    assert!(HD.is_power_of_two());
+    assert!(HD <= flash_device::MAX_HEAD_DIM);
+    assert!(N * H <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: ((N * H) as u32, 1, 1),
+        block_dim: (HD as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
 
 fn add_into<S: Shape, P: KernelProfiler>(
     lhs: &GpuTensor<f32, S>,
@@ -627,6 +653,21 @@ impl<const N: usize, const VOCAB: usize> NaiveClassifierWorkspace<N, VOCAB> {
     }
 }
 
+/// Materialized attention probabilities used only by the retained naive oracle.
+///
+/// The normal flash-attention path neither allocates nor stores `[N,H,T]`.
+pub struct NaiveAttentionWorkspace<const N: usize, const H: usize, const T: usize> {
+    probabilities: GpuTensor<f32, Rank3<N, H, T>>,
+}
+
+impl<const N: usize, const H: usize, const T: usize> NaiveAttentionWorkspace<N, H, T> {
+    pub fn new(stream: &CudaStream) -> Result<Self, DriverError> {
+        Ok(Self {
+            probabilities: GpuTensor::zeros(stream)?,
+        })
+    }
+}
+
 /// Persistent device and pinned-host storage for one model's training steps.
 ///
 /// Create this once and pass it to every forward/backward call. All operator
@@ -650,8 +691,8 @@ pub struct GpuLlamaWorkspace<
     q: GpuTensor<f32, Rank2<N, D>>,
     k: GpuTensor<f32, Rank2<N, D>>,
     v: GpuTensor<f32, Rank2<N, D>>,
-    probabilities: GpuTensor<f32, Rank3<N, H, T>>,
     attended: GpuTensor<f32, Rank2<N, D>>,
+    attention_logsumexp: GpuTensor<f32, Rank2<N, H>>,
     ffn_input: GpuTensor<f32, Rank2<N, D>>,
     ffn_normalized: GpuTensor<f32, Rank2<N, D>>,
     gate_up: GpuTensor<f32, Rank3<N, 2, FF>>,
@@ -696,8 +737,8 @@ impl<
             q: GpuTensor::zeros(stream)?,
             k: GpuTensor::zeros(stream)?,
             v: GpuTensor::zeros(stream)?,
-            probabilities: GpuTensor::zeros(stream)?,
             attended: GpuTensor::zeros(stream)?,
+            attention_logsumexp: GpuTensor::zeros(stream)?,
             ffn_input: GpuTensor::zeros(stream)?,
             ffn_normalized: GpuTensor::zeros(stream)?,
             gate_up: GpuTensor::zeros(stream)?,
@@ -803,6 +844,7 @@ impl<
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
@@ -813,6 +855,7 @@ impl<
             stream,
             tensor,
             gemm,
+            flash,
             llama,
             &mut profiler,
         )
@@ -826,15 +869,19 @@ impl<
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        self.forward_profiled_with_probabilities(
-            tokens, targets, workspace, None, stream, tensor, gemm, llama, profiler,
+        self.forward_profiled_with_oracles(
+            tokens, targets, workspace, None, None, stream, tensor, gemm, flash, llama, profiler,
         )
     }
 
     /// Retained full-model baseline for same-process profiling and parity.
+    /// Retained oracle: only the profiler binary calls this, so other
+    /// binaries see it as dead code.
+    #[allow(dead_code)]
     pub fn forward_naive_profiled<P: KernelProfiler>(
         &self,
         tokens: [usize; N],
@@ -844,31 +891,68 @@ impl<
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        self.forward_profiled_with_probabilities(
+        self.forward_profiled_with_oracles(
             tokens,
             targets,
             workspace,
             Some(&mut classifier.probabilities),
+            None,
             stream,
             tensor,
             gemm,
+            flash,
             llama,
             profiler,
         )
     }
 
-    fn forward_profiled_with_probabilities<P: KernelProfiler>(
+    /// Retained naive-attention baseline for same-process profiling and parity.
+    /// Retained oracle: only the profiler binary calls this, so other
+    /// binaries see it as dead code.
+    #[allow(dead_code)]
+    pub fn forward_naive_attention_profiled<P: KernelProfiler>(
         &self,
         tokens: [usize; N],
         targets: [usize; N],
         workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
-        naive_probabilities: Option<&mut GpuTensor<f32, Rank2<N, VOCAB>>>,
+        attention: &mut NaiveAttentionWorkspace<N, H, T>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        flash: &flash_kernels::LoadedModule,
+        llama: &llama_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        self.forward_profiled_with_oracles(
+            tokens,
+            targets,
+            workspace,
+            None,
+            Some(&mut attention.probabilities),
+            stream,
+            tensor,
+            gemm,
+            flash,
+            llama,
+            profiler,
+        )
+    }
+
+    fn forward_profiled_with_oracles<P: KernelProfiler>(
+        &self,
+        tokens: [usize; N],
+        targets: [usize; N],
+        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        naive_classifier_probabilities: Option<&mut GpuTensor<f32, Rank2<N, VOCAB>>>,
+        naive_attention_probabilities: Option<&mut GpuTensor<f32, Rank3<N, H, T>>>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+        flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
@@ -928,16 +1012,29 @@ impl<
             "forward.k_rope",
         )?;
         std::mem::swap(&mut workspace.k, &mut workspace.d_model_0);
-        attention_forward_into::<N, T, D, H, HD, P>(
-            &workspace.q,
-            &workspace.k,
-            &workspace.v,
-            &mut workspace.attended,
-            &mut workspace.probabilities,
-            stream,
-            llama,
-            profiler,
-        )?;
+        if let Some(probabilities) = naive_attention_probabilities {
+            naive_attention_forward_into::<N, T, D, H, HD, P>(
+                &workspace.q,
+                &workspace.k,
+                &workspace.v,
+                &mut workspace.attended,
+                probabilities,
+                stream,
+                llama,
+                profiler,
+            )?;
+        } else {
+            flash_attention_forward_into::<N, T, D, H, HD, P>(
+                &workspace.q,
+                &workspace.k,
+                &workspace.v,
+                &mut workspace.attended,
+                &mut workspace.attention_logsumexp,
+                stream,
+                flash,
+                profiler,
+            )?;
+        }
         self.o_proj.forward_into(
             &workspace.attended,
             &mut workspace.projection_output,
@@ -1025,7 +1122,7 @@ impl<
             profiler,
             "forward.lm_head.gemm",
         )?;
-        if let Some(probabilities) = naive_probabilities {
+        if let Some(probabilities) = naive_classifier_probabilities {
             naive_cross_entropy_into(
                 &workspace.logits,
                 &workspace.targets,
@@ -1059,10 +1156,11 @@ impl<
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
-        self.backward_profiled(workspace, stream, tensor, gemm, llama, &mut profiler)
+        self.backward_profiled(workspace, stream, tensor, gemm, flash, llama, &mut profiler)
     }
 
     pub fn backward_profiled<P: KernelProfiler>(
@@ -1071,15 +1169,19 @@ impl<
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        self.backward_profiled_with_probabilities(
-            workspace, None, stream, tensor, gemm, llama, profiler,
+        self.backward_profiled_with_oracles(
+            workspace, None, None, stream, tensor, gemm, flash, llama, profiler,
         )
     }
 
     /// Retained full-model baseline for same-process profiling and parity.
+    /// Retained oracle: only the profiler binary calls this, so other
+    /// binaries see it as dead code.
+    #[allow(dead_code)]
     pub fn backward_naive_profiled<P: KernelProfiler>(
         &mut self,
         workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
@@ -1087,31 +1189,64 @@ impl<
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        self.backward_profiled_with_probabilities(
+        self.backward_profiled_with_oracles(
             workspace,
             Some(&classifier.probabilities),
+            None,
             stream,
             tensor,
             gemm,
+            flash,
             llama,
             profiler,
         )
     }
 
-    fn backward_profiled_with_probabilities<P: KernelProfiler>(
+    /// Retained naive-attention baseline for same-process profiling and parity.
+    /// Retained oracle: only the profiler binary calls this, so other
+    /// binaries see it as dead code.
+    #[allow(dead_code)]
+    pub fn backward_naive_attention_profiled<P: KernelProfiler>(
         &mut self,
         workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
-        naive_probabilities: Option<&GpuTensor<f32, Rank2<N, VOCAB>>>,
+        attention: &NaiveAttentionWorkspace<N, H, T>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        if let Some(probabilities) = naive_probabilities {
+        self.backward_profiled_with_oracles(
+            workspace,
+            None,
+            Some(&attention.probabilities),
+            stream,
+            tensor,
+            gemm,
+            flash,
+            llama,
+            profiler,
+        )
+    }
+
+    fn backward_profiled_with_oracles<P: KernelProfiler>(
+        &mut self,
+        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        naive_classifier_probabilities: Option<&GpuTensor<f32, Rank2<N, VOCAB>>>,
+        naive_attention_probabilities: Option<&GpuTensor<f32, Rank3<N, H, T>>>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+        flash: &flash_kernels::LoadedModule,
+        llama: &llama_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        if let Some(probabilities) = naive_classifier_probabilities {
             naive_cross_entropy_backward_into(
                 probabilities,
                 &workspace.targets,
@@ -1223,19 +1358,36 @@ impl<
             profiler,
             ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
         )?;
-        attention_backward_into::<N, T, D, H, HD, P>(
-            &workspace.q,
-            &workspace.k,
-            &workspace.v,
-            &workspace.probabilities,
-            &workspace.d_model_0,
-            &mut workspace.d_model_1,
-            &mut workspace.d_model_3,
-            &mut workspace.d_model_4,
-            stream,
-            llama,
-            profiler,
-        )?;
+        if let Some(probabilities) = naive_attention_probabilities {
+            naive_attention_backward_into::<N, T, D, H, HD, P>(
+                &workspace.q,
+                &workspace.k,
+                &workspace.v,
+                probabilities,
+                &workspace.d_model_0,
+                &mut workspace.d_model_1,
+                &mut workspace.d_model_3,
+                &mut workspace.d_model_4,
+                stream,
+                llama,
+                profiler,
+            )?;
+        } else {
+            flash_attention_backward_into::<N, T, D, H, HD, P>(
+                &workspace.q,
+                &workspace.k,
+                &workspace.v,
+                &workspace.attended,
+                &workspace.attention_logsumexp,
+                &workspace.d_model_0,
+                &mut workspace.d_model_1,
+                &mut workspace.d_model_3,
+                &mut workspace.d_model_4,
+                stream,
+                flash,
+                profiler,
+            )?;
+        }
         rope_into::<N, T, D, H, HD, P>(
             &workspace.d_model_1,
             &mut workspace.d_model_0,
@@ -1391,7 +1543,7 @@ fn rope_into<
     Ok(())
 }
 
-fn attention_forward_into<
+fn naive_attention_forward_into<
     const N: usize,
     const T: usize,
     const D: usize,
@@ -1435,7 +1587,40 @@ fn attention_forward_into<
     Ok(())
 }
 
-fn attention_backward_into<
+fn flash_attention_forward_into<
+    const N: usize,
+    const T: usize,
+    const D: usize,
+    const H: usize,
+    const HD: usize,
+    P: KernelProfiler,
+>(
+    q: &GpuTensor<f32, Rank2<N, D>>,
+    k: &GpuTensor<f32, Rank2<N, D>>,
+    v: &GpuTensor<f32, Rank2<N, D>>,
+    output: &mut GpuTensor<f32, Rank2<N, D>>,
+    logsumexp: &mut GpuTensor<f32, Rank2<N, H>>,
+    stream: &CudaStream,
+    kernels: &flash_kernels::LoadedModule,
+    profiler: &mut P,
+) -> Result<(), DriverError> {
+    profiler.measure(stream, "forward.attention.flash", || {
+        kernels.flash_attention_forward(
+            stream,
+            flash_forward_config::<N, H, HD>(),
+            q.as_device_buffer(),
+            k.as_device_buffer(),
+            v.as_device_buffer(),
+            T as u32,
+            H as u32,
+            HD as u32,
+            output.as_device_buffer_mut(),
+            logsumexp.as_device_buffer_mut(),
+        )
+    })
+}
+
+fn naive_attention_backward_into<
     const N: usize,
     const T: usize,
     const D: usize,
@@ -1494,6 +1679,65 @@ fn attention_backward_into<
             T as u32,
             H as u32,
             HD as u32,
+            dv.as_device_buffer_mut(),
+        )
+    })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flash_attention_backward_into<
+    const N: usize,
+    const T: usize,
+    const D: usize,
+    const H: usize,
+    const HD: usize,
+    P: KernelProfiler,
+>(
+    q: &GpuTensor<f32, Rank2<N, D>>,
+    k: &GpuTensor<f32, Rank2<N, D>>,
+    v: &GpuTensor<f32, Rank2<N, D>>,
+    output: &GpuTensor<f32, Rank2<N, D>>,
+    logsumexp: &GpuTensor<f32, Rank2<N, H>>,
+    dy: &GpuTensor<f32, Rank2<N, D>>,
+    dq: &mut GpuTensor<f32, Rank2<N, D>>,
+    dk: &mut GpuTensor<f32, Rank2<N, D>>,
+    dv: &mut GpuTensor<f32, Rank2<N, D>>,
+    stream: &CudaStream,
+    kernels: &flash_kernels::LoadedModule,
+    profiler: &mut P,
+) -> Result<(), DriverError> {
+    let config = flash_backward_config::<N, T, H, HD>();
+    profiler.measure(stream, "backward.attention.flash_q", || {
+        kernels.flash_attention_backward_q(
+            stream,
+            config,
+            q.as_device_buffer(),
+            k.as_device_buffer(),
+            v.as_device_buffer(),
+            output.as_device_buffer(),
+            dy.as_device_buffer(),
+            logsumexp.as_device_buffer(),
+            T as u32,
+            H as u32,
+            HD as u32,
+            dq.as_device_buffer_mut(),
+        )
+    })?;
+    profiler.measure(stream, "backward.attention.flash_kv", || {
+        kernels.flash_attention_backward_kv(
+            stream,
+            config,
+            q.as_device_buffer(),
+            k.as_device_buffer(),
+            v.as_device_buffer(),
+            output.as_device_buffer(),
+            dy.as_device_buffer(),
+            logsumexp.as_device_buffer(),
+            T as u32,
+            H as u32,
+            HD as u32,
+            dk.as_device_buffer_mut(),
             dv.as_device_buffer_mut(),
         )
     })?;

@@ -25,7 +25,7 @@ fn forward_config() -> LaunchConfig {
 
 fn backward_config() -> LaunchConfig {
     LaunchConfig {
-        grid_dim: ((B * H) as u32, 1, 1),
+        grid_dim: ((N * H) as u32, 1, 1),
         block_dim: (HD as u32, 1, 1),
         shared_mem_bytes: 0,
     }
@@ -121,6 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let mut actual_y = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
+    let mut logsumexp = DeviceBuffer::<f32>::zeroed(&stream, N * H)?;
     let mut actual_dq = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
     let mut actual_dk = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
     let mut actual_dv = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
@@ -134,18 +135,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         H as u32,
         HD as u32,
         &mut actual_y,
+        &mut logsumexp,
     )?;
-    flash_module.flash_attention_backward(
+    flash_module.flash_attention_backward_q(
         &stream,
         backward_config(),
         &q,
         &k,
         &v,
+        &actual_y,
         &dy,
+        &logsumexp,
         T as u32,
         H as u32,
         HD as u32,
         &mut actual_dq,
+    )?;
+    flash_module.flash_attention_backward_kv(
+        &stream,
+        backward_config(),
+        &q,
+        &k,
+        &v,
+        &actual_y,
+        &dy,
+        &logsumexp,
+        T as u32,
+        H as u32,
+        HD as u32,
         &mut actual_dk,
         &mut actual_dv,
     )?;
