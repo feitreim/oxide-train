@@ -8,6 +8,11 @@
 //! Dimensions are the smallest that exercise the real tcgen05 path: `D` and
 //! `VP` are one 128 tile, `N` = 8 real token rows inside one padded `NP` =
 //! 128 tile, and the odd `VOCAB` = 17 exercises the classifier's packed tail.
+//!
+//! These shapes are deliberately non-tile-aligned, so the block linears take
+//! their fp32 fallback; [`aligned_tcgen05_linears`] runs a second, fully
+//! 128-aligned configuration that is the end-to-end gate for the bf16
+//! tcgen05 block-linear path (7e9).
 
 use cuda_core::CudaContext;
 use nn::Llama;
@@ -272,6 +277,133 @@ fn overfit_tiny_batch(
     Ok(())
 }
 
+/// End-to-end gate for the tcgen05 block-linear path (7e9).
+///
+/// Every shape here is a multiple of the 128 tile, so the block linears run
+/// the integrated bf16 path: activation quantize, the two weight-gradient
+/// transposes, the prefix TMA maps, the fp32-output epilogues, and the
+/// post-AdamW compute-weight refresh. One forward/backward is compared
+/// against the CPU reference under the bf16 tolerances, then the same model
+/// must overfit a deterministic token mapping — which fails if any operand
+/// orientation, map selection, or master/compute sync is wrong.
+fn aligned_tcgen05_linears(
+    stream: &cuda_core::CudaStream,
+    tensor: &model::tensor_kernels::LoadedModule,
+    gemm: &model::gemm_kernels::LoadedModule,
+    gemm_bf16: &model::Tcgen05Gemm,
+    flash: &model::flash_kernels::LoadedModule,
+    llama: &model::llama_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const NA: usize = 128;
+    const TA: usize = 4;
+    const VA: usize = 17;
+    const VPA: usize = 128;
+    const DA: usize = 128;
+    const HA: usize = 2;
+    const FFA: usize = 128;
+
+    let mut cpu = Llama::<NA, TA, VA, DA, HA, HD, FFA>::new(7);
+    let mut gpu = GpuLlama::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
+    let mut workspace = GpuLlamaWorkspace::<NA, NA, TA, VA, VPA, DA, HA, FFA>::new(stream)?;
+    assert!(
+        workspace.tcgen05_linears_active(),
+        "aligned gate is not exercising the tcgen05 block-linear path"
+    );
+
+    // Target is a fixed function of the current token: exact for parity and
+    // learnable to ~zero loss by the overfit loop below.
+    let tokens: [usize; NA] = std::array::from_fn(|i| (i * 7 + 3) % VA);
+    let targets: [usize; NA] = std::array::from_fn(|i| (tokens[i] + 1) % VA);
+
+    let (cpu_loss, cpu_ctx) = cpu.forward(tokens, targets);
+    gpu.forward(
+        &tokens, &targets, &mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama,
+    )?;
+    assert_close(
+        "aligned loss",
+        workspace.loss(),
+        &cpu_loss,
+        stream,
+        BF16_ATOL,
+        BF16_RTOL,
+    )?;
+
+    cpu.backward(cpu_ctx);
+    gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama)?;
+
+    macro_rules! grad {
+        ($field:ident) => {
+            assert_close(
+                concat!("aligned ", stringify!($field), ".dw"),
+                &gpu.$field.dw,
+                &cpu.$field.dw,
+                stream,
+                BF16_ATOL,
+                BF16_RTOL,
+            )?;
+        };
+    }
+    grad!(embedding);
+    grad!(attention_norm);
+    assert_grouped_close(
+        "aligned qkv_proj.dw",
+        &gpu.qkv_proj.dw,
+        [&cpu.q_proj.dw, &cpu.k_proj.dw, &cpu.v_proj.dw],
+        stream,
+        BF16_ATOL,
+        BF16_RTOL,
+    )?;
+    grad!(o_proj);
+    grad!(ffn_norm);
+    assert_grouped_close(
+        "aligned gate_up_proj.dw",
+        &gpu.gate_up_proj.dw,
+        [&cpu.gate_proj.dw, &cpu.up_proj.dw],
+        stream,
+        BF16_ATOL,
+        BF16_RTOL,
+    )?;
+    grad!(down_proj);
+    grad!(final_norm);
+    println!("✓ aligned tcgen05 block linears match CPU forward/backward");
+
+    let config = AdamWConfig {
+        learning_rate: 0.02,
+        weight_decay: 0.0,
+        ..AdamWConfig::default()
+    };
+    let mut optimizer = GpuLlamaAdamW::new(stream, config)?;
+    let mut initial_loss = None;
+    for _ in 0..600 {
+        gpu.zero_grad(stream, tensor)?;
+        gpu.forward(
+            &tokens, &targets, &mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama,
+        )?;
+        if initial_loss.is_none() {
+            initial_loss = Some(workspace.loss().to_host(stream)?[0]);
+        }
+        gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama)?;
+        optimizer.update(&mut gpu, stream, tensor)?;
+    }
+    gpu.forward(
+        &tokens, &targets, &mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama,
+    )?;
+    let final_loss = workspace.loss().to_host(stream)?[0];
+    let initial_loss = initial_loss.expect("training loop runs at least once");
+    assert!(
+        final_loss < 0.05,
+        "aligned tcgen05 model did not overfit: initial={initial_loss}, final={final_loss}"
+    );
+    assert!(
+        final_loss < initial_loss * 0.05,
+        "aligned tcgen05 loss did not fall enough: initial={initial_loss}, final={final_loss}"
+    );
+    println!(
+        "✓ aligned tcgen05 block linears overfit ({initial_loss:.6} -> {final_loss:.6})"
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
@@ -475,5 +607,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("✓ full GPU Llama forward/backward and AdamW (bf16 lm-head) match CPU");
     overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
+    aligned_tcgen05_linears(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
     Ok(())
 }

@@ -136,6 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         .map_err(Into::into)
     })?;
+    let mut bf16_f32_accumulate_c = DeviceBuffer::<f32>::zeroed(&stream, BF16_M * BF16_N)?;
     let bf16_f32_accumulate_ms = time_gpu_iters(&stream, 5, 20, || {
         unsafe {
             module.gemm_tcgen05_bf16_f32_accumulate(
@@ -143,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bf16_config,
                 a_tma.as_ptr(),
                 b_tma.as_ptr(),
-                &mut bf16_f32_c,
+                &mut bf16_f32_accumulate_c,
                 BF16_N as u32,
                 BF16_K as u32,
             )

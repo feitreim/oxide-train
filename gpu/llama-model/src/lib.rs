@@ -565,6 +565,9 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                     )
                 }
             })?;
+            // `scratch.rows` still holds the quantized `dy` written by the
+            // weight-gradient pass above; this launch consumes it as its row
+            // operand, so nothing may overwrite `rows` between the two.
             profiler.measure(stream, names[1], || unsafe {
                 tcgen05.f32_store(
                     stream,
@@ -738,6 +741,9 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     )
                 }
             })?;
+            // `scratch.rows` still holds the quantized `dy` written by the
+            // weight-gradient pass above; this launch consumes it as its row
+            // operand, so nothing may overwrite `rows` between the two.
             profiler.measure(stream, names[1], || unsafe {
                 tcgen05.f32_store(
                     stream,
@@ -1492,6 +1498,13 @@ impl<
 
     pub fn loss(&self) -> &GpuTensor<f32, Rank1<1>> {
         &self.loss
+    }
+
+    /// Whether this workspace's shapes route the block linears through the
+    /// bf16 tcgen05 path. Lets the aligned parity gate assert it is actually
+    /// exercising that path rather than silently falling back to fp32.
+    pub fn tcgen05_linears_active(&self) -> bool {
+        self.linear_scratch.is_some()
     }
 
     /// Host readback of one packed-bf16 logits row, widened to f32.
