@@ -77,6 +77,7 @@ modal run modal_app.py::doctor          # toolchain + GPU sanity check
 ./run.sh vecadd                         # correctness
 ./run.sh vecadd bench                   # throughput
 ./run.sh llama-ops                      # Llama leaf-op CPU/GPU parity
+./run.sh llama-model profile            # full-step per-kernel CUDA-event profile
 SWEEP="BM=128 BN=128,BM=256 BN=64" ./run.sh gemm   # tuning sweep (one container)
 ```
 
