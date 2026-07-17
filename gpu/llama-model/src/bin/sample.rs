@@ -75,6 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = cuda.default_stream();
     let tensor = model::tensor_kernels::load(&cuda)?;
     let gemm = model::gemm_kernels::load(&cuda)?;
+    let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&cuda, "gemm.ptx")?;
+    let flash = model::flash_kernels::load(&cuda)?;
     let llama = model::llama_kernels::load(&cuda)?;
 
     let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF>(
@@ -101,7 +103,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut live = PROMPT_TOKENS;
         while live < PROMPT_TOKENS + generate {
-            gpu.forward(window, [0; N], &mut workspace, &stream, &tensor, &gemm, &llama)?;
+            gpu.forward(
+                window,
+                [0; N],
+                &mut workspace,
+                &stream,
+                &tensor,
+                &gemm,
+                &gemm_bf16,
+                &flash,
+                &llama,
+            )?;
             let logits = workspace.logits_row(live - 1, &stream)?;
             window[live] = sample_top_k(&logits[..VOCAB], &mut rng);
             live += 1;
