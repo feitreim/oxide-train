@@ -266,7 +266,8 @@ gpu/               standalone cuda-oxide kernel crates (Modal-built)
                    store/accumulate variants, sweep benchmarks; host-only
                    tcgen05 support (TMA maps, raw launchers) in src/host.rs
   flash-attn/      fused fp32 causal attention forward/backward, parity-tested
-                   against llama-ops without materialized probabilities
+                   against llama-ops without materialized probabilities;
+                   FlashAttention-2 tiled kernels + per-row oracles
   tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled
                    GEMM; packed-bf16 converts/transpose + master-weight AdamW
   llama-model/     full GPU Llama forward/backward + CPU parity (fp32 with a
@@ -376,17 +377,36 @@ Each gated on tests; correctness before speed at every step.
        now flash attention at 36.9 ms combined (29.0%, quadratic-in-T forward
        + backward), followed by the three `*_norm.input` backwards at 20.6 ms
        combined (16.1%).
-     - **7e7 flash-attention tiling** (open): the post-7e6 batch-shape
+     - ✅ **7e7 flash-attention tiling**: the post-7e6 batch-shape
        sweep (B200, 182.7M) measured a flat 38.9 µs/token across
        B=32/64/128 at T=1024 (GPU saturates by N≈32k; B is an
        optimization knob, not throughput) and 56.5 µs/token at T=2048,
        with the flash rows at 45.8% of the step at T=1024 and 62.7% at
-       T=2048. The per-(row, head) blocks scan keys serially with HD
-       lanes; re-tile to the FlashAttention-2 block structure
-       (key/query-block staging through shared memory, parallelism over
-       key blocks) in forward, `backward_q`, and `backward_kv`. Naive and
-       current flash kernels both retained as oracles. Gate per §10.1 at
-       B=32 T=1024 and B=128 T=2048.
+       T=2048. The per-(row, head) blocks scanned keys serially with HD
+       lanes; re-tiled to the FlashAttention-2 block structure: query/key
+       tiles staged through shared memory with register-tiled score
+       fragments, forward and dQ parallel over query blocks, dK/dV over
+       key blocks, and the per-row `dy·y` dots staged once by a new
+       `backward_dot` kernel (tile sizes are SWEEP consts; kernels
+       specialize on `TILE_HD` = 64). Naive and per-row flash kernels
+       retained as oracles; parity vs naive at T=80 (partial tiles) and
+       T=4 holds to ~1e-7. B200 same-container results — B=32 T=1024:
+       1276.4 → 751.8 ms full step (-41.1%, 1.70×), flash rows 582.6 →
+       58.0 ms (10.0×); B=64 T=2048: 7402.4 → 3199.6 ms (-56.8%, 2.31×),
+       flash rows 4645.1 → 442.5 ms (10.5×, 62.7% → 13.8% of step),
+       56.5 → 24.4 µs/token. The T=2048 gate ran at B=64, not B=128:
+       at B=128 the packed-bf16 logits launches index `NP*VP/2` words,
+       which overflows u32 — a real scale ceiling to lift when a shape
+       needs it. Landing note: the tiny-overfit gate's lr 0.03 proved
+       knife-edge — a CPU probe injecting ±1-ulp-scale noise into
+       attention outputs/gradients (modelling summation-order changes)
+       parked ~1 in 8 realizations on the bf16 two-logit tie, which the
+       tiled kernels' rounding realized on GPU; the gate now runs lr
+       0.02, where every sampled realization converges by ~step 60. The
+       re-profiled tail at B=32 T=1024 is the RMSNorm family (three
+       `*_norm.input` backwards 163.6 ms + three forwards 88.3 ms,
+       ~33.5% combined) and the fp32 block GEMMs
+       (`backward.gate_up_proj` pair 118.7 ms, 15.8%).
    - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
      time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 
