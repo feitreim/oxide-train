@@ -322,11 +322,15 @@ Each gated on tests; correctness before speed at every step.
        same-process result after 7e3: 36.35 → 29.79 ms full step (-18.0%);
        attention forward+backward 6.789 → 0.243 ms (27.9×), with no `[N,H,T]`
        probability matrix.
-     - **7e5 bf16 compute**: tcgen05 GEMMs + fp32 master weights/optimizer
-       states (§7 phase 2, plumbing from 7d); pad vocab 50,257 → 50,304
-       (393×128) so the lm-head satisfies tcgen05's M,N ≡ 0 (mod 128)
-       contract. Residual+RMSNorm fusion joins here if the re-profile
-       still shows it above noise.
+     - **7e5 bf16 compute + norm backward**: tcgen05 GEMMs + fp32 master
+       weights/optimizer states (§7 phase 2, plumbing from 7d); pad vocab
+       50,257 → 50,304 (393×128) so the lm-head satisfies tcgen05's
+       M,N ≡ 0 (mod 128) contract. Also owns the RMSNorm weight-gradient
+       reductions: post-7e4 profile shows the three
+       `backward.*_norm.weight` rows at ~2.7 ms each (~8.2 ms, 27% of the
+       30.2 ms step) — with `backward.lm_head` (~9.2 ms, the bf16 target)
+       they are the last two big rocks. Residual+RMSNorm fusion joins
+       here if the re-profile still shows it above noise.
    - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
      time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 
