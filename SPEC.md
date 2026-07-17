@@ -65,8 +65,7 @@ generics. Fixed `T` with packed/padded sequences, standard for pretraining.
 - **Parity via shared RNG**: one splitmix64 (top-24-bit f32 draws, exactly
   representable) lives in tensor-core and is re-exported by gpu/bench-util,
   so CPU and GPU tests reproduce identical inputs from a seed, bit-for-bit.
-- Element types: `f32`, `u16` (token ids), `u32`. `bf16` joins with the
-  mixed-precision phase (§7).
+- Element types: `f32`, `bf16`, `u16` (token ids), `u32`.
 
 ## 5. Differentiation: typed module-level reverse mode (no tape)
 
@@ -206,7 +205,7 @@ crates/            CPU-side workspace (builds/tests anywhere, no CUDA)
   tensor-cpu/      CpuTensor + naive reference ops
   nn/              Module trait, combinators, layers, gradcheck
   data/            tokenizer, shard format, mmap loader, prepare-wiki binary
-  (planned) optim/ AdamW, Muon, param visitor
+  optim/           mixed-precision master weights; AdamW, Muon, param visitor
   (planned) train/ the training binary: config, loop, checkpoints, logging
 gpu/               standalone cuda-oxide kernel crates (Modal-built)
   bench-util/      CUDA-event timing + shared-RNG re-export
@@ -244,7 +243,7 @@ Each gated on tests; correctness before speed at every step.
    - **7c flash attention ✅** (`gpu/flash-attn`): fused online-softmax fp32
      forward and recompute-softmax backward, parity-tested against llama-ops'
      naive attention kernels without materializing the probability matrix.
-   - **7d bf16 plumbing** (crates/tensor-core, tensor-cpu, optim): bf16
+   - ✅ **7d bf16 plumbing** (crates/tensor-core, tensor-cpu, optim): bf16
      `Element`, conversions, fp32 master weights — feeds 7b's tcgen05 phase.
    - **7e integration/fusion pass** (gpu/llama-model): horizontal QKV and
      gate+up, accumulate-GEMM in backward, residual+RMSNorm fusion. Small

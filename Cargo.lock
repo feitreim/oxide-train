@@ -1178,6 +1178,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "optim"
+version = "0.1.0"
+dependencies = [
+ "tensor-core",
+ "tensor-cpu",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1750,6 +1758,9 @@ dependencies = [
 [[package]]
 name = "tensor-core"
 version = "0.1.0"
+dependencies = [
+ "half",
+]
 
 [[package]]
 name = "tensor-cpu"
