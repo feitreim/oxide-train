@@ -220,6 +220,62 @@ pub mod kernels {
             *slot = acc;
         }
     }
+
+    /// `C = A^T . B`: `[M,K]^T x [M,N] -> [K,N]`.
+    #[kernel]
+    pub fn gemm_tn(
+        m: u32,
+        n: u32,
+        k: u32,
+        a: &[f32],
+        b: &[f32],
+        mut c: DisjointSlice<f32, thread::Runtime2DIndex>,
+    ) {
+        let row = thread::blockIdx_y() as usize * thread::blockDim_y() as usize
+            + thread::threadIdx_y() as usize;
+        let col = thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize;
+        if row >= k as usize || col >= n as usize {
+            return;
+        }
+        let mut acc = 0.0f32;
+        for inner in 0..m as usize {
+            acc += a[inner * k as usize + row] * b[inner * n as usize + col];
+        }
+        if let Some(index) = unsafe { thread::index_2d_runtime(n as usize) }
+            && let Some(slot) = c.get_mut(index)
+        {
+            *slot = acc;
+        }
+    }
+
+    /// `C = A . B^T`: `[M,K] x [N,K]^T -> [M,N]`.
+    #[kernel]
+    pub fn gemm_nt(
+        m: u32,
+        n: u32,
+        k: u32,
+        a: &[f32],
+        b: &[f32],
+        mut c: DisjointSlice<f32, thread::Runtime2DIndex>,
+    ) {
+        let row = thread::blockIdx_y() as usize * thread::blockDim_y() as usize
+            + thread::threadIdx_y() as usize;
+        let col = thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize;
+        if row >= m as usize || col >= n as usize {
+            return;
+        }
+        let mut acc = 0.0f32;
+        for inner in 0..k as usize {
+            acc += a[row * k as usize + inner] * b[col * k as usize + inner];
+        }
+        if let Some(index) = unsafe { thread::index_2d_runtime(n as usize) }
+            && let Some(slot) = c.get_mut(index)
+        {
+            *slot = acc;
+        }
+    }
 }
 
 /// Owning, contiguous device tensor. Shape information is zero-sized and
@@ -439,6 +495,48 @@ impl<const M: usize, const K: usize> GpuTensor<f32, Rank2<M, K>> {
         assert!(K <= u32::MAX as usize);
         let mut out = GpuTensor::zeros(stream)?;
         module.gemm_tiled(
+            stream,
+            gemm_config::<M, N>(),
+            M as u32,
+            N as u32,
+            K as u32,
+            &self.data,
+            &rhs.data,
+            &mut out.data,
+        )?;
+        Ok(out)
+    }
+
+    pub fn matmul_tn<const N: usize>(
+        &self,
+        rhs: &GpuTensor<f32, Rank2<M, N>>,
+        stream: &CudaStream,
+        module: &kernels::LoadedModule,
+    ) -> Result<GpuTensor<f32, Rank2<K, N>>, DriverError> {
+        assert!(M <= u32::MAX as usize);
+        let mut out = GpuTensor::zeros(stream)?;
+        module.gemm_tn(
+            stream,
+            gemm_config::<K, N>(),
+            M as u32,
+            N as u32,
+            K as u32,
+            &self.data,
+            &rhs.data,
+            &mut out.data,
+        )?;
+        Ok(out)
+    }
+
+    pub fn matmul_nt<const N: usize>(
+        &self,
+        rhs: &GpuTensor<f32, Rank2<N, K>>,
+        stream: &CudaStream,
+        module: &kernels::LoadedModule,
+    ) -> Result<GpuTensor<f32, Rank2<M, N>>, DriverError> {
+        assert!(K <= u32::MAX as usize);
+        let mut out = GpuTensor::zeros(stream)?;
+        module.gemm_nt(
             stream,
             gemm_config::<M, N>(),
             M as u32,
