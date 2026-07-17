@@ -76,6 +76,11 @@ fn write_tensor<S: Shape>(
     Ok(())
 }
 
+fn write_host_tensor(writer: &mut impl Write, host: &[f32]) -> io::Result<()> {
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr().cast::<u8>(), host.len() * 4) };
+    writer.write_all(bytes)
+}
+
 fn read_tensor<S: Shape>(
     reader: &mut impl Read,
     stream: &CudaStream,
@@ -85,6 +90,14 @@ fn read_tensor<S: Shape>(
         unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), host.len() * 4) };
     reader.read_exact(bytes)?;
     Ok(GpuTensor::from_host(stream, &host)?)
+}
+
+fn read_host_tensor(reader: &mut impl Read, elements: usize) -> io::Result<Vec<f32>> {
+    let mut host = vec![0.0f32; elements];
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), host.len() * 4) };
+    reader.read_exact(bytes)?;
+    Ok(host)
 }
 
 fn write_config(writer: &mut impl Write, config: AdamWConfig) -> io::Result<()> {
@@ -159,9 +172,15 @@ pub fn save<
     }
     write_parameter!(embedding);
     write_parameter!(attention_norm);
-    write_parameter!(q_proj);
-    write_parameter!(k_proj);
-    write_parameter!(v_proj);
+    let (q_weight, k_weight, v_weight) = model.qkv.weights_to_host(stream)?;
+    let ((q_first, k_first, v_first), (q_second, k_second, v_second)) =
+        optimizer.qkv.moments_to_host(stream)?;
+    for tensor in [
+        &q_weight, &q_first, &q_second, &k_weight, &k_first, &k_second, &v_weight, &v_first,
+        &v_second,
+    ] {
+        write_host_tensor(&mut writer, tensor)?;
+    }
     write_parameter!(o_proj);
     write_parameter!(ffn_norm);
     write_parameter!(gate_proj);
@@ -230,9 +249,21 @@ pub fn load<
     }
     read_parameter!(embedding);
     read_parameter!(attention_norm);
-    read_parameter!(q_proj);
-    read_parameter!(k_proj);
-    read_parameter!(v_proj);
+    let q_weight = read_host_tensor(&mut reader, D * D)?;
+    let q_first = read_host_tensor(&mut reader, D * D)?;
+    let q_second = read_host_tensor(&mut reader, D * D)?;
+    let k_weight = read_host_tensor(&mut reader, D * D)?;
+    let k_first = read_host_tensor(&mut reader, D * D)?;
+    let k_second = read_host_tensor(&mut reader, D * D)?;
+    let v_weight = read_host_tensor(&mut reader, D * D)?;
+    let v_first = read_host_tensor(&mut reader, D * D)?;
+    let v_second = read_host_tensor(&mut reader, D * D)?;
+    model
+        .qkv
+        .replace_weights(&q_weight, &k_weight, &v_weight, stream)?;
+    optimizer.qkv.replace_moments(
+        &q_first, &k_first, &v_first, &q_second, &k_second, &v_second, stream,
+    )?;
     read_parameter!(o_proj);
     read_parameter!(ffn_norm);
     read_parameter!(gate_proj);

@@ -100,8 +100,12 @@ Run the dedicated profiler without a dataset shard:
 
 The binary uses a fixed, compile-time performance configuration: `B=1`, `T=64`,
 `VOCAB=50,257`, `D=1536`, `H=24`, `HD=64`, and `FF=4096` (about 182.7M
-parameters). It runs two complete warmup steps, synchronizes the stream, and
-then measures one `zero_grad + forward + backward + AdamW` step. Normal
+parameters). For the active QKV-fusion comparison it constructs the retained
+three-projection baseline and packed candidate from the same seed, gives each
+two complete warmup steps, and runs both paths in the same process. The
+performance gate uses the mean of ten normal
+`zero_grad + forward + backward + AdamW` steps with only outer CUDA events;
+one fully instrumented step per path provides the changed kernel rows. Normal
 correctness and training binaries retain the zero-event `NoopProfiler` path.
 
 The report contains one CUDA-event duration per named kernel launch plus:
@@ -110,7 +114,12 @@ The report contains one CUDA-event duration per named kernel launch plus:
 - `unattributed`: device time inside the full-step events but outside a named
   kernel span, including input copies, allocations, gradient-buffer zero fills,
   and launch gaps;
-- `full step`: the end-to-end device timeline used for performance comparisons.
+- `full step`: the end-to-end device timeline for that instrumented diagnostic
+  step.
+
+The final `unprofiled full-step mean` line is the performance-gate number.
+Keeping per-kernel timing events out of that interval avoids attributing
+host-side event-recording stalls to either implementation.
 
 Shard reading, checkpointing, and loss copies performed only for logging are
 not part of this compute-step profile. Kernel names are prefixed with

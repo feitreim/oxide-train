@@ -29,10 +29,22 @@ fn assert_close<S: Shape>(
     Ok(())
 }
 
+fn assert_close_slice(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
+    assert_eq!(actual.len(), expected.len());
+    for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+        let tolerance = atol + rtol * e.abs();
+        assert!(
+            (a - e).abs() <= tolerance,
+            "{name} mismatch at {i}: gpu={a}, cpu={e}, tolerance={tolerance}"
+        );
+    }
+}
+
 fn overfit_tiny_batch(
     stream: &cuda_core::CudaStream,
     tensor: &model::tensor_kernels::LoadedModule,
     llama: &model::llama_kernels::LoadedModule,
+    fusion: &model::fusion_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     type TinyLlama = Llama<4, 4, 4, 8, 2, 4, 12>;
     let tokens = [0, 1, 2, 3];
@@ -49,16 +61,16 @@ fn overfit_tiny_batch(
 
     for _ in 0..200 {
         gpu.zero_grad(stream)?;
-        let (loss, backward) = gpu.forward(tokens, targets, stream, tensor, llama)?;
+        let (loss, backward) = gpu.forward(tokens, targets, stream, tensor, llama, fusion)?;
         if initial_loss.is_none() {
             initial_loss = Some(loss.to_host(stream)?[0]);
         }
-        gpu.backward(backward, stream, tensor, llama)?;
+        gpu.backward(backward, stream, tensor, llama, fusion)?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
 
     let final_loss = gpu
-        .forward(tokens, targets, stream, tensor, llama)?
+        .forward(tokens, targets, stream, tensor, llama, fusion)?
         .0
         .to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -87,6 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
     let tensor = model::tensor_kernels::load(&ctx)?;
     let llama = model::llama_kernels::load(&ctx)?;
+    let fusion = model::fusion_kernels::load(&ctx)?;
 
     let mut cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
     let mut gpu = GpuLlama::from_cpu(&stream, &cpu)?;
@@ -94,11 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let targets = [5, 5, 2, 7, 3, 16, 0, 4];
 
     let (cpu_loss, cpu_ctx) = cpu.forward(tokens, targets);
-    let (gpu_loss, gpu_ctx) = gpu.forward(tokens, targets, &stream, &tensor, &llama)?;
+    let (gpu_loss, gpu_ctx) = gpu.forward(tokens, targets, &stream, &tensor, &llama, &fusion)?;
     assert_close("loss", &gpu_loss, &cpu_loss, &stream, 5e-5, 5e-5)?;
 
     cpu.backward(cpu_ctx);
-    gpu.backward(gpu_ctx, &stream, &tensor, &llama)?;
+    gpu.backward(gpu_ctx, &stream, &tensor, &llama, &fusion)?;
 
     macro_rules! grad {
         ($field:ident, $tol:expr) => {
@@ -114,9 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     grad!(embedding, 2e-4);
     grad!(attention_norm, 2e-4);
-    grad!(q_proj, 2e-4);
-    grad!(k_proj, 2e-4);
-    grad!(v_proj, 2e-4);
+    let (q_grad, k_grad, v_grad) = gpu.qkv.gradients_to_host(&stream)?;
+    assert_close_slice("q_proj.dw", &q_grad, cpu.q_proj.dw.as_slice(), 2e-4, 2e-4);
+    assert_close_slice("k_proj.dw", &k_grad, cpu.k_proj.dw.as_slice(), 2e-4, 2e-4);
+    assert_close_slice("v_proj.dw", &v_grad, cpu.v_proj.dw.as_slice(), 2e-4, 2e-4);
     grad!(o_proj, 2e-4);
     grad!(ffn_norm, 2e-4);
     grad!(gate_proj, 2e-4);
@@ -134,9 +148,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     copy_grad!(embedding);
     copy_grad!(attention_norm);
-    copy_grad!(q_proj);
-    copy_grad!(k_proj);
-    copy_grad!(v_proj);
+    cpu.q_proj.dw = CpuTensor::from_slice(&q_grad);
+    cpu.k_proj.dw = CpuTensor::from_slice(&k_grad);
+    cpu.v_proj.dw = CpuTensor::from_slice(&v_grad);
     copy_grad!(o_proj);
     copy_grad!(ffn_norm);
     copy_grad!(gate_proj);
@@ -169,9 +183,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     weight!(embedding);
     weight!(attention_norm);
-    weight!(q_proj);
-    weight!(k_proj);
-    weight!(v_proj);
+    let (q_weight, k_weight, v_weight) = gpu.qkv.weights_to_host(&stream)?;
+    assert_close_slice(
+        "q_proj.w after AdamW",
+        &q_weight,
+        cpu.q_proj.w.as_slice(),
+        2e-6,
+        2e-6,
+    );
+    assert_close_slice(
+        "k_proj.w after AdamW",
+        &k_weight,
+        cpu.k_proj.w.as_slice(),
+        2e-6,
+        2e-6,
+    );
+    assert_close_slice(
+        "v_proj.w after AdamW",
+        &v_weight,
+        cpu.v_proj.w.as_slice(),
+        2e-6,
+        2e-6,
+    );
     weight!(o_proj);
     weight!(ffn_norm);
     weight!(gate_proj);
@@ -182,6 +215,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     gpu.zero_grad(&stream)?;
 
     println!("✓ full fp32 GPU Llama forward/backward and AdamW match CPU");
-    overfit_tiny_batch(&stream, &tensor, &llama)?;
+    overfit_tiny_batch(&stream, &tensor, &llama, &fusion)?;
     Ok(())
 }

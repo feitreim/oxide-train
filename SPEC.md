@@ -183,11 +183,15 @@ the thing it checks.
   no shard and runs a fixed static configuration representative of the initial
   model scale: `B=1`, `T=64`, `VOCAB=50,257`, `D=1536`, `H=24`, `HD=64`, and
   `FF=4096` (182,705,664 parameters).
-- The binary performs two untimed `zero_grad + forward + backward + AdamW`
-  warmup steps, synchronizes, then records one complete step with CUDA events.
-  Every explicit kernel launch is named by phase (`forward.*`, `backward.*`,
-  `optimizer.*`). The normal training path uses `NoopProfiler`, so collecting
-  events is opt-in.
+- For an active 7.x comparison, the binary constructs retained-baseline and
+  candidate models from the same seed, performs two untimed
+  `zero_grad + forward + backward + AdamW` warmup steps per path, then times ten
+  normal steps per path back-to-back in the same process using only outer CUDA
+  events. It additionally records one fully instrumented step per path so every
+  explicit kernel launch is named by phase (`forward.*`, `backward.*`,
+  `optimizer.*`). The outer-only mean is the performance-gate number; the
+  instrumented steps diagnose affected rows. Normal training uses
+  `NoopProfiler`.
 - The full-step event interval includes gradient zeroing, allocations, and
   input H2D copies. Work not enclosed by a named kernel span is reported as
   `unattributed`; it must not be silently dropped when quoting step time.
@@ -247,8 +251,8 @@ gpu/               standalone cuda-oxide kernel crates (Modal-built)
   flash-attn/      fused fp32 causal attention forward/backward, parity-tested
                    against llama-ops without materialized probabilities
   tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled GEMM
-  llama-model/     full fp32 GPU Llama forward/backward + CPU parity, fused
-                   AdamW, tiny overfit gate, TOK1 shard trainer, checkpoints
+  llama-model/     full fp32 GPU Llama forward/backward + CPU parity, packed
+                   QKV, fused AdamW, tiny overfit gate, TOK1 trainer/checkpoints
 modal_app.py       Modal image + run/bench/sweep/sanitize/baseline/ptx
 ```
 
@@ -279,10 +283,14 @@ Each gated on tests; correctness before speed at every step.
      naive attention kernels without materializing the probability matrix.
    - ✅ **7d bf16 plumbing** (crates/tensor-core, tensor-cpu, optim): bf16
      `Element`, conversions, fp32 master weights — feeds 7b's tcgen05 phase.
-   - **7e integration/fusion pass** (gpu/llama-model): horizontal QKV and
-     gate+up, accumulate-GEMM in backward, residual+RMSNorm fusion. Small
-     serialized PRs after 7b/7c merge, each gated on same-container step
-     time.
+   - **7e integration/fusion pass** (gpu/llama-model), as small serialized PRs
+     after 7b/7c merge, each gated on same-container step time:
+     - ✅ **7e1 horizontal QKV**: packed `[D,3D]` weights, activations,
+       gradients, and AdamW state; retained three-projection oracle; checkpoint
+       wire compatibility.
+     - **7e2 horizontal gate+up**
+     - **7e3 accumulate-GEMM in backward**
+     - **7e4 residual+RMSNorm fusion**
    - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
      time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 
