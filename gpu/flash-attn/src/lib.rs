@@ -369,6 +369,9 @@ pub mod kernels {
         for key_position in 0..=query_position {
             let key_row = sequence_start + key_position;
             let key_base = (key_row * h + head) * hd;
+            // Every lane must finish its broadcast read of PARTIALS[0] above
+            // before lane zero overwrites it for the next reduction.
+            thread::sync_threads();
             unsafe {
                 PARTIALS[tid] = q[query_base + tid] * k[key_base + tid];
             }
@@ -385,6 +388,8 @@ pub mod kernels {
             }
             let probability = (unsafe { PARTIALS[0] } * scale - row_logsumexp).exp();
 
+            // Same broadcast-read ordering as above.
+            thread::sync_threads();
             unsafe {
                 PARTIALS[tid] = dy[query_base + tid] * v[key_base + tid];
             }
@@ -457,6 +462,9 @@ pub mod kernels {
             let query_row = sequence_start + query_position;
             let query_head = query_row * h + head;
             let query_base = query_head * hd;
+            // Every lane must finish its broadcast reads of the partials
+            // below before lane zero overwrites them for this iteration.
+            thread::sync_threads();
             unsafe {
                 SCORE_PARTIALS[tid] = q[query_base + tid] * k[key_base + tid];
             }
@@ -473,6 +481,8 @@ pub mod kernels {
             }
             let probability = (unsafe { SCORE_PARTIALS[0] } * scale - logsumexp[query_head]).exp();
 
+            // Same broadcast-read ordering as above.
+            thread::sync_threads();
             unsafe {
                 SCORE_PARTIALS[tid] = dy[query_base + tid] * output[query_base + tid];
                 DOT_PARTIALS[tid] = dy[query_base + tid] * v[key_base + tid];
