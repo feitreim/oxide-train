@@ -5,7 +5,7 @@
 //! ownership of every backward context stay visible.
 
 use bench_util::{KernelProfiler, NoopProfiler};
-use cuda_core::{CudaStream, DriverError, LaunchConfig};
+use cuda_core::{CudaEvent, CudaStream, DriverError, LaunchConfig, PinnedHostBuffer};
 use nn::Llama;
 use optim::AdamWConfig;
 use tensor_core::{Rank1, Rank2, Rank3, Shape};
@@ -52,15 +52,15 @@ fn gemm_config<const M: usize, const N: usize>() -> LaunchConfig {
     }
 }
 
-fn add<S: Shape, P: KernelProfiler>(
+fn add_into<S: Shape, P: KernelProfiler>(
     lhs: &GpuTensor<f32, S>,
     rhs: &GpuTensor<f32, S>,
+    output: &mut GpuTensor<f32, S>,
     stream: &CudaStream,
     kernels: &tensor_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
-) -> Result<GpuTensor<f32, S>, DriverError> {
-    let mut output = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
         kernels.add(
             stream,
@@ -69,37 +69,34 @@ fn add<S: Shape, P: KernelProfiler>(
             rhs.as_device_buffer(),
             output.as_device_buffer_mut(),
         )
-    })?;
-    Ok(output)
+    })
 }
 
-fn add_scaled_assign<S: Shape, P: KernelProfiler>(
-    dst: &mut GpuTensor<f32, S>,
-    src: &GpuTensor<f32, S>,
+fn fill_zero<S: Shape, P: KernelProfiler>(
+    output: &mut GpuTensor<f32, S>,
     stream: &CudaStream,
     kernels: &tensor_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
-        kernels.add_scaled(
+        kernels.fill(
             stream,
             elementwise_config::<S>(),
-            src.as_device_buffer(),
-            1.0,
-            dst.as_device_buffer_mut(),
+            0.0,
+            output.as_device_buffer_mut(),
         )
     })
 }
 
-fn sum<S: Shape, P: KernelProfiler>(
+fn sum_into<S: Shape, P: KernelProfiler>(
     input: &GpuTensor<f32, S>,
+    output: &mut GpuTensor<f32, Rank1<1>>,
     stream: &CudaStream,
     kernels: &tensor_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
-) -> Result<GpuTensor<f32, Rank1<1>>, DriverError> {
-    let mut output = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
         kernels.sum(
             stream,
@@ -108,19 +105,18 @@ fn sum<S: Shape, P: KernelProfiler>(
             S::NUM_ELEMENTS as u32,
             output.as_device_buffer_mut(),
         )
-    })?;
-    Ok(output)
+    })
 }
 
-fn scale<S: Shape, P: KernelProfiler>(
+fn scale_into<S: Shape, P: KernelProfiler>(
     input: &GpuTensor<f32, S>,
     factor: f32,
+    output: &mut GpuTensor<f32, S>,
     stream: &CudaStream,
     kernels: &tensor_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
-) -> Result<GpuTensor<f32, S>, DriverError> {
-    let mut output = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
         kernels.scale(
             stream,
@@ -129,19 +125,18 @@ fn scale<S: Shape, P: KernelProfiler>(
             factor,
             output.as_device_buffer_mut(),
         )
-    })?;
-    Ok(output)
+    })
 }
 
-fn gemm<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
+fn gemm_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
     lhs: &GpuTensor<f32, Rank2<M, K>>,
     rhs: &GpuTensor<f32, Rank2<K, N>>,
+    output: &mut GpuTensor<f32, Rank2<M, N>>,
     stream: &CudaStream,
     kernels: &tensor_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
-) -> Result<GpuTensor<f32, Rank2<M, N>>, DriverError> {
-    let mut output = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
         kernels.gemm_tiled(
             stream,
@@ -153,21 +148,20 @@ fn gemm<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
             rhs.as_device_buffer(),
             output.as_device_buffer_mut(),
         )
-    })?;
-    Ok(output)
+    })
 }
 
-fn gemm_tn<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
+fn gemm_tn_accumulate_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
     lhs: &GpuTensor<f32, Rank2<M, K>>,
     rhs: &GpuTensor<f32, Rank2<M, N>>,
+    output: &mut GpuTensor<f32, Rank2<K, N>>,
     stream: &CudaStream,
     kernels: &tensor_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
-) -> Result<GpuTensor<f32, Rank2<K, N>>, DriverError> {
-    let mut output = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
-        kernels.gemm_tn(
+        kernels.gemm_tn_accumulate(
             stream,
             gemm_config::<K, N>(),
             M as u32,
@@ -177,19 +171,18 @@ fn gemm_tn<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
             rhs.as_device_buffer(),
             output.as_device_buffer_mut(),
         )
-    })?;
-    Ok(output)
+    })
 }
 
-fn gemm_nt<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
+fn gemm_nt_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
     lhs: &GpuTensor<f32, Rank2<M, K>>,
     rhs: &GpuTensor<f32, Rank2<N, K>>,
+    output: &mut GpuTensor<f32, Rank2<M, N>>,
     stream: &CudaStream,
     kernels: &tensor_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
-) -> Result<GpuTensor<f32, Rank2<M, N>>, DriverError> {
-    let mut output = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
         kernels.gemm_nt(
             stream,
@@ -201,8 +194,7 @@ fn gemm_nt<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
             rhs.as_device_buffer(),
             output.as_device_buffer_mut(),
         )
-    })?;
-    Ok(output)
+    })
 }
 
 pub struct GpuLinear<const IN: usize, const OUT: usize> {
@@ -221,29 +213,30 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         })
     }
 
-    fn forward<const N: usize, P: KernelProfiler>(
+    fn forward_into<const N: usize, P: KernelProfiler>(
         &self,
         x: &GpuTensor<f32, Rank2<N, IN>>,
+        output: &mut GpuTensor<f32, Rank2<N, OUT>>,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
         profiler: &mut P,
         name: &'static str,
-    ) -> Result<GpuTensor<f32, Rank2<N, OUT>>, DriverError> {
-        gemm(x, &self.w, stream, kernels, profiler, name)
+    ) -> Result<(), DriverError> {
+        gemm_into(x, &self.w, output, stream, kernels, profiler, name)
     }
 
-    fn backward<const N: usize, P: KernelProfiler>(
+    fn backward_into<const N: usize, P: KernelProfiler>(
         &mut self,
         x: &GpuTensor<f32, Rank2<N, IN>>,
         dy: &GpuTensor<f32, Rank2<N, OUT>>,
+        dx: &mut GpuTensor<f32, Rank2<N, IN>>,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
         profiler: &mut P,
-        names: [&'static str; 3],
-    ) -> Result<GpuTensor<f32, Rank2<N, IN>>, DriverError> {
-        let dw = gemm_tn(x, dy, stream, kernels, profiler, names[0])?;
-        add_scaled_assign(&mut self.dw, &dw, stream, kernels, profiler, names[1])?;
-        gemm_nt(dy, &self.w, stream, kernels, profiler, names[2])
+        names: [&'static str; 2],
+    ) -> Result<(), DriverError> {
+        gemm_tn_accumulate_into(x, dy, &mut self.dw, stream, kernels, profiler, names[0])?;
+        gemm_nt_into(dy, &self.w, dx, stream, kernels, profiler, names[1])
     }
 }
 
@@ -265,15 +258,15 @@ impl<const D: usize> GpuRmsNorm<D> {
         })
     }
 
-    fn forward<const N: usize, P: KernelProfiler>(
+    fn forward_into<const N: usize, P: KernelProfiler>(
         &self,
         x: &GpuTensor<f32, Rank2<N, D>>,
+        y: &mut GpuTensor<f32, Rank2<N, D>>,
         stream: &CudaStream,
         kernels: &llama_kernels::LoadedModule,
         profiler: &mut P,
         name: &'static str,
-    ) -> Result<GpuTensor<f32, Rank2<N, D>>, DriverError> {
-        let mut y = GpuTensor::zeros(stream)?;
+    ) -> Result<(), DriverError> {
         profiler.measure(stream, name, || {
             kernels.rms_norm_forward(
                 stream,
@@ -284,20 +277,19 @@ impl<const D: usize> GpuRmsNorm<D> {
                 D as u32,
                 y.as_device_buffer_mut(),
             )
-        })?;
-        Ok(y)
+        })
     }
 
-    fn backward<const N: usize, P: KernelProfiler>(
+    fn backward_into<const N: usize, P: KernelProfiler>(
         &mut self,
         x: &GpuTensor<f32, Rank2<N, D>>,
         dy: &GpuTensor<f32, Rank2<N, D>>,
+        dx: &mut GpuTensor<f32, Rank2<N, D>>,
         stream: &CudaStream,
         kernels: &llama_kernels::LoadedModule,
         profiler: &mut P,
         names: [&'static str; 2],
-    ) -> Result<GpuTensor<f32, Rank2<N, D>>, DriverError> {
-        let mut dx = GpuTensor::zeros(stream)?;
+    ) -> Result<(), DriverError> {
         profiler.measure(stream, names[0], || {
             kernels.rms_norm_backward_x(
                 stream,
@@ -321,8 +313,7 @@ impl<const D: usize> GpuRmsNorm<D> {
                 D as u32,
                 self.dw.as_device_buffer_mut(),
             )
-        })?;
-        Ok(dx)
+        })
     }
 }
 
@@ -342,15 +333,15 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
         })
     }
 
-    fn forward<const N: usize, P: KernelProfiler>(
+    fn forward_into<const N: usize, P: KernelProfiler>(
         &self,
         tokens: &GpuTensor<u32, Rank1<N>>,
+        y: &mut GpuTensor<f32, Rank2<N, D>>,
         stream: &CudaStream,
         kernels: &llama_kernels::LoadedModule,
         profiler: &mut P,
         name: &'static str,
-    ) -> Result<GpuTensor<f32, Rank2<N, D>>, DriverError> {
-        let mut y = GpuTensor::zeros(stream)?;
+    ) -> Result<(), DriverError> {
         profiler.measure(stream, name, || {
             kernels.embedding_forward(
                 stream,
@@ -360,8 +351,7 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
                 D as u32,
                 y.as_device_buffer_mut(),
             )
-        })?;
-        Ok(y)
+        })
     }
 
     fn backward<const N: usize, P: KernelProfiler>(
@@ -527,7 +517,30 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> GpuLlamaAdamW<VOCAB, D
     }
 }
 
-pub struct GpuLlamaCtx<
+struct InputStaging<const N: usize> {
+    tokens: PinnedHostBuffer<u32>,
+    targets: PinnedHostBuffer<u32>,
+    copied: CudaEvent,
+    pending: bool,
+}
+
+impl<const N: usize> InputStaging<N> {
+    fn new(stream: &CudaStream) -> Result<Self, DriverError> {
+        Ok(Self {
+            tokens: PinnedHostBuffer::zeroed(stream.context(), N)?,
+            targets: PinnedHostBuffer::zeroed(stream.context(), N)?,
+            copied: stream.context().new_event(None)?,
+            pending: false,
+        })
+    }
+}
+
+/// Persistent device and pinned-host storage for one model's training steps.
+///
+/// Create this once and pass it to every forward/backward call. All operator
+/// outputs are written into these allocations, so a steady-state step performs
+/// no device allocation or synchronous device free.
+pub struct GpuLlamaWorkspace<
     const N: usize,
     const T: usize,
     const VOCAB: usize,
@@ -537,6 +550,8 @@ pub struct GpuLlamaCtx<
 > {
     tokens: GpuTensor<u32, Rank1<N>>,
     targets: GpuTensor<u32, Rank1<N>>,
+    staging: [InputStaging<N>; 2],
+    next_staging: usize,
     attention_input: GpuTensor<f32, Rank2<N, D>>,
     attention_normalized: GpuTensor<f32, Rank2<N, D>>,
     q: GpuTensor<f32, Rank2<N, D>>,
@@ -552,6 +567,104 @@ pub struct GpuLlamaCtx<
     final_input: GpuTensor<f32, Rank2<N, D>>,
     final_normalized: GpuTensor<f32, Rank2<N, D>>,
     loss_probabilities: GpuTensor<f32, Rank2<N, VOCAB>>,
+    projection_output: GpuTensor<f32, Rank2<N, D>>,
+    logits: GpuTensor<f32, Rank2<N, VOCAB>>,
+    losses: GpuTensor<f32, Rank1<N>>,
+    loss_sum: GpuTensor<f32, Rank1<1>>,
+    loss: GpuTensor<f32, Rank1<1>>,
+    d_model_0: GpuTensor<f32, Rank2<N, D>>,
+    d_model_1: GpuTensor<f32, Rank2<N, D>>,
+    d_model_2: GpuTensor<f32, Rank2<N, D>>,
+    d_model_3: GpuTensor<f32, Rank2<N, D>>,
+    d_model_4: GpuTensor<f32, Rank2<N, D>>,
+    d_ff_0: GpuTensor<f32, Rank2<N, FF>>,
+    d_ff_1: GpuTensor<f32, Rank2<N, FF>>,
+    d_ff_2: GpuTensor<f32, Rank2<N, FF>>,
+}
+
+impl<
+    const N: usize,
+    const T: usize,
+    const VOCAB: usize,
+    const D: usize,
+    const H: usize,
+    const FF: usize,
+> GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>
+{
+    pub fn new(stream: &CudaStream) -> Result<Self, DriverError> {
+        Ok(Self {
+            tokens: GpuTensor::zeros(stream)?,
+            targets: GpuTensor::zeros(stream)?,
+            staging: [InputStaging::new(stream)?, InputStaging::new(stream)?],
+            next_staging: 0,
+            attention_input: GpuTensor::zeros(stream)?,
+            attention_normalized: GpuTensor::zeros(stream)?,
+            q: GpuTensor::zeros(stream)?,
+            k: GpuTensor::zeros(stream)?,
+            v: GpuTensor::zeros(stream)?,
+            probabilities: GpuTensor::zeros(stream)?,
+            attended: GpuTensor::zeros(stream)?,
+            ffn_input: GpuTensor::zeros(stream)?,
+            ffn_normalized: GpuTensor::zeros(stream)?,
+            gate: GpuTensor::zeros(stream)?,
+            up: GpuTensor::zeros(stream)?,
+            activated: GpuTensor::zeros(stream)?,
+            final_input: GpuTensor::zeros(stream)?,
+            final_normalized: GpuTensor::zeros(stream)?,
+            loss_probabilities: GpuTensor::zeros(stream)?,
+            projection_output: GpuTensor::zeros(stream)?,
+            logits: GpuTensor::zeros(stream)?,
+            losses: GpuTensor::zeros(stream)?,
+            loss_sum: GpuTensor::zeros(stream)?,
+            loss: GpuTensor::zeros(stream)?,
+            d_model_0: GpuTensor::zeros(stream)?,
+            d_model_1: GpuTensor::zeros(stream)?,
+            d_model_2: GpuTensor::zeros(stream)?,
+            d_model_3: GpuTensor::zeros(stream)?,
+            d_model_4: GpuTensor::zeros(stream)?,
+            d_ff_0: GpuTensor::zeros(stream)?,
+            d_ff_1: GpuTensor::zeros(stream)?,
+            d_ff_2: GpuTensor::zeros(stream)?,
+        })
+    }
+
+    pub fn loss(&self) -> &GpuTensor<f32, Rank1<1>> {
+        &self.loss
+    }
+
+    fn upload_inputs(
+        &mut self,
+        tokens: [usize; N],
+        targets: [usize; N],
+        stream: &CudaStream,
+    ) -> Result<(), DriverError> {
+        let slot = &mut self.staging[self.next_staging];
+        if slot.pending {
+            slot.copied.synchronize()?;
+        }
+        for i in 0..N {
+            assert!(tokens[i] < VOCAB);
+            assert!(targets[i] < VOCAB);
+            slot.tokens[i] = tokens[i] as u32;
+            slot.targets[i] = targets[i] as u32;
+        }
+
+        // SAFETY: the staging slot remains owned by this workspace and is not
+        // read, mutated, or dropped until `copied` has synchronized before its
+        // next reuse. The event is recorded after both copies on this stream.
+        unsafe {
+            self.tokens
+                .as_device_buffer_mut()
+                .copy_from_pinned_host_async(stream, &slot.tokens)?;
+            self.targets
+                .as_device_buffer_mut()
+                .copy_from_pinned_host_async(stream, &slot.targets)?;
+        }
+        slot.copied.record(stream)?;
+        slot.pending = true;
+        self.next_staging ^= 1;
+        Ok(())
+    }
 }
 
 impl<
@@ -592,339 +705,415 @@ impl<
         &self,
         tokens: [usize; N],
         targets: [usize; N],
+        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
-    ) -> Result<(GpuTensor<f32, Rank1<1>>, GpuLlamaCtx<N, T, VOCAB, D, H, FF>), DriverError> {
+    ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
-        self.forward_profiled(tokens, targets, stream, tensor, llama, &mut profiler)
+        self.forward_profiled(
+            tokens,
+            targets,
+            workspace,
+            stream,
+            tensor,
+            llama,
+            &mut profiler,
+        )
     }
 
     pub fn forward_profiled<P: KernelProfiler>(
         &self,
         tokens: [usize; N],
         targets: [usize; N],
+        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
-    ) -> Result<(GpuTensor<f32, Rank1<1>>, GpuLlamaCtx<N, T, VOCAB, D, H, FF>), DriverError> {
-        let token_u32 = tokens.map(|token| {
-            assert!(token < VOCAB);
-            token as u32
-        });
-        let target_u32 = targets.map(|target| {
-            assert!(target < VOCAB);
-            target as u32
-        });
-        let tokens = GpuTensor::from_host(stream, &token_u32)?;
-        let targets = GpuTensor::from_host(stream, &target_u32)?;
-        let attention_input =
-            self.embedding
-                .forward(&tokens, stream, llama, profiler, "forward.embedding")?;
-        let attention_normalized = self.attention_norm.forward(
-            &attention_input,
+    ) -> Result<(), DriverError> {
+        workspace.upload_inputs(tokens, targets, stream)?;
+        self.embedding.forward_into(
+            &workspace.tokens,
+            &mut workspace.attention_input,
+            stream,
+            llama,
+            profiler,
+            "forward.embedding",
+        )?;
+        self.attention_norm.forward_into(
+            &workspace.attention_input,
+            &mut workspace.attention_normalized,
             stream,
             llama,
             profiler,
             "forward.attention_norm",
         )?;
-        let q = self.q_proj.forward(
-            &attention_normalized,
+        self.q_proj.forward_into(
+            &workspace.attention_normalized,
+            &mut workspace.q,
             stream,
             tensor,
             profiler,
             "forward.q_proj.gemm",
         )?;
-        let k = self.k_proj.forward(
-            &attention_normalized,
+        self.k_proj.forward_into(
+            &workspace.attention_normalized,
+            &mut workspace.k,
             stream,
             tensor,
             profiler,
             "forward.k_proj.gemm",
         )?;
-        let v = self.v_proj.forward(
-            &attention_normalized,
+        self.v_proj.forward_into(
+            &workspace.attention_normalized,
+            &mut workspace.v,
             stream,
             tensor,
             profiler,
             "forward.v_proj.gemm",
         )?;
-        let q = rope::<N, T, D, H, HD, P>(&q, false, stream, llama, profiler, "forward.q_rope")?;
-        let k = rope::<N, T, D, H, HD, P>(&k, false, stream, llama, profiler, "forward.k_rope")?;
-        let (attended, probabilities) =
-            attention_forward::<N, T, D, H, HD, P>(&q, &k, &v, stream, llama, profiler)?;
-        let attention_output =
-            self.o_proj
-                .forward(&attended, stream, tensor, profiler, "forward.o_proj.gemm")?;
-        let ffn_input = add(
-            &attention_input,
-            &attention_output,
+        rope_into::<N, T, D, H, HD, P>(
+            &workspace.q,
+            &mut workspace.d_model_0,
+            false,
+            stream,
+            llama,
+            profiler,
+            "forward.q_rope",
+        )?;
+        std::mem::swap(&mut workspace.q, &mut workspace.d_model_0);
+        rope_into::<N, T, D, H, HD, P>(
+            &workspace.k,
+            &mut workspace.d_model_0,
+            false,
+            stream,
+            llama,
+            profiler,
+            "forward.k_rope",
+        )?;
+        std::mem::swap(&mut workspace.k, &mut workspace.d_model_0);
+        attention_forward_into::<N, T, D, H, HD, P>(
+            &workspace.q,
+            &workspace.k,
+            &workspace.v,
+            &mut workspace.attended,
+            &mut workspace.probabilities,
+            stream,
+            llama,
+            profiler,
+        )?;
+        self.o_proj.forward_into(
+            &workspace.attended,
+            &mut workspace.projection_output,
+            stream,
+            tensor,
+            profiler,
+            "forward.o_proj.gemm",
+        )?;
+        add_into(
+            &workspace.attention_input,
+            &workspace.projection_output,
+            &mut workspace.ffn_input,
             stream,
             tensor,
             profiler,
             "forward.attention_residual",
         )?;
 
-        let ffn_normalized =
-            self.ffn_norm
-                .forward(&ffn_input, stream, llama, profiler, "forward.ffn_norm")?;
-        let gate = self.gate_proj.forward(
-            &ffn_normalized,
+        self.ffn_norm.forward_into(
+            &workspace.ffn_input,
+            &mut workspace.ffn_normalized,
+            stream,
+            llama,
+            profiler,
+            "forward.ffn_norm",
+        )?;
+        self.gate_proj.forward_into(
+            &workspace.ffn_normalized,
+            &mut workspace.gate,
             stream,
             tensor,
             profiler,
             "forward.gate_proj.gemm",
         )?;
-        let up = self.up_proj.forward(
-            &ffn_normalized,
+        self.up_proj.forward_into(
+            &workspace.ffn_normalized,
+            &mut workspace.up,
             stream,
             tensor,
             profiler,
             "forward.up_proj.gemm",
         )?;
-        let activated = swiglu(&gate, &up, stream, llama, profiler, "forward.swiglu")?;
-        let ffn_output = self.down_proj.forward(
-            &activated,
+        swiglu_into(
+            &workspace.gate,
+            &workspace.up,
+            &mut workspace.activated,
+            stream,
+            llama,
+            profiler,
+            "forward.swiglu",
+        )?;
+        self.down_proj.forward_into(
+            &workspace.activated,
+            &mut workspace.projection_output,
             stream,
             tensor,
             profiler,
             "forward.down_proj.gemm",
         )?;
-        let final_input = add(
-            &ffn_input,
-            &ffn_output,
+        add_into(
+            &workspace.ffn_input,
+            &workspace.projection_output,
+            &mut workspace.final_input,
             stream,
             tensor,
             profiler,
             "forward.ffn_residual",
         )?;
 
-        let final_normalized =
-            self.final_norm
-                .forward(&final_input, stream, llama, profiler, "forward.final_norm")?;
-        let logits = self.lm_head.forward(
-            &final_normalized,
+        self.final_norm.forward_into(
+            &workspace.final_input,
+            &mut workspace.final_normalized,
+            stream,
+            llama,
+            profiler,
+            "forward.final_norm",
+        )?;
+        self.lm_head.forward_into(
+            &workspace.final_normalized,
+            &mut workspace.logits,
             stream,
             tensor,
             profiler,
             "forward.lm_head.gemm",
         )?;
-        let (loss, loss_probabilities) =
-            cross_entropy(&logits, &targets, stream, tensor, llama, profiler)?;
-        Ok((
-            loss,
-            GpuLlamaCtx {
-                tokens,
-                targets,
-                attention_input,
-                attention_normalized,
-                q,
-                k,
-                v,
-                probabilities,
-                attended,
-                ffn_input,
-                ffn_normalized,
-                gate,
-                up,
-                activated,
-                final_input,
-                final_normalized,
-                loss_probabilities,
-            },
-        ))
+        cross_entropy_into(
+            &workspace.logits,
+            &workspace.targets,
+            &mut workspace.loss_probabilities,
+            &mut workspace.losses,
+            &mut workspace.loss_sum,
+            &mut workspace.loss,
+            stream,
+            tensor,
+            llama,
+            profiler,
+        )
     }
 
     pub fn backward(
         &mut self,
-        ctx: GpuLlamaCtx<N, T, VOCAB, D, H, FF>,
+        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
-        self.backward_profiled(ctx, stream, tensor, llama, &mut profiler)
+        self.backward_profiled(workspace, stream, tensor, llama, &mut profiler)
     }
 
     pub fn backward_profiled<P: KernelProfiler>(
         &mut self,
-        ctx: GpuLlamaCtx<N, T, VOCAB, D, H, FF>,
+        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        let dlogits = cross_entropy_backward(
-            &ctx.loss_probabilities,
-            &ctx.targets,
+        cross_entropy_backward_into(
+            &workspace.loss_probabilities,
+            &workspace.targets,
+            &mut workspace.logits,
             stream,
             llama,
             profiler,
         )?;
-        let dx = self.lm_head.backward(
-            &ctx.final_normalized,
-            &dlogits,
+        self.lm_head.backward_into(
+            &workspace.final_normalized,
+            &workspace.logits,
+            &mut workspace.d_model_0,
             stream,
             tensor,
             profiler,
             [
                 "backward.lm_head.weight_gemm",
-                "backward.lm_head.grad_accumulate",
                 "backward.lm_head.input_gemm",
             ],
         )?;
-        let dx = self.final_norm.backward(
-            &ctx.final_input,
-            &dx,
+        self.final_norm.backward_into(
+            &workspace.final_input,
+            &workspace.d_model_0,
+            &mut workspace.d_model_1,
             stream,
             llama,
             profiler,
             ["backward.final_norm.input", "backward.final_norm.weight"],
         )?;
 
-        let dactivated = self.down_proj.backward(
-            &ctx.activated,
-            &dx,
+        self.down_proj.backward_into(
+            &workspace.activated,
+            &workspace.d_model_1,
+            &mut workspace.d_ff_0,
             stream,
             tensor,
             profiler,
             [
                 "backward.down_proj.weight_gemm",
-                "backward.down_proj.grad_accumulate",
                 "backward.down_proj.input_gemm",
             ],
         )?;
-        let (dgate, dup) =
-            swiglu_backward(&ctx.gate, &ctx.up, &dactivated, stream, llama, profiler)?;
-        let dgate_input = self.gate_proj.backward(
-            &ctx.ffn_normalized,
-            &dgate,
+        swiglu_backward_into(
+            &workspace.gate,
+            &workspace.up,
+            &workspace.d_ff_0,
+            &mut workspace.d_ff_1,
+            &mut workspace.d_ff_2,
+            stream,
+            llama,
+            profiler,
+        )?;
+        self.gate_proj.backward_into(
+            &workspace.ffn_normalized,
+            &workspace.d_ff_1,
+            &mut workspace.d_model_0,
             stream,
             tensor,
             profiler,
             [
                 "backward.gate_proj.weight_gemm",
-                "backward.gate_proj.grad_accumulate",
                 "backward.gate_proj.input_gemm",
             ],
         )?;
-        let dup_input = self.up_proj.backward(
-            &ctx.ffn_normalized,
-            &dup,
+        self.up_proj.backward_into(
+            &workspace.ffn_normalized,
+            &workspace.d_ff_2,
+            &mut workspace.d_model_2,
             stream,
             tensor,
             profiler,
             [
                 "backward.up_proj.weight_gemm",
-                "backward.up_proj.grad_accumulate",
                 "backward.up_proj.input_gemm",
             ],
         )?;
-        let dnormalized = add(
-            &dgate_input,
-            &dup_input,
+        add_into(
+            &workspace.d_model_0,
+            &workspace.d_model_2,
+            &mut workspace.d_model_3,
             stream,
             tensor,
             profiler,
             "backward.ffn_projection_sum",
         )?;
-        let dffn_input = self.ffn_norm.backward(
-            &ctx.ffn_input,
-            &dnormalized,
+        self.ffn_norm.backward_into(
+            &workspace.ffn_input,
+            &workspace.d_model_3,
+            &mut workspace.d_model_0,
             stream,
             llama,
             profiler,
             ["backward.ffn_norm.input", "backward.ffn_norm.weight"],
         )?;
-        let dx = add(
-            &dx,
-            &dffn_input,
+        add_into(
+            &workspace.d_model_1,
+            &workspace.d_model_0,
+            &mut workspace.d_model_2,
             stream,
             tensor,
             profiler,
             "backward.ffn_residual",
         )?;
 
-        let dattended = self.o_proj.backward(
-            &ctx.attended,
-            &dx,
+        self.o_proj.backward_into(
+            &workspace.attended,
+            &workspace.d_model_2,
+            &mut workspace.d_model_0,
             stream,
             tensor,
             profiler,
-            [
-                "backward.o_proj.weight_gemm",
-                "backward.o_proj.grad_accumulate",
-                "backward.o_proj.input_gemm",
-            ],
+            ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
         )?;
-        let (dq, dk, dv) = attention_backward::<N, T, D, H, HD, P>(
-            &ctx.q,
-            &ctx.k,
-            &ctx.v,
-            &ctx.probabilities,
-            &dattended,
+        attention_backward_into::<N, T, D, H, HD, P>(
+            &workspace.q,
+            &workspace.k,
+            &workspace.v,
+            &workspace.probabilities,
+            &workspace.d_model_0,
+            &mut workspace.d_model_1,
+            &mut workspace.d_model_3,
+            &mut workspace.d_model_4,
             stream,
             llama,
             profiler,
         )?;
-        let dq = rope::<N, T, D, H, HD, P>(&dq, true, stream, llama, profiler, "backward.q_rope")?;
-        let dk = rope::<N, T, D, H, HD, P>(&dk, true, stream, llama, profiler, "backward.k_rope")?;
-        let dq_input = self.q_proj.backward(
-            &ctx.attention_normalized,
-            &dq,
+        rope_into::<N, T, D, H, HD, P>(
+            &workspace.d_model_1,
+            &mut workspace.d_model_0,
+            true,
+            stream,
+            llama,
+            profiler,
+            "backward.q_rope",
+        )?;
+        rope_into::<N, T, D, H, HD, P>(
+            &workspace.d_model_3,
+            &mut workspace.d_model_1,
+            true,
+            stream,
+            llama,
+            profiler,
+            "backward.k_rope",
+        )?;
+        self.q_proj.backward_into(
+            &workspace.attention_normalized,
+            &workspace.d_model_0,
+            &mut workspace.d_model_3,
             stream,
             tensor,
             profiler,
-            [
-                "backward.q_proj.weight_gemm",
-                "backward.q_proj.grad_accumulate",
-                "backward.q_proj.input_gemm",
-            ],
+            ["backward.q_proj.weight_gemm", "backward.q_proj.input_gemm"],
         )?;
-        let dk_input = self.k_proj.backward(
-            &ctx.attention_normalized,
-            &dk,
+        self.k_proj.backward_into(
+            &workspace.attention_normalized,
+            &workspace.d_model_1,
+            &mut workspace.d_model_0,
             stream,
             tensor,
             profiler,
-            [
-                "backward.k_proj.weight_gemm",
-                "backward.k_proj.grad_accumulate",
-                "backward.k_proj.input_gemm",
-            ],
+            ["backward.k_proj.weight_gemm", "backward.k_proj.input_gemm"],
         )?;
-        let dv_input = self.v_proj.backward(
-            &ctx.attention_normalized,
-            &dv,
+        self.v_proj.backward_into(
+            &workspace.attention_normalized,
+            &workspace.d_model_4,
+            &mut workspace.d_model_1,
             stream,
             tensor,
             profiler,
-            [
-                "backward.v_proj.weight_gemm",
-                "backward.v_proj.grad_accumulate",
-                "backward.v_proj.input_gemm",
-            ],
+            ["backward.v_proj.weight_gemm", "backward.v_proj.input_gemm"],
         )?;
-        let dqk = add(
-            &dq_input,
-            &dk_input,
+        add_into(
+            &workspace.d_model_3,
+            &workspace.d_model_0,
+            &mut workspace.d_model_4,
             stream,
             tensor,
             profiler,
             "backward.qk_projection_sum",
         )?;
-        let dnormalized = add(
-            &dqk,
-            &dv_input,
+        add_into(
+            &workspace.d_model_4,
+            &workspace.d_model_1,
+            &mut workspace.d_model_3,
             stream,
             tensor,
             profiler,
             "backward.qkv_projection_sum",
         )?;
-        let dattn_input = self.attention_norm.backward(
-            &ctx.attention_input,
-            &dnormalized,
+        self.attention_norm.backward_into(
+            &workspace.attention_input,
+            &workspace.d_model_3,
+            &mut workspace.d_model_0,
             stream,
             llama,
             profiler,
@@ -933,17 +1122,18 @@ impl<
                 "backward.attention_norm.weight",
             ],
         )?;
-        let dx = add(
-            &dx,
-            &dattn_input,
+        add_into(
+            &workspace.d_model_2,
+            &workspace.d_model_0,
+            &mut workspace.d_model_1,
             stream,
             tensor,
             profiler,
             "backward.attention_residual",
         )?;
         self.embedding.backward(
-            &ctx.tokens,
-            &dx,
+            &workspace.tokens,
+            &workspace.d_model_1,
             stream,
             llama,
             profiler,
@@ -951,24 +1141,49 @@ impl<
         )
     }
 
-    pub fn zero_grad(&mut self, stream: &CudaStream) -> Result<(), DriverError> {
-        self.embedding.dw = GpuTensor::zeros(stream)?;
-        self.attention_norm.dw = GpuTensor::zeros(stream)?;
-        self.q_proj.dw = GpuTensor::zeros(stream)?;
-        self.k_proj.dw = GpuTensor::zeros(stream)?;
-        self.v_proj.dw = GpuTensor::zeros(stream)?;
-        self.o_proj.dw = GpuTensor::zeros(stream)?;
-        self.ffn_norm.dw = GpuTensor::zeros(stream)?;
-        self.gate_proj.dw = GpuTensor::zeros(stream)?;
-        self.up_proj.dw = GpuTensor::zeros(stream)?;
-        self.down_proj.dw = GpuTensor::zeros(stream)?;
-        self.final_norm.dw = GpuTensor::zeros(stream)?;
-        self.lm_head.dw = GpuTensor::zeros(stream)?;
+    pub fn zero_grad(
+        &mut self,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        let mut profiler = NoopProfiler;
+        self.zero_grad_profiled(stream, tensor, &mut profiler)
+    }
+
+    pub fn zero_grad_profiled<P: KernelProfiler>(
+        &mut self,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        macro_rules! zero {
+            ($field:ident) => {
+                fill_zero(
+                    &mut self.$field.dw,
+                    stream,
+                    tensor,
+                    profiler,
+                    concat!("zero_grad.", stringify!($field)),
+                )?;
+            };
+        }
+        zero!(embedding);
+        zero!(attention_norm);
+        zero!(q_proj);
+        zero!(k_proj);
+        zero!(v_proj);
+        zero!(o_proj);
+        zero!(ffn_norm);
+        zero!(gate_proj);
+        zero!(up_proj);
+        zero!(down_proj);
+        zero!(final_norm);
+        zero!(lm_head);
         Ok(())
     }
 }
 
-fn rope<
+fn rope_into<
     const N: usize,
     const T: usize,
     const D: usize,
@@ -977,13 +1192,13 @@ fn rope<
     P: KernelProfiler,
 >(
     x: &GpuTensor<f32, Rank2<N, D>>,
+    y: &mut GpuTensor<f32, Rank2<N, D>>,
     backward: bool,
     stream: &CudaStream,
     kernels: &llama_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
-) -> Result<GpuTensor<f32, Rank2<N, D>>, DriverError> {
-    let mut y = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     if backward {
         profiler.measure(stream, name, || {
             kernels.rope_backward(
@@ -1009,10 +1224,10 @@ fn rope<
             )
         })?;
     }
-    Ok(y)
+    Ok(())
 }
 
-fn attention_forward<
+fn attention_forward_into<
     const N: usize,
     const T: usize,
     const D: usize,
@@ -1023,12 +1238,12 @@ fn attention_forward<
     q: &GpuTensor<f32, Rank2<N, D>>,
     k: &GpuTensor<f32, Rank2<N, D>>,
     v: &GpuTensor<f32, Rank2<N, D>>,
+    output: &mut GpuTensor<f32, Rank2<N, D>>,
+    probabilities: &mut GpuTensor<f32, Rank3<N, H, T>>,
     stream: &CudaStream,
     kernels: &llama_kernels::LoadedModule,
     profiler: &mut P,
-) -> Result<(GpuTensor<f32, Rank2<N, D>>, GpuTensor<f32, Rank3<N, H, T>>), DriverError> {
-    let mut probabilities = GpuTensor::zeros(stream)?;
-    let mut output = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     profiler.measure(stream, "forward.attention.probabilities", || {
         kernels.attention_probabilities(
             stream,
@@ -1053,10 +1268,10 @@ fn attention_forward<
             output.as_device_buffer_mut(),
         )
     })?;
-    Ok((output, probabilities))
+    Ok(())
 }
 
-fn attention_backward<
+fn attention_backward_into<
     const N: usize,
     const T: usize,
     const D: usize,
@@ -1069,20 +1284,13 @@ fn attention_backward<
     v: &GpuTensor<f32, Rank2<N, D>>,
     probabilities: &GpuTensor<f32, Rank3<N, H, T>>,
     dy: &GpuTensor<f32, Rank2<N, D>>,
+    dq: &mut GpuTensor<f32, Rank2<N, D>>,
+    dk: &mut GpuTensor<f32, Rank2<N, D>>,
+    dv: &mut GpuTensor<f32, Rank2<N, D>>,
     stream: &CudaStream,
     kernels: &llama_kernels::LoadedModule,
     profiler: &mut P,
-) -> Result<
-    (
-        GpuTensor<f32, Rank2<N, D>>,
-        GpuTensor<f32, Rank2<N, D>>,
-        GpuTensor<f32, Rank2<N, D>>,
-    ),
-    DriverError,
-> {
-    let mut dq = GpuTensor::zeros(stream)?;
-    let mut dk = GpuTensor::zeros(stream)?;
-    let mut dv = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     let config = LaunchConfig::for_num_elems((N * D) as u32);
     profiler.measure(stream, "backward.attention.q", || {
         kernels.attention_backward_q(
@@ -1125,18 +1333,18 @@ fn attention_backward<
             dv.as_device_buffer_mut(),
         )
     })?;
-    Ok((dq, dk, dv))
+    Ok(())
 }
 
-fn swiglu<const N: usize, const FF: usize, P: KernelProfiler>(
+fn swiglu_into<const N: usize, const FF: usize, P: KernelProfiler>(
     gate: &GpuTensor<f32, Rank2<N, FF>>,
     up: &GpuTensor<f32, Rank2<N, FF>>,
+    output: &mut GpuTensor<f32, Rank2<N, FF>>,
     stream: &CudaStream,
     kernels: &llama_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
-) -> Result<GpuTensor<f32, Rank2<N, FF>>, DriverError> {
-    let mut output = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
         kernels.swiglu_forward(
             stream,
@@ -1146,19 +1354,19 @@ fn swiglu<const N: usize, const FF: usize, P: KernelProfiler>(
             output.as_device_buffer_mut(),
         )
     })?;
-    Ok(output)
+    Ok(())
 }
 
-fn swiglu_backward<const N: usize, const FF: usize, P: KernelProfiler>(
+fn swiglu_backward_into<const N: usize, const FF: usize, P: KernelProfiler>(
     gate: &GpuTensor<f32, Rank2<N, FF>>,
     up: &GpuTensor<f32, Rank2<N, FF>>,
     dy: &GpuTensor<f32, Rank2<N, FF>>,
+    dgate: &mut GpuTensor<f32, Rank2<N, FF>>,
+    dup: &mut GpuTensor<f32, Rank2<N, FF>>,
     stream: &CudaStream,
     kernels: &llama_kernels::LoadedModule,
     profiler: &mut P,
-) -> Result<(GpuTensor<f32, Rank2<N, FF>>, GpuTensor<f32, Rank2<N, FF>>), DriverError> {
-    let mut dgate = GpuTensor::zeros(stream)?;
-    let mut dup = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     let config = LaunchConfig::for_num_elems((N * FF) as u32);
     profiler.measure(stream, "backward.swiglu.gate", || {
         kernels.swiglu_backward_gate(
@@ -1179,19 +1387,21 @@ fn swiglu_backward<const N: usize, const FF: usize, P: KernelProfiler>(
             dup.as_device_buffer_mut(),
         )
     })?;
-    Ok((dgate, dup))
+    Ok(())
 }
 
-fn cross_entropy<const N: usize, const VOCAB: usize, P: KernelProfiler>(
+fn cross_entropy_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
     logits: &GpuTensor<f32, Rank2<N, VOCAB>>,
     targets: &GpuTensor<u32, Rank1<N>>,
+    probabilities: &mut GpuTensor<f32, Rank2<N, VOCAB>>,
+    losses: &mut GpuTensor<f32, Rank1<N>>,
+    loss_sum: &mut GpuTensor<f32, Rank1<1>>,
+    loss: &mut GpuTensor<f32, Rank1<1>>,
     stream: &CudaStream,
     tensor: &tensor_kernels::LoadedModule,
     llama: &llama_kernels::LoadedModule,
     profiler: &mut P,
-) -> Result<(GpuTensor<f32, Rank1<1>>, GpuTensor<f32, Rank2<N, VOCAB>>), DriverError> {
-    let mut probabilities = GpuTensor::zeros(stream)?;
-    let mut losses = GpuTensor::<f32, Rank1<N>>::zeros(stream)?;
+) -> Result<(), DriverError> {
     profiler.measure(stream, "forward.loss.softmax", || {
         llama.softmax_forward(
             stream,
@@ -1212,26 +1422,33 @@ fn cross_entropy<const N: usize, const VOCAB: usize, P: KernelProfiler>(
             losses.as_device_buffer_mut(),
         )
     })?;
-    let loss_sum = sum(&losses, stream, tensor, profiler, "forward.loss.reduction")?;
-    let loss = scale(
-        &loss_sum,
+    sum_into(
+        losses,
+        loss_sum,
+        stream,
+        tensor,
+        profiler,
+        "forward.loss.reduction",
+    )?;
+    scale_into(
+        loss_sum,
         1.0 / N as f32,
+        loss,
         stream,
         tensor,
         profiler,
         "forward.loss.mean",
-    )?;
-    Ok((loss, probabilities))
+    )
 }
 
-fn cross_entropy_backward<const N: usize, const VOCAB: usize, P: KernelProfiler>(
+fn cross_entropy_backward_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
     probabilities: &GpuTensor<f32, Rank2<N, VOCAB>>,
     targets: &GpuTensor<u32, Rank1<N>>,
+    dlogits: &mut GpuTensor<f32, Rank2<N, VOCAB>>,
     stream: &CudaStream,
     kernels: &llama_kernels::LoadedModule,
     profiler: &mut P,
-) -> Result<GpuTensor<f32, Rank2<N, VOCAB>>, DriverError> {
-    let mut dlogits = GpuTensor::zeros(stream)?;
+) -> Result<(), DriverError> {
     profiler.measure(stream, "backward.loss.softmax_cross_entropy", || {
         kernels.softmax_cross_entropy_backward(
             stream,
@@ -1243,6 +1460,5 @@ fn cross_entropy_backward<const N: usize, const VOCAB: usize, P: KernelProfiler>
             VOCAB as u32,
             dlogits.as_device_buffer_mut(),
         )
-    })?;
-    Ok(dlogits)
+    })
 }

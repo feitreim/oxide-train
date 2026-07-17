@@ -291,11 +291,13 @@ Each gated on tests; correctness before speed at every step.
        `[N,VOCAB]` probability tensor saved in ctx). Motivation: the naive
        softmax recomputes the row max/denominator per element — O(V²) per
        row at V=50,257 — and alone measured 59.6–67.6% of the step.
-     - **7e2 memory hygiene**: in-place `zero_grad` via a fill kernel
-       (today: twelve fresh `DeviceBuffer::zeroed` allocations per step);
+     - ✅ **7e2 memory hygiene**: in-place `zero_grad` via a fill kernel
+       (formerly twelve fresh `DeviceBuffer::zeroed` allocations per step);
        reuse activation/output buffers across steps instead of allocating
        per op; pinned-host staging for token H2D. Motivation: 24.8% of the
-       step is unattributed allocation/zero-fill/copy time.
+       step is unattributed allocation/zero-fill/copy time. B200 re-profile:
+       196.67 ms full step, 0.226 ms (0.12%) unattributed; all twelve in-place
+       gradient fills total 0.436 ms.
      - **7e3 GEMM integration**: swap model matmuls to gpu/gemm's
        register-tiled fp32 (store + accumulate variants — the accumulate
        path deletes the separate grad-accumulate launch per linear);

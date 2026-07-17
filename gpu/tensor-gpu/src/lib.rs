@@ -49,6 +49,15 @@ pub mod kernels {
         }
     }
 
+    /// Fill an existing buffer without allocating replacement storage.
+    #[kernel]
+    pub fn fill(value: f32, mut out: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        if let Some(slot) = out.get_mut(index) {
+            *slot = value;
+        }
+    }
+
     /// `dst += factor * src`, used by gradient accumulation and optimizers.
     #[kernel]
     pub fn add_scaled(src: &[f32], factor: f32, mut dst: DisjointSlice<f32>) {
@@ -280,6 +289,34 @@ pub mod kernels {
             && let Some(slot) = c.get_mut(index)
         {
             *slot = acc;
+        }
+    }
+
+    /// `C += A^T . B`: the accumulating counterpart to [`gemm_tn`].
+    #[kernel]
+    pub fn gemm_tn_accumulate(
+        m: u32,
+        n: u32,
+        k: u32,
+        a: &[f32],
+        b: &[f32],
+        mut c: DisjointSlice<f32, thread::Runtime2DIndex>,
+    ) {
+        let row = thread::blockIdx_y() as usize * thread::blockDim_y() as usize
+            + thread::threadIdx_y() as usize;
+        let col = thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize;
+        if row >= k as usize || col >= n as usize {
+            return;
+        }
+        let mut acc = 0.0f32;
+        for inner in 0..m as usize {
+            acc += a[inner * k as usize + row] * b[inner * n as usize + col];
+        }
+        if let Some(index) = unsafe { thread::index_2d_runtime(n as usize) }
+            && let Some(slot) = c.get_mut(index)
+        {
+            *slot += acc;
         }
     }
 
