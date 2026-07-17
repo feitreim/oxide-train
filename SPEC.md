@@ -363,6 +363,15 @@ Each gated on tests; correctness before speed at every step.
        3.48 ms (26.7%) — the token-scan reference kernel — followed by the
        remaining fp32 block GEMMs (`gate_up` input 1.35 ms, lm-head
        weight-GEMM 1.08 ms); a future 7e6 should start there.
+     - **7e6 embedding backward** (open): at the training shape B=8 T=512
+       (N=4096, first profile after moving off the correctness batch),
+       `backward.embedding` is 214.3 ms of a 341.9 ms step (62.7%) — the
+       token-scan kernel is O(V·D·N) so it grew linearly with batch while
+       everything else scaled sublinearly. Replace with a scatter-add
+       (fp32 atomics or token bucketing), naive kernel retained as the
+       parity oracle. Next rows at this shape: flash attention 36.9 ms
+       combined (10.8%, quadratic-in-T forward + backward), the three
+       `*_norm.input` backwards 20.6 ms (6.0%).
    - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
      time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 

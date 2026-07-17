@@ -166,7 +166,7 @@ def _prepare_gemm_ptx(root: str) -> None:
 
 @app.function(
     gpu=DEFAULT_GPU,
-    timeout=3600,
+    timeout=4 * 3600,
     volumes={"/data": wiki_volume},
 )
 def run_kernel(
