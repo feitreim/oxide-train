@@ -14,7 +14,7 @@ mod ops;
 use std::marker::PhantomData;
 
 use tensor_core::rng::SplitMix64;
-use tensor_core::{Element, Rank2, Shape, Tensor};
+use tensor_core::{Element, Rank2, Shape, Tensor, bf16};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CpuTensor<E: Element, S: Shape> {
@@ -70,6 +70,18 @@ impl<S: Shape> CpuTensor<f32, S> {
         let mut rng = SplitMix64::new(seed);
         Self::from_fn(|_| rng.next_uniform())
     }
+
+    /// Round an fp32 tensor to bf16 while preserving its static shape.
+    pub fn to_bf16(&self) -> CpuTensor<bf16, S> {
+        CpuTensor::from_fn(|i| bf16::from_f32(self.data[i]))
+    }
+}
+
+impl<S: Shape> CpuTensor<bf16, S> {
+    /// Widen a bf16 tensor to fp32 exactly while preserving its static shape.
+    pub fn to_f32(&self) -> CpuTensor<f32, S> {
+        CpuTensor::from_fn(|i| self.data[i].to_f32())
+    }
 }
 
 impl<E: Element, const M: usize, const N: usize> CpuTensor<E, Rank2<M, N>> {
@@ -77,5 +89,30 @@ impl<E: Element, const M: usize, const N: usize> CpuTensor<E, Rank2<M, N>> {
     pub fn at(&self, i: usize, j: usize) -> E {
         debug_assert!(i < M && j < N);
         self.data[i * N + j]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tensor_core::{Rank1, bf16};
+
+    use super::CpuTensor;
+
+    #[test]
+    fn f32_bf16_conversions_preserve_shape_and_expected_values() {
+        let fp32 =
+            CpuTensor::<f32, Rank1<4>>::from_slice(&[0.0, 1.0, -2.5, f32::from_bits(0x3f80_8000)]);
+        let compute: CpuTensor<bf16, Rank1<4>> = fp32.to_bf16();
+
+        assert_eq!(
+            compute.as_slice(),
+            &[
+                bf16::from_f32(0.0),
+                bf16::from_f32(1.0),
+                bf16::from_f32(-2.5),
+                bf16::from_f32(1.0),
+            ]
+        );
+        assert_eq!(compute.to_f32().as_slice(), &[0.0, 1.0, -2.5, 1.0]);
     }
 }
