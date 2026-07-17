@@ -1,0 +1,19 @@
+[package]
+name = "llama-model"
+version = "0.1.0"
+edition = "2024"
+default-run = "llama-model"
+
+[workspace]
+
+[dependencies]
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+tensor-core = { path = "../../crates/tensor-core" }
+tensor-cpu = { path = "../../crates/tensor-cpu" }
+nn = { path = "../../crates/nn" }
+
+[profile.release]
+debug = false
+lto = true

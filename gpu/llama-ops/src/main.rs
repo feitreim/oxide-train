@@ -1,8 +1,11 @@
 //! CPU/GPU parity checks for the reference Llama kernels.
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
-use nn::{Embedding, Module, RmsNorm, SoftmaxCrossEntropy, SoftmaxCrossEntropyInput, SwiGlu};
-use tensor_core::{Rank1, Rank2};
+use nn::{
+    CausalAttention, Embedding, Module, RmsNorm, Rope, SoftmaxCrossEntropy,
+    SoftmaxCrossEntropyInput, SwiGlu,
+};
+use tensor_core::{Rank1, Rank2, Rank3};
 use tensor_cpu::CpuTensor;
 
 // `cargo oxide` collects kernels from the selected binary target, not from a
@@ -32,8 +35,186 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_swiglu(&stream, &module)?;
     check_embedding(&stream, &module)?;
     check_cross_entropy(&stream, &module)?;
+    check_rope(&stream, &module)?;
+    check_attention(&stream, &module)?;
 
     println!("✓ llama-ops forward/backward parity checks passed");
+    Ok(())
+}
+
+fn check_rope(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 10;
+    const T: usize = 5;
+    const D: usize = 12;
+    const H: usize = 3;
+    const HD: usize = 4;
+    let x = CpuTensor::<f32, Rank2<N, D>>::uniform(10);
+    let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(11);
+    let mut cpu = Rope::<N, T, D, H, HD>;
+    let (cpu_y, ()) = cpu.forward(x.clone());
+    let cpu_dx = cpu.backward((), dy.clone());
+    let x_dev = DeviceBuffer::from_host(stream, x.as_slice())?;
+    let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+    let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    let mut dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+
+    module.rope_forward(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &x_dev,
+        T as u32,
+        H as u32,
+        HD as u32,
+        &mut y_dev,
+    )?;
+    module.rope_backward(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &dy_dev,
+        T as u32,
+        H as u32,
+        HD as u32,
+        &mut dx_dev,
+    )?;
+    assert_close(
+        "rope y",
+        &y_dev.to_host_vec(stream)?,
+        cpu_y.as_slice(),
+        2e-6,
+        2e-6,
+    );
+    assert_close(
+        "rope dx",
+        &dx_dev.to_host_vec(stream)?,
+        cpu_dx.as_slice(),
+        2e-6,
+        2e-6,
+    );
+    Ok(())
+}
+
+fn check_attention(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 10;
+    const T: usize = 5;
+    const D: usize = 12;
+    const H: usize = 3;
+    const HD: usize = 4;
+    let q = CpuTensor::<f32, Rank2<N, D>>::uniform(12);
+    let k = CpuTensor::<f32, Rank2<N, D>>::uniform(13);
+    let v = CpuTensor::<f32, Rank2<N, D>>::uniform(14);
+    let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(15);
+    let mut cpu = CausalAttention::<N, T, D, H, HD>;
+    let (cpu_y, cpu_ctx) = cpu.forward((q.clone(), k.clone(), v.clone()));
+    let (cpu_dq, cpu_dk, cpu_dv) = cpu.backward(cpu_ctx, dy.clone());
+
+    let q_dev = DeviceBuffer::from_host(stream, q.as_slice())?;
+    let k_dev = DeviceBuffer::from_host(stream, k.as_slice())?;
+    let v_dev = DeviceBuffer::from_host(stream, v.as_slice())?;
+    let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+    let mut p_dev = DeviceBuffer::<f32>::zeroed(stream, N * H * T)?;
+    let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    let mut dq_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    let mut dk_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    let mut dv_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    module.attention_probabilities(
+        stream,
+        LaunchConfig::for_num_elems((N * H * T) as u32),
+        &q_dev,
+        &k_dev,
+        T as u32,
+        H as u32,
+        HD as u32,
+        &mut p_dev,
+    )?;
+    module.attention_output(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &p_dev,
+        &v_dev,
+        T as u32,
+        H as u32,
+        HD as u32,
+        &mut y_dev,
+    )?;
+    module.attention_backward_q(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &q_dev,
+        &k_dev,
+        &v_dev,
+        &p_dev,
+        &dy_dev,
+        T as u32,
+        H as u32,
+        HD as u32,
+        &mut dq_dev,
+    )?;
+    module.attention_backward_k(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &q_dev,
+        &v_dev,
+        &p_dev,
+        &dy_dev,
+        T as u32,
+        H as u32,
+        HD as u32,
+        &mut dk_dev,
+    )?;
+    module.attention_backward_v(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &p_dev,
+        &dy_dev,
+        T as u32,
+        H as u32,
+        HD as u32,
+        &mut dv_dev,
+    )?;
+
+    assert_close(
+        "attention y",
+        &y_dev.to_host_vec(stream)?,
+        cpu_y.as_slice(),
+        3e-5,
+        3e-5,
+    );
+    assert_close(
+        "attention dq",
+        &dq_dev.to_host_vec(stream)?,
+        cpu_dq.as_slice(),
+        5e-5,
+        5e-5,
+    );
+    assert_close(
+        "attention dk",
+        &dk_dev.to_host_vec(stream)?,
+        cpu_dk.as_slice(),
+        5e-5,
+        5e-5,
+    );
+    assert_close(
+        "attention dv",
+        &dv_dev.to_host_vec(stream)?,
+        cpu_dv.as_slice(),
+        5e-5,
+        5e-5,
+    );
+    let probabilities = p_dev.to_host_vec(stream)?;
+    let probabilities = CpuTensor::<f32, Rank3<N, H, T>>::from_slice(&probabilities);
+    for row in 0..N {
+        for head in 0..H {
+            let start = (row * H + head) * T;
+            let sum: f32 = probabilities.as_slice()[start..start + T].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-5);
+        }
+    }
     Ok(())
 }
 

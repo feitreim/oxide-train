@@ -243,4 +243,277 @@ pub mod kernels {
             *slot = upstream * (probabilities[i] - indicator) / rows as f32;
         }
     }
+
+    #[kernel]
+    pub fn rope_forward(
+        x: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        head_dim: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = y.get_mut(index) {
+            let hd = head_dim as usize;
+            let col = i % hd;
+            let row = i / (heads as usize * hd);
+            let position = row % sequence_length as usize;
+            let pair = col / 2;
+            let frequency = 10_000.0f32.powf(-((2 * pair) as f32) / head_dim as f32);
+            let angle = position as f32 * frequency;
+            let sin = angle.sin();
+            let cos = angle.cos();
+            let base = i - col % 2;
+            *slot = if col % 2 == 0 {
+                x[base] * cos - x[base + 1] * sin
+            } else {
+                x[base] * sin + x[base + 1] * cos
+            };
+        }
+    }
+
+    #[kernel]
+    pub fn rope_backward(
+        dy: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        head_dim: u32,
+        mut dx: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = dx.get_mut(index) {
+            let hd = head_dim as usize;
+            let col = i % hd;
+            let row = i / (heads as usize * hd);
+            let position = row % sequence_length as usize;
+            let pair = col / 2;
+            let frequency = 10_000.0f32.powf(-((2 * pair) as f32) / head_dim as f32);
+            let angle = position as f32 * frequency;
+            let sin = angle.sin();
+            let cos = angle.cos();
+            let base = i - col % 2;
+            *slot = if col % 2 == 0 {
+                dy[base] * cos + dy[base + 1] * sin
+            } else {
+                -dy[base] * sin + dy[base + 1] * cos
+            };
+        }
+    }
+
+    /// Materialize causal softmax probabilities as `[N,H,T]`.
+    #[kernel]
+    pub fn attention_probabilities(
+        q: &[f32],
+        k: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        head_dim: u32,
+        mut probabilities: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = probabilities.get_mut(index) {
+            let t = sequence_length as usize;
+            let h = heads as usize;
+            let hd = head_dim as usize;
+            let key_position = i % t;
+            let head = (i / t) % h;
+            let query_row = i / (t * h);
+            let query_position = query_row % t;
+            if key_position > query_position {
+                *slot = 0.0;
+                return;
+            }
+            let sequence_start = query_row - query_position;
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let mut max_score = f32::NEG_INFINITY;
+            for candidate in 0..=query_position {
+                let key_row = sequence_start + candidate;
+                let mut dot = 0.0f32;
+                for dim in 0..hd {
+                    dot += q[query_row * h * hd + head * hd + dim]
+                        * k[key_row * h * hd + head * hd + dim];
+                }
+                max_score = max_score.max(dot * scale);
+            }
+            let mut denominator = 0.0f32;
+            let mut selected = 0.0f32;
+            for candidate in 0..=query_position {
+                let key_row = sequence_start + candidate;
+                let mut dot = 0.0f32;
+                for dim in 0..hd {
+                    dot += q[query_row * h * hd + head * hd + dim]
+                        * k[key_row * h * hd + head * hd + dim];
+                }
+                let exponential = (dot * scale - max_score).exp();
+                denominator += exponential;
+                if candidate == key_position {
+                    selected = exponential;
+                }
+            }
+            *slot = selected / denominator;
+        }
+    }
+
+    #[kernel]
+    pub fn attention_output(
+        probabilities: &[f32],
+        v: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        head_dim: u32,
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = output.get_mut(index) {
+            let t = sequence_length as usize;
+            let h = heads as usize;
+            let hd = head_dim as usize;
+            let dim = i % hd;
+            let head = (i / hd) % h;
+            let query_row = i / (h * hd);
+            let query_position = query_row % t;
+            let sequence_start = query_row - query_position;
+            let mut value = 0.0f32;
+            for key_position in 0..=query_position {
+                let key_row = sequence_start + key_position;
+                let p = probabilities[(query_row * h + head) * t + key_position];
+                value += p * v[key_row * h * hd + head * hd + dim];
+            }
+            *slot = value;
+        }
+    }
+
+    #[kernel]
+    pub fn attention_backward_q(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        probabilities: &[f32],
+        dy: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        head_dim: u32,
+        mut dq: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = dq.get_mut(index) {
+            let t = sequence_length as usize;
+            let h = heads as usize;
+            let hd = head_dim as usize;
+            let dim = i % hd;
+            let head = (i / hd) % h;
+            let query_row = i / (h * hd);
+            let query_position = query_row % t;
+            let sequence_start = query_row - query_position;
+            let mut softmax_dot = 0.0f32;
+            for key_position in 0..=query_position {
+                let key_row = sequence_start + key_position;
+                let mut dp = 0.0f32;
+                for d in 0..hd {
+                    dp += dy[query_row * h * hd + head * hd + d]
+                        * v[key_row * h * hd + head * hd + d];
+                }
+                softmax_dot += probabilities[(query_row * h + head) * t + key_position] * dp;
+            }
+            let mut value = 0.0f32;
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            for key_position in 0..=query_position {
+                let key_row = sequence_start + key_position;
+                let mut dp = 0.0f32;
+                for d in 0..hd {
+                    dp += dy[query_row * h * hd + head * hd + d]
+                        * v[key_row * h * hd + head * hd + d];
+                }
+                let p = probabilities[(query_row * h + head) * t + key_position];
+                value += p * (dp - softmax_dot) * scale * k[key_row * h * hd + head * hd + dim];
+            }
+            *slot = value;
+            let _ = q;
+        }
+    }
+
+    #[kernel]
+    pub fn attention_backward_k(
+        q: &[f32],
+        v: &[f32],
+        probabilities: &[f32],
+        dy: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        head_dim: u32,
+        mut dk: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = dk.get_mut(index) {
+            let t = sequence_length as usize;
+            let h = heads as usize;
+            let hd = head_dim as usize;
+            let dim = i % hd;
+            let head = (i / hd) % h;
+            let key_row = i / (h * hd);
+            let key_position = key_row % t;
+            let sequence_start = key_row - key_position;
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let mut value = 0.0f32;
+            for query_position in key_position..t {
+                let query_row = sequence_start + query_position;
+                let mut softmax_dot = 0.0f32;
+                let mut selected_dp = 0.0f32;
+                for candidate in 0..=query_position {
+                    let candidate_row = sequence_start + candidate;
+                    let mut dp = 0.0f32;
+                    for d in 0..hd {
+                        dp += dy[query_row * h * hd + head * hd + d]
+                            * v[candidate_row * h * hd + head * hd + d];
+                    }
+                    softmax_dot += probabilities[(query_row * h + head) * t + candidate] * dp;
+                    if candidate == key_position {
+                        selected_dp = dp;
+                    }
+                }
+                let p = probabilities[(query_row * h + head) * t + key_position];
+                value += p
+                    * (selected_dp - softmax_dot)
+                    * scale
+                    * q[query_row * h * hd + head * hd + dim];
+            }
+            *slot = value;
+        }
+    }
+
+    #[kernel]
+    pub fn attention_backward_v(
+        probabilities: &[f32],
+        dy: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        head_dim: u32,
+        mut dv: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = dv.get_mut(index) {
+            let t = sequence_length as usize;
+            let h = heads as usize;
+            let hd = head_dim as usize;
+            let dim = i % hd;
+            let head = (i / hd) % h;
+            let key_row = i / (h * hd);
+            let key_position = key_row % t;
+            let sequence_start = key_row - key_position;
+            let mut value = 0.0f32;
+            for query_position in key_position..t {
+                let query_row = sequence_start + query_position;
+                value += probabilities[(query_row * h + head) * t + key_position]
+                    * dy[query_row * h * hd + head * hd + dim];
+            }
+            *slot = value;
+        }
+    }
 }

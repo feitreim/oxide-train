@@ -130,5 +130,25 @@ fn check_gemm(
         2e-5,
         2e-5,
     );
+
+    let rhs_tn = CpuTensor::<f32, Rank2<M, N>>::uniform(5);
+    let gpu_rhs_tn = GpuTensor::from_cpu(stream, &rhs_tn)?;
+    assert_close(
+        "gemm tn",
+        &ga.matmul_tn(&gpu_rhs_tn, stream, module)?.to_host(stream)?,
+        a.matmul_tn(&rhs_tn).as_slice(),
+        2e-5,
+        2e-5,
+    );
+
+    let rhs_nt = CpuTensor::<f32, Rank2<N, K>>::uniform(6);
+    let gpu_rhs_nt = GpuTensor::from_cpu(stream, &rhs_nt)?;
+    assert_close(
+        "gemm nt",
+        &ga.matmul_nt(&gpu_rhs_nt, stream, module)?.to_host(stream)?,
+        a.matmul_nt(&rhs_nt).as_slice(),
+        2e-5,
+        2e-5,
+    );
     Ok(())
 }

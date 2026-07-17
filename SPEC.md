@@ -185,8 +185,9 @@ gpu/               standalone cuda-oxide kernel crates (Modal-built)
   bench-util/      CUDA-event timing + shared-RNG re-export
   vecadd/          toolchain smoke test; template for new kernels
   llama-ops/       direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
-                   SwiGLU, embedding, and fused softmax-cross-entropy
+                   RoPE, causal attention, SwiGLU, embedding, and loss
   tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled GEMM
+  llama-model/     full fp32 GPU Llama forward/backward + CPU parity
 modal_app.py       Modal image + run/bench/sweep/sanitize/baseline/ptx
 ```
 
@@ -201,7 +202,7 @@ Each gated on tests; correctness before speed at every step.
    fused softmax-cross-entropy — all gradchecked; overfit a tiny batch on CPU
 4. ✅ GPU foundation: tensor-gpu (GpuTensor), elementwise/reduction kernels,
    naive-then-tiled GEMM — all parity-tested vs CPU
-5. GPU forward+backward of the full model; parity vs CPU at fp32
+5. ✅ GPU forward+backward of the full model; parity vs CPU at fp32
 6. AdamW + training loop on GPU; overfit tiny batch, then real wiki run
 7. Perf: bf16 + fp32 master, kernel fusion, tcgen05 GEMM, flash-style
    attention, sweeps; Muon
