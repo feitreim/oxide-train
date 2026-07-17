@@ -24,9 +24,10 @@ const NP: usize = 128;
 const T: usize = 4;
 const VOCAB: usize = 17;
 const VP: usize = 128;
+// `HD` must match the tiled flash kernels' compile-time head width (7e7).
 const D: usize = 128;
-const H: usize = 4;
-const HD: usize = 32;
+const H: usize = 2;
+const HD: usize = 64;
 const FF: usize = 19;
 
 /// Loss and gradients that crossed the bf16 head: inputs quantized to bf16,
@@ -201,8 +202,14 @@ fn overfit_tiny_batch(
     let targets = [1, 2, 3, 0];
     let cpu = TinyLlama::new(100);
     let mut gpu = GpuLlama::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
+    // 0.03 is knife-edge on this batch: the bf16 two-logit tie's escape is
+    // violently sensitive there, and a CPU sweep injecting +/-1-ulp-scale
+    // noise (modelling kernel summation-order differences, 7e7) left ~1 in 8
+    // realizations parked on the tie past step 900. At 0.02 every sampled
+    // realization converges by ~step 60; the plateau-escape mechanism itself
+    // stays observable in crates/optim/examples/overfit_probe.rs at 0.03.
     let config = AdamWConfig {
-        learning_rate: 0.03,
+        learning_rate: 0.02,
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
@@ -210,11 +217,8 @@ fn overfit_tiny_batch(
     let mut workspace = GpuLlamaWorkspace::<4, 128, 4, 4, 128, 128, 2, 12>::new(stream)?;
     let mut initial_loss = None;
 
-    // More steps than the fp32 gate needed: the bf16 head plateaus for a few
-    // hundred steps with two competing logits tied at bf16 resolution until
-    // the fp32 master accumulates enough sub-ulp progress to break the tie
-    // (reproduced on CPU in crates/optim/examples/overfit_probe.rs, which
-    // escapes by step ~300 and reaches ~5e-6 by step 360).
+    // At this learning rate the CPU probe converges by ~step 60 across all
+    // sampled sub-ulp noise realizations; 600 steps keeps a wide margin.
     for _ in 0..600 {
         gpu.zero_grad(stream, tensor)?;
         gpu.forward(
