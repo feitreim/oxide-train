@@ -530,6 +530,7 @@ fn check_embedding(
     let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut dw_dev = DeviceBuffer::<f32>::zeroed(stream, V * D)?;
+    let mut dw_scatter_dev = DeviceBuffer::<f32>::zeroed(stream, V * D)?;
     module.embedding_forward(
         stream,
         LaunchConfig::for_num_elems((N * D) as u32),
@@ -547,6 +548,16 @@ fn check_embedding(
         D as u32,
         &mut dw_dev,
     )?;
+    unsafe {
+        module.embedding_backward_scatter(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &tokens_dev,
+            &dy_dev,
+            D as u32,
+            &mut dw_scatter_dev,
+        )?;
+    }
 
     assert_close(
         "embedding y",
@@ -559,6 +570,13 @@ fn check_embedding(
         "embedding dw",
         &dw_dev.to_host_vec(stream)?,
         cpu.dw.as_slice(),
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "embedding dw scatter vs naive",
+        &dw_scatter_dev.to_host_vec(stream)?,
+        &dw_dev.to_host_vec(stream)?,
         1e-6,
         1e-6,
     );

@@ -9,7 +9,11 @@
 //! remains the single source of kernel definitions while the selected target
 //! receives an embedded CUDA artifact.
 
-use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread};
+use cuda_device::{
+    DisjointSlice, SharedArray,
+    atomic::{AtomicOrdering, DeviceAtomicF32},
+    cuda_module, kernel, thread,
+};
 
 /// Threads in the row-parallel fused classifier kernels.
 ///
@@ -367,6 +371,42 @@ pub mod kernels {
             }
             *slot += grad;
         }
+    }
+
+    /// Embedding backward scatter: one thread owns each upstream-gradient
+    /// element and atomically accumulates it into the selected vocabulary row.
+    ///
+    /// Unlike [`embedding_backward`], this does O(token_count * dim) work
+    /// rather than making every vocabulary/feature slot scan all token
+    /// positions. Device-scope relaxed atomics are sufficient: the stream
+    /// orders this kernel with the gradient fill before it and optimizer use
+    /// after it, while the atomic only needs to serialize colliding tokens
+    /// within this launch.
+    #[kernel]
+    pub unsafe fn embedding_backward_scatter(
+        tokens: &[u32],
+        dy: &[f32],
+        dim: u32,
+        mut dweight: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= dy.len() {
+            return;
+        }
+        let d = dim as usize;
+        let row = i / d;
+        let col = i % d;
+        let output = tokens[row] as usize * d + col;
+        if output >= dweight.len() {
+            return;
+        }
+
+        // SAFETY: `output` was bounds-checked above and the pointer remains
+        // valid for the kernel launch. Multiple token positions may select the
+        // same output, so every access to that location in this kernel is an
+        // atomic fetch-add.
+        let slot = unsafe { DeviceAtomicF32::from_ptr(dweight.as_mut_ptr().add(output)) };
+        slot.fetch_add(dy[i], AtomicOrdering::Relaxed);
     }
 
     #[kernel]

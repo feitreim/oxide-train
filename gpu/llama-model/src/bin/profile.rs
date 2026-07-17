@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     optimizer.update_profiled(&mut gpu, &stream, &tensor, &mut profiler)?;
     let profile = profiler.finish(&stream)?;
 
-    println!("bf16 tcgen05 lm-head + fast norm backward");
+    println!("bf16 tcgen05 lm-head + fast norm and atomic embedding backward");
     println!("{profile}");
     println!();
     println!("scope: in-place zero_grad + forward + backward + AdamW");
