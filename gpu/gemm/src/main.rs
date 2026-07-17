@@ -156,9 +156,11 @@ fn check_tcgen05_bf16(
     stream: &cuda_core::CudaStream,
     module: &kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const M: usize = 128;
-    const N: usize = 128;
-    const K: usize = 64;
+    // Multi-CTA grid (2x2) and three k-iterations so the TMA tile offsets and
+    // the mbarrier phase-parity toggle are exercised, not just phase 0.
+    const M: usize = 256;
+    const N: usize = 256;
+    const K: usize = 192;
     let (a_bits, a) = quantize_bf16(&uniform_vec(M * K, 4));
     // tcgen05 consumes B in transposed [N,K] storage so K remains contiguous.
     let (b_bits, b) = quantize_bf16(&uniform_vec(N * K, 5));
