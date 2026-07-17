@@ -279,10 +279,36 @@ Each gated on tests; correctness before speed at every step.
      naive attention kernels without materializing the probability matrix.
    - ✅ **7d bf16 plumbing** (crates/tensor-core, tensor-cpu, optim): bf16
      `Element`, conversions, fp32 master weights — feeds 7b's tcgen05 phase.
-   - **7e integration/fusion pass** (gpu/llama-model): horizontal QKV and
-     gate+up, accumulate-GEMM in backward, residual+RMSNorm fusion. Small
-     serialized PRs after 7b/7c merge, each gated on same-container step
-     time.
+   - **7e integration/fusion pass** (gpu/llama-model): small serialized PRs,
+     each gated on a §10.1 same-process before/after at the 182.7M profile
+     config. Ordered by the first real-scale profile (2026-07-16: full step
+     261 ms; loss softmax 59.6%, unattributed alloc/zero-fill/copy 24.8%,
+     all other kernels ~15% combined); re-profile after each landing and
+     reorder the remainder if the measured tail moves:
+     - **7e1 fused classifier**: replace the naive softmax + cross-entropy
+       pair with one row-parallel fused forward/backward (llm.c-style:
+       block-per-row online reduction, dlogits produced in place, no
+       `[N,VOCAB]` probability tensor saved in ctx). Motivation: the naive
+       softmax recomputes the row max/denominator per element — O(V²) per
+       row at V=50,257 — and alone measured 59.6–67.6% of the step.
+     - **7e2 memory hygiene**: in-place `zero_grad` via a fill kernel
+       (today: twelve fresh `DeviceBuffer::zeroed` allocations per step);
+       reuse activation/output buffers across steps instead of allocating
+       per op; pinned-host staging for token H2D. Motivation: 24.8% of the
+       step is unattributed allocation/zero-fill/copy time.
+     - **7e3 GEMM integration**: swap model matmuls to gpu/gemm's
+       register-tiled fp32 (store + accumulate variants — the accumulate
+       path deletes the separate grad-accumulate launch per linear);
+       horizontal QKV `[D,3D]` and gate+up `[D,2FF]` fusion.
+     - **7e4 flash-attention integration**: swap the naive attention
+       kernels for gpu/flash-attn; re-tile its backward (key-block
+       parallel, flash-2 style) if the profile shows the B·H-block launch
+       becoming the tail at real T.
+     - **7e5 bf16 compute**: tcgen05 GEMMs + fp32 master weights/optimizer
+       states (§7 phase 2, plumbing from 7d); pad vocab 50,257 → 50,304
+       (393×128) so the lm-head satisfies tcgen05's M,N ≡ 0 (mod 128)
+       contract. Residual+RMSNorm fusion joins here if the re-profile
+       still shows it above noise.
    - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
      time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 
@@ -311,3 +337,4 @@ Each gated on tests; correctness before speed at every step.
 | 14 | B200 on Modal; Blackwell-only paths OK | The one real target; dev machines have no GPU |
 | 15 | Fusion = typed substitution; no graph, no epilogue framework | Fused kernel = new module with identical types, parity vs the unfused path; Blackwell epilogues are pipeline stages, not scalar hooks — abstractions get extracted from ≥3 working variants, never designed first |
 | 16 | Perf claims need same-container before/after | ~3× variance observed across Modal containers on identical code; sweeps already share one container for exactly this reason |
+| 17 | Optimization backlog is profile-ordered | First real-scale profile contradicted intuition (naive loss softmax 60%+ of step, tcgen05 GEMM integration nowhere near top); 7e sub-milestones follow measured step share and get re-ordered after each landing |
