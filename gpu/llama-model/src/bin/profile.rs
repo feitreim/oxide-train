@@ -63,8 +63,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(cpu);
     let mut optimizer = GpuLlamaAdamW::new(&stream, AdamWConfig::default())?;
     let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF>::new(&stream)?;
-    let tokens = std::array::from_fn(|i| (i * 7919 + 17) % VOCAB);
-    let targets = std::array::from_fn(|i| tokens[(i + 1) % N]);
+    let tokens: Vec<usize> = (0..N).map(|i| (i * 7919 + 17) % VOCAB).collect();
+    let targets: Vec<usize> = (0..N).map(|i| tokens[(i + 1) % N]).collect();
+    let tokens: &[usize; N] = tokens.as_slice().try_into().expect("length N");
+    let targets: &[usize; N] = targets.as_slice().try_into().expect("length N");
 
     for _ in 0..WARMUP_STEPS {
         gpu.zero_grad(&stream, &tensor)?;

@@ -93,8 +93,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shard = TokenFile::open(&shard_path)?;
     let mut rng = 0x5EED_5EED_5EED_5EEDu64;
 
+    let zero_targets = vec![0usize; N];
+    let zero_targets: &[usize; N] = zero_targets.as_slice().try_into().expect("length N");
     for (index, offset) in [0usize, 1_000_000, 5_000_000].into_iter().enumerate() {
-        let mut window = [EOT; N];
+        let mut window = vec![EOT; N];
         for (slot, &token) in window[..PROMPT_TOKENS]
             .iter_mut()
             .zip(&shard.tokens()[offset..offset + PROMPT_TOKENS])
@@ -104,8 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut live = PROMPT_TOKENS;
         while live < PROMPT_TOKENS + generate {
             gpu.forward(
-                window,
-                [0; N],
+                window.as_slice().try_into().expect("length N"),
+                zero_targets,
                 &mut workspace,
                 &stream,
                 &tensor,

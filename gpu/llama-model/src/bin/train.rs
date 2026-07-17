@@ -133,8 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         next_batch += 1;
-        let inputs = std::array::from_fn(|i| inputs.as_slice()[i] as usize);
-        let targets = std::array::from_fn(|i| targets.as_slice()[i] as usize);
+        let inputs: Vec<usize> = inputs.as_slice().iter().map(|&t| t as usize).collect();
+        let targets: Vec<usize> = targets.as_slice().iter().map(|&t| t as usize).collect();
+        let inputs: &[usize; N] = inputs.as_slice().try_into().expect("length N");
+        let targets: &[usize; N] = targets.as_slice().try_into().expect("length N");
 
         gpu.zero_grad(&stream, &tensor)?;
         gpu.forward(

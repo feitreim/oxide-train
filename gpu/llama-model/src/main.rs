@@ -218,8 +218,8 @@ fn overfit_tiny_batch(
     for _ in 0..600 {
         gpu.zero_grad(stream, tensor)?;
         gpu.forward(
-            tokens,
-            targets,
+            &tokens,
+            &targets,
             &mut workspace,
             stream,
             tensor,
@@ -244,8 +244,8 @@ fn overfit_tiny_batch(
     }
 
     gpu.forward(
-        tokens,
-        targets,
+        &tokens,
+        &targets,
         &mut workspace,
         stream,
         tensor,
@@ -285,8 +285,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (cpu_loss, cpu_ctx) = cpu.forward(tokens, targets);
     gpu.forward(
-        tokens,
-        targets,
+        &tokens,
+        &targets,
         &mut workspace,
         &stream,
         &tensor,
@@ -362,8 +362,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // packed head buffers), which single-pass parity cannot.
     gpu.zero_grad(&stream, &tensor)?;
     gpu.forward(
-        tokens,
-        targets,
+        &tokens,
+        &targets,
         &mut workspace,
         &stream,
         &tensor,

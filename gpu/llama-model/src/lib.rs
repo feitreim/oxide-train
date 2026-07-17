@@ -1105,8 +1105,8 @@ impl<
 
     fn upload_inputs(
         &mut self,
-        tokens: [usize; N],
-        targets: [usize; N],
+        tokens: &[usize; N],
+        targets: &[usize; N],
         stream: &CudaStream,
     ) -> Result<(), DriverError> {
         let slot = &mut self.staging[self.next_staging];
@@ -1184,8 +1184,8 @@ impl<
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
-        tokens: [usize; N],
-        targets: [usize; N],
+        tokens: &[usize; N],
+        targets: &[usize; N],
         workspace: &mut GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
@@ -1212,8 +1212,8 @@ impl<
     #[allow(clippy::too_many_arguments)]
     pub fn forward_profiled<P: KernelProfiler>(
         &self,
-        tokens: [usize; N],
-        targets: [usize; N],
+        tokens: &[usize; N],
+        targets: &[usize; N],
         workspace: &mut GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
