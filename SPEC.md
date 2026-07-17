@@ -376,6 +376,17 @@ Each gated on tests; correctness before speed at every step.
        now flash attention at 36.9 ms combined (29.0%, quadratic-in-T forward
        + backward), followed by the three `*_norm.input` backwards at 20.6 ms
        combined (16.1%).
+     - **7e7 flash-attention tiling** (open): the post-7e6 batch-shape
+       sweep (B200, 182.7M) measured a flat 38.9 µs/token across
+       B=32/64/128 at T=1024 (GPU saturates by N≈32k; B is an
+       optimization knob, not throughput) and 56.5 µs/token at T=2048,
+       with the flash rows at 45.8% of the step at T=1024 and 62.7% at
+       T=2048. The per-(row, head) blocks scan keys serially with HD
+       lanes; re-tile to the FlashAttention-2 block structure
+       (key/query-block staging through shared memory, parallelism over
+       key blocks) in forward, `backward_q`, and `backward_kv`. Naive and
+       current flash kernels both retained as oracles. Gate per §10.1 at
+       B=32 T=1024 and B=128 T=2048.
    - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
      time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 
