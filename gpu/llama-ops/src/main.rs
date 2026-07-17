@@ -13,7 +13,7 @@ use tensor_cpu::CpuTensor;
 // as a module so this binary's embedded artifact contains the kernels.
 #[path = "lib.rs"]
 mod device;
-use device::kernels;
+use device::{CLASSIFIER_THREADS, kernels};
 
 fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
     assert_eq!(actual.len(), expected.len());
@@ -416,10 +416,16 @@ fn check_cross_entropy(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const N: usize = 5;
-    const C: usize = 13;
+    check_cross_entropy_case::<5, 13>(stream, module)?;
+    check_cross_entropy_case::<5, 517>(stream, module)
+}
+
+fn check_cross_entropy_case<const N: usize, const C: usize>(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
     let logits = CpuTensor::<f32, Rank2<N, C>>::uniform(9).scale(5.0);
-    let targets_usize = [0, 7, 12, 3, 7];
+    let targets_usize = std::array::from_fn(|row| (row * 101 + C - 1) % C);
     let targets = targets_usize.map(|v| v as u32);
     let mut cpu = SoftmaxCrossEntropy::<N, C>;
     let (cpu_loss, cpu_ctx) = cpu.forward(SoftmaxCrossEntropyInput {
@@ -433,6 +439,8 @@ fn check_cross_entropy(
     let mut probabilities_dev = DeviceBuffer::<f32>::zeroed(stream, N * C)?;
     let mut losses_dev = DeviceBuffer::<f32>::zeroed(stream, N)?;
     let mut dlogits_dev = DeviceBuffer::<f32>::zeroed(stream, N * C)?;
+    let mut fused_losses_dev = DeviceBuffer::<f32>::zeroed(stream, N)?;
+    let mut fused_dlogits_dev = DeviceBuffer::from_host(stream, logits.as_slice())?;
     module.softmax_forward(
         stream,
         LaunchConfig::for_num_elems((N * C) as u32),
@@ -459,8 +467,40 @@ fn check_cross_entropy(
         C as u32,
         &mut dlogits_dev,
     )?;
+    let classifier_config = LaunchConfig {
+        grid_dim: (N as u32, 1, 1),
+        block_dim: (CLASSIFIER_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    module.fused_classifier_forward(
+        stream,
+        classifier_config,
+        &logits_dev,
+        &targets_dev,
+        N as u32,
+        C as u32,
+        &mut fused_losses_dev,
+    )?;
+    module.fused_classifier_backward_in_place(
+        stream,
+        classifier_config,
+        &targets_dev,
+        1.0,
+        N as u32,
+        C as u32,
+        &mut fused_dlogits_dev,
+    )?;
 
-    let gpu_loss = losses_dev.to_host_vec(stream)?.iter().sum::<f32>() / N as f32;
+    let losses = losses_dev.to_host_vec(stream)?;
+    let fused_losses = fused_losses_dev.to_host_vec(stream)?;
+    assert_close(
+        "fused classifier losses vs naive",
+        &fused_losses,
+        &losses,
+        5e-5,
+        2e-5,
+    );
+    let gpu_loss = fused_losses.iter().sum::<f32>() / N as f32;
     assert_close(
         "cross entropy loss",
         &[gpu_loss],
@@ -469,10 +509,17 @@ fn check_cross_entropy(
         2e-5,
     );
     assert_close(
-        "cross entropy dx",
+        "fused classifier dx vs naive",
+        &fused_dlogits_dev.to_host_vec(stream)?,
         &dlogits_dev.to_host_vec(stream)?,
+        5e-6,
+        2e-5,
+    );
+    assert_close(
+        "fused classifier dx vs CPU",
+        &fused_dlogits_dev.to_host_vec(stream)?,
         cpu_dx.as_slice(),
-        2e-6,
+        5e-6,
         2e-5,
     );
     Ok(())
