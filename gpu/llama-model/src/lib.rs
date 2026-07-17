@@ -101,28 +101,26 @@ fn pairs_config(words: usize) -> LaunchConfig {
     LaunchConfig::for_num_elems(words as u32)
 }
 
-fn flash_forward_config<const N: usize, const H: usize, const HD: usize>() -> LaunchConfig {
-    assert!(HD.is_power_of_two());
-    assert!(HD <= flash_device::MAX_HEAD_DIM);
-    assert!(N * H <= u32::MAX as usize);
-    LaunchConfig {
-        grid_dim: ((N * H) as u32, 1, 1),
-        block_dim: (HD as u32, 1, 1),
-        shared_mem_bytes: 0,
-    }
-}
-
-fn flash_backward_config<const N: usize, const T: usize, const H: usize, const HD: usize>()
+fn flash_forward_config<const N: usize, const T: usize, const H: usize, const HD: usize>()
 -> LaunchConfig {
     assert_eq!(N % T, 0);
-    assert!(HD.is_power_of_two());
-    assert!(HD <= flash_device::MAX_HEAD_DIM);
-    assert!(N * H <= u32::MAX as usize);
-    LaunchConfig {
-        grid_dim: ((N * H) as u32, 1, 1),
-        block_dim: (HD as u32, 1, 1),
-        shared_mem_bytes: 0,
-    }
+    flash_device::tiled_forward_config(N / T, T, H, HD)
+}
+
+fn flash_dot_config<const N: usize, const H: usize, const HD: usize>() -> LaunchConfig {
+    flash_device::dot_config(N, H, HD)
+}
+
+fn flash_backward_q_config<const N: usize, const T: usize, const H: usize, const HD: usize>()
+-> LaunchConfig {
+    assert_eq!(N % T, 0);
+    flash_device::tiled_backward_q_config(N / T, T, H, HD)
+}
+
+fn flash_backward_kv_config<const N: usize, const T: usize, const H: usize, const HD: usize>()
+-> LaunchConfig {
+    assert_eq!(N % T, 0);
+    flash_device::tiled_backward_kv_config(N / T, T, H, HD)
 }
 
 fn add_into<S: Shape, P: KernelProfiler>(
@@ -970,6 +968,7 @@ pub struct GpuLlamaWorkspace<
     v: GpuTensor<f32, Rank2<N, D>>,
     attended: GpuTensor<f32, Rank2<N, D>>,
     attention_logsumexp: GpuTensor<f32, Rank2<N, H>>,
+    attention_dot: GpuTensor<f32, Rank2<N, H>>,
     ffn_input: GpuTensor<f32, Rank2<N, D>>,
     ffn_normalized: GpuTensor<f32, Rank2<N, D>>,
     gate_up: GpuTensor<f32, Rank3<N, 2, FF>>,
@@ -1037,6 +1036,7 @@ impl<
             v: GpuTensor::zeros(stream)?,
             attended: GpuTensor::zeros(stream)?,
             attention_logsumexp: GpuTensor::zeros(stream)?,
+            attention_dot: GpuTensor::zeros(stream)?,
             ffn_input: GpuTensor::zeros(stream)?,
             ffn_normalized: GpuTensor::zeros(stream)?,
             gate_up: GpuTensor::zeros(stream)?,
@@ -1586,6 +1586,7 @@ impl<
             &workspace.v,
             &workspace.attended,
             &workspace.attention_logsumexp,
+            &mut workspace.attention_dot,
             &workspace.d_model_0,
             &mut workspace.d_model_1,
             &mut workspace.d_model_3,
@@ -1770,15 +1771,14 @@ fn flash_attention_forward_into<
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, "forward.attention.flash", || {
-        kernels.flash_attention_forward(
+        kernels.flash_attention_forward_tiled(
             stream,
-            flash_forward_config::<N, H, HD>(),
+            flash_forward_config::<N, T, H, HD>(),
             q.as_device_buffer(),
             k.as_device_buffer(),
             v.as_device_buffer(),
             T as u32,
             H as u32,
-            HD as u32,
             output.as_device_buffer_mut(),
             logsumexp.as_device_buffer_mut(),
         )
@@ -1799,6 +1799,7 @@ fn flash_attention_backward_into<
     v: &GpuTensor<f32, Rank2<N, D>>,
     output: &GpuTensor<f32, Rank2<N, D>>,
     logsumexp: &GpuTensor<f32, Rank2<N, H>>,
+    softmax_dot: &mut GpuTensor<f32, Rank2<N, H>>,
     dy: &GpuTensor<f32, Rank2<N, D>>,
     dq: &mut GpuTensor<f32, Rank2<N, D>>,
     dk: &mut GpuTensor<f32, Rank2<N, D>>,
@@ -1807,36 +1808,43 @@ fn flash_attention_backward_into<
     kernels: &flash_kernels::LoadedModule,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
-    let config = flash_backward_config::<N, T, H, HD>();
-    profiler.measure(stream, "backward.attention.flash_q", || {
-        kernels.flash_attention_backward_q(
+    profiler.measure(stream, "backward.attention.flash_dot", || {
+        kernels.flash_attention_backward_dot(
             stream,
-            config,
+            flash_dot_config::<N, H, HD>(),
+            dy.as_device_buffer(),
+            output.as_device_buffer(),
+            HD as u32,
+            softmax_dot.as_device_buffer_mut(),
+        )
+    })?;
+    profiler.measure(stream, "backward.attention.flash_q", || {
+        kernels.flash_attention_backward_q_tiled(
+            stream,
+            flash_backward_q_config::<N, T, H, HD>(),
             q.as_device_buffer(),
             k.as_device_buffer(),
             v.as_device_buffer(),
-            output.as_device_buffer(),
             dy.as_device_buffer(),
             logsumexp.as_device_buffer(),
+            softmax_dot.as_device_buffer(),
             T as u32,
             H as u32,
-            HD as u32,
             dq.as_device_buffer_mut(),
         )
     })?;
     profiler.measure(stream, "backward.attention.flash_kv", || {
-        kernels.flash_attention_backward_kv(
+        kernels.flash_attention_backward_kv_tiled(
             stream,
-            config,
+            flash_backward_kv_config::<N, T, H, HD>(),
             q.as_device_buffer(),
             k.as_device_buffer(),
             v.as_device_buffer(),
-            output.as_device_buffer(),
             dy.as_device_buffer(),
             logsumexp.as_device_buffer(),
+            softmax_dot.as_device_buffer(),
             T as u32,
             H as u32,
-            HD as u32,
             dk.as_device_buffer_mut(),
             dv.as_device_buffer_mut(),
         )

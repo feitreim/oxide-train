@@ -1,4 +1,9 @@
-//! Flash attention versus the `llama-ops` materialized-probability baseline.
+//! Flash attention generations versus the `llama-ops` materialized baseline.
+//!
+//! The shape matches the training sequence length (T=1024, H=24, HD=64) where
+//! the per-row kernels' serial key scan is the measured tail (7e7); `B` is
+//! kept small because attention time scales with `B` while its parallelism is
+//! already saturated.
 //!
 //! Run with `./run.sh flash-attn bench`.
 
@@ -11,21 +16,13 @@ mod flash;
 mod naive;
 
 const B: usize = 2;
-const T: usize = 64;
-const H: usize = 8;
+const T: usize = 1024;
+const H: usize = 24;
 const HD: usize = 64;
 const N: usize = B * T;
 const D: usize = H * HD;
 
-fn forward_config() -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: ((N * H) as u32, 1, 1),
-        block_dim: (HD as u32, 1, 1),
-        shared_mem_bytes: 0,
-    }
-}
-
-fn backward_config() -> LaunchConfig {
+fn per_row_config() -> LaunchConfig {
     LaunchConfig {
         grid_dim: ((N * H) as u32, 1, 1),
         block_dim: (HD as u32, 1, 1),
@@ -35,6 +32,7 @@ fn backward_config() -> LaunchConfig {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(HD.is_power_of_two() && HD <= flash::MAX_HEAD_DIM);
+    assert_eq!(HD, flash::TILE_HD);
 
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
@@ -48,11 +46,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut probabilities = DeviceBuffer::<f32>::zeroed(&stream, N * H * T)?;
     let mut y = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
     let mut logsumexp = DeviceBuffer::<f32>::zeroed(&stream, N * H)?;
+    let mut softmax_dot = DeviceBuffer::<f32>::zeroed(&stream, N * H)?;
     let mut dq = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
     let mut dk = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
     let mut dv = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
 
-    let naive_forward_ms = time_gpu_iters(&stream, 2, 10, || {
+    let naive_forward_ms = time_gpu_iters(&stream, 1, 5, || {
         naive_module.attention_probabilities(
             &stream,
             LaunchConfig::for_num_elems((N * H * T) as u32),
@@ -75,16 +74,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         Ok(())
     })?;
-    let flash_forward_ms = time_gpu_iters(&stream, 5, 20, || {
+    let per_row_forward_ms = time_gpu_iters(&stream, 2, 10, || {
         flash_module.flash_attention_forward(
             &stream,
-            forward_config(),
+            per_row_config(),
             &q,
             &k,
             &v,
             T as u32,
             H as u32,
             HD as u32,
+            &mut y,
+            &mut logsumexp,
+        )?;
+        Ok(())
+    })?;
+    let tiled_forward_ms = time_gpu_iters(&stream, 5, 20, || {
+        flash_module.flash_attention_forward_tiled(
+            &stream,
+            flash::tiled_forward_config(B, T, H, HD),
+            &q,
+            &k,
+            &v,
+            T as u32,
+            H as u32,
             &mut y,
             &mut logsumexp,
         )?;
@@ -129,10 +142,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         Ok(())
     })?;
-    let flash_backward_ms = time_gpu_iters(&stream, 2, 10, || {
+    let per_row_backward_ms = time_gpu_iters(&stream, 2, 10, || {
         flash_module.flash_attention_backward_q(
             &stream,
-            backward_config(),
+            per_row_config(),
             &q,
             &k,
             &v,
@@ -146,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         flash_module.flash_attention_backward_kv(
             &stream,
-            backward_config(),
+            per_row_config(),
             &q,
             &k,
             &v,
@@ -161,17 +174,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         Ok(())
     })?;
+    let tiled_backward_ms = time_gpu_iters(&stream, 5, 20, || {
+        flash_module.flash_attention_backward_dot(
+            &stream,
+            flash::dot_config(N, H, HD),
+            &dy,
+            &y,
+            HD as u32,
+            &mut softmax_dot,
+        )?;
+        flash_module.flash_attention_backward_q_tiled(
+            &stream,
+            flash::tiled_backward_q_config(B, T, H, HD),
+            &q,
+            &k,
+            &v,
+            &dy,
+            &logsumexp,
+            &softmax_dot,
+            T as u32,
+            H as u32,
+            &mut dq,
+        )?;
+        flash_module.flash_attention_backward_kv_tiled(
+            &stream,
+            flash::tiled_backward_kv_config(B, T, H, HD),
+            &q,
+            &k,
+            &v,
+            &dy,
+            &logsumexp,
+            &softmax_dot,
+            T as u32,
+            H as u32,
+            &mut dk,
+            &mut dv,
+        )?;
+        Ok(())
+    })?;
 
     let probability_mib = (N * H * T * size_of::<f32>()) as f64 / (1024.0 * 1024.0);
     println!("fp32 causal attention [B={B},T={T},H={H},HD={HD}]");
     println!("  materialized probabilities: {probability_mib:.2} MiB");
     println!(
-        "  forward  naive={naive_forward_ms:8.3} ms  flash={flash_forward_ms:8.3} ms  speedup={:.2}x",
-        naive_forward_ms / flash_forward_ms
+        "  forward  naive={naive_forward_ms:9.3} ms  per-row={per_row_forward_ms:9.3} ms  tiled={tiled_forward_ms:9.3} ms  tiled speedup vs per-row={:.2}x",
+        per_row_forward_ms / tiled_forward_ms
     );
     println!(
-        "  backward naive={naive_backward_ms:8.3} ms  flash={flash_backward_ms:8.3} ms  speedup={:.2}x",
-        naive_backward_ms / flash_backward_ms
+        "  backward naive={naive_backward_ms:9.3} ms  per-row={per_row_backward_ms:9.3} ms  tiled={tiled_backward_ms:9.3} ms  tiled speedup vs per-row={:.2}x",
+        per_row_backward_ms / tiled_backward_ms
     );
     Ok(())
 }

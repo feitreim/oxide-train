@@ -24,9 +24,10 @@ const NP: usize = 128;
 const T: usize = 4;
 const VOCAB: usize = 17;
 const VP: usize = 128;
+// `HD` must match the tiled flash kernels' compile-time head width (7e7).
 const D: usize = 128;
-const H: usize = 4;
-const HD: usize = 32;
+const H: usize = 2;
+const HD: usize = 64;
 const FF: usize = 19;
 
 /// Loss and gradients that crossed the bf16 head: inputs quantized to bf16,
