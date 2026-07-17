@@ -2,7 +2,10 @@
 //!
 //! Parameters, gradients, and saved activations remain GPU-resident. The
 //! implementation mirrors `nn::Llama` explicitly so residual splits and the
-//! ownership of every backward context stay visible.
+//! aliasing story stay visible. Since 7e2, activations and scratch live in a
+//! persistent `GpuLlamaWorkspace` reused across steps; safety comes from
+//! disjoint workspace fields (each saved activation has a dedicated buffer),
+//! not from the CPU reference's by-value Ctx ownership.
 
 use bench_util::{KernelProfiler, NoopProfiler};
 use cuda_core::{CudaEvent, CudaStream, DriverError, LaunchConfig, PinnedHostBuffer};

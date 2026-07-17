@@ -86,7 +86,11 @@ trait Module {
 - **Ownership contract**: `forward` takes input *by value*; a module that
   needs it for backward moves it into `Ctx`. No implicit clones — on GPU that
   means no implicit device copies. Values needed twice (residual streams) are
-  duplicated by an explicit combinator that owns that policy.
+  duplicated by an explicit combinator that owns that policy. This by-value
+  Ctx contract governs the CPU reference; the GPU model deliberately trades
+  it for a persistent typed workspace (7e2) — aliasing safety there comes
+  from disjoint workspace fields, verified by two-pass parity, rather than
+  from ownership.
 - **Accumulation contract**: `backward` *accumulates* (`+=`) into the module's
   own grad buffers — shared params and micro-batch gradient accumulation come
   free. `zero_grad` resets.
