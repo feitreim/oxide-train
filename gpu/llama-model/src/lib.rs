@@ -1083,16 +1083,34 @@ impl<
 
     /// Host readback of one packed-bf16 logits row, widened to f32.
     ///
-    /// Sampling and debugging only: this copies the whole logits buffer.
-    pub fn logits_row(
-        &self,
-        row: usize,
-        stream: &CudaStream,
-    ) -> Result<Vec<f32>, DriverError> {
+    /// Sampling and debugging only: this synchronizes the stream after copying
+    /// only the requested row.
+    pub fn logits_row(&self, row: usize, stream: &CudaStream) -> Result<Vec<f32>, DriverError> {
         assert!(row < NP);
-        let words = self.logits.to_host_vec(stream)?;
         let stride = VP / 2;
-        Ok(words[row * stride..(row + 1) * stride]
+        let byte_offset = row
+            .checked_mul(stride)
+            .and_then(|offset| offset.checked_mul(std::mem::size_of::<u32>()))
+            .expect("logits row byte offset overflow");
+        let source = self
+            .logits
+            .cu_deviceptr()
+            .checked_add(byte_offset as u64)
+            .expect("logits row device pointer overflow");
+        let mut words = vec![0u32; stride];
+        // SAFETY: `row < NP` and the workspace allocation of `NP * VP / 2`
+        // words guarantee that `source` has `words.len()` readable elements.
+        // The initialized host vector remains live until stream synchronization.
+        unsafe {
+            cuda_core::memory::memcpy_dtoh_async(
+                words.as_mut_ptr(),
+                source,
+                std::mem::size_of_val(words.as_slice()),
+                stream.cu_stream(),
+            )?;
+        }
+        stream.synchronize()?;
+        Ok(words
             .iter()
             .flat_map(|&word| {
                 [
