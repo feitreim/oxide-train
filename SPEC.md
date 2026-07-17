@@ -65,8 +65,7 @@ generics. Fixed `T` with packed/padded sequences, standard for pretraining.
 - **Parity via shared RNG**: one splitmix64 (top-24-bit f32 draws, exactly
   representable) lives in tensor-core and is re-exported by gpu/bench-util,
   so CPU and GPU tests reproduce identical inputs from a seed, bit-for-bit.
-- Element types: `f32`, `u16` (token ids), `u32`. `bf16` joins with the
-  mixed-precision phase (§7).
+- Element types: `f32`, `bf16`, `u16` (token ids), `u32`.
 
 ## 5. Differentiation: typed module-level reverse mode (no tape)
 
@@ -206,7 +205,7 @@ crates/            CPU-side workspace (builds/tests anywhere, no CUDA)
   tensor-cpu/      CpuTensor + naive reference ops
   nn/              Module trait, combinators, layers, gradcheck
   data/            tokenizer, shard format, mmap loader, prepare-wiki binary
-  (planned) optim/ AdamW, Muon, param visitor
+  optim/           mixed-precision master weights; AdamW, Muon, param visitor
   (planned) train/ the training binary: config, loop, checkpoints, logging
 gpu/               standalone cuda-oxide kernel crates (Modal-built)
   bench-util/      CUDA-event timing + shared-RNG re-export
@@ -214,7 +213,9 @@ gpu/               standalone cuda-oxide kernel crates (Modal-built)
   llama-ops/       direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
                    RoPE, causal attention, SwiGLU, embedding, and loss
   gemm/            register-tiled fp32 + Blackwell tcgen05 bf16 GEMMs,
-                   including store/accumulate epilogues and sweep benchmarks
+                   store/accumulate variants, sweep benchmarks
+  flash-attn/      fused fp32 causal attention forward/backward, parity-tested
+                   against llama-ops without materialized probabilities
   tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled GEMM
   llama-model/     full fp32 GPU Llama forward/backward + CPU parity
 modal_app.py       Modal image + run/bench/sweep/sanitize/baseline/ptx
@@ -241,9 +242,10 @@ Each gated on tests; correctness before speed at every step.
    - ✅ **7b GEMM ladder** (`gpu/gemm`, starting from cuda-oxide
      `gemm_sol_final`): register-tiled fp32 → tcgen05 bf16; store +
      accumulate variants; tuned via SWEEP.
-   - **7c flash attention** (`gpu/flash-attn`): fp32 forward/backward,
-     parity-tested against llama-ops' naive attention kernels.
-   - **7d bf16 plumbing** (crates/tensor-core, tensor-cpu, optim): bf16
+   - **7c flash attention ✅** (`gpu/flash-attn`): fused online-softmax fp32
+     forward and recompute-softmax backward, parity-tested against llama-ops'
+     naive attention kernels without materializing the probability matrix.
+   - ✅ **7d bf16 plumbing** (crates/tensor-core, tensor-cpu, optim): bf16
      `Element`, conversions, fp32 master weights — feeds 7b's tcgen05 phase.
    - **7e integration/fusion pass** (gpu/llama-model): horizontal QKV and
      gate+up, accumulate-GEMM in backward, residual+RMSNorm fusion. Small
