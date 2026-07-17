@@ -274,7 +274,7 @@ Each gated on tests; correctness before speed at every step.
    - ✅ **7b GEMM ladder** (`gpu/gemm`, starting from cuda-oxide
      `gemm_sol_final`): register-tiled fp32 → tcgen05 bf16; store +
      accumulate variants; tuned via SWEEP.
-   - **7c flash attention ✅** (`gpu/flash-attn`): fused online-softmax fp32
+   - ✅ **7c flash attention** (`gpu/flash-attn`): fused online-softmax fp32
      forward and recompute-softmax backward, parity-tested against llama-ops'
      naive attention kernels without materializing the probability matrix.
    - ✅ **7d bf16 plumbing** (crates/tensor-core, tensor-cpu, optim): bf16
