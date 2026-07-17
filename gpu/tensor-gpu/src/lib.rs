@@ -17,6 +17,11 @@ pub const TILE: usize = 16;
 /// Threads in the single-block reduction kernels. Must remain a power of two.
 pub const REDUCE_THREADS: usize = 256;
 const TILE_ELEMENTS: usize = TILE * TILE;
+/// Square element-tile edge of the packed-bf16 transpose kernel. Both matrix
+/// dimensions must be multiples of this.
+pub const TRANSPOSE_TILE: usize = 64;
+const TRANSPOSE_THREADS: usize = 256;
+const TRANSPOSE_WORDS: usize = TRANSPOSE_TILE * TRANSPOSE_TILE / 2;
 
 #[cuda_module]
 pub mod kernels {
@@ -100,6 +105,167 @@ pub mod kernels {
         let second_hat = *second * second_correction;
         let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * *parameter;
         *parameter -= learning_rate * update;
+    }
+
+    #[inline(always)]
+    fn bf16_bits_to_f32(bits: u16) -> f32 {
+        f32::from_bits((bits as u32) << 16)
+    }
+
+    #[inline(always)]
+    fn f32_to_bf16_bits(value: f32) -> u16 {
+        let bits = value.to_bits();
+        let round = 0x7fffu32 + ((bits >> 16) & 1);
+        (bits.wrapping_add(round) >> 16) as u16
+    }
+
+    /// [`fill`] for packed storage, used to zero packed-bf16 gradients.
+    #[kernel]
+    pub fn fill_u32(value: u32, mut out: DisjointSlice<u32>) {
+        let index = thread::index_1d();
+        if let Some(slot) = out.get_mut(index) {
+            *slot = value;
+        }
+    }
+
+    /// Round two adjacent f32s into one packed bf16 pair per thread.
+    ///
+    /// `output` may be longer than `input / 2`; trailing words (padding rows)
+    /// are left untouched.
+    #[kernel]
+    pub fn convert_f32_to_bf16_pairs(input: &[f32], mut output: DisjointSlice<u32>) {
+        let index = thread::index_1d();
+        let pair = index.get();
+        if 2 * pair + 1 >= input.len() {
+            return;
+        }
+        if let Some(slot) = output.get_mut(index) {
+            *slot = f32_to_bf16_bits(input[2 * pair]) as u32
+                | ((f32_to_bf16_bits(input[2 * pair + 1]) as u32) << 16);
+        }
+    }
+
+    /// Widen packed bf16 pairs to f32, one output element per thread.
+    ///
+    /// `input` may be longer than `output / 2`; trailing words (padding rows)
+    /// are ignored.
+    #[kernel]
+    pub fn convert_bf16_pairs_to_f32(input: &[u32], mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = output.get_mut(index) {
+            let word = input[i / 2];
+            let bits = (if i % 2 == 0 { word } else { word >> 16 }) as u16;
+            *slot = bf16_bits_to_f32(bits);
+        }
+    }
+
+    /// Element-level transpose of a packed-bf16 `[rows, cols]` matrix into
+    /// `[cols, rows]`, staged through a shared tile so both global sides stay
+    /// coalesced. Launch with [`transpose_pairs_config`]; both dimensions must
+    /// be multiples of `TRANSPOSE_TILE`.
+    #[kernel]
+    pub unsafe fn transpose_bf16_pairs(
+        input: &[u32],
+        rows: u32,
+        cols: u32,
+        mut output: DisjointSlice<u32>,
+    ) {
+        // One u16 value per slot, zero-extended; +1 padding column so the
+        // column-major reads of the store phase spread across banks.
+        static mut VALUES: SharedArray<u32, { TRANSPOSE_TILE * (TRANSPOSE_TILE + 1) }> =
+            SharedArray::UNINIT;
+        const TILE_WORDS_WIDE: usize = TRANSPOSE_TILE / 2;
+
+        let tid = thread::threadIdx_x() as usize;
+        let tile_row = thread::blockIdx_y() as usize * TRANSPOSE_TILE;
+        let tile_col = thread::blockIdx_x() as usize * TRANSPOSE_TILE;
+        let source_words_per_row = cols as usize / 2;
+        let output_words_per_row = rows as usize / 2;
+
+        let mut local = tid;
+        while local < TRANSPOSE_WORDS {
+            let row = local / TILE_WORDS_WIDE;
+            let word_column = local % TILE_WORDS_WIDE;
+            let word = input[(tile_row + row) * source_words_per_row + tile_col / 2 + word_column];
+            unsafe {
+                VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column] = word & 0xffff;
+                VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column + 1] = word >> 16;
+            }
+            local += TRANSPOSE_THREADS;
+        }
+        thread::sync_threads();
+
+        let mut local = tid;
+        while local < TRANSPOSE_WORDS {
+            // Output word [c, p] packs source elements [2p, c] and [2p+1, c].
+            let output_row = local / TILE_WORDS_WIDE;
+            let word_column = local % TILE_WORDS_WIDE;
+            let (low, high) = unsafe {
+                (
+                    VALUES[(2 * word_column) * (TRANSPOSE_TILE + 1) + output_row],
+                    VALUES[(2 * word_column + 1) * (TRANSPOSE_TILE + 1) + output_row],
+                )
+            };
+            let global =
+                (tile_col + output_row) * output_words_per_row + tile_row / 2 + word_column;
+            // SAFETY: each (tile, local) pair maps to a unique output word.
+            unsafe {
+                *output.get_unchecked_mut(global) = low | (high << 16);
+            }
+            local += TRANSPOSE_THREADS;
+        }
+    }
+
+    /// Fused decoupled AdamW over an fp32 master parameter with a packed-bf16
+    /// gradient and compute copy: one thread owns one pair.
+    ///
+    /// Moment and master updates match [`adamw`] exactly; the compute copy is
+    /// the rounded shadow of the updated master.
+    #[kernel]
+    pub fn adamw_master_bf16(
+        gradient: &[u32],
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+        first_correction: f32,
+        second_correction: f32,
+        mut master: DisjointSlice<f32>,
+        mut first: DisjointSlice<f32>,
+        mut second: DisjointSlice<f32>,
+        mut compute: DisjointSlice<u32>,
+    ) {
+        let index = thread::index_1d();
+        let pair = index.get();
+        let Some(word) = compute.get_mut(index) else {
+            return;
+        };
+        let gradient = gradient[pair];
+
+        let mut packed = 0u32;
+        let mut half = 0;
+        while half < 2 {
+            let element = 2 * pair + half;
+            let g = bf16_bits_to_f32((gradient >> (16 * half)) as u16);
+            // SAFETY: this thread exclusively owns elements 2*pair and
+            // 2*pair+1 of every per-element buffer.
+            unsafe {
+                let first = first.get_unchecked_mut(element);
+                let second = second.get_unchecked_mut(element);
+                let master = master.get_unchecked_mut(element);
+                *first = beta1 * *first + (1.0 - beta1) * g;
+                *second = beta2 * *second + (1.0 - beta2) * g * g;
+                let first_hat = *first * first_correction;
+                let second_hat = *second * second_correction;
+                let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * *master;
+                *master -= learning_rate * update;
+                packed |= (f32_to_bf16_bits(*master) as u32) << (16 * half);
+            }
+            half += 1;
+        }
+        *word = packed;
     }
 
     /// One-block reduction. Threads accumulate grid-stride partial sums before
@@ -426,6 +592,21 @@ fn reduction_config() -> LaunchConfig {
     LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (REDUCE_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Validate dimensions and build the packed-bf16 transpose launch.
+pub fn transpose_pairs_config(rows: usize, cols: usize) -> LaunchConfig {
+    assert!(rows.is_multiple_of(TRANSPOSE_TILE) && cols.is_multiple_of(TRANSPOSE_TILE));
+    assert!(rows <= u32::MAX as usize && cols <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (
+            (cols / TRANSPOSE_TILE) as u32,
+            (rows / TRANSPOSE_TILE) as u32,
+            1,
+        ),
+        block_dim: (TRANSPOSE_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
 }

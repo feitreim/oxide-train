@@ -1,4 +1,6 @@
-//! Full fp32 GPU forward and backward for the single-block reference Llama.
+//! GPU forward and backward for the single-block reference Llama: fp32
+//! everywhere except the lm-head, which runs bf16 tcgen05 GEMMs against fp32
+//! master weights (§7 phase 2, adopted head-first per the 7e5 profile).
 //!
 //! Parameters, gradients, and saved activations remain GPU-resident. The
 //! implementation mirrors `nn::Llama` explicitly so residual splits and the
@@ -6,20 +8,42 @@
 //! persistent `GpuLlamaWorkspace` reused across steps; safety comes from
 //! disjoint workspace fields (each saved activation has a dedicated buffer),
 //! not from the CPU reference's by-value Ctx ownership.
+//!
+//! Two padded dimensions keep every head GEMM inside the tcgen05 tile
+//! contract without touching the tuned kernel:
+//! - `VP` pads the vocabulary (50,257 -> 50,304). The padded weight columns
+//!   are zero at initialization and stay zero: the classifier backward writes
+//!   exact zeros there, so their gradients, moments, and decayed masters never
+//!   move. Checkpoints store the unpadded columns only.
+//! - `NP` pads the token rows to the 128-row tile. Padded rows of the head
+//!   input are zeroed once and never written, so they contribute exactly
+//!   nothing to any product (including the `K = NP` weight-gradient GEMM).
+
+use std::error::Error;
 
 use bench_util::{KernelProfiler, NoopProfiler};
-use cuda_core::{CudaEvent, CudaStream, DriverError, LaunchConfig, PinnedHostBuffer};
+use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, DriverError, LaunchConfig, PinnedHostBuffer};
 use nn::Llama;
 use optim::AdamWConfig;
-use tensor_core::{Rank1, Rank2, Rank3, Shape};
+use tensor_core::{Rank1, Rank2, Rank3, Shape, bf16};
 
 // cuda-oxide collects kernels from the selected binary target. The binary
 // includes this file as a module, which in turn includes each canonical kernel
 // source here instead of copying definitions or relying on dependency PTX.
+//
+// The tcgen05 GEMM kernels are the one exception: this binary's kernels use
+// libdevice math (`exp`/`ln`/`sqrt`), which forces its device artifact
+// through libNVVM, and libNVVM rejects tcgen05 lowerings. Only gpu/gemm's
+// host-side support is included here; the kernels themselves load at runtime
+// from the pure-PTX `gemm.ptx` that `cargo oxide build gemm` produces
+// (modal_app.py prebuilds it for llama-model runs).
 #[path = "../../flash-attn/src/lib.rs"]
 mod flash_device;
 #[path = "../../gemm/src/fp32.rs"]
 mod gemm_device;
+#[path = "../../gemm/src/host.rs"]
+#[allow(dead_code)]
+mod gemm_host;
 #[path = "../../llama-ops/src/lib.rs"]
 mod llama_device;
 #[path = "../../tensor-gpu/src/lib.rs"]
@@ -28,9 +52,13 @@ pub mod tensor_device;
 
 pub use flash_device::kernels as flash_kernels;
 pub use gemm_device::kernels as gemm_kernels;
+pub use gemm_host::Tcgen05Gemm;
 pub use llama_device::kernels as llama_kernels;
 pub use tensor_device::kernels as tensor_kernels;
-use tensor_device::{GpuAdamWMoments, GpuTensor};
+
+use gemm_device::launch_config as fp32_launch_config;
+use gemm_host::{Bf16PairsTmaMap, TC_TILE, create_bf16_pairs_tma_map, tcgen05_launch_config};
+use tensor_device::{GpuAdamWMoments, GpuTensor, transpose_pairs_config};
 
 pub mod checkpoint;
 
@@ -56,6 +84,21 @@ fn classifier_config<const N: usize>() -> LaunchConfig {
         block_dim: (llama_device::CLASSIFIER_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
+}
+
+fn norm_inv_config<const N: usize>() -> LaunchConfig {
+    assert!(llama_device::NORM_THREADS.is_power_of_two());
+    assert!(N <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (N as u32, 1, 1),
+        block_dim: (llama_device::NORM_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn pairs_config(words: usize) -> LaunchConfig {
+    assert!(words <= u32::MAX as usize);
+    LaunchConfig::for_num_elems(words as u32)
 }
 
 fn flash_forward_config<const N: usize, const H: usize, const HD: usize>() -> LaunchConfig {
@@ -170,7 +213,7 @@ fn gemm_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
     profiler.measure(stream, name, || unsafe {
         kernels.register_gemm_store(
             stream,
-            gemm_device::launch_config(M, N),
+            fp32_launch_config(M, N),
             M,
             N,
             K,
@@ -193,7 +236,7 @@ fn gemm_tn_accumulate_into<const M: usize, const K: usize, const N: usize, P: Ke
     profiler.measure(stream, name, || unsafe {
         kernels.register_gemm_tn_accumulate(
             stream,
-            gemm_device::launch_config(K, N),
+            fp32_launch_config(K, N),
             K,
             N,
             M,
@@ -216,7 +259,7 @@ fn gemm_nt_into<const M: usize, const K: usize, const N: usize, P: KernelProfile
     profiler.measure(stream, name, || unsafe {
         kernels.register_gemm_nt_store(
             stream,
-            gemm_device::launch_config(M, N),
+            fp32_launch_config(M, N),
             M,
             N,
             K,
@@ -306,7 +349,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         profiler.measure(stream, name, || unsafe {
             kernels.register_gemm_store(
                 stream,
-                gemm_device::launch_config(N, GROUPS * OUT),
+                fp32_launch_config(N, GROUPS * OUT),
                 N,
                 GROUPS * OUT,
                 IN,
@@ -330,7 +373,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         profiler.measure(stream, names[0], || unsafe {
             kernels.register_gemm_tn_accumulate(
                 stream,
-                gemm_device::launch_config(IN, GROUPS * OUT),
+                fp32_launch_config(IN, GROUPS * OUT),
                 IN,
                 GROUPS * OUT,
                 N,
@@ -342,7 +385,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         profiler.measure(stream, names[1], || unsafe {
             kernels.register_gemm_nt_store(
                 stream,
-                gemm_device::launch_config(N, IN),
+                fp32_launch_config(N, IN),
                 N,
                 IN,
                 GROUPS * OUT,
@@ -399,10 +442,11 @@ impl<const D: usize> GpuRmsNorm<D> {
         x: &GpuTensor<f32, Rank2<N, D>>,
         dy: &GpuTensor<f32, Rank2<N, D>>,
         dx: &mut GpuTensor<f32, Rank2<N, D>>,
+        inv: &mut GpuTensor<f32, Rank1<N>>,
         stream: &CudaStream,
         kernels: &llama_kernels::LoadedModule,
         profiler: &mut P,
-        names: [&'static str; 2],
+        names: [&'static str; 3],
     ) -> Result<(), DriverError> {
         profiler.measure(stream, names[0], || {
             kernels.rms_norm_backward_x(
@@ -417,12 +461,22 @@ impl<const D: usize> GpuRmsNorm<D> {
             )
         })?;
         profiler.measure(stream, names[1], || {
-            kernels.rms_norm_backward_weight(
+            kernels.rms_norm_row_inv(
+                stream,
+                norm_inv_config::<N>(),
+                x.as_device_buffer(),
+                self.eps,
+                D as u32,
+                inv.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, names[2], || {
+            kernels.rms_norm_backward_weight_fast(
                 stream,
                 LaunchConfig::for_num_elems(D as u32),
                 x.as_device_buffer(),
                 dy.as_device_buffer(),
-                self.eps,
+                inv.as_device_buffer(),
                 N as u32,
                 D as u32,
                 self.dw.as_device_buffer_mut(),
@@ -491,10 +545,233 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
     }
 }
 
+/// bf16 lm-head with fp32 master weights (§7 phase 2).
+///
+/// The compute weight exists in both layouts the tcgen05 `C = A B^T` form
+/// needs as a K-contiguous `B` operand: `w` is `[D, VP]` (consumed by the
+/// input-gradient GEMM) and `w_t` is `[VP, D]` (consumed by the forward
+/// GEMM). `master` is the fp32 source of truth; the optimizer updates it and
+/// re-rounds both compute copies every step. `dw` accumulates in packed bf16,
+/// produced directly by the tcgen05 accumulate epilogue.
+pub struct GpuBf16Head<const D: usize, const VP: usize> {
+    pub master: GpuTensor<f32, Rank2<D, VP>>,
+    w: DeviceBuffer<u32>,
+    w_t: DeviceBuffer<u32>,
+    dw: DeviceBuffer<u32>,
+    w_tma: Bf16PairsTmaMap,
+    w_t_tma: Bf16PairsTmaMap,
+}
+
+impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
+    fn from_cpu<const N: usize, const VOCAB: usize>(
+        stream: &CudaStream,
+        layer: &nn::Linear<N, D, VOCAB>,
+    ) -> Result<Self, Box<dyn Error>> {
+        assert!(VP >= VOCAB);
+        let mut padded = vec![0.0f32; D * VP];
+        for row in 0..D {
+            padded[row * VP..row * VP + VOCAB]
+                .copy_from_slice(&layer.w.as_slice()[row * VOCAB..(row + 1) * VOCAB]);
+        }
+        Self::from_master_values(stream, &padded)
+    }
+
+    /// Rebuild the head from padded `[D, VP]` fp32 master values, rounding
+    /// both packed compute copies on the host.
+    pub(crate) fn from_master_values(
+        stream: &CudaStream,
+        values: &[f32],
+    ) -> Result<Self, Box<dyn Error>> {
+        assert_eq!(values.len(), D * VP);
+        let pack = |low: f32, high: f32| {
+            bf16::from_f32(low).to_bits() as u32 | ((bf16::from_f32(high).to_bits() as u32) << 16)
+        };
+        let compute: Vec<u32> = values
+            .chunks_exact(2)
+            .map(|pair| pack(pair[0], pair[1]))
+            .collect();
+        let mut transposed = vec![0u32; VP * D / 2];
+        for column in 0..VP {
+            for pair in 0..D / 2 {
+                transposed[column * D / 2 + pair] = pack(
+                    values[2 * pair * VP + column],
+                    values[(2 * pair + 1) * VP + column],
+                );
+            }
+        }
+
+        let master = GpuTensor::from_host(stream, values)?;
+        let w = DeviceBuffer::from_host(stream, &compute)?;
+        let w_t = DeviceBuffer::from_host(stream, &transposed)?;
+        let dw = DeviceBuffer::zeroed(stream, D * VP / 2)?;
+        // SAFETY: `w` and `w_t` live in this struct beside their maps and are
+        // never reallocated.
+        let w_tma = unsafe { create_bf16_pairs_tma_map(stream, &w, VP, D)? };
+        let w_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &w_t, D, VP)? };
+        Ok(Self {
+            master,
+            w,
+            w_t,
+            dw,
+            w_tma,
+            w_t_tma,
+        })
+    }
+
+    /// Packed-bf16 weight gradient. Parity-test accessor: binaries other than
+    /// the parity check see it as dead code.
+    #[allow(dead_code)]
+    pub fn dw_words(&self) -> &DeviceBuffer<u32> {
+        &self.dw
+    }
+
+    /// Packed-bf16 `[D, VP]` compute weights. Parity-test accessor: binaries
+    /// other than the parity check see it as dead code.
+    #[allow(dead_code)]
+    pub fn w_words(&self) -> &DeviceBuffer<u32> {
+        &self.w
+    }
+
+    /// Packed-bf16 `[VP, D]` transposed compute weights. Parity-test accessor:
+    /// binaries other than the parity check see it as dead code.
+    #[allow(dead_code)]
+    pub fn w_t_words(&self) -> &DeviceBuffer<u32> {
+        &self.w_t
+    }
+
+    fn zero_grad<P: KernelProfiler>(
+        &mut self,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+        profiler: &mut P,
+        name: &'static str,
+    ) -> Result<(), DriverError> {
+        profiler.measure(stream, name, || {
+            kernels.fill_u32(stream, pairs_config(D * VP / 2), 0, &mut self.dw)
+        })
+    }
+
+    fn forward_into<const NP: usize, P: KernelProfiler>(
+        &self,
+        x_tma: &Bf16PairsTmaMap,
+        logits: &mut DeviceBuffer<u32>,
+        stream: &CudaStream,
+        kernels: &Tcgen05Gemm,
+        profiler: &mut P,
+        name: &'static str,
+    ) -> Result<(), DriverError> {
+        profiler.measure(stream, name, || unsafe {
+            kernels.store(
+                stream,
+                tcgen05_launch_config(NP, VP, D),
+                x_tma.as_ptr(),
+                self.w_t_tma.as_ptr(),
+                logits,
+                VP as u32,
+                D as u32,
+            )
+        })
+    }
+
+    /// `dw += x^T dlogits` from the transposed operands staged in the
+    /// workspace; padded token rows and vocabulary columns contribute zeros.
+    fn backward_weight<const NP: usize, P: KernelProfiler>(
+        &mut self,
+        x_t_tma: &Bf16PairsTmaMap,
+        dlogits_t_tma: &Bf16PairsTmaMap,
+        stream: &CudaStream,
+        kernels: &Tcgen05Gemm,
+        profiler: &mut P,
+        name: &'static str,
+    ) -> Result<(), DriverError> {
+        profiler.measure(stream, name, || unsafe {
+            kernels.accumulate(
+                stream,
+                tcgen05_launch_config(D, VP, NP),
+                x_t_tma.as_ptr(),
+                dlogits_t_tma.as_ptr(),
+                &mut self.dw,
+                VP as u32,
+                NP as u32,
+            )
+        })
+    }
+
+    fn backward_input<const NP: usize, P: KernelProfiler>(
+        &self,
+        dlogits_tma: &Bf16PairsTmaMap,
+        dx: &mut DeviceBuffer<u32>,
+        stream: &CudaStream,
+        kernels: &Tcgen05Gemm,
+        profiler: &mut P,
+        name: &'static str,
+    ) -> Result<(), DriverError> {
+        profiler.measure(stream, name, || unsafe {
+            kernels.store(
+                stream,
+                tcgen05_launch_config(NP, D, VP),
+                dlogits_tma.as_ptr(),
+                self.w_tma.as_ptr(),
+                dx,
+                D as u32,
+                VP as u32,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adamw_step(
+        &mut self,
+        moments: &mut GpuAdamWMoments<Rank2<D, VP>>,
+        config: AdamWConfig,
+        first_correction: f32,
+        second_correction: f32,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        kernels.adamw_master_bf16(
+            stream,
+            pairs_config(D * VP / 2),
+            &self.dw,
+            config.learning_rate,
+            config.beta1,
+            config.beta2,
+            config.epsilon,
+            config.weight_decay,
+            first_correction,
+            second_correction,
+            self.master.as_device_buffer_mut(),
+            moments.first.as_device_buffer_mut(),
+            moments.second.as_device_buffer_mut(),
+            &mut self.w,
+        )
+    }
+
+    /// Refresh `w_t` from `w` after an optimizer step.
+    fn sync_transposed(
+        &mut self,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            kernels.transpose_bf16_pairs(
+                stream,
+                transpose_pairs_config(D, VP),
+                &self.w,
+                D as u32,
+                VP as u32,
+                &mut self.w_t,
+            )
+        }
+    }
+}
+
 pub struct GpuLlama<
     const N: usize,
+    const NP: usize,
     const T: usize,
     const VOCAB: usize,
+    const VP: usize,
     const D: usize,
     const H: usize,
     const HD: usize,
@@ -508,11 +785,14 @@ pub struct GpuLlama<
     pub gate_up_proj: GpuGroupedLinear<D, 2, FF>,
     pub down_proj: GpuLinear<FF, D>,
     pub final_norm: GpuRmsNorm<D>,
-    pub lm_head: GpuLinear<D, VOCAB>,
+    pub lm_head: GpuBf16Head<D, VP>,
 }
 
 /// GPU-resident AdamW state mirroring every model parameter.
-pub struct GpuLlamaAdamW<const VOCAB: usize, const D: usize, const FF: usize> {
+///
+/// The lm-head moments span the padded `[D, VP]` master; padded columns hold
+/// zeros forever because their gradients are exactly zero.
+pub struct GpuLlamaAdamW<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize> {
     config: AdamWConfig,
     step: u64,
     pub embedding: GpuAdamWMoments<Rank2<VOCAB, D>>,
@@ -523,10 +803,12 @@ pub struct GpuLlamaAdamW<const VOCAB: usize, const D: usize, const FF: usize> {
     pub gate_up_proj: GpuAdamWMoments<Rank3<D, 2, FF>>,
     pub down_proj: GpuAdamWMoments<Rank2<FF, D>>,
     pub final_norm: GpuAdamWMoments<Rank1<D>>,
-    pub lm_head: GpuAdamWMoments<Rank2<D, VOCAB>>,
+    pub lm_head: GpuAdamWMoments<Rank2<D, VP>>,
 }
 
-impl<const VOCAB: usize, const D: usize, const FF: usize> GpuLlamaAdamW<VOCAB, D, FF> {
+impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
+    GpuLlamaAdamW<VOCAB, VP, D, FF>
+{
     pub fn new(stream: &CudaStream, config: AdamWConfig) -> Result<Self, DriverError> {
         config.validate();
         Ok(Self {
@@ -556,9 +838,15 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> GpuLlamaAdamW<VOCAB, D
         self.step = step;
     }
 
-    pub fn update<const N: usize, const T: usize, const H: usize, const HD: usize>(
+    pub fn update<
+        const N: usize,
+        const NP: usize,
+        const T: usize,
+        const H: usize,
+        const HD: usize,
+    >(
         &mut self,
-        model: &mut GpuLlama<N, T, VOCAB, D, H, HD, FF>,
+        model: &mut GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
@@ -568,13 +856,14 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> GpuLlamaAdamW<VOCAB, D
 
     pub fn update_profiled<
         const N: usize,
+        const NP: usize,
         const T: usize,
         const H: usize,
         const HD: usize,
         P: KernelProfiler,
     >(
         &mut self,
-        model: &mut GpuLlama<N, T, VOCAB, D, H, HD, FF>,
+        model: &mut GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
         profiler: &mut P,
@@ -614,7 +903,19 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> GpuLlamaAdamW<VOCAB, D
         update!(gate_up_proj, self.config.weight_decay);
         update!(down_proj, self.config.weight_decay);
         update!(final_norm, 0.0);
-        update!(lm_head, self.config.weight_decay);
+        profiler.measure(stream, "optimizer.lm_head.adamw", || {
+            model.lm_head.adamw_step(
+                &mut self.lm_head,
+                self.config,
+                first_correction,
+                second_correction,
+                stream,
+                kernels,
+            )
+        })?;
+        profiler.measure(stream, "optimizer.lm_head.sync_w_t", || {
+            model.lm_head.sync_transposed(stream, kernels)
+        })?;
         Ok(())
     }
 }
@@ -637,46 +938,23 @@ impl<const N: usize> InputStaging<N> {
     }
 }
 
-/// Probability storage used only by the retained naive classifier oracle.
-///
-/// Normal forward/backward never constructs this type; it exists so the
-/// full-step profiler can satisfy the same-process baseline/candidate gate.
-pub struct NaiveClassifierWorkspace<const N: usize, const VOCAB: usize> {
-    probabilities: GpuTensor<f32, Rank2<N, VOCAB>>,
-}
-
-impl<const N: usize, const VOCAB: usize> NaiveClassifierWorkspace<N, VOCAB> {
-    pub fn new(stream: &CudaStream) -> Result<Self, DriverError> {
-        Ok(Self {
-            probabilities: GpuTensor::zeros(stream)?,
-        })
-    }
-}
-
-/// Materialized attention probabilities used only by the retained naive oracle.
-///
-/// The normal flash-attention path neither allocates nor stores `[N,H,T]`.
-pub struct NaiveAttentionWorkspace<const N: usize, const H: usize, const T: usize> {
-    probabilities: GpuTensor<f32, Rank3<N, H, T>>,
-}
-
-impl<const N: usize, const H: usize, const T: usize> NaiveAttentionWorkspace<N, H, T> {
-    pub fn new(stream: &CudaStream) -> Result<Self, DriverError> {
-        Ok(Self {
-            probabilities: GpuTensor::zeros(stream)?,
-        })
-    }
-}
-
 /// Persistent device and pinned-host storage for one model's training steps.
 ///
 /// Create this once and pass it to every forward/backward call. All operator
 /// outputs are written into these allocations, so a steady-state step performs
 /// no device allocation or synchronous device free.
+///
+/// The packed lm-head buffers are `NP` rows tall. Rows `N..NP` of
+/// `head_input` are zeroed at allocation and never written afterwards
+/// (`convert_f32_to_bf16_pairs` stops at the input length), and the same rows
+/// of `logits` always hold zeros: the forward GEMM computes them from the
+/// zero input rows and the classifier backward never touches them.
 pub struct GpuLlamaWorkspace<
     const N: usize,
+    const NP: usize,
     const T: usize,
     const VOCAB: usize,
+    const VP: usize,
     const D: usize,
     const H: usize,
     const FF: usize,
@@ -702,7 +980,16 @@ pub struct GpuLlamaWorkspace<
     final_input: GpuTensor<f32, Rank2<N, D>>,
     final_normalized: GpuTensor<f32, Rank2<N, D>>,
     projection_output: GpuTensor<f32, Rank2<N, D>>,
-    logits: GpuTensor<f32, Rank2<N, VOCAB>>,
+    head_input: DeviceBuffer<u32>,
+    head_input_t: DeviceBuffer<u32>,
+    logits: DeviceBuffer<u32>,
+    dlogits_t: DeviceBuffer<u32>,
+    d_head_input: DeviceBuffer<u32>,
+    head_input_tma: Bf16PairsTmaMap,
+    head_input_t_tma: Bf16PairsTmaMap,
+    logits_tma: Bf16PairsTmaMap,
+    dlogits_t_tma: Bf16PairsTmaMap,
+    norm_backward_inv: GpuTensor<f32, Rank1<N>>,
     losses: GpuTensor<f32, Rank1<N>>,
     loss_sum: GpuTensor<f32, Rank1<1>>,
     loss: GpuTensor<f32, Rank1<1>>,
@@ -718,14 +1005,26 @@ pub struct GpuLlamaWorkspace<
 
 impl<
     const N: usize,
+    const NP: usize,
     const T: usize,
     const VOCAB: usize,
+    const VP: usize,
     const D: usize,
     const H: usize,
     const FF: usize,
-> GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>
+> GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF>
 {
-    pub fn new(stream: &CudaStream) -> Result<Self, DriverError> {
+    pub fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+        let head_input = DeviceBuffer::zeroed(stream, NP * D / 2)?;
+        let head_input_t = DeviceBuffer::zeroed(stream, D * NP / 2)?;
+        let logits = DeviceBuffer::zeroed(stream, NP * VP / 2)?;
+        let dlogits_t = DeviceBuffer::zeroed(stream, VP * NP / 2)?;
+        // SAFETY: the mapped buffers live in this workspace beside their maps
+        // and are never reallocated.
+        let head_input_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input, D, NP)? };
+        let head_input_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input_t, NP, D)? };
+        let logits_tma = unsafe { create_bf16_pairs_tma_map(stream, &logits, VP, NP)? };
+        let dlogits_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &dlogits_t, NP, VP)? };
         Ok(Self {
             tokens: GpuTensor::zeros(stream)?,
             targets: GpuTensor::zeros(stream)?,
@@ -748,7 +1047,16 @@ impl<
             final_input: GpuTensor::zeros(stream)?,
             final_normalized: GpuTensor::zeros(stream)?,
             projection_output: GpuTensor::zeros(stream)?,
-            logits: GpuTensor::zeros(stream)?,
+            head_input,
+            head_input_t,
+            logits,
+            dlogits_t,
+            d_head_input: DeviceBuffer::zeroed(stream, NP * D / 2)?,
+            head_input_tma,
+            head_input_t_tma,
+            logits_tma,
+            dlogits_t_tma,
+            norm_backward_inv: GpuTensor::zeros(stream)?,
             losses: GpuTensor::zeros(stream)?,
             loss_sum: GpuTensor::zeros(stream)?,
             loss: GpuTensor::zeros(stream)?,
@@ -761,6 +1069,13 @@ impl<
             d_ff_1: GpuTensor::zeros(stream)?,
             d_ff_2: GpuTensor::zeros(stream)?,
         })
+    }
+
+    /// Packed-bf16 logits (dlogits after a backward pass). Parity-test
+    /// accessor: binaries other than the parity check see it as dead code.
+    #[allow(dead_code)]
+    pub fn logits_words(&self) -> &DeviceBuffer<u32> {
+        &self.logits
     }
 
     pub fn loss(&self) -> &GpuTensor<f32, Rank1<1>> {
@@ -804,22 +1119,31 @@ impl<
 
 impl<
     const N: usize,
+    const NP: usize,
     const T: usize,
     const VOCAB: usize,
+    const VP: usize,
     const D: usize,
     const H: usize,
     const HD: usize,
     const FF: usize,
-> GpuLlama<N, T, VOCAB, D, H, HD, FF>
+> GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>
 {
     pub fn from_cpu(
         stream: &CudaStream,
         model: &Llama<N, T, VOCAB, D, H, HD, FF>,
-    ) -> Result<Self, DriverError> {
+    ) -> Result<Self, Box<dyn Error>> {
         assert!(N <= u32::MAX as usize);
         assert!(N * H * T <= u32::MAX as usize);
         assert_eq!(N % T, 0);
         assert_eq!(D, H * HD);
+        // tcgen05 head contract: padded tokens and vocabulary are tile
+        // multiples, and D serves as both an output dimension (input-gradient
+        // N, weight-gradient M) and a reduction width.
+        assert_eq!(NP, N.next_multiple_of(TC_TILE));
+        assert!(VP >= VOCAB);
+        assert_eq!(VP % TC_TILE, 0);
+        assert_eq!(D % TC_TILE, 0);
         Ok(Self {
             embedding: GpuEmbedding::from_cpu(stream, &model.embedding)?,
             attention_norm: GpuRmsNorm::from_cpu(stream, &model.attention_norm)?,
@@ -832,18 +1156,20 @@ impl<
             gate_up_proj: GpuGroupedLinear::from_cpu(stream, [&model.gate_proj, &model.up_proj])?,
             down_proj: GpuLinear::from_cpu(stream, &model.down_proj)?,
             final_norm: GpuRmsNorm::from_cpu(stream, &model.final_norm)?,
-            lm_head: GpuLinear::from_cpu(stream, &model.lm_head)?,
+            lm_head: GpuBf16Head::from_cpu(stream, &model.lm_head)?,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         tokens: [usize; N],
         targets: [usize; N],
-        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        workspace: &mut GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
@@ -855,103 +1181,23 @@ impl<
             stream,
             tensor,
             gemm,
+            gemm_bf16,
             flash,
             llama,
             &mut profiler,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_profiled<P: KernelProfiler>(
         &self,
         tokens: [usize; N],
         targets: [usize; N],
-        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        workspace: &mut GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
-        flash: &flash_kernels::LoadedModule,
-        llama: &llama_kernels::LoadedModule,
-        profiler: &mut P,
-    ) -> Result<(), DriverError> {
-        self.forward_profiled_with_oracles(
-            tokens, targets, workspace, None, None, stream, tensor, gemm, flash, llama, profiler,
-        )
-    }
-
-    /// Retained full-model baseline for same-process profiling and parity.
-    /// Retained oracle: only the profiler binary calls this, so other
-    /// binaries see it as dead code.
-    #[allow(dead_code)]
-    pub fn forward_naive_profiled<P: KernelProfiler>(
-        &self,
-        tokens: [usize; N],
-        targets: [usize; N],
-        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
-        classifier: &mut NaiveClassifierWorkspace<N, VOCAB>,
-        stream: &CudaStream,
-        tensor: &tensor_kernels::LoadedModule,
-        gemm: &gemm_kernels::LoadedModule,
-        flash: &flash_kernels::LoadedModule,
-        llama: &llama_kernels::LoadedModule,
-        profiler: &mut P,
-    ) -> Result<(), DriverError> {
-        self.forward_profiled_with_oracles(
-            tokens,
-            targets,
-            workspace,
-            Some(&mut classifier.probabilities),
-            None,
-            stream,
-            tensor,
-            gemm,
-            flash,
-            llama,
-            profiler,
-        )
-    }
-
-    /// Retained naive-attention baseline for same-process profiling and parity.
-    /// Retained oracle: only the profiler binary calls this, so other
-    /// binaries see it as dead code.
-    #[allow(dead_code)]
-    pub fn forward_naive_attention_profiled<P: KernelProfiler>(
-        &self,
-        tokens: [usize; N],
-        targets: [usize; N],
-        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
-        attention: &mut NaiveAttentionWorkspace<N, H, T>,
-        stream: &CudaStream,
-        tensor: &tensor_kernels::LoadedModule,
-        gemm: &gemm_kernels::LoadedModule,
-        flash: &flash_kernels::LoadedModule,
-        llama: &llama_kernels::LoadedModule,
-        profiler: &mut P,
-    ) -> Result<(), DriverError> {
-        self.forward_profiled_with_oracles(
-            tokens,
-            targets,
-            workspace,
-            None,
-            Some(&mut attention.probabilities),
-            stream,
-            tensor,
-            gemm,
-            flash,
-            llama,
-            profiler,
-        )
-    }
-
-    fn forward_profiled_with_oracles<P: KernelProfiler>(
-        &self,
-        tokens: [usize; N],
-        targets: [usize; N],
-        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
-        naive_classifier_probabilities: Option<&mut GpuTensor<f32, Rank2<N, VOCAB>>>,
-        naive_attention_probabilities: Option<&mut GpuTensor<f32, Rank3<N, H, T>>>,
-        stream: &CudaStream,
-        tensor: &tensor_kernels::LoadedModule,
-        gemm: &gemm_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
@@ -1012,29 +1258,16 @@ impl<
             "forward.k_rope",
         )?;
         std::mem::swap(&mut workspace.k, &mut workspace.d_model_0);
-        if let Some(probabilities) = naive_attention_probabilities {
-            naive_attention_forward_into::<N, T, D, H, HD, P>(
-                &workspace.q,
-                &workspace.k,
-                &workspace.v,
-                &mut workspace.attended,
-                probabilities,
-                stream,
-                llama,
-                profiler,
-            )?;
-        } else {
-            flash_attention_forward_into::<N, T, D, H, HD, P>(
-                &workspace.q,
-                &workspace.k,
-                &workspace.v,
-                &mut workspace.attended,
-                &mut workspace.attention_logsumexp,
-                stream,
-                flash,
-                profiler,
-            )?;
-        }
+        flash_attention_forward_into::<N, T, D, H, HD, P>(
+            &workspace.q,
+            &workspace.k,
+            &workspace.v,
+            &mut workspace.attended,
+            &mut workspace.attention_logsumexp,
+            stream,
+            flash,
+            profiler,
+        )?;
         self.o_proj.forward_into(
             &workspace.attended,
             &mut workspace.projection_output,
@@ -1114,176 +1347,140 @@ impl<
             profiler,
             "forward.final_norm",
         )?;
-        self.lm_head.forward_into(
-            &workspace.final_normalized,
+        // Rows N..NP of head_input were zeroed at allocation and the convert
+        // stops at the fp32 input's length, so they stay zero.
+        profiler.measure(stream, "forward.lm_head.quantize", || {
+            tensor.convert_f32_to_bf16_pairs(
+                stream,
+                pairs_config(N * D / 2),
+                workspace.final_normalized.as_device_buffer(),
+                &mut workspace.head_input,
+            )
+        })?;
+        self.lm_head.forward_into::<NP, P>(
+            &workspace.head_input_tma,
             &mut workspace.logits,
             stream,
-            gemm,
+            gemm_bf16,
             profiler,
             "forward.lm_head.gemm",
         )?;
-        if let Some(probabilities) = naive_classifier_probabilities {
-            naive_cross_entropy_into(
-                &workspace.logits,
-                &workspace.targets,
-                probabilities,
-                &mut workspace.losses,
-                &mut workspace.loss_sum,
-                &mut workspace.loss,
-                stream,
-                tensor,
-                llama,
-                profiler,
-            )
-        } else {
-            cross_entropy_into(
-                &workspace.logits,
-                &workspace.targets,
-                &mut workspace.losses,
-                &mut workspace.loss_sum,
-                &mut workspace.loss,
-                stream,
-                tensor,
-                llama,
-                profiler,
-            )
-        }
+        cross_entropy_into::<N, VOCAB, VP, P>(
+            &workspace.logits,
+            &workspace.targets,
+            &mut workspace.losses,
+            &mut workspace.loss_sum,
+            &mut workspace.loss,
+            stream,
+            tensor,
+            llama,
+            profiler,
+        )
     }
 
     pub fn backward(
         &mut self,
-        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        workspace: &mut GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
-        self.backward_profiled(workspace, stream, tensor, gemm, flash, llama, &mut profiler)
+        self.backward_profiled(
+            workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
+            &mut profiler,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn backward_profiled<P: KernelProfiler>(
         &mut self,
-        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        workspace: &mut GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        self.backward_profiled_with_oracles(
-            workspace, None, None, stream, tensor, gemm, flash, llama, profiler,
-        )
-    }
-
-    /// Retained full-model baseline for same-process profiling and parity.
-    /// Retained oracle: only the profiler binary calls this, so other
-    /// binaries see it as dead code.
-    #[allow(dead_code)]
-    pub fn backward_naive_profiled<P: KernelProfiler>(
-        &mut self,
-        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
-        classifier: &NaiveClassifierWorkspace<N, VOCAB>,
-        stream: &CudaStream,
-        tensor: &tensor_kernels::LoadedModule,
-        gemm: &gemm_kernels::LoadedModule,
-        flash: &flash_kernels::LoadedModule,
-        llama: &llama_kernels::LoadedModule,
-        profiler: &mut P,
-    ) -> Result<(), DriverError> {
-        self.backward_profiled_with_oracles(
-            workspace,
-            Some(&classifier.probabilities),
-            None,
+        cross_entropy_backward_into::<N, VOCAB, VP, P>(
+            &workspace.targets,
+            &mut workspace.logits,
             stream,
-            tensor,
-            gemm,
-            flash,
             llama,
             profiler,
-        )
-    }
-
-    /// Retained naive-attention baseline for same-process profiling and parity.
-    /// Retained oracle: only the profiler binary calls this, so other
-    /// binaries see it as dead code.
-    #[allow(dead_code)]
-    pub fn backward_naive_attention_profiled<P: KernelProfiler>(
-        &mut self,
-        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
-        attention: &NaiveAttentionWorkspace<N, H, T>,
-        stream: &CudaStream,
-        tensor: &tensor_kernels::LoadedModule,
-        gemm: &gemm_kernels::LoadedModule,
-        flash: &flash_kernels::LoadedModule,
-        llama: &llama_kernels::LoadedModule,
-        profiler: &mut P,
-    ) -> Result<(), DriverError> {
-        self.backward_profiled_with_oracles(
-            workspace,
-            None,
-            Some(&attention.probabilities),
-            stream,
-            tensor,
-            gemm,
-            flash,
-            llama,
-            profiler,
-        )
-    }
-
-    fn backward_profiled_with_oracles<P: KernelProfiler>(
-        &mut self,
-        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
-        naive_classifier_probabilities: Option<&GpuTensor<f32, Rank2<N, VOCAB>>>,
-        naive_attention_probabilities: Option<&GpuTensor<f32, Rank3<N, H, T>>>,
-        stream: &CudaStream,
-        tensor: &tensor_kernels::LoadedModule,
-        gemm: &gemm_kernels::LoadedModule,
-        flash: &flash_kernels::LoadedModule,
-        llama: &llama_kernels::LoadedModule,
-        profiler: &mut P,
-    ) -> Result<(), DriverError> {
-        if let Some(probabilities) = naive_classifier_probabilities {
-            naive_cross_entropy_backward_into(
-                probabilities,
-                &workspace.targets,
-                &mut workspace.logits,
-                stream,
-                llama,
-                profiler,
-            )?;
-        } else {
-            cross_entropy_backward_into(
-                &workspace.targets,
-                &mut workspace.logits,
-                stream,
-                llama,
-                profiler,
-            )?;
-        }
-        self.lm_head.backward_into(
-            &workspace.final_normalized,
-            &workspace.logits,
-            &mut workspace.d_model_0,
-            stream,
-            gemm,
-            profiler,
-            [
-                "backward.lm_head.weight_gemm",
-                "backward.lm_head.input_gemm",
-            ],
         )?;
+        // Rows N..NP of logits hold zeros (forward computed them from the
+        // zero-padded head input and the classifier backward skips them), so
+        // the transposed operands feed exact zeros into the weight GEMM's
+        // padded reduction slice.
+        profiler.measure(stream, "backward.lm_head.transpose_input", || unsafe {
+            tensor.transpose_bf16_pairs(
+                stream,
+                transpose_pairs_config(NP, D),
+                &workspace.head_input,
+                NP as u32,
+                D as u32,
+                &mut workspace.head_input_t,
+            )
+        })?;
+        profiler.measure(stream, "backward.lm_head.transpose_dlogits", || unsafe {
+            tensor.transpose_bf16_pairs(
+                stream,
+                transpose_pairs_config(NP, VP),
+                &workspace.logits,
+                NP as u32,
+                VP as u32,
+                &mut workspace.dlogits_t,
+            )
+        })?;
+        self.lm_head.backward_weight::<NP, P>(
+            &workspace.head_input_t_tma,
+            &workspace.dlogits_t_tma,
+            stream,
+            gemm_bf16,
+            profiler,
+            "backward.lm_head.weight_gemm",
+        )?;
+        self.lm_head.backward_input::<NP, P>(
+            &workspace.logits_tma,
+            &mut workspace.d_head_input,
+            stream,
+            gemm_bf16,
+            profiler,
+            "backward.lm_head.input_gemm",
+        )?;
+        profiler.measure(stream, "backward.lm_head.dequantize", || {
+            tensor.convert_bf16_pairs_to_f32(
+                stream,
+                elementwise_config::<Rank2<N, D>>(),
+                &workspace.d_head_input,
+                workspace.d_model_0.as_device_buffer_mut(),
+            )
+        })?;
         self.final_norm.backward_into(
             &workspace.final_input,
             &workspace.d_model_0,
             &mut workspace.d_model_1,
+            &mut workspace.norm_backward_inv,
             stream,
             llama,
             profiler,
-            ["backward.final_norm.input", "backward.final_norm.weight"],
+            [
+                "backward.final_norm.input",
+                "backward.final_norm.weight_inv",
+                "backward.final_norm.weight",
+            ],
         )?;
 
         self.down_proj.backward_into(
@@ -1334,10 +1531,15 @@ impl<
             &workspace.ffn_input,
             &workspace.d_model_3,
             &mut workspace.d_model_0,
+            &mut workspace.norm_backward_inv,
             stream,
             llama,
             profiler,
-            ["backward.ffn_norm.input", "backward.ffn_norm.weight"],
+            [
+                "backward.ffn_norm.input",
+                "backward.ffn_norm.weight_inv",
+                "backward.ffn_norm.weight",
+            ],
         )?;
         add_into(
             &workspace.d_model_1,
@@ -1358,36 +1560,20 @@ impl<
             profiler,
             ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
         )?;
-        if let Some(probabilities) = naive_attention_probabilities {
-            naive_attention_backward_into::<N, T, D, H, HD, P>(
-                &workspace.q,
-                &workspace.k,
-                &workspace.v,
-                probabilities,
-                &workspace.d_model_0,
-                &mut workspace.d_model_1,
-                &mut workspace.d_model_3,
-                &mut workspace.d_model_4,
-                stream,
-                llama,
-                profiler,
-            )?;
-        } else {
-            flash_attention_backward_into::<N, T, D, H, HD, P>(
-                &workspace.q,
-                &workspace.k,
-                &workspace.v,
-                &workspace.attended,
-                &workspace.attention_logsumexp,
-                &workspace.d_model_0,
-                &mut workspace.d_model_1,
-                &mut workspace.d_model_3,
-                &mut workspace.d_model_4,
-                stream,
-                flash,
-                profiler,
-            )?;
-        }
+        flash_attention_backward_into::<N, T, D, H, HD, P>(
+            &workspace.q,
+            &workspace.k,
+            &workspace.v,
+            &workspace.attended,
+            &workspace.attention_logsumexp,
+            &workspace.d_model_0,
+            &mut workspace.d_model_1,
+            &mut workspace.d_model_3,
+            &mut workspace.d_model_4,
+            stream,
+            flash,
+            profiler,
+        )?;
         rope_into::<N, T, D, H, HD, P>(
             &workspace.d_model_1,
             &mut workspace.d_model_0,
@@ -1433,11 +1619,13 @@ impl<
             &workspace.attention_input,
             &workspace.d_model_3,
             &mut workspace.d_model_0,
+            &mut workspace.norm_backward_inv,
             stream,
             llama,
             profiler,
             [
                 "backward.attention_norm.input",
+                "backward.attention_norm.weight_inv",
                 "backward.attention_norm.weight",
             ],
         )?;
@@ -1494,7 +1682,8 @@ impl<
         zero!(gate_up_proj);
         zero!(down_proj);
         zero!(final_norm);
-        zero!(lm_head);
+        self.lm_head
+            .zero_grad(stream, tensor, profiler, "zero_grad.lm_head")?;
         Ok(())
     }
 }
@@ -1543,50 +1732,6 @@ fn rope_into<
     Ok(())
 }
 
-fn naive_attention_forward_into<
-    const N: usize,
-    const T: usize,
-    const D: usize,
-    const H: usize,
-    const HD: usize,
-    P: KernelProfiler,
->(
-    q: &GpuTensor<f32, Rank2<N, D>>,
-    k: &GpuTensor<f32, Rank2<N, D>>,
-    v: &GpuTensor<f32, Rank2<N, D>>,
-    output: &mut GpuTensor<f32, Rank2<N, D>>,
-    probabilities: &mut GpuTensor<f32, Rank3<N, H, T>>,
-    stream: &CudaStream,
-    kernels: &llama_kernels::LoadedModule,
-    profiler: &mut P,
-) -> Result<(), DriverError> {
-    profiler.measure(stream, "forward.attention.probabilities", || {
-        kernels.attention_probabilities(
-            stream,
-            LaunchConfig::for_num_elems((N * H * T) as u32),
-            q.as_device_buffer(),
-            k.as_device_buffer(),
-            T as u32,
-            H as u32,
-            HD as u32,
-            probabilities.as_device_buffer_mut(),
-        )
-    })?;
-    profiler.measure(stream, "forward.attention.output", || {
-        kernels.attention_output(
-            stream,
-            LaunchConfig::for_num_elems((N * D) as u32),
-            probabilities.as_device_buffer(),
-            v.as_device_buffer(),
-            T as u32,
-            H as u32,
-            HD as u32,
-            output.as_device_buffer_mut(),
-        )
-    })?;
-    Ok(())
-}
-
 fn flash_attention_forward_into<
     const N: usize,
     const T: usize,
@@ -1618,71 +1763,6 @@ fn flash_attention_forward_into<
             logsumexp.as_device_buffer_mut(),
         )
     })
-}
-
-fn naive_attention_backward_into<
-    const N: usize,
-    const T: usize,
-    const D: usize,
-    const H: usize,
-    const HD: usize,
-    P: KernelProfiler,
->(
-    q: &GpuTensor<f32, Rank2<N, D>>,
-    k: &GpuTensor<f32, Rank2<N, D>>,
-    v: &GpuTensor<f32, Rank2<N, D>>,
-    probabilities: &GpuTensor<f32, Rank3<N, H, T>>,
-    dy: &GpuTensor<f32, Rank2<N, D>>,
-    dq: &mut GpuTensor<f32, Rank2<N, D>>,
-    dk: &mut GpuTensor<f32, Rank2<N, D>>,
-    dv: &mut GpuTensor<f32, Rank2<N, D>>,
-    stream: &CudaStream,
-    kernels: &llama_kernels::LoadedModule,
-    profiler: &mut P,
-) -> Result<(), DriverError> {
-    let config = LaunchConfig::for_num_elems((N * D) as u32);
-    profiler.measure(stream, "backward.attention.q", || {
-        kernels.attention_backward_q(
-            stream,
-            config,
-            q.as_device_buffer(),
-            k.as_device_buffer(),
-            v.as_device_buffer(),
-            probabilities.as_device_buffer(),
-            dy.as_device_buffer(),
-            T as u32,
-            H as u32,
-            HD as u32,
-            dq.as_device_buffer_mut(),
-        )
-    })?;
-    profiler.measure(stream, "backward.attention.k", || {
-        kernels.attention_backward_k(
-            stream,
-            config,
-            q.as_device_buffer(),
-            v.as_device_buffer(),
-            probabilities.as_device_buffer(),
-            dy.as_device_buffer(),
-            T as u32,
-            H as u32,
-            HD as u32,
-            dk.as_device_buffer_mut(),
-        )
-    })?;
-    profiler.measure(stream, "backward.attention.v", || {
-        kernels.attention_backward_v(
-            stream,
-            config,
-            probabilities.as_device_buffer(),
-            dy.as_device_buffer(),
-            T as u32,
-            H as u32,
-            HD as u32,
-            dv.as_device_buffer_mut(),
-        )
-    })?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1798,8 +1878,9 @@ fn swiglu_backward_into<const N: usize, const FF: usize, P: KernelProfiler>(
     Ok(())
 }
 
-fn cross_entropy_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
-    logits: &GpuTensor<f32, Rank2<N, VOCAB>>,
+#[allow(clippy::too_many_arguments)]
+fn cross_entropy_into<const N: usize, const VOCAB: usize, const VP: usize, P: KernelProfiler>(
+    logits: &DeviceBuffer<u32>,
     targets: &GpuTensor<u32, Rank1<N>>,
     losses: &mut GpuTensor<f32, Rank1<N>>,
     loss_sum: &mut GpuTensor<f32, Rank1<1>>,
@@ -1810,13 +1891,14 @@ fn cross_entropy_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, "forward.loss.fused_classifier", || {
-        llama.fused_classifier_forward(
+        llama.fused_classifier_forward_bf16(
             stream,
             classifier_config::<N>(),
-            logits.as_device_buffer(),
+            logits,
             targets.as_device_buffer(),
             N as u32,
             VOCAB as u32,
+            VP as u32,
             losses.as_device_buffer_mut(),
         )
     })?;
@@ -1839,96 +1921,28 @@ fn cross_entropy_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn naive_cross_entropy_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
-    logits: &GpuTensor<f32, Rank2<N, VOCAB>>,
+fn cross_entropy_backward_into<
+    const N: usize,
+    const VOCAB: usize,
+    const VP: usize,
+    P: KernelProfiler,
+>(
     targets: &GpuTensor<u32, Rank1<N>>,
-    probabilities: &mut GpuTensor<f32, Rank2<N, VOCAB>>,
-    losses: &mut GpuTensor<f32, Rank1<N>>,
-    loss_sum: &mut GpuTensor<f32, Rank1<1>>,
-    loss: &mut GpuTensor<f32, Rank1<1>>,
-    stream: &CudaStream,
-    tensor: &tensor_kernels::LoadedModule,
-    llama: &llama_kernels::LoadedModule,
-    profiler: &mut P,
-) -> Result<(), DriverError> {
-    profiler.measure(stream, "forward.loss.naive.softmax", || {
-        llama.softmax_forward(
-            stream,
-            LaunchConfig::for_num_elems((N * VOCAB) as u32),
-            logits.as_device_buffer(),
-            VOCAB as u32,
-            probabilities.as_device_buffer_mut(),
-        )
-    })?;
-    profiler.measure(stream, "forward.loss.naive.cross_entropy", || {
-        llama.cross_entropy_loss(
-            stream,
-            LaunchConfig::for_num_elems(N as u32),
-            logits.as_device_buffer(),
-            targets.as_device_buffer(),
-            N as u32,
-            VOCAB as u32,
-            losses.as_device_buffer_mut(),
-        )
-    })?;
-    sum_into(
-        losses,
-        loss_sum,
-        stream,
-        tensor,
-        profiler,
-        "forward.loss.reduction",
-    )?;
-    scale_into(
-        loss_sum,
-        1.0 / N as f32,
-        loss,
-        stream,
-        tensor,
-        profiler,
-        "forward.loss.mean",
-    )
-}
-
-fn cross_entropy_backward_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
-    targets: &GpuTensor<u32, Rank1<N>>,
-    dlogits: &mut GpuTensor<f32, Rank2<N, VOCAB>>,
+    dlogits: &mut DeviceBuffer<u32>,
     stream: &CudaStream,
     kernels: &llama_kernels::LoadedModule,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, "backward.loss.fused_classifier", || {
-        kernels.fused_classifier_backward_in_place(
+        kernels.fused_classifier_backward_in_place_bf16(
             stream,
             classifier_config::<N>(),
             targets.as_device_buffer(),
             1.0,
             N as u32,
             VOCAB as u32,
-            dlogits.as_device_buffer_mut(),
-        )
-    })
-}
-
-fn naive_cross_entropy_backward_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
-    probabilities: &GpuTensor<f32, Rank2<N, VOCAB>>,
-    targets: &GpuTensor<u32, Rank1<N>>,
-    dlogits: &mut GpuTensor<f32, Rank2<N, VOCAB>>,
-    stream: &CudaStream,
-    kernels: &llama_kernels::LoadedModule,
-    profiler: &mut P,
-) -> Result<(), DriverError> {
-    profiler.measure(stream, "backward.loss.naive.softmax_cross_entropy", || {
-        kernels.softmax_cross_entropy_backward(
-            stream,
-            LaunchConfig::for_num_elems((N * VOCAB) as u32),
-            probabilities.as_device_buffer(),
-            targets.as_device_buffer(),
-            1.0,
-            N as u32,
-            VOCAB as u32,
-            dlogits.as_device_buffer_mut(),
+            VP as u32,
+            dlogits,
         )
     })
 }

@@ -120,6 +120,16 @@ trait Module {
    (tcgen05 GEMMs want bf16 inputs). Loss scaling not expected to be needed
    for bf16; revisit if grads underflow.
 
+Phase 2 is adopted head-first (7e5): the lm-head — ~70% of this one-block
+model's GEMM FLOPs and the profile's named bf16 target — runs bf16 tcgen05
+against fp32 master weights, while the block linears stay fp32 until a
+profile puts them above noise. Device-side bf16 is stored as packed pairs
+(`u32` = two adjacent row elements), matching the tcgen05 epilogue. The
+master-weight mechanism is observable: the tiny overfit gate plateaus while
+per-step updates are below one bf16 ulp of the compute weights, then escapes
+once the fp32 master crosses a rounding boundary
+(`crates/optim/examples/overfit_probe.rs` reproduces this on CPU).
+
 CPU reference reductions accumulate in f64 so the reference never loses to
 the thing it checks.
 
@@ -198,10 +208,15 @@ the thing it checks.
   Dataset mmap/batching, checkpoint I/O, and optional loss D2H logging are
   outside the compute-step scope.
 - A standalone profile run is suitable for hotspot discovery and baseline
-  recording. A 7.x performance claim must execute the retained baseline path
-  and candidate path back-to-back in the same profiling process/container,
-  after equivalent warmups, and report both full-step totals plus affected
-  kernel rows. Comparing separate `run.sh` invocations is invalid because
+  recording. A 7.x performance claim must execute the baseline and candidate
+  back-to-back in the same container after equivalent warmups, and report
+  both full-step totals plus affected kernel rows:
+  `BASELINE_REF=<git-ref> ./run.sh llama-model profile` builds the pushed
+  baseline ref and the mounted candidate in one container and profiles both.
+  This replaced the in-model naive-oracle plumbing (7e5): the retained naive
+  kernels stay in their crates as parity oracles, but historical step
+  configurations are reproduced from git rather than kept callable inside
+  the model. Comparing separate `run.sh` invocations is invalid because
   Modal may assign different hardware or clock states.
 
 ## 11. Kernel fusion
@@ -245,14 +260,18 @@ gpu/               standalone cuda-oxide kernel crates (Modal-built)
   bench-util/      CUDA-event timing + shared-RNG re-export
   vecadd/          toolchain smoke test; template for new kernels
   llama-ops/       direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
-                   RoPE, causal attention, SwiGLU, embedding, and loss
+                   RoPE, causal attention, SwiGLU, embedding, and loss;
+                   packed-bf16 fused classifier + fast norm weight-gradient
   gemm/            register-tiled fp32 + Blackwell tcgen05 bf16 GEMMs,
-                   store/accumulate variants, sweep benchmarks
+                   store/accumulate variants, sweep benchmarks; host-only
+                   tcgen05 support (TMA maps, raw launchers) in src/host.rs
   flash-attn/      fused fp32 causal attention forward/backward, parity-tested
                    against llama-ops without materialized probabilities
-  tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled GEMM
-  llama-model/     full fp32 GPU Llama forward/backward + CPU parity, fused
-                   AdamW, tiny overfit gate, TOK1 shard trainer, checkpoints
+  tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled
+                   GEMM; packed-bf16 converts/transpose + master-weight AdamW
+  llama-model/     full GPU Llama forward/backward + CPU parity (fp32 with a
+                   bf16 tcgen05 lm-head), fused AdamW, tiny overfit gate,
+                   TOK1 shard trainer, checkpoints
 modal_app.py       Modal image + run/bench/sweep/sanitize/baseline/ptx
 ```
 
@@ -322,15 +341,28 @@ Each gated on tests; correctness before speed at every step.
        same-process result after 7e3: 36.35 → 29.79 ms full step (-18.0%);
        attention forward+backward 6.789 → 0.243 ms (27.9×), with no `[N,H,T]`
        probability matrix.
-     - **7e5 bf16 compute + norm backward**: tcgen05 GEMMs + fp32 master
-       weights/optimizer states (§7 phase 2, plumbing from 7d); pad vocab
-       50,257 → 50,304 (393×128) so the lm-head satisfies tcgen05's
-       M,N ≡ 0 (mod 128) contract. Also owns the RMSNorm weight-gradient
-       reductions: post-7e4 profile shows the three
-       `backward.*_norm.weight` rows at ~2.7 ms each (~8.2 ms, 27% of the
-       30.2 ms step) — with `backward.lm_head` (~9.2 ms, the bf16 target)
-       they are the last two big rocks. Residual+RMSNorm fusion joins
-       here if the re-profile still shows it above noise.
+     - ✅ **7e5 bf16 compute + norm backward**: tcgen05 GEMMs + fp32 master
+       weights/optimizer states (§7 phase 2, plumbing from 7d), adopted
+       head-first — the lm-head is ~70% of this one-block model's GEMM
+       FLOPs and the profile's named target; block linears stay fp32
+       register-tiled until a profile moves them (rule 17). Vocab padded
+       50,257 → 50,304 (393×128) and token rows padded to `NP` (128) with
+       provably inert zeros, so the tuned tcgen05 kernel's M,N ≡ 0 (mod
+       128) contract holds unmodified and checkpoints stay byte-compatible
+       (masters stored without padding). Also replaced the naive RMSNorm
+       weight-gradient reduction (per-column row-norm recomputation) with a
+       block-per-row inverse pass + column-parallel reduce. B200
+       same-container result vs post-7e4 main: 29.84 → 13.03 ms full step
+       (-56.3%, 2.29×); `backward.lm_head.input_gemm` 9.05 → 0.88 ms,
+       `forward.lm_head.gemm` 0.66 → 0.10 ms, the three
+       `backward.*_norm.weight` rows 8.29 → 0.06 ms (incl. the new inverse
+       pass), all new head plumbing (quantize/transposes/dequantize/w_t
+       sync) ~0.19 ms combined. Residual+RMSNorm fusion measured below
+       noise (residual adds ~0.007 ms) and was dropped per the
+       conditional. The re-profiled tail is `backward.embedding` at
+       3.48 ms (26.7%) — the token-scan reference kernel — followed by the
+       remaining fp32 block GEMMs (`gate_up` input 1.35 ms, lm-head
+       weight-GEMM 1.08 ms); a future 7e6 should start there.
    - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
      time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 
@@ -360,3 +392,5 @@ Each gated on tests; correctness before speed at every step.
 | 15 | Fusion = typed substitution; no graph, no epilogue framework | Fused kernel = new module with identical types, parity vs the unfused path; Blackwell epilogues are pipeline stages, not scalar hooks — abstractions get extracted from ≥3 working variants, never designed first |
 | 16 | Perf claims need same-container before/after | ~3× variance observed across Modal containers on identical code; sweeps already share one container for exactly this reason |
 | 17 | Optimization backlog is profile-ordered | First real-scale profile contradicted intuition (naive loss softmax 60%+ of step, tcgen05 GEMM integration nowhere near top); 7e sub-milestones follow measured step share and get re-ordered after each landing |
+| 18 | bf16 adopted head-first via padded NP/VP dims | lm-head ≈70% of the one-block model's GEMM FLOPs and the measured rock; zero-padding tokens→NP and vocab→VP keeps the tuned tcgen05 kernel's tile contract with provably inert padding (zero rows/columns never move), so no boundary-guard variants and byte-compatible checkpoints |
+| 19 | tcgen05 kernels ship as a second, pure-PTX artifact | One embedded artifact per binary, and libdevice math (`exp`/`ln`/`sqrt`) forces it through libNVVM, which rejects tcgen05 lowerings; llama-model loads `gemm.ptx` (prebuilt by gpu/gemm) through hand-written launchers in gemm/src/host.rs that mirror the generated marshalling |

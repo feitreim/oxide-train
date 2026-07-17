@@ -1,4 +1,9 @@
-//! Versioned checkpoints for the fp32 reference trainer.
+//! Versioned checkpoints for the reference trainer.
+//!
+//! The lm-head is stored as its fp32 master weights with the padded
+//! vocabulary columns stripped: those columns (and their moments) are zero by
+//! construction, so the payload is identical to the pre-bf16 format and does
+//! not depend on the build's choice of `VP`.
 
 use std::error::Error;
 use std::fs::{self, File};
@@ -8,10 +13,10 @@ use std::path::Path;
 use cuda_core::CudaStream;
 use nn::Llama;
 use optim::AdamWConfig;
-use tensor_core::Shape;
+use tensor_core::{Rank2, Shape};
 
 use super::tensor_device::GpuTensor;
-use super::{GpuLlama, GpuLlamaAdamW};
+use super::{GpuBf16Head, GpuLlama, GpuLlamaAdamW};
 
 const MAGIC: &[u8; 8] = b"RTCKPT01";
 const VERSION: u32 = 2;
@@ -19,15 +24,17 @@ const CONFIG_FLOATS: usize = 5;
 
 pub struct LoadedCheckpoint<
     const N: usize,
+    const NP: usize,
     const T: usize,
     const VOCAB: usize,
+    const VP: usize,
     const D: usize,
     const H: usize,
     const HD: usize,
     const FF: usize,
 > {
-    pub model: GpuLlama<N, T, VOCAB, D, H, HD, FF>,
-    pub optimizer: GpuLlamaAdamW<VOCAB, D, FF>,
+    pub model: GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
+    pub optimizer: GpuLlamaAdamW<VOCAB, VP, D, FF>,
     pub next_batch: u64,
 }
 
@@ -87,6 +94,40 @@ fn read_tensor<S: Shape>(
     Ok(GpuTensor::from_host(stream, &host)?)
 }
 
+/// Write a padded `[D, VP]` head tensor as its first `vocab` columns.
+fn write_head_tensor<const D: usize, const VP: usize>(
+    writer: &mut impl Write,
+    tensor: &GpuTensor<f32, Rank2<D, VP>>,
+    vocab: usize,
+    stream: &CudaStream,
+) -> Result<(), Box<dyn Error>> {
+    let host = tensor.to_host(stream)?;
+    for row in 0..D {
+        let columns = &host[row * VP..row * VP + vocab];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(columns.as_ptr().cast::<u8>(), columns.len() * 4) };
+        writer.write_all(bytes)?;
+    }
+    Ok(())
+}
+
+/// Read `[D, vocab]` head values back into padded `[D, VP]` form; the padded
+/// columns are zero.
+fn read_head_values<const D: usize, const VP: usize>(
+    reader: &mut impl Read,
+    vocab: usize,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    let mut padded = vec![0.0f32; D * VP];
+    for row in 0..D {
+        let columns = &mut padded[row * VP..row * VP + vocab];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(columns.as_mut_ptr().cast::<u8>(), columns.len() * 4)
+        };
+        reader.read_exact(bytes)?;
+    }
+    Ok(padded)
+}
+
 fn write_config(writer: &mut impl Write, config: AdamWConfig) -> io::Result<()> {
     for value in [
         config.learning_rate,
@@ -119,16 +160,18 @@ fn read_config(reader: &mut impl Read) -> io::Result<AdamWConfig> {
 #[allow(clippy::too_many_arguments)]
 pub fn save<
     const N: usize,
+    const NP: usize,
     const T: usize,
     const VOCAB: usize,
+    const VP: usize,
     const D: usize,
     const H: usize,
     const HD: usize,
     const FF: usize,
 >(
     path: impl AsRef<Path>,
-    model: &GpuLlama<N, T, VOCAB, D, H, HD, FF>,
-    optimizer: &GpuLlamaAdamW<VOCAB, D, FF>,
+    model: &GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
+    optimizer: &GpuLlamaAdamW<VOCAB, VP, D, FF>,
     next_batch: u64,
     stream: &CudaStream,
 ) -> Result<(), Box<dyn Error>> {
@@ -165,7 +208,9 @@ pub fn save<
     write_parameter!(gate_up_proj);
     write_parameter!(down_proj);
     write_parameter!(final_norm);
-    write_parameter!(lm_head);
+    write_head_tensor::<D, VP>(&mut writer, &model.lm_head.master, VOCAB, stream)?;
+    write_head_tensor::<D, VP>(&mut writer, &optimizer.lm_head.first, VOCAB, stream)?;
+    write_head_tensor::<D, VP>(&mut writer, &optimizer.lm_head.second, VOCAB, stream)?;
 
     writer.flush()?;
     writer.get_ref().sync_all()?;
@@ -176,8 +221,10 @@ pub fn save<
 
 pub fn load<
     const N: usize,
+    const NP: usize,
     const T: usize,
     const VOCAB: usize,
+    const VP: usize,
     const D: usize,
     const H: usize,
     const HD: usize,
@@ -185,7 +232,7 @@ pub fn load<
 >(
     path: impl AsRef<Path>,
     stream: &CudaStream,
-) -> Result<LoadedCheckpoint<N, T, VOCAB, D, H, HD, FF>, Box<dyn Error>> {
+) -> Result<LoadedCheckpoint<N, NP, T, VOCAB, VP, D, H, HD, FF>, Box<dyn Error>> {
     const { assert!(cfg!(target_endian = "little")) };
     let mut reader = BufReader::new(File::open(path)?);
     let mut magic = [0; MAGIC.len()];
@@ -233,7 +280,12 @@ pub fn load<
     read_parameter!(gate_up_proj);
     read_parameter!(down_proj);
     read_parameter!(final_norm);
-    read_parameter!(lm_head);
+    model.lm_head =
+        GpuBf16Head::from_master_values(stream, &read_head_values::<D, VP>(&mut reader, VOCAB)?)?;
+    optimizer.lm_head.first =
+        GpuTensor::from_host(stream, &read_head_values::<D, VP>(&mut reader, VOCAB)?)?;
+    optimizer.lm_head.second =
+        GpuTensor::from_host(stream, &read_head_values::<D, VP>(&mut reader, VOCAB)?)?;
     optimizer.restore_step(step);
 
     let mut trailing = [0];

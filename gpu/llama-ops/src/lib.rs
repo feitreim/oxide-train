@@ -18,9 +18,25 @@ use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread};
 /// arbitrary vocabulary sizes.
 pub const CLASSIFIER_THREADS: usize = 256;
 
+/// Threads in the block-per-row RMSNorm factor reduction. Must remain a power
+/// of two.
+pub const NORM_THREADS: usize = 256;
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
+
+    #[inline(always)]
+    fn bf16_bits_to_f32(bits: u16) -> f32 {
+        f32::from_bits((bits as u32) << 16)
+    }
+
+    #[inline(always)]
+    fn f32_to_bf16_bits(value: f32) -> u16 {
+        let bits = value.to_bits();
+        let round = 0x7fffu32 + ((bits >> 16) & 1);
+        (bits.wrapping_add(round) >> 16) as u16
+    }
 
     #[kernel]
     pub fn rms_norm_forward(
@@ -101,6 +117,84 @@ pub mod kernels {
             }
             let inv = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
             grad += dy[base + col] * x[base + col] * inv;
+        }
+        if let Some(slot) = dweight.get_mut(index) {
+            *slot += grad;
+        }
+    }
+
+    /// Per-row `1 / sqrt(mean(x^2) + eps)` factors, one block per row.
+    ///
+    /// Feeds [`rms_norm_backward_weight_fast`], which would otherwise
+    /// recompute every row's norm once per column.
+    #[kernel]
+    pub fn rms_norm_row_inv(x: &[f32], eps: f32, dim: u32, mut inv: DisjointSlice<f32>) {
+        static mut PARTIALS: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != NORM_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        let base = row * d;
+        if base + d > x.len() {
+            return;
+        }
+
+        let mut partial = 0.0f32;
+        let mut col = tid;
+        while col < d {
+            let value = x[base + col];
+            partial += value * value;
+            col += NORM_THREADS;
+        }
+        unsafe {
+            PARTIALS[tid] = partial;
+        }
+        thread::sync_threads();
+
+        let mut stride = NORM_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    PARTIALS[tid] += PARTIALS[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+
+        if tid == 0 {
+            // SAFETY: this block exclusively owns `row`.
+            unsafe {
+                *inv.get_unchecked_mut(row) = 1.0 / (PARTIALS[0] / dim as f32 + eps).sqrt();
+            }
+        }
+    }
+
+    /// Column-parallel RMSNorm weight gradient from precomputed row factors.
+    ///
+    /// One thread owns one column and its reads coalesce across the block;
+    /// [`rms_norm_backward_weight`] stays as the naive parity oracle.
+    #[kernel]
+    pub fn rms_norm_backward_weight_fast(
+        x: &[f32],
+        dy: &[f32],
+        inv: &[f32],
+        rows: u32,
+        dim: u32,
+        mut dweight: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let col = index.get();
+        if col >= dim as usize {
+            return;
+        }
+        let d = dim as usize;
+        let mut grad = 0.0f32;
+        for row in 0..rows as usize {
+            grad += dy[row * d + col] * x[row * d + col] * inv[row];
         }
         if let Some(slot) = dweight.get_mut(index) {
             *slot += grad;
@@ -506,6 +600,204 @@ pub mod kernels {
                 *logits.get_unchecked_mut(index) = scale * (probability - indicator);
             }
             col += CLASSIFIER_THREADS;
+        }
+    }
+
+    /// [`fused_classifier_forward`] over packed-bf16 logits rows.
+    ///
+    /// Rows are `padded_classes` elements wide (packed two per word) but the
+    /// softmax and loss only see the first `classes` columns; the padded tail
+    /// holds the lm-head's zero-weight vocabulary columns.
+    #[kernel]
+    pub fn fused_classifier_forward_bf16(
+        logits: &[u32],
+        targets: &[u32],
+        rows: u32,
+        classes: u32,
+        padded_classes: u32,
+        mut losses: DisjointSlice<f32>,
+    ) {
+        static mut MAXIMA: SharedArray<f32, CLASSIFIER_THREADS> = SharedArray::UNINIT;
+        static mut SUMS: SharedArray<f32, CLASSIFIER_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != CLASSIFIER_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        if row >= rows as usize {
+            return;
+        }
+
+        let c = classes as usize;
+        let base = row * padded_classes as usize / 2;
+        let mut running_max = f32::NEG_INFINITY;
+        let mut running_sum = 0.0f32;
+        let mut pair = tid;
+        while 2 * pair < c {
+            let word = logits[base + pair];
+            let mut half = 0;
+            while half < 2 {
+                let col = 2 * pair + half;
+                if col < c {
+                    let value = bf16_bits_to_f32((word >> (16 * half)) as u16);
+                    let next_max = running_max.max(value);
+                    running_sum =
+                        running_sum * (running_max - next_max).exp() + (value - next_max).exp();
+                    running_max = next_max;
+                }
+                half += 1;
+            }
+            pair += CLASSIFIER_THREADS;
+        }
+        unsafe {
+            MAXIMA[tid] = running_max;
+            SUMS[tid] = running_sum;
+        }
+        thread::sync_threads();
+
+        let mut stride = CLASSIFIER_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    let right_sum = SUMS[tid + stride];
+                    if right_sum > 0.0 {
+                        let left_sum = SUMS[tid];
+                        if left_sum > 0.0 {
+                            let left_max = MAXIMA[tid];
+                            let right_max = MAXIMA[tid + stride];
+                            let next_max = left_max.max(right_max);
+                            SUMS[tid] = left_sum * (left_max - next_max).exp()
+                                + right_sum * (right_max - next_max).exp();
+                            MAXIMA[tid] = next_max;
+                        } else {
+                            SUMS[tid] = right_sum;
+                            MAXIMA[tid] = MAXIMA[tid + stride];
+                        }
+                    }
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+
+        if tid == 0 {
+            let target = targets[row] as usize;
+            let word = logits[base + target / 2];
+            let bits = (if target % 2 == 0 { word } else { word >> 16 }) as u16;
+            unsafe {
+                *losses.get_unchecked_mut(row) = MAXIMA[0] + SUMS[0].ln() - bf16_bits_to_f32(bits);
+            }
+        }
+    }
+
+    /// [`fused_classifier_backward_in_place`] over packed-bf16 logits rows.
+    ///
+    /// The recomputed softmax sees the first `classes` columns; the write-back
+    /// covers the full `padded_classes` stride so padded vocabulary columns
+    /// carry exactly-zero gradients into the weight GEMM.
+    #[kernel]
+    pub fn fused_classifier_backward_in_place_bf16(
+        targets: &[u32],
+        upstream: f32,
+        rows: u32,
+        classes: u32,
+        padded_classes: u32,
+        mut logits: DisjointSlice<u32>,
+    ) {
+        static mut MAXIMA: SharedArray<f32, CLASSIFIER_THREADS> = SharedArray::UNINIT;
+        static mut SUMS: SharedArray<f32, CLASSIFIER_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != CLASSIFIER_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        if row >= rows as usize {
+            return;
+        }
+
+        let c = classes as usize;
+        let stride_words = padded_classes as usize / 2;
+        let base = row * stride_words;
+        let mut running_max = f32::NEG_INFINITY;
+        let mut running_sum = 0.0f32;
+        let mut pair = tid;
+        while 2 * pair < c {
+            // SAFETY: the row belongs to this block and striding by the block
+            // width gives each lane exclusive ownership of this word.
+            let word = unsafe { *logits.get_unchecked_mut(base + pair) };
+            let mut half = 0;
+            while half < 2 {
+                let col = 2 * pair + half;
+                if col < c {
+                    let value = bf16_bits_to_f32((word >> (16 * half)) as u16);
+                    let next_max = running_max.max(value);
+                    running_sum =
+                        running_sum * (running_max - next_max).exp() + (value - next_max).exp();
+                    running_max = next_max;
+                }
+                half += 1;
+            }
+            pair += CLASSIFIER_THREADS;
+        }
+        unsafe {
+            MAXIMA[tid] = running_max;
+            SUMS[tid] = running_sum;
+        }
+        thread::sync_threads();
+
+        let mut stride = CLASSIFIER_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    let right_sum = SUMS[tid + stride];
+                    if right_sum > 0.0 {
+                        let left_sum = SUMS[tid];
+                        if left_sum > 0.0 {
+                            let left_max = MAXIMA[tid];
+                            let right_max = MAXIMA[tid + stride];
+                            let next_max = left_max.max(right_max);
+                            SUMS[tid] = left_sum * (left_max - next_max).exp()
+                                + right_sum * (right_max - next_max).exp();
+                            MAXIMA[tid] = next_max;
+                        } else {
+                            SUMS[tid] = right_sum;
+                            MAXIMA[tid] = MAXIMA[tid + stride];
+                        }
+                    }
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+
+        let row_max = unsafe { MAXIMA[0] };
+        let inverse_sum = 1.0 / unsafe { SUMS[0] };
+        let target = targets[row] as usize;
+        let scale = upstream / rows as f32;
+        let mut pair = tid;
+        while pair < stride_words {
+            // SAFETY: this lane exclusively owns the word for both the read
+            // and the in-place gradient write.
+            let word = unsafe { *logits.get_unchecked_mut(base + pair) };
+            let mut packed = 0u32;
+            let mut half = 0;
+            while half < 2 {
+                let col = 2 * pair + half;
+                if col < c {
+                    let value = bf16_bits_to_f32((word >> (16 * half)) as u16);
+                    let probability = (value - row_max).exp() * inverse_sum;
+                    let indicator = if col == target { 1.0 } else { 0.0 };
+                    let gradient = scale * (probability - indicator);
+                    packed |= (f32_to_bf16_bits(gradient) as u32) << (16 * half);
+                }
+                half += 1;
+            }
+            unsafe {
+                *logits.get_unchecked_mut(base + pair) = packed;
+            }
+            pair += CLASSIFIER_THREADS;
         }
     }
 
