@@ -2,6 +2,12 @@
 //!
 //! These favor direct, auditable implementations over performance. They are
 //! the GPU correctness baseline that later optimized kernels must match.
+//!
+//! With the pinned stock cuda-oxide backend, kernels are collected from the
+//! selected binary target rather than a separately compiled library target.
+//! Host binaries should include this file as a module (see `main.rs`) so this
+//! remains the single source of kernel definitions while the selected target
+//! receives an embedded CUDA artifact.
 
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
@@ -115,10 +121,8 @@ pub mod kernels {
         let i = index.get();
         if let Some(gate_slot) = dgate.get_mut(index) {
             let sigmoid = 1.0 / (1.0 + (-gate[i]).exp());
-            let silu = gate[i] * sigmoid;
             let dsilu = sigmoid * (1.0 + gate[i] * (1.0 - sigmoid));
             *gate_slot = dy[i] * up[i] * dsilu;
-            let _ = silu;
         }
     }
 

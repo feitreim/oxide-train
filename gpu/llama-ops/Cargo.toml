@@ -10,7 +10,6 @@ default-run = "llama-ops"
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
-bench-util = { path = "../bench-util" }
 tensor-core = { path = "../../crates/tensor-core" }
 tensor-cpu = { path = "../../crates/tensor-cpu" }
 nn = { path = "../../crates/nn" }
