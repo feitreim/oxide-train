@@ -2,10 +2,10 @@
 //!
 //! Run on a GPU with `./run.sh tensor-gpu`.
 
-use cuda_core::CudaContext;
-use tensor_core::{Rank1, Rank2, Rank3};
+use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use tensor_core::{Rank1, Rank2, Rank3, bf16};
 use tensor_cpu::CpuTensor;
-use tensor_gpu::{GpuTensor, kernels};
+use tensor_gpu::{GpuTensor, kernels, transpose_pairs_config};
 
 fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
     assert_eq!(actual.len(), expected.len(), "{name}: length mismatch");
@@ -26,8 +26,152 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_storage(&stream)?;
     check_elementwise_and_reductions(&stream, &module)?;
     check_gemm(&stream, &module)?;
+    check_bf16_pairs(&stream, &module)?;
+    check_adamw_master(&stream, &module)?;
 
-    println!("✓ tensor-gpu storage, elementwise, reduction, and GEMM parity passed");
+    println!("✓ tensor-gpu storage, elementwise, reduction, GEMM, and bf16 parity passed");
+    Ok(())
+}
+
+fn pack_bf16(values: &[f32]) -> Vec<u32> {
+    values
+        .chunks_exact(2)
+        .map(|pair| {
+            bf16::from_f32(pair[0]).to_bits() as u32
+                | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
+        })
+        .collect()
+}
+
+fn unpack_bf16(words: &[u32]) -> Vec<f32> {
+    let mut values = Vec::with_capacity(words.len() * 2);
+    for &word in words {
+        values.push(bf16::from_bits(word as u16).to_f32());
+        values.push(bf16::from_bits((word >> 16) as u16).to_f32());
+    }
+    values
+}
+
+fn check_bf16_pairs(
+    stream: &cuda_core::CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const ROWS: usize = 128;
+    const COLS: usize = 192;
+    let source = CpuTensor::<f32, Rank2<ROWS, COLS>>::uniform(7);
+
+    // fill_u32 overwrites stale packed contents in place.
+    let mut filled = DeviceBuffer::<u32>::from_host(stream, &vec![u32::MAX; 96])?;
+    module.fill_u32(stream, LaunchConfig::for_num_elems(96), 0, &mut filled)?;
+    assert!(filled.to_host_vec(stream)?.iter().all(|&word| word == 0));
+
+    // f32 -> packed pairs matches host round-to-nearest-even bit-for-bit and
+    // leaves padding words beyond the input untouched.
+    let device_source = DeviceBuffer::from_host(stream, source.as_slice())?;
+    let mut packed = DeviceBuffer::<u32>::zeroed(stream, ROWS * COLS / 2 + 64)?;
+    module.convert_f32_to_bf16_pairs(
+        stream,
+        LaunchConfig::for_num_elems((ROWS * COLS / 2) as u32),
+        &device_source,
+        &mut packed,
+    )?;
+    let packed_host = packed.to_host_vec(stream)?;
+    assert_eq!(&packed_host[..ROWS * COLS / 2], pack_bf16(source.as_slice()));
+    assert!(packed_host[ROWS * COLS / 2..].iter().all(|&word| word == 0));
+
+    // packed pairs -> f32 round-trips the rounded values exactly.
+    let mut widened = DeviceBuffer::<f32>::zeroed(stream, ROWS * COLS)?;
+    module.convert_bf16_pairs_to_f32(
+        stream,
+        LaunchConfig::for_num_elems((ROWS * COLS) as u32),
+        &packed,
+        &mut widened,
+    )?;
+    assert_close(
+        "convert_bf16_pairs_to_f32",
+        &widened.to_host_vec(stream)?,
+        &unpack_bf16(&packed_host[..ROWS * COLS / 2]),
+        0.0,
+        0.0,
+    );
+
+    // Element-level transpose, checked bit-exactly against a host transpose.
+    let matrix = DeviceBuffer::from_host(stream, &packed_host[..ROWS * COLS / 2])?;
+    let mut transposed = DeviceBuffer::<u32>::zeroed(stream, ROWS * COLS / 2)?;
+    unsafe {
+        module.transpose_bf16_pairs(
+            stream,
+            transpose_pairs_config(ROWS, COLS),
+            &matrix,
+            ROWS as u32,
+            COLS as u32,
+            &mut transposed,
+        )?;
+    }
+    let elements = unpack_bf16(&packed_host[..ROWS * COLS / 2]);
+    let mut expected = vec![0.0f32; ROWS * COLS];
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            expected[col * ROWS + row] = elements[row * COLS + col];
+        }
+    }
+    assert_eq!(transposed.to_host_vec(stream)?, pack_bf16(&expected));
+    Ok(())
+}
+
+fn check_adamw_master(
+    stream: &cuda_core::CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const LEN: usize = 1030;
+    let initial = CpuTensor::<f32, Rank1<LEN>>::uniform(8);
+    let gradient = CpuTensor::<f32, Rank1<LEN>>::uniform(9);
+    let gradient_packed = pack_bf16(gradient.as_slice());
+    let (learning_rate, beta1, beta2, epsilon, weight_decay) = (0.01, 0.9, 0.999, 1e-8, 0.1);
+    let (first_correction, second_correction) = (1.0 / (1.0 - beta1), 1.0 / (1.0 - beta2));
+
+    let device_gradient = DeviceBuffer::from_host(stream, &gradient_packed)?;
+    let mut master = DeviceBuffer::from_host(stream, initial.as_slice())?;
+    let mut first = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+    let mut second = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+    let mut compute = DeviceBuffer::<u32>::zeroed(stream, LEN / 2)?;
+    module.adamw_master_bf16(
+        stream,
+        LaunchConfig::for_num_elems((LEN / 2) as u32),
+        &device_gradient,
+        learning_rate,
+        beta1,
+        beta2,
+        epsilon,
+        weight_decay,
+        first_correction,
+        second_correction,
+        &mut master,
+        &mut first,
+        &mut second,
+        &mut compute,
+    )?;
+
+    // Reference update on the exact bf16-rounded gradients the kernel saw.
+    let rounded = unpack_bf16(&gradient_packed);
+    let expected: Vec<f32> = initial
+        .as_slice()
+        .iter()
+        .zip(&rounded)
+        .map(|(&parameter, &g)| {
+            let first_hat = (1.0 - beta1) * g * first_correction;
+            let second_hat = (1.0 - beta2) * g * g * second_correction;
+            let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * parameter;
+            parameter - learning_rate * update
+        })
+        .collect();
+    let master_host = master.to_host_vec(stream)?;
+    assert_close("adamw_master_bf16 master", &master_host, &expected, 1e-7, 1e-6);
+    assert_eq!(
+        compute.to_host_vec(stream)?,
+        pack_bf16(&master_host),
+        "compute copy is not the rounded shadow of the master"
+    );
     Ok(())
 }
 

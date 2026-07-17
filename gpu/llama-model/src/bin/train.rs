@@ -1,8 +1,9 @@
-//! Minimal fp32 Wikipedia training loop.
+//! Minimal Wikipedia training loop.
 //!
 //! This is the milestone-6 correctness runner, not the eventual performance
 //! configuration. It intentionally uses the auditable reference kernels and a
 //! small single-block model while exercising real `TOK1` shards end to end.
+//! `D` is the one-tile minimum the bf16 tcgen05 lm-head requires.
 
 use std::env;
 
@@ -18,10 +19,12 @@ use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace};
 const B: usize = 1;
 const T: usize = 64;
 const N: usize = 64;
+const NP: usize = 128;
 const VOCAB: usize = 50_257;
-const D: usize = 64;
+const VP: usize = 50_304;
+const D: usize = 128;
 const H: usize = 4;
-const HD: usize = 16;
+const HD: usize = 32;
 const FF: usize = 192;
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -67,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = cuda.default_stream();
     let tensor = model::tensor_kernels::load(&cuda)?;
     let gemm = model::gemm_kernels::load(&cuda)?;
+    let gemm_bf16 = model::gemm_bf16_kernels::load(&cuda)?;
     let flash = model::flash_kernels::load(&cuda)?;
     let llama = model::llama_kernels::load(&cuda)?;
     let config = AdamWConfig {
@@ -75,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..AdamWConfig::default()
     };
     let (mut gpu, mut optimizer, mut next_batch) = if resume {
-        let checkpoint = model::checkpoint::load::<N, T, VOCAB, D, H, HD, FF>(
+        let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF>(
             checkpoint_path.as_deref().expect("validated above"),
             &stream,
         )?;
@@ -101,13 +105,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
         (
-            GpuLlama::from_cpu(&stream, &cpu)?,
+            GpuLlama::<N, NP, T, VOCAB, VP, D, H, HD, FF>::from_cpu(&stream, &cpu)?,
             GpuLlamaAdamW::new(&stream, config)?,
             0,
         )
     };
     let starting_step = optimizer.step() as usize;
-    let mut workspace = GpuLlamaWorkspace::<N, T, VOCAB, D, H, FF>::new(&stream)?;
+    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF>::new(&stream)?;
     if max_steps < starting_step {
         return Err(
             format!("TRAIN_STEPS={max_steps} is behind checkpoint step {starting_step}").into(),
@@ -142,6 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &stream,
             &tensor,
             &gemm,
+            &gemm_bf16,
             &flash,
             &llama,
         )?;
@@ -153,7 +158,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("non-finite loss at step {step}").into());
             }
         }
-        gpu.backward(&mut workspace, &stream, &tensor, &gemm, &flash, &llama)?;
+        gpu.backward(
+            &mut workspace,
+            &stream,
+            &tensor,
+            &gemm,
+            &gemm_bf16,
+            &flash,
+            &llama,
+        )?;
         optimizer.update(&mut gpu, &stream, &tensor)?;
 
         let periodic_checkpoint = checkpoint_every > 0 && step % checkpoint_every == 0;

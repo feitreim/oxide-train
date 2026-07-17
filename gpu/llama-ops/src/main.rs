@@ -13,7 +13,8 @@ use tensor_cpu::CpuTensor;
 // as a module so this binary's embedded artifact contains the kernels.
 #[path = "lib.rs"]
 mod device;
-use device::{CLASSIFIER_THREADS, kernels};
+use device::{CLASSIFIER_THREADS, NORM_THREADS, kernels};
+use tensor_core::bf16;
 
 fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
     assert_eq!(actual.len(), expected.len());
@@ -35,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_swiglu(&stream, &module)?;
     check_embedding(&stream, &module)?;
     check_cross_entropy(&stream, &module)?;
+    check_classifier_bf16(&stream, &module)?;
     check_rope(&stream, &module)?;
     check_attention(&stream, &module)?;
     check_group_split_join(&stream, &module)?;
@@ -290,6 +292,156 @@ fn check_rms_norm(
         3e-5,
         3e-5,
     );
+
+    // Fast weight-gradient pair against the naive oracle above.
+    let mut inv_dev = DeviceBuffer::<f32>::zeroed(stream, N)?;
+    let mut dw_fast_dev = DeviceBuffer::<f32>::zeroed(stream, D)?;
+    module.rms_norm_row_inv(
+        stream,
+        LaunchConfig {
+            grid_dim: (N as u32, 1, 1),
+            block_dim: (NORM_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        &x_dev,
+        1e-5,
+        D as u32,
+        &mut inv_dev,
+    )?;
+    module.rms_norm_backward_weight_fast(
+        stream,
+        LaunchConfig::for_num_elems(D as u32),
+        &x_dev,
+        &dy_dev,
+        &inv_dev,
+        N as u32,
+        D as u32,
+        &mut dw_fast_dev,
+    )?;
+    assert_close(
+        "rmsnorm dw fast vs naive",
+        &dw_fast_dev.to_host_vec(stream)?,
+        &dw_dev.to_host_vec(stream)?,
+        1e-6,
+        1e-5,
+    );
+    Ok(())
+}
+
+fn check_classifier_bf16(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Odd real vocabulary exercises the packed tail; the second case covers a
+    // multi-iteration lane stride.
+    check_classifier_bf16_case::<5, 13, 16>(stream, module)?;
+    check_classifier_bf16_case::<3, 517, 520>(stream, module)
+}
+
+fn check_classifier_bf16_case<const N: usize, const C: usize, const CP: usize>(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(CP % 2 == 0 && CP >= C);
+    let logits = CpuTensor::<f32, Rank2<N, C>>::uniform(16).scale(5.0);
+    // Round to bf16 once; the f32 oracle then sees the exact values the bf16
+    // kernels decode, so the only differences are lane order and the bf16
+    // rounding of the written gradients.
+    let rounded: Vec<f32> = logits
+        .as_slice()
+        .iter()
+        .map(|&value| bf16::from_f32(value).to_f32())
+        .collect();
+    let mut packed = vec![0u32; N * CP / 2];
+    for row in 0..N {
+        for col in 0..C {
+            let bits = bf16::from_f32(rounded[row * C + col]).to_bits() as u32;
+            packed[(row * CP + col) / 2] |= bits << (16 * (col % 2));
+        }
+    }
+    let targets_usize: [usize; N] = std::array::from_fn(|row| (row * 101 + C - 1) % C);
+    let targets = targets_usize.map(|v| v as u32);
+    let targets_dev = DeviceBuffer::from_host(stream, &targets)?;
+    let classifier_config = LaunchConfig {
+        grid_dim: (N as u32, 1, 1),
+        block_dim: (CLASSIFIER_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // f32 fused oracle on the rounded values.
+    let rounded_dev = DeviceBuffer::from_host(stream, &rounded)?;
+    let mut oracle_losses = DeviceBuffer::<f32>::zeroed(stream, N)?;
+    let mut oracle_dlogits = DeviceBuffer::from_host(stream, &rounded)?;
+    module.fused_classifier_forward(
+        stream,
+        classifier_config,
+        &rounded_dev,
+        &targets_dev,
+        N as u32,
+        C as u32,
+        &mut oracle_losses,
+    )?;
+    module.fused_classifier_backward_in_place(
+        stream,
+        classifier_config,
+        &targets_dev,
+        1.0,
+        N as u32,
+        C as u32,
+        &mut oracle_dlogits,
+    )?;
+
+    let packed_dev = DeviceBuffer::from_host(stream, &packed)?;
+    let mut losses = DeviceBuffer::<f32>::zeroed(stream, N)?;
+    let mut dlogits = DeviceBuffer::from_host(stream, &packed)?;
+    module.fused_classifier_forward_bf16(
+        stream,
+        classifier_config,
+        &packed_dev,
+        &targets_dev,
+        N as u32,
+        C as u32,
+        CP as u32,
+        &mut losses,
+    )?;
+    module.fused_classifier_backward_in_place_bf16(
+        stream,
+        classifier_config,
+        &targets_dev,
+        1.0,
+        N as u32,
+        C as u32,
+        CP as u32,
+        &mut dlogits,
+    )?;
+
+    assert_close(
+        "bf16 classifier losses vs f32 fused",
+        &losses.to_host_vec(stream)?,
+        &oracle_losses.to_host_vec(stream)?,
+        5e-5,
+        2e-5,
+    );
+    let dlogits = dlogits.to_host_vec(stream)?;
+    let oracle = oracle_dlogits.to_host_vec(stream)?;
+    for row in 0..N {
+        for col in 0..CP {
+            let word = dlogits[(row * CP + col) / 2];
+            let bits = (word >> (16 * (col % 2))) as u16;
+            if col < C {
+                let actual = bf16::from_bits(bits).to_f32();
+                let expected = oracle[row * C + col];
+                let tolerance = 1e-6 + 4e-3 * expected.abs();
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "bf16 classifier dlogits mismatch at [{row},{col}]: \
+                     gpu={actual}, oracle={expected}, tolerance={tolerance}"
+                );
+            } else {
+                assert_eq!(bits, 0, "padded dlogits column [{row},{col}] is not zero");
+            }
+        }
+    }
     Ok(())
 }
 
