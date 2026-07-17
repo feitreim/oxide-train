@@ -879,6 +879,9 @@ impl<
     }
 
     /// Retained full-model baseline for same-process profiling and parity.
+    /// Retained oracle: only the profiler binary calls this, so other
+    /// binaries see it as dead code.
+    #[allow(dead_code)]
     pub fn forward_naive_profiled<P: KernelProfiler>(
         &self,
         tokens: [usize; N],
@@ -908,6 +911,9 @@ impl<
     }
 
     /// Retained naive-attention baseline for same-process profiling and parity.
+    /// Retained oracle: only the profiler binary calls this, so other
+    /// binaries see it as dead code.
+    #[allow(dead_code)]
     pub fn forward_naive_attention_profiled<P: KernelProfiler>(
         &self,
         tokens: [usize; N],
@@ -1173,6 +1179,9 @@ impl<
     }
 
     /// Retained full-model baseline for same-process profiling and parity.
+    /// Retained oracle: only the profiler binary calls this, so other
+    /// binaries see it as dead code.
+    #[allow(dead_code)]
     pub fn backward_naive_profiled<P: KernelProfiler>(
         &mut self,
         workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
@@ -1198,6 +1207,9 @@ impl<
     }
 
     /// Retained naive-attention baseline for same-process profiling and parity.
+    /// Retained oracle: only the profiler binary calls this, so other
+    /// binaries see it as dead code.
+    #[allow(dead_code)]
     pub fn backward_naive_attention_profiled<P: KernelProfiler>(
         &mut self,
         workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
