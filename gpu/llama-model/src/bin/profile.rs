@@ -14,10 +14,10 @@ use optim::AdamWConfig;
 mod model;
 use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace};
 
-const B: usize = 32;
-const T: usize = 1_024;
+const B: usize = 64;
+const T: usize = 2_048;
 const N: usize = B * T;
-const NP: usize = 32_768;
+const NP: usize = 131_072;
 const VOCAB: usize = 50_257;
 const VP: usize = 50_304;
 const D: usize = 1_536;
