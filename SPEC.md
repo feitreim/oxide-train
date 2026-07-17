@@ -309,9 +309,10 @@ Each gated on tests; correctness before speed at every step.
        register-tiled fp32 (store + accumulate variants — the accumulate
        path deletes the separate grad-accumulate launch per linear);
        horizontal QKV `[D,3D]` and gate+up `[D,2FF]` fusion. B200
-       same-container re-profile against 7e2: 195.97 → 194.25 ms full step
-       (-0.88%); affected linear/GEMM forward+backward rows, including the
-       new split/join kernels, total 16.51 → 14.82 ms.
+       same-container re-profile against post-7e1 main: 37.95 → 36.23 ms
+       full step (-4.5%); the same ~1.7 ms GEMM-row win measured 0.88%
+       against the pre-7e1 196 ms step, before the fused classifier
+       removed the softmax that buried it.
      - **7e4 flash-attention integration**: swap the naive attention
        kernels for gpu/flash-attn; re-tile its backward (key-block
        parallel, flash-2 style) if the profile shows the B·H-block launch
