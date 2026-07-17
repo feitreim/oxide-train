@@ -32,11 +32,20 @@ use tensor_core::{Rank1, Rank2, Rank3, Shape, bf16};
 // cuda-oxide collects kernels from the selected binary target. The binary
 // includes this file as a module, which in turn includes each canonical kernel
 // source here instead of copying definitions or relying on dependency PTX.
+//
+// The tcgen05 GEMM kernels are the one exception: this binary's kernels use
+// libdevice math (`exp`/`ln`/`sqrt`), which forces its device artifact
+// through libNVVM, and libNVVM rejects tcgen05 lowerings. Only gpu/gemm's
+// host-side support is included here; the kernels themselves load at runtime
+// from the pure-PTX `gemm.ptx` that `cargo oxide build gemm` produces
+// (modal_app.py prebuilds it for llama-model runs).
 #[path = "../../flash-attn/src/lib.rs"]
 mod flash_device;
-#[path = "../../gemm/src/lib.rs"]
-#[allow(dead_code)]
+#[path = "../../gemm/src/fp32.rs"]
 mod gemm_device;
+#[path = "../../gemm/src/host.rs"]
+#[allow(dead_code)]
+mod gemm_host;
 #[path = "../../llama-ops/src/lib.rs"]
 mod llama_device;
 #[path = "../../tensor-gpu/src/lib.rs"]
@@ -44,15 +53,13 @@ mod llama_device;
 pub mod tensor_device;
 
 pub use flash_device::kernels as flash_kernels;
-pub use gemm_device::fp32::kernels as gemm_kernels;
-pub use gemm_device::kernels as gemm_bf16_kernels;
+pub use gemm_device::kernels as gemm_kernels;
+pub use gemm_host::Tcgen05Gemm;
 pub use llama_device::kernels as llama_kernels;
 pub use tensor_device::kernels as tensor_kernels;
 
-use gemm_device::{
-    Bf16PairsTmaMap, TC_TILE, create_bf16_pairs_tma_map, fp32_launch_config,
-    tcgen05_launch_config,
-};
+use gemm_device::launch_config as fp32_launch_config;
+use gemm_host::{Bf16PairsTmaMap, TC_TILE, create_bf16_pairs_tma_map, tcgen05_launch_config};
 use tensor_device::{GpuAdamWMoments, GpuTensor, transpose_pairs_config};
 
 pub mod checkpoint;
@@ -649,12 +656,12 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         x_tma: &Bf16PairsTmaMap,
         logits: &mut DeviceBuffer<u32>,
         stream: &CudaStream,
-        kernels: &gemm_bf16_kernels::LoadedModule,
+        kernels: &Tcgen05Gemm,
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
         profiler.measure(stream, name, || unsafe {
-            kernels.gemm_tcgen05_bf16_store(
+            kernels.store(
                 stream,
                 tcgen05_launch_config(NP, VP, D),
                 x_tma.as_ptr(),
@@ -673,12 +680,12 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         x_t_tma: &Bf16PairsTmaMap,
         dlogits_t_tma: &Bf16PairsTmaMap,
         stream: &CudaStream,
-        kernels: &gemm_bf16_kernels::LoadedModule,
+        kernels: &Tcgen05Gemm,
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
         profiler.measure(stream, name, || unsafe {
-            kernels.gemm_tcgen05_bf16_accumulate(
+            kernels.accumulate(
                 stream,
                 tcgen05_launch_config(D, VP, NP),
                 x_t_tma.as_ptr(),
@@ -695,12 +702,12 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         dlogits_tma: &Bf16PairsTmaMap,
         dx: &mut DeviceBuffer<u32>,
         stream: &CudaStream,
-        kernels: &gemm_bf16_kernels::LoadedModule,
+        kernels: &Tcgen05Gemm,
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
         profiler.measure(stream, name, || unsafe {
-            kernels.gemm_tcgen05_bf16_store(
+            kernels.store(
                 stream,
                 tcgen05_launch_config(NP, D, VP),
                 dlogits_tma.as_ptr(),
@@ -1157,7 +1164,7 @@ impl<
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
-        gemm_bf16: &gemm_bf16_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
@@ -1177,7 +1184,7 @@ impl<
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
-        gemm_bf16: &gemm_bf16_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
@@ -1364,7 +1371,7 @@ impl<
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
-        gemm_bf16: &gemm_bf16_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
@@ -1388,7 +1395,7 @@ impl<
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
-        gemm_bf16: &gemm_bf16_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,

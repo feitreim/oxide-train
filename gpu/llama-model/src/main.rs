@@ -192,7 +192,7 @@ fn overfit_tiny_batch(
     stream: &cuda_core::CudaStream,
     tensor: &model::tensor_kernels::LoadedModule,
     gemm: &model::gemm_kernels::LoadedModule,
-    gemm_bf16: &model::gemm_bf16_kernels::LoadedModule,
+    gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
     llama: &model::llama_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -260,7 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
     let tensor = model::tensor_kernels::load(&ctx)?;
     let gemm = model::gemm_kernels::load(&ctx)?;
-    let gemm_bf16 = model::gemm_bf16_kernels::load(&ctx)?;
+    let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&ctx, "gemm.ptx")?;
     let flash = model::flash_kernels::load(&ctx)?;
     let llama = model::llama_kernels::load(&ctx)?;
 

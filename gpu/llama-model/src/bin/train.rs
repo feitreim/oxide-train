@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = cuda.default_stream();
     let tensor = model::tensor_kernels::load(&cuda)?;
     let gemm = model::gemm_kernels::load(&cuda)?;
-    let gemm_bf16 = model::gemm_bf16_kernels::load(&cuda)?;
+    let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&cuda, "gemm.ptx")?;
     let flash = model::flash_kernels::load(&cuda)?;
     let llama = model::llama_kernels::load(&cuda)?;
     let config = AdamWConfig {

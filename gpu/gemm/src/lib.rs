@@ -16,9 +16,6 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::{marker::PhantomData, mem::MaybeUninit};
-
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use cuda_device::barrier::{
     Barrier, fence_proxy_async_shared_cta, mbarrier_arrive_expect_tx, mbarrier_init,
     mbarrier_inval, mbarrier_try_wait_parity,
@@ -35,11 +32,11 @@ use cuda_host::cuda_module;
 
 pub mod fp32;
 pub use fp32::{BK, BM, BN, TM, TN, launch_config as fp32_launch_config};
-
-/// tcgen05 CTA output tile edge: `M` and `N` must be multiples of this.
-pub const TC_TILE: usize = 128;
-/// tcgen05 reduction tile: `K` must be a multiple of this.
-pub const TC_BK: usize = 64;
+pub mod host;
+pub use host::{
+    Bf16PairsTmaMap, Bf16TmaMap, TC_BK, TC_TILE, Tcgen05Gemm, create_bf16_pairs_tma_map,
+    create_bf16_tma_map, tcgen05_launch_config,
+};
 
 #[cuda_module]
 pub mod kernels {
@@ -288,127 +285,3 @@ pub mod kernels {
     }
 }
 
-/// Launch for the fixed Blackwell 128x128 tcgen05 output tile.
-pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
-    assert!(m.is_multiple_of(TC_TILE));
-    assert!(n.is_multiple_of(TC_TILE) && n.is_multiple_of(2));
-    assert!(k.is_multiple_of(TC_BK));
-    assert!(m <= u32::MAX as usize && n <= u32::MAX as usize && k <= u32::MAX as usize);
-    LaunchConfig {
-        grid_dim: ((m / TC_TILE) as u32, (n / TC_TILE) as u32, 1),
-        block_dim: (TC_TILE as u32, 1, 1),
-        shared_mem_bytes: 0,
-    }
-}
-
-/// Device-resident CUDA tensor map for a row-major bf16 matrix.
-///
-/// The map owns only the descriptor. The mapped matrix buffer must outlive all
-/// launches that use this value.
-pub struct Bf16TmaMap<'matrix> {
-    descriptor: DeviceBuffer<u64>,
-    _matrix: PhantomData<&'matrix DeviceBuffer<u16>>,
-}
-
-impl Bf16TmaMap<'_> {
-    pub fn as_ptr(&self) -> *const TmaDescriptor {
-        self.descriptor.cu_deviceptr() as *const TmaDescriptor
-    }
-}
-
-/// Encode a `SWIZZLE_128B` tensor map loading 128x64 bf16 tiles from a
-/// row-major `[height, width]` bf16 matrix at `base` (a device pointer).
-fn encode_bf16_tma_map(
-    stream: &CudaStream,
-    base: u64,
-    width: usize,
-    height: usize,
-) -> Result<DeviceBuffer<u64>, Box<dyn std::error::Error>> {
-    use cuda_core::sys::{
-        CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-        CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B, cuTensorMapEncodeTiled,
-        cudaError_enum_CUDA_SUCCESS,
-    };
-
-    assert!(width.is_multiple_of(TC_BK));
-    assert!(height.is_multiple_of(TC_TILE));
-    let mut tensor_map = MaybeUninit::<cuda_core::sys::CUtensorMap>::uninit();
-    let global_dimensions = [width as u64, height as u64];
-    let global_strides = [(width * 2) as u64];
-    let box_dimensions = [TC_BK as u32, TC_TILE as u32];
-    let element_strides = [1u32, 1u32];
-    let status = unsafe {
-        cuTensorMapEncodeTiled(
-            tensor_map.as_mut_ptr(),
-            CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            2,
-            base as *mut std::ffi::c_void,
-            global_dimensions.as_ptr(),
-            global_strides.as_ptr(),
-            box_dimensions.as_ptr(),
-            element_strides.as_ptr(),
-            CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B,
-            CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-        )
-    };
-    if status != cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuTensorMapEncodeTiled(bf16) failed: {status:?}").into());
-    }
-    let tensor_map = unsafe { tensor_map.assume_init() };
-    Ok(DeviceBuffer::from_host(stream, &tensor_map.opaque)?)
-}
-
-/// Build a `SWIZZLE_128B` tensor map loading a 128x64 bf16 tile.
-pub fn create_bf16_tma_map<'matrix>(
-    stream: &CudaStream,
-    matrix: &'matrix DeviceBuffer<u16>,
-    width: usize,
-    height: usize,
-) -> Result<Bf16TmaMap<'matrix>, Box<dyn std::error::Error>> {
-    assert_eq!(matrix.len(), width * height);
-    Ok(Bf16TmaMap {
-        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height)?,
-        _matrix: PhantomData,
-    })
-}
-
-/// Tensor map over packed-pair bf16 storage (`u32` = two adjacent row
-/// elements), for owners that hold the mapped buffer alongside the map.
-///
-/// Unlike [`Bf16TmaMap`] this does not borrow the matrix: the constructor is
-/// `unsafe` and the caller promises the mapped allocation outlives every
-/// launch that consumes the map.
-pub struct Bf16PairsTmaMap {
-    descriptor: DeviceBuffer<u64>,
-}
-
-impl Bf16PairsTmaMap {
-    pub fn as_ptr(&self) -> *const TmaDescriptor {
-        self.descriptor.cu_deviceptr() as *const TmaDescriptor
-    }
-}
-
-/// Build a `SWIZZLE_128B` tensor map over a row-major `[height, width]` bf16
-/// matrix stored as packed pairs.
-///
-/// # Safety
-///
-/// `matrix` must stay allocated at the same device address for every kernel
-/// launch that consumes the returned map.
-pub unsafe fn create_bf16_pairs_tma_map(
-    stream: &CudaStream,
-    matrix: &DeviceBuffer<u32>,
-    width: usize,
-    height: usize,
-) -> Result<Bf16PairsTmaMap, Box<dyn std::error::Error>> {
-    assert!(width.is_multiple_of(2));
-    assert_eq!(matrix.len() * 2, width * height);
-    Ok(Bf16PairsTmaMap {
-        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height)?,
-    })
-}

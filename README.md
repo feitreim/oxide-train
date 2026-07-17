@@ -43,9 +43,13 @@ gpu/                    standalone cuda-oxide crates -- built on Modal GPUs
   vecadd/               toolchain smoke test (lib.rs kernel, main.rs check,
                         bin/bench.rs benchmark) -- the template for new kernels
   llama-ops/            auditable fp32 RMSNorm, SwiGLU, embedding, and fused
-                        softmax-cross-entropy forward/backward parity kernels
-  tensor-gpu/           GpuTensor, elementwise/reduction/GEMM, fused AdamW
-  llama-model/          full fp32 model parity, tiny overfit gate, shard trainer
+                        classifier parity kernels (f32 + packed-bf16 variants)
+  gemm/                 register-tiled fp32 + Blackwell tcgen05 bf16 GEMMs
+  flash-attn/           fused fp32 causal attention forward/backward
+  tensor-gpu/           GpuTensor, elementwise/reduction/GEMM, fused AdamW,
+                        packed-bf16 converts/transpose + master-weight AdamW
+  llama-model/          full model parity (fp32 + bf16 tcgen05 lm-head),
+                        tiny overfit gate, shard trainer
 modal_app.py            Modal image (CUDA 13 + LLVM 21 + pinned nightly +
                         cuda-oxide backend) and run/bench/sweep/sanitize entrypoints
 run.sh                  thin wrapper over `modal run`
@@ -99,10 +103,11 @@ Run the dedicated profiler without a dataset shard:
 ```
 
 The binary uses a fixed, compile-time performance configuration: `B=1`, `T=64`,
-`VOCAB=50,257`, `D=1536`, `H=24`, `HD=64`, and `FF=4096` (about 182.7M
-parameters). It runs two complete warmup steps, synchronizes the stream, and
-then measures one `zero_grad + forward + backward + AdamW` step. Normal
-correctness and training binaries retain the zero-event `NoopProfiler` path.
+`VOCAB=50,257` (padded to 50,304 for the bf16 tcgen05 lm-head), `D=1536`,
+`H=24`, `HD=64`, and `FF=4096` (about 182.7M parameters). It runs two complete
+warmup steps, synchronizes the stream, and then measures one `zero_grad +
+forward + backward + AdamW` step. Normal correctness and training binaries
+retain the zero-event `NoopProfiler` path.
 
 The report contains one CUDA-event duration per named kernel launch plus:
 
@@ -118,11 +123,12 @@ not part of this compute-step profile. Kernel names are prefixed with
 training phase directly.
 
 Use a single run to find hotspots or record the current baseline. For a
-performance/fusion PR, execute the old and candidate paths back-to-back in one
-profiling process/container after equivalent warmups, then report both full-step
-times and the changed kernel rows. Two separate `./run.sh` invocations may land
-on different GPUs or clock states and do **not** satisfy the same-container
-measurement gate in `SPEC.md`.
+performance/fusion PR, run `BASELINE_REF=<git-ref> ./run.sh llama-model
+profile`: it builds the pushed baseline ref and the mounted candidate in one
+container and profiles both back-to-back after equivalent warmups. Report both
+full-step times and the changed kernel rows. Two separate `./run.sh`
+invocations may land on different GPUs or clock states and do **not** satisfy
+the same-container measurement gate in `SPEC.md`.
 
 To add a kernel: copy `gpu/vecadd` to `gpu/<name>`, set `name` in its
 `Cargo.toml`, write the `#[kernel]` in `src/lib.rs`, and give it a real
@@ -133,8 +139,8 @@ rewrite them.
 ## GPU training smoke run
 
 The milestone-6 trainer reads `TOK1` shards from the `rust-trainer-wiki` Modal
-volume. Upload a prepared shard once, then launch the small fp32 reference
-configuration:
+volume. Upload a prepared shard once, then launch the small reference
+configuration (fp32 with the bf16 tcgen05 lm-head):
 
 ```bash
 modal volume create rust-trainer-wiki

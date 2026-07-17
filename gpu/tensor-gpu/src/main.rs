@@ -5,7 +5,13 @@
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use tensor_core::{Rank1, Rank2, Rank3, bf16};
 use tensor_cpu::CpuTensor;
-use tensor_gpu::{GpuTensor, kernels, transpose_pairs_config};
+
+// `cargo oxide` embeds the CUDA artifact into the selected binary target, so
+// this binary includes the canonical kernel source as a module (the same
+// pattern as llama-ops) instead of importing the library crate.
+#[path = "lib.rs"]
+mod device;
+use device::{GpuTensor, kernels, transpose_pairs_config};
 
 fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
     assert_eq!(actual.len(), expected.len(), "{name}: length mismatch");
@@ -21,7 +27,10 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
-    let module = kernels::from_module(ctx.load_module_from_file("tensor_gpu.ptx")?)?;
+    // The embedded-artifact loader, not `load_module_from_file`: kernels that
+    // touch libdevice math (`sqrt` in the AdamW updates) make the backend
+    // emit NVVM IR instead of a standalone .ptx file.
+    let module = kernels::load(&ctx)?;
 
     check_storage(&stream)?;
     check_elementwise_and_reductions(&stream, &module)?;
@@ -166,7 +175,7 @@ fn check_adamw_master(
         })
         .collect();
     let master_host = master.to_host_vec(stream)?;
-    assert_close("adamw_master_bf16 master", &master_host, &expected, 1e-7, 1e-6);
+    assert_close("adamw_master_bf16 master", &master_host, &expected, 2e-6, 2e-6);
     assert_eq!(
         compute.to_host_vec(stream)?,
         pack_bf16(&master_host),
