@@ -261,7 +261,7 @@ gpu/               standalone cuda-oxide kernel crates (Modal-built)
   vecadd/          toolchain smoke test; template for new kernels
   llama-ops/       direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
                    RoPE, causal attention, SwiGLU, embedding, and loss;
-                   packed-bf16 fused classifier + fast norm weight-gradient
+                   packed-bf16 fused classifier + block-parallel RMSNorm
   gemm/            register-tiled fp32 + Blackwell tcgen05 bf16 GEMMs,
                    store/accumulate variants, sweep benchmarks; host-only
                    tcgen05 support (TMA maps, raw launchers) in src/host.rs
@@ -407,6 +407,20 @@ Each gated on tests; correctness before speed at every step.
        `*_norm.input` backwards 163.6 ms + three forwards 88.3 ms,
        ~33.5% combined) and the fp32 block GEMMs
        (`backward.gate_up_proj` pair 118.7 ms, 15.8%).
+     - ✅ **7e8 block-parallel RMSNorm**: the forward and input-backward
+       reference kernels launched one thread per output element and had every
+       thread rescan all D features, making both O(N·D²). Replaced the model
+       path with one 256-thread block per row: lanes cooperatively reduce
+       `sum(x²)` (and `sum(dy·w·x)` backward), then write strided columns.
+       Input-backward also writes the row inverse factors, deleting the
+       standalone inverse pass. The weight gradient now tiles the row
+       dimension into 256-row chunks and atomically contributes one partial
+       per column/chunk, exposing 128× more row-grid parallelism at N=32,768;
+       naive kernels remain parity oracles. B200 same-container result at
+       B=32 T=1024: 751.93 → 485.19 ms full step (-35.5%, 1.55×); all norm
+       rows combined 267.99 → 1.08 ms (~248×). The three forwards fell
+       88.34 → 0.38 ms, input backward plus inverse 163.77 → 0.45 ms, and
+       weight backward 15.88 → 0.25 ms.
    - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
      time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 

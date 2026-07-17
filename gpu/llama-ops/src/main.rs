@@ -13,7 +13,7 @@ use tensor_cpu::CpuTensor;
 // as a module so this binary's embedded artifact contains the kernels.
 #[path = "lib.rs"]
 mod device;
-use device::{CLASSIFIER_THREADS, NORM_THREADS, kernels};
+use device::{CLASSIFIER_THREADS, NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, kernels};
 use tensor_core::bf16;
 
 fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
@@ -225,8 +225,9 @@ fn check_rms_norm(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const N: usize = 5;
-    const D: usize = 7;
+    // Cross both optimized kernels' 256-wide row/column tile boundaries.
+    const N: usize = 259;
+    const D: usize = 261;
     let x = CpuTensor::<f32, Rank2<N, D>>::uniform(1);
     let weight = CpuTensor::<f32, Rank1<D>>::uniform(2).map(|v| v + 1.25);
     let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(3);
@@ -293,8 +294,11 @@ fn check_rms_norm(
         3e-5,
     );
 
-    // Fast weight-gradient pair against the naive oracle above.
+    // Optimized model path against the naive oracle above.
     let mut inv_dev = DeviceBuffer::<f32>::zeroed(stream, N)?;
+    let mut inv_fast_dev = DeviceBuffer::<f32>::zeroed(stream, N)?;
+    let mut y_fast_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    let mut dx_fast_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut dw_fast_dev = DeviceBuffer::<f32>::zeroed(stream, D)?;
     module.rms_norm_row_inv(
         stream,
@@ -308,16 +312,75 @@ fn check_rms_norm(
         D as u32,
         &mut inv_dev,
     )?;
-    module.rms_norm_backward_weight_fast(
+    module.rms_norm_forward_fast(
         stream,
-        LaunchConfig::for_num_elems(D as u32),
+        LaunchConfig {
+            grid_dim: (N as u32, 1, 1),
+            block_dim: (NORM_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        },
         &x_dev,
-        &dy_dev,
-        &inv_dev,
-        N as u32,
+        &weight_dev,
+        1e-5,
         D as u32,
-        &mut dw_fast_dev,
+        &mut y_fast_dev,
     )?;
+    module.rms_norm_backward_x_fast(
+        stream,
+        LaunchConfig {
+            grid_dim: (N as u32, 1, 1),
+            block_dim: (NORM_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        &x_dev,
+        &weight_dev,
+        &dy_dev,
+        1e-5,
+        D as u32,
+        &mut dx_fast_dev,
+        &mut inv_fast_dev,
+    )?;
+    unsafe {
+        module.rms_norm_backward_weight_fast(
+            stream,
+            LaunchConfig {
+                grid_dim: (
+                    D.div_ceil(NORM_THREADS) as u32,
+                    N.div_ceil(NORM_WEIGHT_ROWS_PER_BLOCK) as u32,
+                    1,
+                ),
+                block_dim: (NORM_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &x_dev,
+            &dy_dev,
+            &inv_fast_dev,
+            N as u32,
+            D as u32,
+            &mut dw_fast_dev,
+        )?;
+    }
+    assert_close(
+        "rmsnorm y fast vs naive",
+        &y_fast_dev.to_host_vec(stream)?,
+        &y_dev.to_host_vec(stream)?,
+        2e-5,
+        2e-5,
+    );
+    assert_close(
+        "rmsnorm dx fast vs naive",
+        &dx_fast_dev.to_host_vec(stream)?,
+        &dx_dev.to_host_vec(stream)?,
+        3e-5,
+        3e-5,
+    );
+    assert_close(
+        "rmsnorm inv fused vs standalone",
+        &inv_fast_dev.to_host_vec(stream)?,
+        &inv_dev.to_host_vec(stream)?,
+        1e-6,
+        1e-6,
+    );
     assert_close(
         "rmsnorm dw fast vs naive",
         &dw_fast_dev.to_host_vec(stream)?,

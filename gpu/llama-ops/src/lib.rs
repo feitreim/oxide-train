@@ -26,6 +26,13 @@ pub const CLASSIFIER_THREADS: usize = 256;
 /// of two.
 pub const NORM_THREADS: usize = 256;
 
+/// Rows accumulated by one RMSNorm weight-gradient block.
+///
+/// Splitting a large batch across the grid's Y dimension exposes enough
+/// parallelism to saturate the GPU. Each block performs one atomic add per
+/// owned column, rather than one atomic per input element.
+pub const NORM_WEIGHT_ROWS_PER_BLOCK: usize = 256;
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -93,6 +100,157 @@ pub mod kernels {
         if let Some(slot) = dx.get_mut(index) {
             let col = i % d;
             *slot = dy[i] * weight[col] * inv - x[i] * correction;
+        }
+    }
+
+    /// Block-per-row RMSNorm forward.
+    ///
+    /// Unlike [`rms_norm_forward`], which is retained as the direct oracle,
+    /// this computes the row reduction once and has lanes write a strided
+    /// slice of the output.
+    #[kernel]
+    pub fn rms_norm_forward_fast(
+        x: &[f32],
+        weight: &[f32],
+        eps: f32,
+        dim: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut PARTIALS: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != NORM_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        let base = row * d;
+        if d == 0 || base + d > x.len() || base + d > y.len() || d > weight.len() {
+            return;
+        }
+
+        let mut sum_sq = 0.0f32;
+        let mut col = tid;
+        while col < d {
+            let value = x[base + col];
+            sum_sq += value * value;
+            col += NORM_THREADS;
+        }
+        unsafe {
+            PARTIALS[tid] = sum_sq;
+        }
+        thread::sync_threads();
+
+        let mut stride = NORM_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    PARTIALS[tid] += PARTIALS[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            unsafe {
+                PARTIALS[0] = 1.0 / (PARTIALS[0] / dim as f32 + eps).sqrt();
+            }
+        }
+        thread::sync_threads();
+
+        let inv = unsafe { PARTIALS[0] };
+        col = tid;
+        while col < d {
+            // SAFETY: each lane owns distinct columns of this block's row.
+            unsafe {
+                *y.get_unchecked_mut(base + col) = x[base + col] * inv * weight[col];
+            }
+            col += NORM_THREADS;
+        }
+    }
+
+    /// Block-per-row RMSNorm input backward, also producing the row inverse
+    /// factors consumed by the weight-gradient kernel.
+    ///
+    /// [`rms_norm_backward_x`] recomputes both reductions once per output
+    /// element. This variant computes them once per row and fuses the otherwise
+    /// separate inverse-factor pass.
+    #[kernel]
+    pub fn rms_norm_backward_x_fast(
+        x: &[f32],
+        weight: &[f32],
+        dy: &[f32],
+        eps: f32,
+        dim: u32,
+        mut dx: DisjointSlice<f32>,
+        mut inv: DisjointSlice<f32>,
+    ) {
+        static mut SUM_SQ: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+        static mut DOT: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != NORM_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        let base = row * d;
+        if d == 0
+            || base + d > x.len()
+            || base + d > dy.len()
+            || base + d > dx.len()
+            || d > weight.len()
+            || row >= inv.len()
+        {
+            return;
+        }
+
+        let mut sum_sq = 0.0f32;
+        let mut dot = 0.0f32;
+        let mut col = tid;
+        while col < d {
+            let value = x[base + col];
+            sum_sq += value * value;
+            dot += dy[base + col] * weight[col] * value;
+            col += NORM_THREADS;
+        }
+        unsafe {
+            SUM_SQ[tid] = sum_sq;
+            DOT[tid] = dot;
+        }
+        thread::sync_threads();
+
+        let mut stride = NORM_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    SUM_SQ[tid] += SUM_SQ[tid + stride];
+                    DOT[tid] += DOT[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            unsafe {
+                let row_inv = 1.0 / (SUM_SQ[0] / dim as f32 + eps).sqrt();
+                SUM_SQ[0] = row_inv;
+                DOT[0] = row_inv * row_inv * row_inv * DOT[0] / dim as f32;
+                *inv.get_unchecked_mut(row) = row_inv;
+            }
+        }
+        thread::sync_threads();
+
+        let row_inv = unsafe { SUM_SQ[0] };
+        let correction = unsafe { DOT[0] };
+        col = tid;
+        while col < d {
+            // SAFETY: each lane owns distinct columns of this block's row.
+            unsafe {
+                *dx.get_unchecked_mut(base + col) =
+                    dy[base + col] * weight[col] * row_inv - x[base + col] * correction;
+            }
+            col += NORM_THREADS;
         }
     }
 
@@ -177,12 +335,14 @@ pub mod kernels {
         }
     }
 
-    /// Column-parallel RMSNorm weight gradient from precomputed row factors.
+    /// Tiled RMSNorm weight gradient from precomputed row factors.
     ///
-    /// One thread owns one column and its reads coalesce across the block;
-    /// [`rms_norm_backward_weight`] stays as the naive parity oracle.
+    /// A block owns a column tile and a bounded row chunk. The Y grid exposes
+    /// parallelism across large batches, and each thread atomically contributes
+    /// one chunk sum to its column. [`rms_norm_backward_weight`] stays as the
+    /// naive parity oracle.
     #[kernel]
-    pub fn rms_norm_backward_weight_fast(
+    pub unsafe fn rms_norm_backward_weight_fast(
         x: &[f32],
         dy: &[f32],
         inv: &[f32],
@@ -190,19 +350,27 @@ pub mod kernels {
         dim: u32,
         mut dweight: DisjointSlice<f32>,
     ) {
-        let index = thread::index_1d();
-        let col = index.get();
-        if col >= dim as usize {
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != NORM_THREADS {
             return;
         }
         let d = dim as usize;
+        let col = thread::blockIdx_x() as usize * NORM_THREADS + tid;
+        if col >= d || col >= dweight.len() {
+            return;
+        }
+        let row_start = thread::blockIdx_y() as usize * NORM_WEIGHT_ROWS_PER_BLOCK;
+        let row_end = (row_start + NORM_WEIGHT_ROWS_PER_BLOCK).min(rows as usize);
         let mut grad = 0.0f32;
-        for row in 0..rows as usize {
+        for row in row_start..row_end {
             grad += dy[row * d + col] * x[row * d + col] * inv[row];
         }
-        if let Some(slot) = dweight.get_mut(index) {
-            *slot += grad;
-        }
+
+        // SAFETY: `col` was bounds-checked and every access to this location
+        // in this kernel is atomic. Stream ordering covers the preceding
+        // zero/accumulation state and subsequent optimizer read.
+        let slot = unsafe { DeviceAtomicF32::from_ptr(dweight.as_mut_ptr().add(col)) };
+        slot.fetch_add(grad, AtomicOrdering::Relaxed);
     }
 
     #[kernel]

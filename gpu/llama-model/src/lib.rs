@@ -86,12 +86,28 @@ fn classifier_config<const N: usize>() -> LaunchConfig {
     }
 }
 
-fn norm_inv_config<const N: usize>() -> LaunchConfig {
+fn norm_config<const N: usize>() -> LaunchConfig {
     assert!(llama_device::NORM_THREADS.is_power_of_two());
     assert!(N <= u32::MAX as usize);
     LaunchConfig {
         grid_dim: (N as u32, 1, 1),
         block_dim: (llama_device::NORM_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn norm_weight_config<const N: usize, const D: usize>() -> LaunchConfig {
+    let threads = llama_device::NORM_THREADS;
+    let rows_per_block = llama_device::NORM_WEIGHT_ROWS_PER_BLOCK;
+    assert!(threads.is_power_of_two());
+    assert!(N <= u32::MAX as usize && D <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (
+            D.div_ceil(threads) as u32,
+            N.div_ceil(rows_per_block) as u32,
+            1,
+        ),
+        block_dim: (threads as u32, 1, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -423,9 +439,9 @@ impl<const D: usize> GpuRmsNorm<D> {
         name: &'static str,
     ) -> Result<(), DriverError> {
         profiler.measure(stream, name, || {
-            kernels.rms_norm_forward(
+            kernels.rms_norm_forward_fast(
                 stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
+                norm_config::<N>(),
                 x.as_device_buffer(),
                 self.w.as_device_buffer(),
                 self.eps,
@@ -444,34 +460,25 @@ impl<const D: usize> GpuRmsNorm<D> {
         stream: &CudaStream,
         kernels: &llama_kernels::LoadedModule,
         profiler: &mut P,
-        names: [&'static str; 3],
+        names: [&'static str; 2],
     ) -> Result<(), DriverError> {
         profiler.measure(stream, names[0], || {
-            kernels.rms_norm_backward_x(
+            kernels.rms_norm_backward_x_fast(
                 stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
+                norm_config::<N>(),
                 x.as_device_buffer(),
                 self.w.as_device_buffer(),
                 dy.as_device_buffer(),
                 self.eps,
                 D as u32,
                 dx.as_device_buffer_mut(),
-            )
-        })?;
-        profiler.measure(stream, names[1], || {
-            kernels.rms_norm_row_inv(
-                stream,
-                norm_inv_config::<N>(),
-                x.as_device_buffer(),
-                self.eps,
-                D as u32,
                 inv.as_device_buffer_mut(),
             )
         })?;
-        profiler.measure(stream, names[2], || {
+        profiler.measure(stream, names[1], || unsafe {
             kernels.rms_norm_backward_weight_fast(
                 stream,
-                LaunchConfig::for_num_elems(D as u32),
+                norm_weight_config::<N, D>(),
                 x.as_device_buffer(),
                 dy.as_device_buffer(),
                 inv.as_device_buffer(),
@@ -1514,11 +1521,7 @@ impl<
             stream,
             llama,
             profiler,
-            [
-                "backward.final_norm.input",
-                "backward.final_norm.weight_inv",
-                "backward.final_norm.weight",
-            ],
+            ["backward.final_norm.input", "backward.final_norm.weight"],
         )?;
 
         self.down_proj.backward_into(
@@ -1573,11 +1576,7 @@ impl<
             stream,
             llama,
             profiler,
-            [
-                "backward.ffn_norm.input",
-                "backward.ffn_norm.weight_inv",
-                "backward.ffn_norm.weight",
-            ],
+            ["backward.ffn_norm.input", "backward.ffn_norm.weight"],
         )?;
         add_into(
             &workspace.d_model_1,
@@ -1664,7 +1663,6 @@ impl<
             profiler,
             [
                 "backward.attention_norm.input",
-                "backward.attention_norm.weight_inv",
                 "backward.attention_norm.weight",
             ],
         )?;
