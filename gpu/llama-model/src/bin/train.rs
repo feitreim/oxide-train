@@ -41,7 +41,8 @@ fn env_flag(name: &str) -> bool {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(N, B * T);
-    let shard_path = env::var("TRAIN_SHARD").unwrap_or_else(|_| "/data/wiki-val.tok".to_owned());
+    let shard_path =
+        env::var("TRAIN_SHARD").unwrap_or_else(|_| "/data/wiki-val-00000.tok".to_owned());
     let max_steps: usize = env_parse("TRAIN_STEPS", 100);
     let log_every: usize = env_parse("TRAIN_LOG_EVERY", 10);
     let checkpoint_every: usize = env_parse("TRAIN_CHECKPOINT_EVERY", 0);
