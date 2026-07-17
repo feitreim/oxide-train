@@ -15,10 +15,10 @@ use data::TokenFile;
 mod model;
 use model::GpuLlamaWorkspace;
 
-const B: usize = 8;
-const T: usize = 512;
-const N: usize = 4_096;
-const NP: usize = 4_096;
+const B: usize = 32;
+const T: usize = 1_024;
+const N: usize = 32_768;
+const NP: usize = 32_768;
 const VOCAB: usize = 50_257;
 const VP: usize = 50_304;
 const D: usize = 1_536;
