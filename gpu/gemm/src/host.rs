@@ -147,6 +147,25 @@ pub unsafe fn create_bf16_pairs_tma_map(
     })
 }
 
+/// Build a tensor map over a prefix of a larger packed-pair scratch buffer.
+///
+/// # Safety
+///
+/// `matrix` must remain at the same address and contain at least
+/// `width * height / 2` words for every launch using the returned map.
+pub unsafe fn create_bf16_pairs_tma_map_prefix(
+    stream: &CudaStream,
+    matrix: &DeviceBuffer<u32>,
+    width: usize,
+    height: usize,
+) -> Result<Bf16PairsTmaMap, Box<dyn Error>> {
+    assert!(width.is_multiple_of(2));
+    assert!(matrix.len() * 2 >= width * height);
+    Ok(Bf16PairsTmaMap {
+        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height)?,
+    })
+}
+
 /// The two tcgen05 bf16 GEMM kernels, loaded from a `gemm.ptx` built by this
 /// crate rather than from the calling binary's embedded artifact.
 ///
@@ -156,6 +175,8 @@ pub unsafe fn create_bf16_pairs_tma_map(
 pub struct Tcgen05Gemm {
     store: CudaFunction,
     accumulate: CudaFunction,
+    f32_store: CudaFunction,
+    f32_accumulate: CudaFunction,
     _module: Arc<CudaModule>,
 }
 
@@ -170,6 +191,8 @@ impl Tcgen05Gemm {
         Ok(Self {
             store: module.load_function("gemm_tcgen05_bf16_store")?,
             accumulate: module.load_function("gemm_tcgen05_bf16_accumulate")?,
+            f32_store: module.load_function("gemm_tcgen05_bf16_f32_store")?,
+            f32_accumulate: module.load_function("gemm_tcgen05_bf16_f32_accumulate")?,
             _module: module,
         })
     }
@@ -213,6 +236,56 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         unsafe { launch_tcgen05(&self.accumulate, stream, config, a_tma, b_tma, output, n, k) }
     }
+
+    /// Blackwell bf16 `C = A B^T` with row-major fp32 output.
+    ///
+    /// # Safety
+    ///
+    /// The maps must describe live matrices matching the launch dimensions,
+    /// and `output` must contain exactly `m * n` elements.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_store(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<f32>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        unsafe { launch_tcgen05_f32(&self.f32_store, stream, config, a_tma, b_tma, output, n, k) }
+    }
+
+    /// Blackwell bf16 `C += A B^T` with row-major fp32 output.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Tcgen05Gemm::f32_store`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_accumulate(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<f32>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            launch_tcgen05_f32(
+                &self.f32_accumulate,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                n,
+                k,
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -223,6 +296,36 @@ unsafe fn launch_tcgen05(
     mut a_tma: *const TmaDescriptor,
     mut b_tma: *const TmaDescriptor,
     output: &mut DeviceBuffer<u32>,
+    mut n: u32,
+    mut k: u32,
+) -> Result<(), DriverError> {
+    let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+    cuda_host::push_kernel_scalar(&mut args, &mut a_tma);
+    cuda_host::push_kernel_scalar(&mut args, &mut b_tma);
+    let (mut output_ptr, mut output_len) = cuda_host::writable_device_buffer_arg(output);
+    cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
+    cuda_host::push_kernel_scalar(&mut args, &mut n);
+    cuda_host::push_kernel_scalar(&mut args, &mut k);
+    unsafe {
+        cuda_core::launch_kernel_on_stream(
+            function,
+            config.grid_dim,
+            config.block_dim,
+            config.shared_mem_bytes,
+            stream,
+            &mut args,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_tcgen05_f32(
+    function: &CudaFunction,
+    stream: &CudaStream,
+    config: LaunchConfig,
+    mut a_tma: *const TmaDescriptor,
+    mut b_tma: *const TmaDescriptor,
+    output: &mut DeviceBuffer<f32>,
     mut n: u32,
     mut k: u32,
 ) -> Result<(), DriverError> {
