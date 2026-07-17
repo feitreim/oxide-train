@@ -3,7 +3,7 @@
 use cuda_core::CudaContext;
 use nn::Llama;
 use optim::{AdamWConfig, LlamaAdamW};
-use tensor_core::Shape;
+use tensor_core::{Rank2, Rank3, Shape};
 use tensor_cpu::CpuTensor;
 
 #[path = "lib.rs"]
@@ -29,9 +29,51 @@ fn assert_close<S: Shape>(
     Ok(())
 }
 
+fn assert_grouped_close<const IN: usize, const GROUPS: usize, const OUT: usize>(
+    name: &str,
+    gpu: &model::tensor_device::GpuTensor<f32, Rank3<IN, GROUPS, OUT>>,
+    expected: [&CpuTensor<f32, Rank2<IN, OUT>>; GROUPS],
+    stream: &cuda_core::CudaStream,
+    atol: f32,
+    rtol: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let actual = gpu.to_host(stream)?;
+    for input in 0..IN {
+        for (group, expected) in expected.iter().enumerate() {
+            for output in 0..OUT {
+                let index = (input * GROUPS + group) * OUT + output;
+                let expected = expected.as_slice()[input * OUT + output];
+                let tolerance = atol + rtol * expected.abs();
+                assert!(
+                    (actual[index] - expected).abs() <= tolerance,
+                    "{name} mismatch at [{input},{group},{output}]: gpu={}, cpu={expected}, tolerance={tolerance}",
+                    actual[index],
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn split_grouped<const IN: usize, const GROUPS: usize, const OUT: usize>(
+    gpu: &model::tensor_device::GpuTensor<f32, Rank3<IN, GROUPS, OUT>>,
+    stream: &cuda_core::CudaStream,
+) -> Result<[CpuTensor<f32, Rank2<IN, OUT>>; GROUPS], Box<dyn std::error::Error>> {
+    let grouped = gpu.to_host(stream)?;
+    Ok(std::array::from_fn(|group| {
+        let mut values = vec![0.0; IN * OUT];
+        for input in 0..IN {
+            let source = (input * GROUPS + group) * OUT;
+            values[input * OUT..(input + 1) * OUT].copy_from_slice(&grouped[source..source + OUT]);
+        }
+        CpuTensor::from_slice(&values)
+    }))
+}
+
 fn overfit_tiny_batch(
     stream: &cuda_core::CudaStream,
     tensor: &model::tensor_kernels::LoadedModule,
+    gemm: &model::gemm_kernels::LoadedModule,
     llama: &model::llama_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     type TinyLlama = Llama<4, 4, 4, 8, 2, 4, 12>;
@@ -50,15 +92,15 @@ fn overfit_tiny_batch(
 
     for _ in 0..200 {
         gpu.zero_grad(stream, tensor)?;
-        gpu.forward(tokens, targets, &mut workspace, stream, tensor, llama)?;
+        gpu.forward(tokens, targets, &mut workspace, stream, tensor, gemm, llama)?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
         }
-        gpu.backward(&mut workspace, stream, tensor, llama)?;
+        gpu.backward(&mut workspace, stream, tensor, gemm, llama)?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
 
-    gpu.forward(tokens, targets, &mut workspace, stream, tensor, llama)?;
+    gpu.forward(tokens, targets, &mut workspace, stream, tensor, gemm, llama)?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
     assert!(
@@ -85,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let tensor = model::tensor_kernels::load(&ctx)?;
+    let gemm = model::gemm_kernels::load(&ctx)?;
     let llama = model::llama_kernels::load(&ctx)?;
 
     let mut cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
@@ -94,11 +137,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let targets = [5, 5, 2, 7, 3, 16, 0, 4];
 
     let (cpu_loss, cpu_ctx) = cpu.forward(tokens, targets);
-    gpu.forward(tokens, targets, &mut workspace, &stream, &tensor, &llama)?;
+    gpu.forward(
+        tokens,
+        targets,
+        &mut workspace,
+        &stream,
+        &tensor,
+        &gemm,
+        &llama,
+    )?;
     assert_close("loss", workspace.loss(), &cpu_loss, &stream, 5e-5, 5e-5)?;
 
     cpu.backward(cpu_ctx);
-    gpu.backward(&mut workspace, &stream, &tensor, &llama)?;
+    gpu.backward(&mut workspace, &stream, &tensor, &gemm, &llama)?;
 
     macro_rules! grad {
         ($field:ident, $tol:expr) => {
@@ -114,13 +165,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     grad!(embedding, 2e-4);
     grad!(attention_norm, 2e-4);
-    grad!(q_proj, 2e-4);
-    grad!(k_proj, 2e-4);
-    grad!(v_proj, 2e-4);
+    assert_grouped_close(
+        "qkv_proj.dw",
+        &gpu.qkv_proj.dw,
+        [&cpu.q_proj.dw, &cpu.k_proj.dw, &cpu.v_proj.dw],
+        &stream,
+        2e-4,
+        2e-4,
+    )?;
     grad!(o_proj, 2e-4);
     grad!(ffn_norm, 2e-4);
-    grad!(gate_proj, 2e-4);
-    grad!(up_proj, 2e-4);
+    assert_grouped_close(
+        "gate_up_proj.dw",
+        &gpu.gate_up_proj.dw,
+        [&cpu.gate_proj.dw, &cpu.up_proj.dw],
+        &stream,
+        2e-4,
+        2e-4,
+    )?;
     grad!(down_proj, 2e-4);
     grad!(final_norm, 2e-4);
     grad!(lm_head, 2e-4);
@@ -134,13 +196,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     copy_grad!(embedding);
     copy_grad!(attention_norm);
-    copy_grad!(q_proj);
-    copy_grad!(k_proj);
-    copy_grad!(v_proj);
+    let [q_grad, k_grad, v_grad] = split_grouped(&gpu.qkv_proj.dw, &stream)?;
+    cpu.q_proj.dw = q_grad;
+    cpu.k_proj.dw = k_grad;
+    cpu.v_proj.dw = v_grad;
     copy_grad!(o_proj);
     copy_grad!(ffn_norm);
-    copy_grad!(gate_proj);
-    copy_grad!(up_proj);
+    let [gate_grad, up_grad] = split_grouped(&gpu.gate_up_proj.dw, &stream)?;
+    cpu.gate_proj.dw = gate_grad;
+    cpu.up_proj.dw = up_grad;
     copy_grad!(down_proj);
     copy_grad!(final_norm);
     copy_grad!(lm_head);
@@ -169,19 +233,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     weight!(embedding);
     weight!(attention_norm);
-    weight!(q_proj);
-    weight!(k_proj);
-    weight!(v_proj);
+    assert_grouped_close(
+        "qkv_proj.w after AdamW",
+        &gpu.qkv_proj.w,
+        [&cpu.q_proj.w, &cpu.k_proj.w, &cpu.v_proj.w],
+        &stream,
+        2e-6,
+        2e-6,
+    )?;
     weight!(o_proj);
     weight!(ffn_norm);
-    weight!(gate_proj);
-    weight!(up_proj);
+    assert_grouped_close(
+        "gate_up_proj.w after AdamW",
+        &gpu.gate_up_proj.w,
+        [&cpu.gate_proj.w, &cpu.up_proj.w],
+        &stream,
+        2e-6,
+        2e-6,
+    )?;
     weight!(down_proj);
     weight!(final_norm);
     weight!(lm_head);
     gpu.zero_grad(&stream, &tensor)?;
 
     println!("✓ full fp32 GPU Llama forward/backward and AdamW match CPU");
-    overfit_tiny_batch(&stream, &tensor, &llama)?;
+    overfit_tiny_batch(&stream, &tensor, &gemm, &llama)?;
     Ok(())
 }

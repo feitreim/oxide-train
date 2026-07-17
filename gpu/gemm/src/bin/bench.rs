@@ -8,7 +8,8 @@
 use bench_util::{time_gpu_iters, uniform_vec};
 use cuda_core::{CudaContext, DeviceBuffer};
 use gemm::{
-    BK, BM, BN, TM, TN, create_bf16_tma_map, fp32_launch_config, kernels, tcgen05_launch_config,
+    BK, BM, BN, TM, TN, create_bf16_tma_map, fp32, fp32_launch_config, kernels,
+    tcgen05_launch_config,
 };
 use half::bf16;
 
@@ -26,6 +27,7 @@ fn tflops(m: usize, n: usize, k: usize, milliseconds: f64) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
     let stream = context.default_stream();
+    let fp32_module = fp32::kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
     let module = kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
 
     let fp32_a = DeviceBuffer::from_host(&stream, &uniform_vec(FP32_M * FP32_K, 11))?;
@@ -35,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fp32_store_ms = time_gpu_iters(&stream, 3, 10, || {
         unsafe {
-            module.gemm_fp32_store(
+            fp32_module.register_gemm_store(
                 &stream,
                 fp32_config,
                 FP32_M,
@@ -50,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let fp32_accumulate_ms = time_gpu_iters(&stream, 3, 10, || {
         unsafe {
-            module.gemm_fp32_accumulate(
+            fp32_module.register_gemm_accumulate(
                 &stream,
                 fp32_config,
                 FP32_M,

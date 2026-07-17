@@ -4,7 +4,7 @@
 
 use bench_util::uniform_vec;
 use cuda_core::{CudaContext, DeviceBuffer};
-use gemm::{create_bf16_tma_map, fp32_launch_config, kernels, tcgen05_launch_config};
+use gemm::{create_bf16_tma_map, fp32, fp32_launch_config, kernels, tcgen05_launch_config};
 use half::bf16;
 
 fn matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
@@ -28,6 +28,20 @@ fn matmul_transposed_b(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Ve
             let mut sum = 0.0f64;
             for inner in 0..k {
                 sum += a[row * k + inner] as f64 * b[column * k + inner] as f64;
+            }
+            output[row * n + column] = sum as f32;
+        }
+    }
+    output
+}
+
+fn matmul_transposed_a(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut output = vec![0.0; k * n];
+    for row in 0..k {
+        for column in 0..n {
+            let mut sum = 0.0f64;
+            for inner in 0..m {
+                sum += a[inner * k + row] as f64 * b[inner * n + column] as f64;
             }
             output[row * n + column] = sum as f32;
         }
@@ -80,9 +94,10 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
     let stream = context.default_stream();
+    let fp32_module = fp32::kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
     let module = kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
 
-    check_fp32(&stream, &module)?;
+    check_fp32(&stream, &fp32_module)?;
     check_tcgen05_bf16(&stream, &module)?;
     println!("✓ fp32 and tcgen05 bf16 GEMM store/accumulate parity passed");
     Ok(())
@@ -90,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn check_fp32(
     stream: &cuda_core::CudaStream,
-    module: &kernels::LoadedModule,
+    module: &fp32::kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Exercise every boundary path, not only aligned training shapes.
     const M: usize = 73;
@@ -110,7 +125,7 @@ fn check_fp32(
 
     let mut store = DeviceBuffer::<f32>::zeroed(stream, M * N)?;
     unsafe {
-        module.gemm_fp32_store(
+        module.register_gemm_store(
             stream,
             fp32_launch_config(M, N),
             M,
@@ -131,7 +146,7 @@ fn check_fp32(
 
     let mut accumulate = DeviceBuffer::from_host(stream, &initial)?;
     unsafe {
-        module.gemm_fp32_accumulate(
+        module.register_gemm_accumulate(
             stream,
             fp32_launch_config(M, N),
             M,
@@ -146,6 +161,64 @@ fn check_fp32(
         "fp32 accumulate",
         &accumulate.to_host_vec(stream)?,
         &expected_accumulate,
+        2e-5,
+        2e-5,
+    );
+
+    let mut b_transposed = vec![0.0; N * K];
+    for column in 0..N {
+        for row in 0..K {
+            b_transposed[column * K + row] = b[row * N + column];
+        }
+    }
+    let device_b_transposed = DeviceBuffer::from_host(stream, &b_transposed)?;
+    let mut nt_store = DeviceBuffer::<f32>::zeroed(stream, M * N)?;
+    unsafe {
+        module.register_gemm_nt_store(
+            stream,
+            fp32_launch_config(M, N),
+            M,
+            N,
+            K,
+            &device_a,
+            &device_b_transposed,
+            &mut nt_store,
+        )
+    }?;
+    assert_close(
+        "fp32 nt store",
+        &nt_store.to_host_vec(stream)?,
+        &matmul_transposed_b(&a, &b_transposed, M, N, K),
+        2e-5,
+        2e-5,
+    );
+
+    let tn_b = uniform_vec(M * N, 4);
+    let tn_initial = uniform_vec(K * N, 5);
+    let tn_product = matmul_transposed_a(&a, &tn_b, M, N, K);
+    let tn_expected: Vec<f32> = tn_initial
+        .iter()
+        .zip(&tn_product)
+        .map(|(initial, product)| initial + product)
+        .collect();
+    let device_tn_b = DeviceBuffer::from_host(stream, &tn_b)?;
+    let mut tn_accumulate = DeviceBuffer::from_host(stream, &tn_initial)?;
+    unsafe {
+        module.register_gemm_tn_accumulate(
+            stream,
+            fp32_launch_config(K, N),
+            K,
+            N,
+            M,
+            &device_a,
+            &device_tn_b,
+            &mut tn_accumulate,
+        )
+    }?;
+    assert_close(
+        "fp32 tn accumulate",
+        &tn_accumulate.to_host_vec(stream)?,
+        &tn_expected,
         2e-5,
         2e-5,
     );

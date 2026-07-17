@@ -298,10 +298,13 @@ Each gated on tests; correctness before speed at every step.
        step is unattributed allocation/zero-fill/copy time. B200 re-profile:
        196.67 ms full step, 0.226 ms (0.12%) unattributed; all twelve in-place
        gradient fills total 0.436 ms.
-     - **7e3 GEMM integration**: swap model matmuls to gpu/gemm's
+     - ✅ **7e3 GEMM integration**: swap model matmuls to gpu/gemm's
        register-tiled fp32 (store + accumulate variants — the accumulate
        path deletes the separate grad-accumulate launch per linear);
-       horizontal QKV `[D,3D]` and gate+up `[D,2FF]` fusion.
+       horizontal QKV `[D,3D]` and gate+up `[D,2FF]` fusion. B200
+       same-container re-profile against 7e2: 195.97 → 194.25 ms full step
+       (-0.88%); affected linear/GEMM forward+backward rows, including the
+       new split/join kernels, total 16.51 → 14.82 ms.
      - **7e4 flash-attention integration**: swap the naive attention
        kernels for gpu/flash-attn; re-tile its backward (key-block
        parallel, flash-2 style) if the profile shows the B·H-block launch

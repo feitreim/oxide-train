@@ -44,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let tensor = model::tensor_kernels::load(&ctx)?;
+    let gemm = model::gemm_kernels::load(&ctx)?;
     let llama = model::llama_kernels::load(&ctx)?;
 
     let cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
@@ -56,8 +57,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _ in 0..WARMUP_STEPS {
         gpu.zero_grad(&stream, &tensor)?;
-        gpu.forward(tokens, targets, &mut workspace, &stream, &tensor, &llama)?;
-        gpu.backward(&mut workspace, &stream, &tensor, &llama)?;
+        gpu.forward(
+            tokens,
+            targets,
+            &mut workspace,
+            &stream,
+            &tensor,
+            &gemm,
+            &llama,
+        )?;
+        gpu.backward(&mut workspace, &stream, &tensor, &gemm, &llama)?;
         optimizer.update(&mut gpu, &stream, &tensor)?;
     }
     stream.synchronize()?;
@@ -73,10 +82,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut workspace,
         &stream,
         &tensor,
+        &gemm,
         &llama,
         &mut profiler,
     )?;
-    gpu.backward_profiled(&mut workspace, &stream, &tensor, &llama, &mut profiler)?;
+    gpu.backward_profiled(
+        &mut workspace,
+        &stream,
+        &tensor,
+        &gemm,
+        &llama,
+        &mut profiler,
+    )?;
     optimizer.update_profiled(&mut gpu, &stream, &tensor, &mut profiler)?;
     let profile = profiler.finish(&stream)?;
 
