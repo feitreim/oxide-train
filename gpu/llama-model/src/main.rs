@@ -8,7 +8,7 @@ use tensor_cpu::CpuTensor;
 
 #[path = "lib.rs"]
 mod model;
-use model::{GpuLlama, GpuLlamaAdamW};
+use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace};
 
 fn assert_close<S: Shape>(
     name: &str,
@@ -45,22 +45,21 @@ fn overfit_tiny_batch(
         ..AdamWConfig::default()
     };
     let mut optimizer = GpuLlamaAdamW::new(stream, config)?;
+    let mut workspace = GpuLlamaWorkspace::<4, 4, 4, 8, 2, 12>::new(stream)?;
     let mut initial_loss = None;
 
     for _ in 0..200 {
-        gpu.zero_grad(stream)?;
-        let (loss, backward) = gpu.forward(tokens, targets, stream, tensor, llama)?;
+        gpu.zero_grad(stream, tensor)?;
+        gpu.forward(tokens, targets, &mut workspace, stream, tensor, llama)?;
         if initial_loss.is_none() {
-            initial_loss = Some(loss.to_host(stream)?[0]);
+            initial_loss = Some(workspace.loss().to_host(stream)?[0]);
         }
-        gpu.backward(backward, stream, tensor, llama)?;
+        gpu.backward(&mut workspace, stream, tensor, llama)?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
 
-    let final_loss = gpu
-        .forward(tokens, targets, stream, tensor, llama)?
-        .0
-        .to_host(stream)?[0];
+    gpu.forward(tokens, targets, &mut workspace, stream, tensor, llama)?;
+    let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
     assert!(
         final_loss < 0.05,
@@ -90,15 +89,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
     let mut gpu = GpuLlama::from_cpu(&stream, &cpu)?;
+    let mut workspace = GpuLlamaWorkspace::<N, T, VOCAB, D, H, FF>::new(&stream)?;
     let tokens = [1, 5, 5, 2, 9, 3, 16, 0];
     let targets = [5, 5, 2, 7, 3, 16, 0, 4];
 
     let (cpu_loss, cpu_ctx) = cpu.forward(tokens, targets);
-    let (gpu_loss, gpu_ctx) = gpu.forward(tokens, targets, &stream, &tensor, &llama)?;
-    assert_close("loss", &gpu_loss, &cpu_loss, &stream, 5e-5, 5e-5)?;
+    gpu.forward(tokens, targets, &mut workspace, &stream, &tensor, &llama)?;
+    assert_close("loss", workspace.loss(), &cpu_loss, &stream, 5e-5, 5e-5)?;
 
     cpu.backward(cpu_ctx);
-    gpu.backward(gpu_ctx, &stream, &tensor, &llama)?;
+    gpu.backward(&mut workspace, &stream, &tensor, &llama)?;
 
     macro_rules! grad {
         ($field:ident, $tol:expr) => {
@@ -112,6 +112,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         };
     }
+    grad!(embedding, 2e-4);
+    grad!(attention_norm, 2e-4);
+    grad!(q_proj, 2e-4);
+    grad!(k_proj, 2e-4);
+    grad!(v_proj, 2e-4);
+    grad!(o_proj, 2e-4);
+    grad!(ffn_norm, 2e-4);
+    grad!(gate_proj, 2e-4);
+    grad!(up_proj, 2e-4);
+    grad!(down_proj, 2e-4);
+    grad!(final_norm, 2e-4);
+    grad!(lm_head, 2e-4);
+
+    // Second pass through the same workspace: identical weights and inputs
+    // must reproduce identical loss and gradients. Catches state leaking
+    // between steps via reused buffers, which single-pass parity cannot.
+    gpu.zero_grad(&stream, &tensor)?;
+    gpu.forward(tokens, targets, &mut workspace, &stream, &tensor, &llama)?;
+    assert_close("loss (pass 2)", workspace.loss(), &cpu_loss, &stream, 5e-5, 5e-5)?;
+    gpu.backward(&mut workspace, &stream, &tensor, &llama)?;
     grad!(embedding, 2e-4);
     grad!(attention_norm, 2e-4);
     grad!(q_proj, 2e-4);
@@ -179,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     weight!(down_proj);
     weight!(final_norm);
     weight!(lm_head);
-    gpu.zero_grad(&stream)?;
+    gpu.zero_grad(&stream, &tensor)?;
 
     println!("✓ full fp32 GPU Llama forward/backward and AdamW match CPU");
     overfit_tiny_batch(&stream, &tensor, &llama)?;

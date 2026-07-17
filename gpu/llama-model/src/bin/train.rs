@@ -13,7 +13,7 @@ use optim::AdamWConfig;
 
 #[path = "../lib.rs"]
 mod model;
-use model::{GpuLlama, GpuLlamaAdamW};
+use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace};
 
 const B: usize = 1;
 const T: usize = 64;
@@ -105,6 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
     let starting_step = optimizer.step() as usize;
+    let mut workspace = GpuLlamaWorkspace::<N, T, VOCAB, D, H, FF>::new(&stream)?;
     if max_steps < starting_step {
         return Err(
             format!("TRAIN_STEPS={max_steps} is behind checkpoint step {starting_step}").into(),
@@ -131,17 +132,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let inputs = std::array::from_fn(|i| inputs.as_slice()[i] as usize);
         let targets = std::array::from_fn(|i| targets.as_slice()[i] as usize);
 
-        gpu.zero_grad(&stream)?;
-        let (loss, backward) = gpu.forward(inputs, targets, &stream, &tensor, &llama)?;
+        gpu.zero_grad(&stream, &tensor)?;
+        gpu.forward(inputs, targets, &mut workspace, &stream, &tensor, &llama)?;
         let should_log = step == 1 || step % log_every == 0 || step == max_steps;
         if should_log {
-            let loss = loss.to_host(&stream)?[0];
+            let loss = workspace.loss().to_host(&stream)?[0];
             println!("step={step} loss={loss:.6}");
             if !loss.is_finite() {
                 return Err(format!("non-finite loss at step {step}").into());
             }
         }
-        gpu.backward(backward, &stream, &tensor, &llama)?;
+        gpu.backward(&mut workspace, &stream, &tensor, &llama)?;
         optimizer.update(&mut gpu, &stream, &tensor)?;
 
         let periodic_checkpoint = checkpoint_every > 0 && step % checkpoint_every == 0;

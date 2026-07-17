@@ -86,7 +86,11 @@ trait Module {
 - **Ownership contract**: `forward` takes input *by value*; a module that
   needs it for backward moves it into `Ctx`. No implicit clones — on GPU that
   means no implicit device copies. Values needed twice (residual streams) are
-  duplicated by an explicit combinator that owns that policy.
+  duplicated by an explicit combinator that owns that policy. This by-value
+  Ctx contract governs the CPU reference; the GPU model deliberately trades
+  it for a persistent typed workspace (7e2) — aliasing safety there comes
+  from disjoint workspace fields, verified by two-pass parity, rather than
+  from ownership.
 - **Accumulation contract**: `backward` *accumulates* (`+=`) into the module's
   own grad buffers — shared params and micro-batch gradient accumulation come
   free. `zero_grad` resets.
@@ -291,11 +295,13 @@ Each gated on tests; correctness before speed at every step.
        `[N,VOCAB]` probability tensor saved in ctx). Motivation: the naive
        softmax recomputes the row max/denominator per element — O(V²) per
        row at V=50,257 — and alone measured 59.6–67.6% of the step.
-     - **7e2 memory hygiene**: in-place `zero_grad` via a fill kernel
-       (today: twelve fresh `DeviceBuffer::zeroed` allocations per step);
+     - ✅ **7e2 memory hygiene**: in-place `zero_grad` via a fill kernel
+       (formerly twelve fresh `DeviceBuffer::zeroed` allocations per step);
        reuse activation/output buffers across steps instead of allocating
        per op; pinned-host staging for token H2D. Motivation: 24.8% of the
-       step is unattributed allocation/zero-fill/copy time.
+       step is unattributed allocation/zero-fill/copy time. B200 re-profile:
+       196.67 ms full step, 0.226 ms (0.12%) unattributed; all twelve in-place
+       gradient fills total 0.436 ms.
      - **7e3 GEMM integration**: swap model matmuls to gpu/gemm's
        register-tiled fp32 (store + accumulate variants — the accumulate
        path deletes the separate grad-accumulate launch per linear);

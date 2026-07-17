@@ -7,7 +7,7 @@ use optim::AdamWConfig;
 
 #[path = "../lib.rs"]
 mod model;
-use model::{GpuLlama, GpuLlamaAdamW};
+use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace};
 
 const B: usize = 1;
 const T: usize = 64;
@@ -50,30 +50,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = GpuLlama::from_cpu(&stream, &cpu)?;
     drop(cpu);
     let mut optimizer = GpuLlamaAdamW::new(&stream, AdamWConfig::default())?;
+    let mut workspace = GpuLlamaWorkspace::<N, T, VOCAB, D, H, FF>::new(&stream)?;
     let tokens = std::array::from_fn(|i| (i * 7919 + 17) % VOCAB);
     let targets = std::array::from_fn(|i| tokens[(i + 1) % N]);
 
     for _ in 0..WARMUP_STEPS {
-        gpu.zero_grad(&stream)?;
-        let (_, step_ctx) = gpu.forward(tokens, targets, &stream, &tensor, &llama)?;
-        gpu.backward(step_ctx, &stream, &tensor, &llama)?;
+        gpu.zero_grad(&stream, &tensor)?;
+        gpu.forward(tokens, targets, &mut workspace, &stream, &tensor, &llama)?;
+        gpu.backward(&mut workspace, &stream, &tensor, &llama)?;
         optimizer.update(&mut gpu, &stream, &tensor)?;
     }
     stream.synchronize()?;
 
     let mut profiler = StepProfiler::start(&stream)?;
-    // Gradient-buffer zero fills and input H2D copies are deliberately inside
-    // the full-step events. They appear as unattributed device time rather than
-    // being mislabeled as kernels.
-    gpu.zero_grad(&stream)?;
-    let (_, step_ctx) =
-        gpu.forward_profiled(tokens, targets, &stream, &tensor, &llama, &mut profiler)?;
-    gpu.backward_profiled(step_ctx, &stream, &tensor, &llama, &mut profiler)?;
+    // Gradient fills are named kernel spans. The pinned input H2D copies remain
+    // deliberately inside the full-step interval and appear as unattributed
+    // device time rather than being mislabeled as kernels.
+    gpu.zero_grad_profiled(&stream, &tensor, &mut profiler)?;
+    gpu.forward_profiled(
+        tokens,
+        targets,
+        &mut workspace,
+        &stream,
+        &tensor,
+        &llama,
+        &mut profiler,
+    )?;
+    gpu.backward_profiled(&mut workspace, &stream, &tensor, &llama, &mut profiler)?;
     optimizer.update_profiled(&mut gpu, &stream, &tensor, &mut profiler)?;
     let profile = profiler.finish(&stream)?;
 
     println!("{profile}");
     println!();
-    println!("scope: zero_grad + forward + backward + AdamW");
+    println!("scope: in-place zero_grad + forward + backward + AdamW");
     Ok(())
 }
