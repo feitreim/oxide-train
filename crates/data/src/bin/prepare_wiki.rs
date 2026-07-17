@@ -10,6 +10,7 @@
 //!
 //!     cargo run --release -p data --bin prepare_wiki -- --out data/wiki
 //!     cargo run --release -p data --bin prepare_wiki -- --limit-files 1  # smoke
+//!     cargo run --release -p data --bin prepare_wiki -- --limit-files 1 --limit-articles 1000
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -34,6 +35,7 @@ struct Args {
     tokens_per_shard: u64,
     val_tokens: u64,
     limit_files: Option<usize>,
+    limit_articles: Option<u64>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -42,6 +44,7 @@ fn parse_args() -> Result<Args> {
         tokens_per_shard: 250_000_000, // 500MB per shard at 2 bytes/token
         val_tokens: 10_000_000,
         limit_files: None,
+        limit_articles: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -51,6 +54,7 @@ fn parse_args() -> Result<Args> {
             "--tokens-per-shard" => args.tokens_per_shard = val()?.parse()?,
             "--val-tokens" => args.val_tokens = val()?.parse()?,
             "--limit-files" => args.limit_files = Some(val()?.parse()?),
+            "--limit-articles" => args.limit_articles = Some(val()?.parse()?),
             other => anyhow::bail!("unknown flag {other}"),
         }
     }
@@ -105,7 +109,11 @@ fn main() -> Result<()> {
 
     for (i, name) in files.iter().enumerate() {
         let local = repo.get(name).with_context(|| format!("download {name}"))?;
-        let texts = read_texts(&local)?;
+        let mut texts = read_texts(&local)?;
+        if let Some(limit) = args.limit_articles {
+            let remaining = limit.saturating_sub(articles);
+            texts.truncate(usize::try_from(remaining).unwrap_or(usize::MAX));
+        }
         articles += texts.len() as u64;
 
         for chunk in texts.chunks(DOC_BATCH) {
@@ -128,6 +136,9 @@ fn main() -> Result<()> {
             i + 1,
             files.len(),
         );
+        if args.limit_articles.is_some_and(|limit| articles >= limit) {
+            break;
+        }
     }
 
     let val_shards = val.finish()?;

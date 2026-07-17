@@ -123,6 +123,13 @@ the thing it checks.
 ## 8. Optimizers
 
 - **AdamW first**: one fused elementwise GPU kernel over params/grads/m/v.
+  The CPU reference and GPU model keep shape-typed first/second moments; norm
+  weights skip decay. A parameter visitor exposes static parameter kinds for
+  later optimizer routing and checkpoint metadata.
+- Training checkpoints use a versioned, little-endian `RTCKPT01` format with
+  static model dimensions, AdamW config/step, next batch position, parameters,
+  and both moments. Saves atomically replace the previous file; resume rejects
+  shape or optimizer-config mismatches before training.
 - **Muon after the first successful AdamW run**: Newton–Schulz
   orthogonalization (~5 matmuls per 2D weight per step) — cheap once GEMM
   works. Standard split: Muon for hidden 2D matrices; AdamW for embeddings,
@@ -179,15 +186,15 @@ crates/            CPU-side workspace (builds/tests anywhere, no CUDA)
   tensor-cpu/      CpuTensor + naive reference ops
   nn/              Module trait, combinators, layers, gradcheck
   data/            tokenizer, shard format, mmap loader, prepare-wiki binary
-  (planned) optim/ AdamW, Muon, param visitor
-  (planned) train/ the training binary: config, loop, checkpoints, logging
+  optim/           AdamW CPU reference, typed Llama state, param visitor
 gpu/               standalone cuda-oxide kernel crates (Modal-built)
   bench-util/      CUDA-event timing + shared-RNG re-export
   vecadd/          toolchain smoke test; template for new kernels
   llama-ops/       direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
                    RoPE, causal attention, SwiGLU, embedding, and loss
   tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled GEMM
-  llama-model/     full fp32 GPU Llama forward/backward + CPU parity
+  llama-model/     full fp32 GPU Llama forward/backward + CPU parity, fused
+                   AdamW, tiny overfit gate, TOK1 shard trainer, checkpoints
 modal_app.py       Modal image + run/bench/sweep/sanitize/baseline/ptx
 ```
 
@@ -203,7 +210,8 @@ Each gated on tests; correctness before speed at every step.
 4. ✅ GPU foundation: tensor-gpu (GpuTensor), elementwise/reduction kernels,
    naive-then-tiled GEMM — all parity-tested vs CPU
 5. ✅ GPU forward+backward of the full model; parity vs CPU at fp32
-6. AdamW + training loop on GPU; overfit tiny batch, then real wiki run
+6. ✅ AdamW + GPU training loop; CPU/GPU update parity, tiny-batch overfit,
+   deterministic checkpoint/resume, and a 100-step real-Wikipedia run
 7. Perf: bf16 + fp32 master, kernel fusion, tcgen05 GEMM, flash-style
    attention, sweeps; Muon
 8. Scale/stretch: bigger model, MoE, (much later) multi-GPU

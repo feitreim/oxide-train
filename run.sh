@@ -21,5 +21,13 @@ args=(--kernel "$kernel")
 [[ -n "${SANITIZE:-}" ]] && args+=(--sanitize "$SANITIZE")
 [[ -n "${BASELINE:-}" ]] && args+=(--baseline "$BASELINE")
 [[ -n "${PTX:-}" ]] && args+=(--ptx)
+[[ -n "${SHARD:-}" ]] && args+=(--shard "$SHARD")
+[[ -n "${STEPS:-}" ]] && args+=(--steps "$STEPS")
+[[ -n "${LR:-}" ]] && args+=(--learning-rate "$LR")
+[[ -n "${WEIGHT_DECAY:-}" ]] && args+=(--weight-decay "$WEIGHT_DECAY")
+[[ -n "${LOG_EVERY:-}" ]] && args+=(--log-every "$LOG_EVERY")
+[[ -n "${CHECKPOINT:-}" ]] && args+=(--checkpoint "$CHECKPOINT")
+[[ -n "${CHECKPOINT_EVERY:-}" ]] && args+=(--checkpoint-every "$CHECKPOINT_EVERY")
+[[ -n "${RESUME:-}" ]] && args+=(--resume)
 
 exec modal run modal_app.py "${args[@]}"

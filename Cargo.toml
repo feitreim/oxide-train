@@ -11,6 +11,7 @@ members = [
     "crates/tensor-cpu",
     "crates/nn",
     "crates/data",
+    "crates/optim",
 ]
 exclude = ["gpu"]
 
@@ -21,3 +22,4 @@ edition = "2024"
 [workspace.dependencies]
 tensor-core = { path = "crates/tensor-core" }
 tensor-cpu = { path = "crates/tensor-cpu" }
+nn = { path = "crates/nn" }

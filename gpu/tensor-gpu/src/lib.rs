@@ -59,6 +59,40 @@ pub mod kernels {
         }
     }
 
+    /// Fused decoupled AdamW update over one flat parameter buffer.
+    #[kernel]
+    pub fn adamw(
+        gradient: &[f32],
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+        first_correction: f32,
+        second_correction: f32,
+        mut parameter: DisjointSlice<f32>,
+        mut first: DisjointSlice<f32>,
+        mut second: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let Some(parameter) = parameter.get_mut(thread::index_1d()) else {
+            return;
+        };
+        let Some(first) = first.get_mut(thread::index_1d()) else {
+            return;
+        };
+        let Some(second) = second.get_mut(thread::index_1d()) else {
+            return;
+        };
+
+        *first = beta1 * *first + (1.0 - beta1) * gradient[i];
+        *second = beta2 * *second + (1.0 - beta2) * gradient[i] * gradient[i];
+        let first_hat = *first * first_correction;
+        let second_hat = *second * second_correction;
+        let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * *parameter;
+        *parameter -= learning_rate * update;
+    }
+
     /// One-block reduction. Threads accumulate grid-stride partial sums before
     /// a standard shared-memory tree reduction.
     #[kernel]
@@ -285,6 +319,21 @@ pub struct GpuTensor<E: Element, S: Shape> {
     _shape: PhantomData<S>,
 }
 
+/// GPU-resident first and second AdamW moments for one parameter tensor.
+pub struct GpuAdamWMoments<S: Shape> {
+    pub first: GpuTensor<f32, S>,
+    pub second: GpuTensor<f32, S>,
+}
+
+impl<S: Shape> GpuAdamWMoments<S> {
+    pub fn zeros(stream: &CudaStream) -> Result<Self, DriverError> {
+        Ok(Self {
+            first: GpuTensor::zeros(stream)?,
+            second: GpuTensor::zeros(stream)?,
+        })
+    }
+}
+
 impl<E: Element, S: Shape> Tensor for GpuTensor<E, S> {
     type Elem = E;
     type Shape = S;
@@ -423,6 +472,38 @@ impl<S: Shape> GpuTensor<f32, S> {
             &rhs.data,
             factor,
             &mut self.data,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn adamw_step(
+        &mut self,
+        gradient: &Self,
+        moments: &mut GpuAdamWMoments<S>,
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+        first_correction: f32,
+        second_correction: f32,
+        stream: &CudaStream,
+        module: &kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        module.adamw(
+            stream,
+            elementwise_config::<S>(),
+            gradient.as_device_buffer(),
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+            first_correction,
+            second_correction,
+            self.as_device_buffer_mut(),
+            moments.first.as_device_buffer_mut(),
+            moments.second.as_device_buffer_mut(),
         )
     }
 
