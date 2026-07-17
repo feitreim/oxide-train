@@ -7,7 +7,7 @@ use optim::AdamWConfig;
 
 #[path = "../lib.rs"]
 mod model;
-use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace};
+use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace, NaiveClassifierWorkspace};
 
 const B: usize = 1;
 const T: usize = 64;
@@ -52,8 +52,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(cpu);
     let mut optimizer = GpuLlamaAdamW::new(&stream, AdamWConfig::default())?;
     let mut workspace = GpuLlamaWorkspace::<N, T, VOCAB, D, H, FF>::new(&stream)?;
+    let mut naive_classifier = NaiveClassifierWorkspace::<N, VOCAB>::new(&stream)?;
     let tokens = std::array::from_fn(|i| (i * 7919 + 17) % VOCAB);
     let targets = std::array::from_fn(|i| tokens[(i + 1) % N]);
+
+    for _ in 0..WARMUP_STEPS {
+        gpu.zero_grad(&stream, &tensor)?;
+        let mut profiler = bench_util::NoopProfiler;
+        gpu.forward_naive_profiled(
+            tokens,
+            targets,
+            &mut workspace,
+            &mut naive_classifier,
+            &stream,
+            &tensor,
+            &gemm,
+            &llama,
+            &mut profiler,
+        )?;
+        gpu.backward_naive_profiled(
+            &mut workspace,
+            &naive_classifier,
+            &stream,
+            &tensor,
+            &gemm,
+            &llama,
+            &mut profiler,
+        )?;
+        optimizer.update(&mut gpu, &stream, &tensor)?;
+    }
+    stream.synchronize()?;
+
+    let mut profiler = StepProfiler::start(&stream)?;
+    // Gradient fills are named kernel spans. The pinned input H2D copies remain
+    // deliberately inside the full-step interval and appear as unattributed
+    // device time rather than being mislabeled as kernels.
+    gpu.zero_grad_profiled(&stream, &tensor, &mut profiler)?;
+    gpu.forward_naive_profiled(
+        tokens,
+        targets,
+        &mut workspace,
+        &mut naive_classifier,
+        &stream,
+        &tensor,
+        &gemm,
+        &llama,
+        &mut profiler,
+    )?;
+    gpu.backward_naive_profiled(
+        &mut workspace,
+        &naive_classifier,
+        &stream,
+        &tensor,
+        &gemm,
+        &llama,
+        &mut profiler,
+    )?;
+    optimizer.update_profiled(&mut gpu, &stream, &tensor, &mut profiler)?;
+    let baseline = profiler.finish(&stream)?;
 
     for _ in 0..WARMUP_STEPS {
         gpu.zero_grad(&stream, &tensor)?;
@@ -72,9 +128,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.synchronize()?;
 
     let mut profiler = StepProfiler::start(&stream)?;
-    // Gradient fills are named kernel spans. The pinned input H2D copies remain
-    // deliberately inside the full-step interval and appear as unattributed
-    // device time rather than being mislabeled as kernels.
     gpu.zero_grad_profiled(&stream, &tensor, &mut profiler)?;
     gpu.forward_profiled(
         tokens,
@@ -95,9 +148,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut profiler,
     )?;
     optimizer.update_profiled(&mut gpu, &stream, &tensor, &mut profiler)?;
-    let profile = profiler.finish(&stream)?;
+    let candidate = profiler.finish(&stream)?;
 
-    println!("{profile}");
+    println!("baseline: naive classifier");
+    println!("{baseline}");
+    println!();
+    println!("candidate: fused classifier");
+    println!("{candidate}");
     println!();
     println!("scope: in-place zero_grad + forward + backward + AdamW");
     Ok(())

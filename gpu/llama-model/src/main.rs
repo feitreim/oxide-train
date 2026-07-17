@@ -187,6 +187,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     grad!(final_norm, 2e-4);
     grad!(lm_head, 2e-4);
 
+    // Second pass through the same workspace: identical weights and inputs
+    // must reproduce identical loss and gradients. Catches state leaking
+    // between steps via reused buffers, which single-pass parity cannot.
+    gpu.zero_grad(&stream, &tensor)?;
+    gpu.forward(
+        tokens,
+        targets,
+        &mut workspace,
+        &stream,
+        &tensor,
+        &gemm,
+        &llama,
+    )?;
+    assert_close(
+        "loss (pass 2)",
+        workspace.loss(),
+        &cpu_loss,
+        &stream,
+        5e-5,
+        5e-5,
+    )?;
+    gpu.backward(&mut workspace, &stream, &tensor, &gemm, &llama)?;
+    grad!(embedding, 2e-4);
+    grad!(attention_norm, 2e-4);
+    assert_grouped_close(
+        "qkv_proj.dw (pass 2)",
+        &gpu.qkv_proj.dw,
+        [&cpu.q_proj.dw, &cpu.k_proj.dw, &cpu.v_proj.dw],
+        &stream,
+        2e-4,
+        2e-4,
+    )?;
+    grad!(o_proj, 2e-4);
+    grad!(ffn_norm, 2e-4);
+    assert_grouped_close(
+        "gate_up_proj.dw (pass 2)",
+        &gpu.gate_up_proj.dw,
+        [&cpu.gate_proj.dw, &cpu.up_proj.dw],
+        &stream,
+        2e-4,
+        2e-4,
+    )?;
+    grad!(down_proj, 2e-4);
+    grad!(final_norm, 2e-4);
+    grad!(lm_head, 2e-4);
+
     // Feed the exact GPU gradients to both optimizers so this comparison
     // isolates the fused update kernel from forward/backward rounding.
     macro_rules! copy_grad {

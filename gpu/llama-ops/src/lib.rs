@@ -9,7 +9,14 @@
 //! remains the single source of kernel definitions while the selected target
 //! receives an embedded CUDA artifact.
 
-use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
+use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread};
+
+/// Threads in the row-parallel fused classifier kernels.
+///
+/// Each block owns one row and lanes stride over the vocabulary. Keeping this
+/// fixed and power-of-two makes the online `(max, sum_exp)` reduction valid for
+/// arbitrary vocabulary sizes.
+pub const CLASSIFIER_THREADS: usize = 256;
 
 #[cuda_module]
 pub mod kernels {
@@ -166,6 +173,10 @@ pub mod kernels {
     ) {
         let index = thread::index_1d();
         let i = index.get();
+        // Launches round up to whole blocks; excess threads must not write.
+        if 2 * i >= output.len() {
+            return;
+        }
         let width = width as usize;
         let row = i / width;
         let column = i % width;
@@ -211,6 +222,10 @@ pub mod kernels {
     ) {
         let index = thread::index_1d();
         let i = index.get();
+        // Launches round up to whole blocks; excess threads must not write.
+        if 3 * i >= output.len() {
+            return;
+        }
         let width = width as usize;
         let row = i / width;
         let column = i % width;
@@ -327,6 +342,170 @@ pub mod kernels {
             let target = targets[row] as usize;
             let indicator = if col == target { 1.0 } else { 0.0 };
             *slot = upstream * (probabilities[i] - indicator) / rows as f32;
+        }
+    }
+
+    /// Fused row-parallel softmax and cross-entropy forward.
+    ///
+    /// One block owns one logits row. Every lane computes an online softmax
+    /// summary over its strided vocabulary slice, then the block combines those
+    /// summaries without materializing probabilities.
+    #[kernel]
+    pub fn fused_classifier_forward(
+        logits: &[f32],
+        targets: &[u32],
+        rows: u32,
+        classes: u32,
+        mut losses: DisjointSlice<f32>,
+    ) {
+        static mut MAXIMA: SharedArray<f32, CLASSIFIER_THREADS> = SharedArray::UNINIT;
+        static mut SUMS: SharedArray<f32, CLASSIFIER_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != CLASSIFIER_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        if row >= rows as usize {
+            return;
+        }
+
+        let c = classes as usize;
+        let base = row * c;
+        let mut running_max = f32::NEG_INFINITY;
+        let mut running_sum = 0.0f32;
+        let mut col = tid;
+        while col < c {
+            let value = logits[base + col];
+            let next_max = running_max.max(value);
+            running_sum = running_sum * (running_max - next_max).exp() + (value - next_max).exp();
+            running_max = next_max;
+            col += CLASSIFIER_THREADS;
+        }
+        unsafe {
+            MAXIMA[tid] = running_max;
+            SUMS[tid] = running_sum;
+        }
+        thread::sync_threads();
+
+        let mut stride = CLASSIFIER_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    let right_sum = SUMS[tid + stride];
+                    if right_sum > 0.0 {
+                        let left_sum = SUMS[tid];
+                        if left_sum > 0.0 {
+                            let left_max = MAXIMA[tid];
+                            let right_max = MAXIMA[tid + stride];
+                            let next_max = left_max.max(right_max);
+                            SUMS[tid] = left_sum * (left_max - next_max).exp()
+                                + right_sum * (right_max - next_max).exp();
+                            MAXIMA[tid] = next_max;
+                        } else {
+                            SUMS[tid] = right_sum;
+                            MAXIMA[tid] = MAXIMA[tid + stride];
+                        }
+                    }
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+
+        if tid == 0 {
+            let target = targets[row] as usize;
+            unsafe {
+                *losses.get_unchecked_mut(row) = MAXIMA[0] + SUMS[0].ln() - logits[base + target];
+            }
+        }
+    }
+
+    /// Recompute softmax and overwrite logits with cross-entropy gradients.
+    ///
+    /// The block reduction matches `fused_classifier_forward`; after all lanes
+    /// have consumed the logits, each lane rewrites its disjoint strided slice.
+    #[kernel]
+    pub fn fused_classifier_backward_in_place(
+        targets: &[u32],
+        upstream: f32,
+        rows: u32,
+        classes: u32,
+        mut logits: DisjointSlice<f32>,
+    ) {
+        static mut MAXIMA: SharedArray<f32, CLASSIFIER_THREADS> = SharedArray::UNINIT;
+        static mut SUMS: SharedArray<f32, CLASSIFIER_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != CLASSIFIER_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        if row >= rows as usize {
+            return;
+        }
+
+        let c = classes as usize;
+        let base = row * c;
+        let mut running_max = f32::NEG_INFINITY;
+        let mut running_sum = 0.0f32;
+        let mut col = tid;
+        while col < c {
+            // SAFETY: the row belongs to this block and striding by the block
+            // width gives each lane exclusive ownership of this element.
+            let value = unsafe { *logits.get_unchecked_mut(base + col) };
+            let next_max = running_max.max(value);
+            running_sum = running_sum * (running_max - next_max).exp() + (value - next_max).exp();
+            running_max = next_max;
+            col += CLASSIFIER_THREADS;
+        }
+        unsafe {
+            MAXIMA[tid] = running_max;
+            SUMS[tid] = running_sum;
+        }
+        thread::sync_threads();
+
+        let mut stride = CLASSIFIER_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    let right_sum = SUMS[tid + stride];
+                    if right_sum > 0.0 {
+                        let left_sum = SUMS[tid];
+                        if left_sum > 0.0 {
+                            let left_max = MAXIMA[tid];
+                            let right_max = MAXIMA[tid + stride];
+                            let next_max = left_max.max(right_max);
+                            SUMS[tid] = left_sum * (left_max - next_max).exp()
+                                + right_sum * (right_max - next_max).exp();
+                            MAXIMA[tid] = next_max;
+                        } else {
+                            SUMS[tid] = right_sum;
+                            MAXIMA[tid] = MAXIMA[tid + stride];
+                        }
+                    }
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+
+        let row_max = unsafe { MAXIMA[0] };
+        let inverse_sum = 1.0 / unsafe { SUMS[0] };
+        let target = targets[row] as usize;
+        let scale = upstream / rows as f32;
+        let mut col = tid;
+        while col < c {
+            let index = base + col;
+            // SAFETY: this lane exclusively owns `index` for both the read and
+            // the subsequent in-place gradient write.
+            let value = unsafe { *logits.get_unchecked_mut(index) };
+            let probability = (value - row_max).exp() * inverse_sum;
+            let indicator = if col == target { 1.0 } else { 0.0 };
+            unsafe {
+                *logits.get_unchecked_mut(index) = scale * (probability - indicator);
+            }
+            col += CLASSIFIER_THREADS;
         }
     }
 

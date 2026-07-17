@@ -86,7 +86,11 @@ trait Module {
 - **Ownership contract**: `forward` takes input *by value*; a module that
   needs it for backward moves it into `Ctx`. No implicit clones — on GPU that
   means no implicit device copies. Values needed twice (residual streams) are
-  duplicated by an explicit combinator that owns that policy.
+  duplicated by an explicit combinator that owns that policy. This by-value
+  Ctx contract governs the CPU reference; the GPU model deliberately trades
+  it for a persistent typed workspace (7e2) — aliasing safety there comes
+  from disjoint workspace fields, verified by two-pass parity, rather than
+  from ownership.
 - **Accumulation contract**: `backward` *accumulates* (`+=`) into the module's
   own grad buffers — shared params and micro-batch gradient accumulation come
   free. `zero_grad` resets.
@@ -274,7 +278,7 @@ Each gated on tests; correctness before speed at every step.
    - ✅ **7b GEMM ladder** (`gpu/gemm`, starting from cuda-oxide
      `gemm_sol_final`): register-tiled fp32 → tcgen05 bf16; store +
      accumulate variants; tuned via SWEEP.
-   - **7c flash attention ✅** (`gpu/flash-attn`): fused online-softmax fp32
+   - ✅ **7c flash attention** (`gpu/flash-attn`): fused online-softmax fp32
      forward and recompute-softmax backward, parity-tested against llama-ops'
      naive attention kernels without materializing the probability matrix.
    - ✅ **7d bf16 plumbing** (crates/tensor-core, tensor-cpu, optim): bf16
@@ -285,12 +289,15 @@ Each gated on tests; correctness before speed at every step.
      261 ms; loss softmax 59.6%, unattributed alloc/zero-fill/copy 24.8%,
      all other kernels ~15% combined); re-profile after each landing and
      reorder the remainder if the measured tail moves:
-     - **7e1 fused classifier**: replace the naive softmax + cross-entropy
+     - ✅ **7e1 fused classifier**: replace the naive softmax + cross-entropy
        pair with one row-parallel fused forward/backward (llm.c-style:
        block-per-row online reduction, dlogits produced in place, no
        `[N,VOCAB]` probability tensor saved in ctx). Motivation: the naive
        softmax recomputes the row max/denominator per element — O(V²) per
-       row at V=50,257 — and alone measured 59.6–67.6% of the step.
+       row at V=50,257 — and alone measured 59.6–67.6% of the step. B200
+       same-process result after 7e2: 196.57 → 38.34 ms full step (5.13×);
+       classifier forward+backward 158.30 → 0.077 ms. The measured tail moved
+       to naive GEMMs and attention backward, so 7e3 remains next.
      - ✅ **7e2 memory hygiene**: in-place `zero_grad` via a fill kernel
        (formerly twelve fresh `DeviceBuffer::zeroed` allocations per step);
        reuse activation/output buffers across steps instead of allocating

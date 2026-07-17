@@ -2,7 +2,10 @@
 //!
 //! Parameters, gradients, and saved activations remain GPU-resident. The
 //! implementation mirrors `nn::Llama` explicitly so residual splits and the
-//! ownership of every backward context stay visible.
+//! aliasing story stay visible. Since 7e2, activations and scratch live in a
+//! persistent `GpuLlamaWorkspace` reused across steps; safety comes from
+//! disjoint workspace fields (each saved activation has a dedicated buffer),
+//! not from the CPU reference's by-value Ctx ownership.
 
 use bench_util::{KernelProfiler, NoopProfiler};
 use cuda_core::{CudaEvent, CudaStream, DriverError, LaunchConfig, PinnedHostBuffer};
@@ -41,6 +44,17 @@ fn reduction_config() -> LaunchConfig {
         shared_mem_bytes: 0,
     }
 }
+
+fn classifier_config<const N: usize>() -> LaunchConfig {
+    assert!(llama_device::CLASSIFIER_THREADS.is_power_of_two());
+    assert!(N <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (N as u32, 1, 1),
+        block_dim: (llama_device::CLASSIFIER_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 
 fn add_into<S: Shape, P: KernelProfiler>(
     lhs: &GpuTensor<f32, S>,
@@ -597,6 +611,22 @@ impl<const N: usize> InputStaging<N> {
     }
 }
 
+/// Probability storage used only by the retained naive classifier oracle.
+///
+/// Normal forward/backward never constructs this type; it exists so the
+/// full-step profiler can satisfy the same-process baseline/candidate gate.
+pub struct NaiveClassifierWorkspace<const N: usize, const VOCAB: usize> {
+    probabilities: GpuTensor<f32, Rank2<N, VOCAB>>,
+}
+
+impl<const N: usize, const VOCAB: usize> NaiveClassifierWorkspace<N, VOCAB> {
+    pub fn new(stream: &CudaStream) -> Result<Self, DriverError> {
+        Ok(Self {
+            probabilities: GpuTensor::zeros(stream)?,
+        })
+    }
+}
+
 /// Persistent device and pinned-host storage for one model's training steps.
 ///
 /// Create this once and pass it to every forward/backward call. All operator
@@ -630,7 +660,6 @@ pub struct GpuLlamaWorkspace<
     activated: GpuTensor<f32, Rank2<N, FF>>,
     final_input: GpuTensor<f32, Rank2<N, D>>,
     final_normalized: GpuTensor<f32, Rank2<N, D>>,
-    loss_probabilities: GpuTensor<f32, Rank2<N, VOCAB>>,
     projection_output: GpuTensor<f32, Rank2<N, D>>,
     logits: GpuTensor<f32, Rank2<N, VOCAB>>,
     losses: GpuTensor<f32, Rank1<N>>,
@@ -677,7 +706,6 @@ impl<
             activated: GpuTensor::zeros(stream)?,
             final_input: GpuTensor::zeros(stream)?,
             final_normalized: GpuTensor::zeros(stream)?,
-            loss_probabilities: GpuTensor::zeros(stream)?,
             projection_output: GpuTensor::zeros(stream)?,
             logits: GpuTensor::zeros(stream)?,
             losses: GpuTensor::zeros(stream)?,
@@ -795,6 +823,49 @@ impl<
         tokens: [usize; N],
         targets: [usize; N],
         workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+        llama: &llama_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        self.forward_profiled_with_probabilities(
+            tokens, targets, workspace, None, stream, tensor, gemm, llama, profiler,
+        )
+    }
+
+    /// Retained full-model baseline for same-process profiling and parity.
+    pub fn forward_naive_profiled<P: KernelProfiler>(
+        &self,
+        tokens: [usize; N],
+        targets: [usize; N],
+        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        classifier: &mut NaiveClassifierWorkspace<N, VOCAB>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+        llama: &llama_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        self.forward_profiled_with_probabilities(
+            tokens,
+            targets,
+            workspace,
+            Some(&mut classifier.probabilities),
+            stream,
+            tensor,
+            gemm,
+            llama,
+            profiler,
+        )
+    }
+
+    fn forward_profiled_with_probabilities<P: KernelProfiler>(
+        &self,
+        tokens: [usize; N],
+        targets: [usize; N],
+        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        naive_probabilities: Option<&mut GpuTensor<f32, Rank2<N, VOCAB>>>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
@@ -954,18 +1025,32 @@ impl<
             profiler,
             "forward.lm_head.gemm",
         )?;
-        cross_entropy_into(
-            &workspace.logits,
-            &workspace.targets,
-            &mut workspace.loss_probabilities,
-            &mut workspace.losses,
-            &mut workspace.loss_sum,
-            &mut workspace.loss,
-            stream,
-            tensor,
-            llama,
-            profiler,
-        )
+        if let Some(probabilities) = naive_probabilities {
+            naive_cross_entropy_into(
+                &workspace.logits,
+                &workspace.targets,
+                probabilities,
+                &mut workspace.losses,
+                &mut workspace.loss_sum,
+                &mut workspace.loss,
+                stream,
+                tensor,
+                llama,
+                profiler,
+            )
+        } else {
+            cross_entropy_into(
+                &workspace.logits,
+                &workspace.targets,
+                &mut workspace.losses,
+                &mut workspace.loss_sum,
+                &mut workspace.loss,
+                stream,
+                tensor,
+                llama,
+                profiler,
+            )
+        }
     }
 
     pub fn backward(
@@ -989,14 +1074,61 @@ impl<
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        cross_entropy_backward_into(
-            &workspace.loss_probabilities,
-            &workspace.targets,
-            &mut workspace.logits,
+        self.backward_profiled_with_probabilities(
+            workspace, None, stream, tensor, gemm, llama, profiler,
+        )
+    }
+
+    /// Retained full-model baseline for same-process profiling and parity.
+    pub fn backward_naive_profiled<P: KernelProfiler>(
+        &mut self,
+        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        classifier: &NaiveClassifierWorkspace<N, VOCAB>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+        llama: &llama_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        self.backward_profiled_with_probabilities(
+            workspace,
+            Some(&classifier.probabilities),
             stream,
+            tensor,
+            gemm,
             llama,
             profiler,
-        )?;
+        )
+    }
+
+    fn backward_profiled_with_probabilities<P: KernelProfiler>(
+        &mut self,
+        workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
+        naive_probabilities: Option<&GpuTensor<f32, Rank2<N, VOCAB>>>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+        llama: &llama_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        if let Some(probabilities) = naive_probabilities {
+            naive_cross_entropy_backward_into(
+                probabilities,
+                &workspace.targets,
+                &mut workspace.logits,
+                stream,
+                llama,
+                profiler,
+            )?;
+        } else {
+            cross_entropy_backward_into(
+                &workspace.targets,
+                &mut workspace.logits,
+                stream,
+                llama,
+                profiler,
+            )?;
+        }
         self.lm_head.backward_into(
             &workspace.final_normalized,
             &workspace.logits,
@@ -1425,6 +1557,48 @@ fn swiglu_backward_into<const N: usize, const FF: usize, P: KernelProfiler>(
 fn cross_entropy_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
     logits: &GpuTensor<f32, Rank2<N, VOCAB>>,
     targets: &GpuTensor<u32, Rank1<N>>,
+    losses: &mut GpuTensor<f32, Rank1<N>>,
+    loss_sum: &mut GpuTensor<f32, Rank1<1>>,
+    loss: &mut GpuTensor<f32, Rank1<1>>,
+    stream: &CudaStream,
+    tensor: &tensor_kernels::LoadedModule,
+    llama: &llama_kernels::LoadedModule,
+    profiler: &mut P,
+) -> Result<(), DriverError> {
+    profiler.measure(stream, "forward.loss.fused_classifier", || {
+        llama.fused_classifier_forward(
+            stream,
+            classifier_config::<N>(),
+            logits.as_device_buffer(),
+            targets.as_device_buffer(),
+            N as u32,
+            VOCAB as u32,
+            losses.as_device_buffer_mut(),
+        )
+    })?;
+    sum_into(
+        losses,
+        loss_sum,
+        stream,
+        tensor,
+        profiler,
+        "forward.loss.reduction",
+    )?;
+    scale_into(
+        loss_sum,
+        1.0 / N as f32,
+        loss,
+        stream,
+        tensor,
+        profiler,
+        "forward.loss.mean",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn naive_cross_entropy_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
+    logits: &GpuTensor<f32, Rank2<N, VOCAB>>,
+    targets: &GpuTensor<u32, Rank1<N>>,
     probabilities: &mut GpuTensor<f32, Rank2<N, VOCAB>>,
     losses: &mut GpuTensor<f32, Rank1<N>>,
     loss_sum: &mut GpuTensor<f32, Rank1<1>>,
@@ -1434,7 +1608,7 @@ fn cross_entropy_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
     llama: &llama_kernels::LoadedModule,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, "forward.loss.softmax", || {
+    profiler.measure(stream, "forward.loss.naive.softmax", || {
         llama.softmax_forward(
             stream,
             LaunchConfig::for_num_elems((N * VOCAB) as u32),
@@ -1443,7 +1617,7 @@ fn cross_entropy_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
             probabilities.as_device_buffer_mut(),
         )
     })?;
-    profiler.measure(stream, "forward.loss.cross_entropy", || {
+    profiler.measure(stream, "forward.loss.naive.cross_entropy", || {
         llama.cross_entropy_loss(
             stream,
             LaunchConfig::for_num_elems(N as u32),
@@ -1474,6 +1648,26 @@ fn cross_entropy_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
 }
 
 fn cross_entropy_backward_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
+    targets: &GpuTensor<u32, Rank1<N>>,
+    dlogits: &mut GpuTensor<f32, Rank2<N, VOCAB>>,
+    stream: &CudaStream,
+    kernels: &llama_kernels::LoadedModule,
+    profiler: &mut P,
+) -> Result<(), DriverError> {
+    profiler.measure(stream, "backward.loss.fused_classifier", || {
+        kernels.fused_classifier_backward_in_place(
+            stream,
+            classifier_config::<N>(),
+            targets.as_device_buffer(),
+            1.0,
+            N as u32,
+            VOCAB as u32,
+            dlogits.as_device_buffer_mut(),
+        )
+    })
+}
+
+fn naive_cross_entropy_backward_into<const N: usize, const VOCAB: usize, P: KernelProfiler>(
     probabilities: &GpuTensor<f32, Rank2<N, VOCAB>>,
     targets: &GpuTensor<u32, Rank1<N>>,
     dlogits: &mut GpuTensor<f32, Rank2<N, VOCAB>>,
@@ -1481,7 +1675,7 @@ fn cross_entropy_backward_into<const N: usize, const VOCAB: usize, P: KernelProf
     kernels: &llama_kernels::LoadedModule,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, "backward.loss.softmax_cross_entropy", || {
+    profiler.measure(stream, "backward.loss.naive.softmax_cross_entropy", || {
         kernels.softmax_cross_entropy_backward(
             stream,
             LaunchConfig::for_num_elems((N * VOCAB) as u32),
