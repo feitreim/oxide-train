@@ -30,4 +30,4 @@ args=(--kernel "$kernel")
 [[ -n "${CHECKPOINT_EVERY:-}" ]] && args+=(--checkpoint-every "$CHECKPOINT_EVERY")
 [[ -n "${RESUME:-}" ]] && args+=(--resume)
 
-exec modal run modal_app.py "${args[@]}"
+exec modal run modal_app.py::main "${args[@]}"
