@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_cross_entropy(&stream, &module)?;
     check_rope(&stream, &module)?;
     check_attention(&stream, &module)?;
+    check_group_split_join(&stream, &module)?;
 
     println!("✓ llama-ops forward/backward parity checks passed");
     Ok(())
@@ -408,6 +409,109 @@ fn check_embedding(
         cpu.dw.as_slice(),
         1e-6,
         1e-6,
+    );
+    Ok(())
+}
+
+/// Round-trips grouped tensors through split and join at a shape that does
+/// not divide the 256-thread launch rounding, so block-excess threads are
+/// exercised in both kernels.
+fn check_group_split_join(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const ROWS: usize = 7;
+    const WIDTH: usize = 13;
+    let packed3 = CpuTensor::<f32, Rank2<ROWS, 39>>::uniform(11);
+    let packed2 = CpuTensor::<f32, Rank2<ROWS, 26>>::uniform(12);
+    let part = |packed: &[f32], groups: usize, group: usize| -> Vec<f32> {
+        (0..ROWS * WIDTH)
+            .map(|i| packed[(i / WIDTH * groups + group) * WIDTH + i % WIDTH])
+            .collect()
+    };
+
+    let packed3_dev = DeviceBuffer::from_host(stream, packed3.as_slice())?;
+    let mut first = DeviceBuffer::<f32>::zeroed(stream, ROWS * WIDTH)?;
+    let mut second = DeviceBuffer::<f32>::zeroed(stream, ROWS * WIDTH)?;
+    let mut third = DeviceBuffer::<f32>::zeroed(stream, ROWS * WIDTH)?;
+    let elems = LaunchConfig::for_num_elems((ROWS * WIDTH) as u32);
+    module.split_group3(
+        stream,
+        elems,
+        &packed3_dev,
+        WIDTH as u32,
+        &mut first,
+        &mut second,
+        &mut third,
+    )?;
+    for (name, buffer, group) in [
+        ("split_group3 first", &first, 0),
+        ("split_group3 second", &second, 1),
+        ("split_group3 third", &third, 2),
+    ] {
+        assert_close(
+            name,
+            &buffer.to_host_vec(stream)?,
+            &part(packed3.as_slice(), 3, group),
+            0.0,
+            0.0,
+        );
+    }
+    let mut joined3 = DeviceBuffer::<f32>::zeroed(stream, ROWS * 3 * WIDTH)?;
+    // SAFETY: the three parts are disjoint [ROWS, WIDTH] tensors and the
+    // output holds exactly ROWS * 3 * WIDTH elements.
+    unsafe {
+        module.join_group3(
+            stream,
+            elems,
+            &first,
+            &second,
+            &third,
+            WIDTH as u32,
+            &mut joined3,
+        )?;
+    }
+    assert_close(
+        "join_group3",
+        &joined3.to_host_vec(stream)?,
+        packed3.as_slice(),
+        0.0,
+        0.0,
+    );
+
+    let packed2_dev = DeviceBuffer::from_host(stream, packed2.as_slice())?;
+    module.split_group2(
+        stream,
+        elems,
+        &packed2_dev,
+        WIDTH as u32,
+        &mut first,
+        &mut second,
+    )?;
+    for (name, buffer, group) in [
+        ("split_group2 first", &first, 0),
+        ("split_group2 second", &second, 1),
+    ] {
+        assert_close(
+            name,
+            &buffer.to_host_vec(stream)?,
+            &part(packed2.as_slice(), 2, group),
+            0.0,
+            0.0,
+        );
+    }
+    let mut joined2 = DeviceBuffer::<f32>::zeroed(stream, ROWS * 2 * WIDTH)?;
+    // SAFETY: both parts are disjoint [ROWS, WIDTH] tensors and the output
+    // holds exactly ROWS * 2 * WIDTH elements.
+    unsafe {
+        module.join_group2(stream, elems, &first, &second, WIDTH as u32, &mut joined2)?;
+    }
+    assert_close(
+        "join_group2",
+        &joined2.to_host_vec(stream)?,
+        packed2.as_slice(),
+        0.0,
+        0.0,
     );
     Ok(())
 }
