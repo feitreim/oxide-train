@@ -186,7 +186,7 @@ gpu/               standalone cuda-oxide kernel crates (Modal-built)
   vecadd/          toolchain smoke test; template for new kernels
   llama-ops/       direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
                    SwiGLU, embedding, and fused softmax-cross-entropy
-  (planned) tensor-gpu host-side GpuTensor wrapping DeviceBuffer + kernel launches
+  tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled GEMM
 modal_app.py       Modal image + run/bench/sweep/sanitize/baseline/ptx
 ```
 
@@ -199,7 +199,7 @@ Each gated on tests; correctness before speed at every step.
 2. ✅ Data: shard format, tokenizer, batcher, prepare-wiki binary
 3. ✅ CPU model forward+backward: RMSNorm, RoPE attention, SwiGLU, embedding,
    fused softmax-cross-entropy — all gradchecked; overfit a tiny batch on CPU
-4. GPU foundation: tensor-gpu (GpuTensor), elementwise/reduction kernels,
+4. ✅ GPU foundation: tensor-gpu (GpuTensor), elementwise/reduction kernels,
    naive-then-tiled GEMM — all parity-tested vs CPU
 5. GPU forward+backward of the full model; parity vs CPU at fp32
 6. AdamW + training loop on GPU; overfit tiny batch, then real wiki run

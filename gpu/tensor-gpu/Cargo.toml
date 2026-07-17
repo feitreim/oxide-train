@@ -1,0 +1,21 @@
+[package]
+name = "tensor-gpu"
+version = "0.1.0"
+edition = "2024"
+default-run = "tensor-gpu"
+
+# GPU crates are built independently by `cargo oxide`, outside the CPU
+# workspace.
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+tensor-core = { path = "../../crates/tensor-core" }
+tensor-cpu = { path = "../../crates/tensor-cpu" }
+bench-util = { path = "../bench-util" }
+
+[profile.release]
+debug = false
+lto = true
