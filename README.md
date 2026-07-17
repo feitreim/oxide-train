@@ -82,13 +82,47 @@ modal run modal_app.py::doctor          # toolchain + GPU sanity check
 ./run.sh vecadd                         # correctness
 ./run.sh vecadd bench                   # throughput
 ./run.sh llama-ops                      # Llama leaf-op CPU/GPU parity
-./run.sh llama-model profile            # full-step per-kernel CUDA-event profile
+./run.sh llama-model profile            # ~183M-param full-step CUDA-event profile
 SWEEP="BM=128 BN=128,BM=256 BN=64" ./run.sh gemm   # tuning sweep (one container)
 ```
 
 The first run builds the Modal image (the cuda-oxide backend build is the slow
 part); later runs reuse it and only recompile the kernel. Default GPU is B200
 (`GPU=H100 ./run.sh ...` to override).
+
+### Full-step profiling
+
+Run the dedicated profiler without a dataset shard:
+
+```bash
+./run.sh llama-model profile
+```
+
+The binary uses a fixed, compile-time performance configuration: `B=1`, `T=64`,
+`VOCAB=50,257`, `D=1536`, `H=24`, `HD=64`, and `FF=4096` (about 182.7M
+parameters). It runs two complete warmup steps, synchronizes the stream, and
+then measures one `zero_grad + forward + backward + AdamW` step. Normal
+correctness and training binaries retain the zero-event `NoopProfiler` path.
+
+The report contains one CUDA-event duration per named kernel launch plus:
+
+- `all kernels`: the sum of the individually measured launches;
+- `unattributed`: device time inside the full-step events but outside a named
+  kernel span, including input copies, allocations, gradient-buffer zero fills,
+  and launch gaps;
+- `full step`: the end-to-end device timeline used for performance comparisons.
+
+Shard reading, checkpointing, and loss copies performed only for logging are
+not part of this compute-step profile. Kernel names are prefixed with
+`forward.`, `backward.`, or `optimizer.` so regressions can be assigned to a
+training phase directly.
+
+Use a single run to find hotspots or record the current baseline. For a
+performance/fusion PR, execute the old and candidate paths back-to-back in one
+profiling process/container after equivalent warmups, then report both full-step
+times and the changed kernel rows. Two separate `./run.sh` invocations may land
+on different GPUs or clock states and do **not** satisfy the same-container
+measurement gate in `SPEC.md`.
 
 To add a kernel: copy `gpu/vecadd` to `gpu/<name>`, set `name` in its
 `Cargo.toml`, write the `#[kernel]` in `src/lib.rs`, and give it a real
