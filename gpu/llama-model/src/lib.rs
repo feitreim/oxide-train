@@ -1155,7 +1155,6 @@ impl<
         model: &Llama<N, T, VOCAB, D, H, HD, FF>,
     ) -> Result<Self, Box<dyn Error>> {
         assert!(N <= u32::MAX as usize);
-        assert!(N * H * T <= u32::MAX as usize);
         assert_eq!(N % T, 0);
         assert_eq!(D, H * HD);
         // tcgen05 head contract: padded tokens and vocabulary are tile
