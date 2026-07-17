@@ -7,6 +7,7 @@
 #   SWEEP="BM=128 BN=128,BM=256 BN=64" ./run.sh gemm   # tuning-const sweep
 #   SANITIZE=synccheck ./run.sh gemm  # compute-sanitizer (memcheck/racecheck/synccheck/initcheck)
 #   BASELINE=gemm_baseline ./run.sh gemm  # CUDA C++ baseline (gpu/<k>/baselines/<name>.cu)
+#   BASELINE_REF=<git-ref> ./run.sh <k> profile  # same-container A/B vs a pushed ref
 #   PTX=1 ./run.sh gemm               # dump the generated PTX
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -29,5 +30,6 @@ args=(--kernel "$kernel")
 [[ -n "${CHECKPOINT:-}" ]] && args+=(--checkpoint "$CHECKPOINT")
 [[ -n "${CHECKPOINT_EVERY:-}" ]] && args+=(--checkpoint-every "$CHECKPOINT_EVERY")
 [[ -n "${RESUME:-}" ]] && args+=(--resume)
+[[ -n "${BASELINE_REF:-}" ]] && args+=(--baseline-ref "$BASELINE_REF")
 
 exec modal run modal_app.py::main "${args[@]}"

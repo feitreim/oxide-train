@@ -24,6 +24,7 @@ import modal
 CUDA_OXIDE_REF = "v0.2.1"
 RUST_TOOLCHAIN = "nightly-2026-04-03"
 GIT_REPO = "https://github.com/NVlabs/cuda-oxide.git"
+TRAINER_REPO = "https://github.com/feitreim/oxide-train.git"
 
 DEFAULT_GPU = "B200"  # training target; kernels will use tcgen05 features.
 PROJECT_DIR = "/root/project"  # local gpu/ + crates/ mounted here at run time
@@ -194,13 +195,35 @@ def run_kernel(
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
+def compare_profile(kernel: str, baseline_ref: str) -> None:
+    """Build a retained git baseline and the mounted candidate, then profile
+    both back-to-back in one container after each binary's equivalent warmups.
+    """
+    baseline_root = "/tmp/rust-trainer-baseline"
+    _run(["git", "clone", "--quiet", TRAINER_REPO, baseline_root], cwd="/tmp")
+    _run(["git", "checkout", "--quiet", baseline_ref], cwd=baseline_root)
+
+    baseline = f"{baseline_root}/gpu/{kernel}"
+    candidate = _proj(kernel)
+    prime = ["cargo", "oxide", "run", kernel, "--bin", "profile"]
+    _run(prime, cwd=baseline)
+    _run(prime, cwd=candidate)
+
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    print(f"=== baseline {baseline_ref} ===", flush=True)
+    _run(["target/release/profile"], cwd=baseline)
+    print("=== candidate ===", flush=True)
+    _run(["target/release/profile"], cwd=candidate)
+
+
+@app.function(gpu=DEFAULT_GPU, timeout=3600)
 def run_sweep(kernel: str, configs: str) -> None:
     """Bench several tuning configs in ONE container so they share a GPU and
     its clocks.
 
     `configs` is comma-separated; each config is space-separated `NAME=VAL`
-    pairs, e.g. "BM=128 BN=128,BM=256 BN=64". Each NAME must exist in the
-    kernel crate's src/lib.rs as `pub const NAME: usize = ...;` -- tuning
+    pairs, e.g. "BM=128 BN=128,BM=256 BN=64". Each NAME must exist in exactly
+    one of the kernel crate's src/*.rs files as `pub const NAME: usize = ...;` -- tuning
     consts feed const generics, so every config is a fresh shape-specialized
     compile. Correctness (main.rs) runs before each bench so a bad config
     fails loudly. Container-side edits never touch the local checkout.
@@ -208,20 +231,24 @@ def run_sweep(kernel: str, configs: str) -> None:
     import re
 
     proj = _proj(kernel)
-    lib = Path(proj, "src", "lib.rs")
+    sources = sorted(Path(proj, "src").glob("*.rs"))
     for cfg in configs.split(","):
-        src = lib.read_text()
+        contents = {source: source.read_text() for source in sources}
         for assign in cfg.split():
             name, val = assign.split("=")
-            src, n = re.subn(
-                rf"(pub const {name}: usize = )\d+", rf"\g<1>{val}", src
-            )
-            if n != 1:
+            matches = 0
+            for source, src in contents.items():
+                contents[source], n = re.subn(
+                    rf"(pub const {name}: usize = )\d+", rf"\g<1>{val}", src
+                )
+                matches += n
+            if matches != 1:
                 raise SystemExit(
                     f"expected exactly one `pub const {name}: usize` in "
-                    f"gpu/{kernel}/src/lib.rs, found {n}"
+                    f"gpu/{kernel}/src/*.rs, found {matches}"
                 )
-        lib.write_text(src)
+        for source, src in contents.items():
+            source.write_text(src)
         print(f"=== config {cfg} ===", flush=True)
         for cmd in (
             ["cargo", "oxide", "run", kernel],
@@ -351,6 +378,7 @@ def main(
     checkpoint: str = "",
     checkpoint_every: int = 0,
     resume: bool = False,
+    baseline_ref: str = "",
 ) -> None:
     if sanitize:
         fn = run_sanitizer.with_options(gpu=gpu) if gpu else run_sanitizer
@@ -367,6 +395,10 @@ def main(
     if sweep:
         fn = run_sweep.with_options(gpu=gpu) if gpu else run_sweep
         fn.remote(kernel, sweep)
+        return
+    if baseline_ref:
+        fn = compare_profile.with_options(gpu=gpu) if gpu else compare_profile
+        fn.remote(kernel, baseline_ref)
         return
     fn = run_kernel.with_options(gpu=gpu) if gpu else run_kernel
     fn.remote(

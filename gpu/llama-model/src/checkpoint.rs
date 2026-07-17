@@ -14,7 +14,7 @@ use super::tensor_device::GpuTensor;
 use super::{GpuLlama, GpuLlamaAdamW};
 
 const MAGIC: &[u8; 8] = b"RTCKPT01";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const CONFIG_FLOATS: usize = 5;
 
 pub struct LoadedCheckpoint<
@@ -159,13 +159,10 @@ pub fn save<
     }
     write_parameter!(embedding);
     write_parameter!(attention_norm);
-    write_parameter!(q_proj);
-    write_parameter!(k_proj);
-    write_parameter!(v_proj);
+    write_parameter!(qkv_proj);
     write_parameter!(o_proj);
     write_parameter!(ffn_norm);
-    write_parameter!(gate_proj);
-    write_parameter!(up_proj);
+    write_parameter!(gate_up_proj);
     write_parameter!(down_proj);
     write_parameter!(final_norm);
     write_parameter!(lm_head);
@@ -230,13 +227,10 @@ pub fn load<
     }
     read_parameter!(embedding);
     read_parameter!(attention_norm);
-    read_parameter!(q_proj);
-    read_parameter!(k_proj);
-    read_parameter!(v_proj);
+    read_parameter!(qkv_proj);
     read_parameter!(o_proj);
     read_parameter!(ffn_norm);
-    read_parameter!(gate_proj);
-    read_parameter!(up_proj);
+    read_parameter!(gate_up_proj);
     read_parameter!(down_proj);
     read_parameter!(final_norm);
     read_parameter!(lm_head);

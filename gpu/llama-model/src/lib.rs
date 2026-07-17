@@ -16,12 +16,15 @@ use tensor_core::{Rank1, Rank2, Rank3, Shape};
 // cuda-oxide collects kernels from the selected binary target. The binary
 // includes this file as a module, which in turn includes each canonical kernel
 // source here instead of copying definitions or relying on dependency PTX.
+#[path = "../../gemm/src/fp32.rs"]
+mod gemm_device;
 #[path = "../../llama-ops/src/lib.rs"]
 mod llama_device;
 #[path = "../../tensor-gpu/src/lib.rs"]
 #[allow(dead_code)]
 pub mod tensor_device;
 
+pub use gemm_device::kernels as gemm_kernels;
 pub use llama_device::kernels as llama_kernels;
 pub use tensor_device::kernels as tensor_kernels;
 use tensor_device::{GpuAdamWMoments, GpuTensor};
@@ -52,18 +55,6 @@ fn classifier_config<const N: usize>() -> LaunchConfig {
     }
 }
 
-fn gemm_config<const M: usize, const N: usize>() -> LaunchConfig {
-    assert!(tensor_device::TILE * tensor_device::TILE <= 1024);
-    LaunchConfig {
-        grid_dim: (
-            (N as u32).div_ceil(tensor_device::TILE as u32),
-            (M as u32).div_ceil(tensor_device::TILE as u32),
-            1,
-        ),
-        block_dim: (tensor_device::TILE as u32, tensor_device::TILE as u32, 1),
-        shared_mem_bytes: 0,
-    }
-}
 
 fn add_into<S: Shape, P: KernelProfiler>(
     lhs: &GpuTensor<f32, S>,
@@ -146,17 +137,17 @@ fn gemm_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
     rhs: &GpuTensor<f32, Rank2<K, N>>,
     output: &mut GpuTensor<f32, Rank2<M, N>>,
     stream: &CudaStream,
-    kernels: &tensor_kernels::LoadedModule,
+    kernels: &gemm_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, name, || {
-        kernels.gemm_tiled(
+    profiler.measure(stream, name, || unsafe {
+        kernels.register_gemm_store(
             stream,
-            gemm_config::<M, N>(),
-            M as u32,
-            N as u32,
-            K as u32,
+            gemm_device::launch_config(M, N),
+            M,
+            N,
+            K,
             lhs.as_device_buffer(),
             rhs.as_device_buffer(),
             output.as_device_buffer_mut(),
@@ -169,17 +160,17 @@ fn gemm_tn_accumulate_into<const M: usize, const K: usize, const N: usize, P: Ke
     rhs: &GpuTensor<f32, Rank2<M, N>>,
     output: &mut GpuTensor<f32, Rank2<K, N>>,
     stream: &CudaStream,
-    kernels: &tensor_kernels::LoadedModule,
+    kernels: &gemm_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, name, || {
-        kernels.gemm_tn_accumulate(
+    profiler.measure(stream, name, || unsafe {
+        kernels.register_gemm_tn_accumulate(
             stream,
-            gemm_config::<K, N>(),
-            M as u32,
-            N as u32,
-            K as u32,
+            gemm_device::launch_config(K, N),
+            K,
+            N,
+            M,
             lhs.as_device_buffer(),
             rhs.as_device_buffer(),
             output.as_device_buffer_mut(),
@@ -192,17 +183,17 @@ fn gemm_nt_into<const M: usize, const K: usize, const N: usize, P: KernelProfile
     rhs: &GpuTensor<f32, Rank2<N, K>>,
     output: &mut GpuTensor<f32, Rank2<M, N>>,
     stream: &CudaStream,
-    kernels: &tensor_kernels::LoadedModule,
+    kernels: &gemm_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, name, || {
-        kernels.gemm_nt(
+    profiler.measure(stream, name, || unsafe {
+        kernels.register_gemm_nt_store(
             stream,
-            gemm_config::<M, N>(),
-            M as u32,
-            N as u32,
-            K as u32,
+            gemm_device::launch_config(M, N),
+            M,
+            N,
+            K,
             lhs.as_device_buffer(),
             rhs.as_device_buffer(),
             output.as_device_buffer_mut(),
@@ -231,7 +222,7 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         x: &GpuTensor<f32, Rank2<N, IN>>,
         output: &mut GpuTensor<f32, Rank2<N, OUT>>,
         stream: &CudaStream,
-        kernels: &tensor_kernels::LoadedModule,
+        kernels: &gemm_kernels::LoadedModule,
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
@@ -244,12 +235,96 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         dy: &GpuTensor<f32, Rank2<N, OUT>>,
         dx: &mut GpuTensor<f32, Rank2<N, IN>>,
         stream: &CudaStream,
-        kernels: &tensor_kernels::LoadedModule,
+        kernels: &gemm_kernels::LoadedModule,
         profiler: &mut P,
         names: [&'static str; 2],
     ) -> Result<(), DriverError> {
         gemm_tn_accumulate_into(x, dy, &mut self.dw, stream, kernels, profiler, names[0])?;
         gemm_nt_into(dy, &self.w, dx, stream, kernels, profiler, names[1])
+    }
+}
+
+pub struct GpuGroupedLinear<const IN: usize, const GROUPS: usize, const OUT: usize> {
+    pub w: GpuTensor<f32, Rank3<IN, GROUPS, OUT>>,
+    pub dw: GpuTensor<f32, Rank3<IN, GROUPS, OUT>>,
+}
+
+impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN, GROUPS, OUT> {
+    fn from_cpu<const N: usize>(
+        stream: &CudaStream,
+        layers: [&nn::Linear<N, IN, OUT>; GROUPS],
+    ) -> Result<Self, DriverError> {
+        let mut weights = vec![0.0; IN * GROUPS * OUT];
+        for input in 0..IN {
+            for (group, layer) in layers.iter().enumerate() {
+                let source = &layer.w.as_slice()[input * OUT..(input + 1) * OUT];
+                let destination = (input * GROUPS + group) * OUT;
+                weights[destination..destination + OUT].copy_from_slice(source);
+            }
+        }
+        Ok(Self {
+            w: GpuTensor::from_host(stream, &weights)?,
+            dw: GpuTensor::zeros(stream)?,
+        })
+    }
+
+    fn forward_into<const N: usize, P: KernelProfiler>(
+        &self,
+        x: &GpuTensor<f32, Rank2<N, IN>>,
+        output: &mut GpuTensor<f32, Rank3<N, GROUPS, OUT>>,
+        stream: &CudaStream,
+        kernels: &gemm_kernels::LoadedModule,
+        profiler: &mut P,
+        name: &'static str,
+    ) -> Result<(), DriverError> {
+        profiler.measure(stream, name, || unsafe {
+            kernels.register_gemm_store(
+                stream,
+                gemm_device::launch_config(N, GROUPS * OUT),
+                N,
+                GROUPS * OUT,
+                IN,
+                x.as_device_buffer(),
+                self.w.as_device_buffer(),
+                output.as_device_buffer_mut(),
+            )
+        })
+    }
+
+    fn backward_into<const N: usize, P: KernelProfiler>(
+        &mut self,
+        x: &GpuTensor<f32, Rank2<N, IN>>,
+        dy: &GpuTensor<f32, Rank3<N, GROUPS, OUT>>,
+        dx: &mut GpuTensor<f32, Rank2<N, IN>>,
+        stream: &CudaStream,
+        kernels: &gemm_kernels::LoadedModule,
+        profiler: &mut P,
+        names: [&'static str; 2],
+    ) -> Result<(), DriverError> {
+        profiler.measure(stream, names[0], || unsafe {
+            kernels.register_gemm_tn_accumulate(
+                stream,
+                gemm_device::launch_config(IN, GROUPS * OUT),
+                IN,
+                GROUPS * OUT,
+                N,
+                x.as_device_buffer(),
+                dy.as_device_buffer(),
+                self.dw.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, names[1], || unsafe {
+            kernels.register_gemm_nt_store(
+                stream,
+                gemm_device::launch_config(N, IN),
+                N,
+                IN,
+                GROUPS * OUT,
+                dy.as_device_buffer(),
+                self.w.as_device_buffer(),
+                dx.as_device_buffer_mut(),
+            )
+        })
     }
 }
 
@@ -401,13 +476,10 @@ pub struct GpuLlama<
 > {
     pub embedding: GpuEmbedding<VOCAB, D>,
     pub attention_norm: GpuRmsNorm<D>,
-    pub q_proj: GpuLinear<D, D>,
-    pub k_proj: GpuLinear<D, D>,
-    pub v_proj: GpuLinear<D, D>,
+    pub qkv_proj: GpuGroupedLinear<D, 3, D>,
     pub o_proj: GpuLinear<D, D>,
     pub ffn_norm: GpuRmsNorm<D>,
-    pub gate_proj: GpuLinear<D, FF>,
-    pub up_proj: GpuLinear<D, FF>,
+    pub gate_up_proj: GpuGroupedLinear<D, 2, FF>,
     pub down_proj: GpuLinear<FF, D>,
     pub final_norm: GpuRmsNorm<D>,
     pub lm_head: GpuLinear<D, VOCAB>,
@@ -419,13 +491,10 @@ pub struct GpuLlamaAdamW<const VOCAB: usize, const D: usize, const FF: usize> {
     step: u64,
     pub embedding: GpuAdamWMoments<Rank2<VOCAB, D>>,
     pub attention_norm: GpuAdamWMoments<Rank1<D>>,
-    pub q_proj: GpuAdamWMoments<Rank2<D, D>>,
-    pub k_proj: GpuAdamWMoments<Rank2<D, D>>,
-    pub v_proj: GpuAdamWMoments<Rank2<D, D>>,
+    pub qkv_proj: GpuAdamWMoments<Rank3<D, 3, D>>,
     pub o_proj: GpuAdamWMoments<Rank2<D, D>>,
     pub ffn_norm: GpuAdamWMoments<Rank1<D>>,
-    pub gate_proj: GpuAdamWMoments<Rank2<D, FF>>,
-    pub up_proj: GpuAdamWMoments<Rank2<D, FF>>,
+    pub gate_up_proj: GpuAdamWMoments<Rank3<D, 2, FF>>,
     pub down_proj: GpuAdamWMoments<Rank2<FF, D>>,
     pub final_norm: GpuAdamWMoments<Rank1<D>>,
     pub lm_head: GpuAdamWMoments<Rank2<D, VOCAB>>,
@@ -439,13 +508,10 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> GpuLlamaAdamW<VOCAB, D
             step: 0,
             embedding: GpuAdamWMoments::zeros(stream)?,
             attention_norm: GpuAdamWMoments::zeros(stream)?,
-            q_proj: GpuAdamWMoments::zeros(stream)?,
-            k_proj: GpuAdamWMoments::zeros(stream)?,
-            v_proj: GpuAdamWMoments::zeros(stream)?,
+            qkv_proj: GpuAdamWMoments::zeros(stream)?,
             o_proj: GpuAdamWMoments::zeros(stream)?,
             ffn_norm: GpuAdamWMoments::zeros(stream)?,
-            gate_proj: GpuAdamWMoments::zeros(stream)?,
-            up_proj: GpuAdamWMoments::zeros(stream)?,
+            gate_up_proj: GpuAdamWMoments::zeros(stream)?,
             down_proj: GpuAdamWMoments::zeros(stream)?,
             final_norm: GpuAdamWMoments::zeros(stream)?,
             lm_head: GpuAdamWMoments::zeros(stream)?,
@@ -516,13 +582,10 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> GpuLlamaAdamW<VOCAB, D
 
         update!(embedding, self.config.weight_decay);
         update!(attention_norm, 0.0);
-        update!(q_proj, self.config.weight_decay);
-        update!(k_proj, self.config.weight_decay);
-        update!(v_proj, self.config.weight_decay);
+        update!(qkv_proj, self.config.weight_decay);
         update!(o_proj, self.config.weight_decay);
         update!(ffn_norm, 0.0);
-        update!(gate_proj, self.config.weight_decay);
-        update!(up_proj, self.config.weight_decay);
+        update!(gate_up_proj, self.config.weight_decay);
         update!(down_proj, self.config.weight_decay);
         update!(final_norm, 0.0);
         update!(lm_head, self.config.weight_decay);
@@ -583,6 +646,7 @@ pub struct GpuLlamaWorkspace<
     next_staging: usize,
     attention_input: GpuTensor<f32, Rank2<N, D>>,
     attention_normalized: GpuTensor<f32, Rank2<N, D>>,
+    qkv: GpuTensor<f32, Rank3<N, 3, D>>,
     q: GpuTensor<f32, Rank2<N, D>>,
     k: GpuTensor<f32, Rank2<N, D>>,
     v: GpuTensor<f32, Rank2<N, D>>,
@@ -590,6 +654,7 @@ pub struct GpuLlamaWorkspace<
     attended: GpuTensor<f32, Rank2<N, D>>,
     ffn_input: GpuTensor<f32, Rank2<N, D>>,
     ffn_normalized: GpuTensor<f32, Rank2<N, D>>,
+    gate_up: GpuTensor<f32, Rank3<N, 2, FF>>,
     gate: GpuTensor<f32, Rank2<N, FF>>,
     up: GpuTensor<f32, Rank2<N, FF>>,
     activated: GpuTensor<f32, Rank2<N, FF>>,
@@ -627,6 +692,7 @@ impl<
             next_staging: 0,
             attention_input: GpuTensor::zeros(stream)?,
             attention_normalized: GpuTensor::zeros(stream)?,
+            qkv: GpuTensor::zeros(stream)?,
             q: GpuTensor::zeros(stream)?,
             k: GpuTensor::zeros(stream)?,
             v: GpuTensor::zeros(stream)?,
@@ -634,6 +700,7 @@ impl<
             attended: GpuTensor::zeros(stream)?,
             ffn_input: GpuTensor::zeros(stream)?,
             ffn_normalized: GpuTensor::zeros(stream)?,
+            gate_up: GpuTensor::zeros(stream)?,
             gate: GpuTensor::zeros(stream)?,
             up: GpuTensor::zeros(stream)?,
             activated: GpuTensor::zeros(stream)?,
@@ -715,13 +782,13 @@ impl<
         Ok(Self {
             embedding: GpuEmbedding::from_cpu(stream, &model.embedding)?,
             attention_norm: GpuRmsNorm::from_cpu(stream, &model.attention_norm)?,
-            q_proj: GpuLinear::from_cpu(stream, &model.q_proj)?,
-            k_proj: GpuLinear::from_cpu(stream, &model.k_proj)?,
-            v_proj: GpuLinear::from_cpu(stream, &model.v_proj)?,
+            qkv_proj: GpuGroupedLinear::from_cpu(
+                stream,
+                [&model.q_proj, &model.k_proj, &model.v_proj],
+            )?,
             o_proj: GpuLinear::from_cpu(stream, &model.o_proj)?,
             ffn_norm: GpuRmsNorm::from_cpu(stream, &model.ffn_norm)?,
-            gate_proj: GpuLinear::from_cpu(stream, &model.gate_proj)?,
-            up_proj: GpuLinear::from_cpu(stream, &model.up_proj)?,
+            gate_up_proj: GpuGroupedLinear::from_cpu(stream, [&model.gate_proj, &model.up_proj])?,
             down_proj: GpuLinear::from_cpu(stream, &model.down_proj)?,
             final_norm: GpuRmsNorm::from_cpu(stream, &model.final_norm)?,
             lm_head: GpuLinear::from_cpu(stream, &model.lm_head)?,
@@ -735,6 +802,7 @@ impl<
         workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
@@ -744,6 +812,7 @@ impl<
             workspace,
             stream,
             tensor,
+            gemm,
             llama,
             &mut profiler,
         )
@@ -756,11 +825,12 @@ impl<
         workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
         self.forward_profiled_with_probabilities(
-            tokens, targets, workspace, None, stream, tensor, llama, profiler,
+            tokens, targets, workspace, None, stream, tensor, gemm, llama, profiler,
         )
     }
 
@@ -773,6 +843,7 @@ impl<
         classifier: &mut NaiveClassifierWorkspace<N, VOCAB>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
@@ -783,6 +854,7 @@ impl<
             Some(&mut classifier.probabilities),
             stream,
             tensor,
+            gemm,
             llama,
             profiler,
         )
@@ -796,6 +868,7 @@ impl<
         naive_probabilities: Option<&mut GpuTensor<f32, Rank2<N, VOCAB>>>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
@@ -816,30 +889,25 @@ impl<
             profiler,
             "forward.attention_norm",
         )?;
-        self.q_proj.forward_into(
+        self.qkv_proj.forward_into(
             &workspace.attention_normalized,
-            &mut workspace.q,
+            &mut workspace.qkv,
             stream,
-            tensor,
+            gemm,
             profiler,
-            "forward.q_proj.gemm",
+            "forward.qkv_proj.gemm",
         )?;
-        self.k_proj.forward_into(
-            &workspace.attention_normalized,
-            &mut workspace.k,
-            stream,
-            tensor,
-            profiler,
-            "forward.k_proj.gemm",
-        )?;
-        self.v_proj.forward_into(
-            &workspace.attention_normalized,
-            &mut workspace.v,
-            stream,
-            tensor,
-            profiler,
-            "forward.v_proj.gemm",
-        )?;
+        profiler.measure(stream, "forward.qkv_proj.split", || {
+            llama.split_group3(
+                stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                workspace.qkv.as_device_buffer(),
+                D as u32,
+                workspace.q.as_device_buffer_mut(),
+                workspace.k.as_device_buffer_mut(),
+                workspace.v.as_device_buffer_mut(),
+            )
+        })?;
         rope_into::<N, T, D, H, HD, P>(
             &workspace.q,
             &mut workspace.d_model_0,
@@ -874,7 +942,7 @@ impl<
             &workspace.attended,
             &mut workspace.projection_output,
             stream,
-            tensor,
+            gemm,
             profiler,
             "forward.o_proj.gemm",
         )?;
@@ -896,22 +964,24 @@ impl<
             profiler,
             "forward.ffn_norm",
         )?;
-        self.gate_proj.forward_into(
+        self.gate_up_proj.forward_into(
             &workspace.ffn_normalized,
-            &mut workspace.gate,
+            &mut workspace.gate_up,
             stream,
-            tensor,
+            gemm,
             profiler,
-            "forward.gate_proj.gemm",
+            "forward.gate_up_proj.gemm",
         )?;
-        self.up_proj.forward_into(
-            &workspace.ffn_normalized,
-            &mut workspace.up,
-            stream,
-            tensor,
-            profiler,
-            "forward.up_proj.gemm",
-        )?;
+        profiler.measure(stream, "forward.gate_up_proj.split", || {
+            llama.split_group2(
+                stream,
+                LaunchConfig::for_num_elems((N * FF) as u32),
+                workspace.gate_up.as_device_buffer(),
+                FF as u32,
+                workspace.gate.as_device_buffer_mut(),
+                workspace.up.as_device_buffer_mut(),
+            )
+        })?;
         swiglu_into(
             &workspace.gate,
             &workspace.up,
@@ -925,7 +995,7 @@ impl<
             &workspace.activated,
             &mut workspace.projection_output,
             stream,
-            tensor,
+            gemm,
             profiler,
             "forward.down_proj.gemm",
         )?;
@@ -951,7 +1021,7 @@ impl<
             &workspace.final_normalized,
             &mut workspace.logits,
             stream,
-            tensor,
+            gemm,
             profiler,
             "forward.lm_head.gemm",
         )?;
@@ -988,10 +1058,11 @@ impl<
         workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
-        self.backward_profiled(workspace, stream, tensor, llama, &mut profiler)
+        self.backward_profiled(workspace, stream, tensor, gemm, llama, &mut profiler)
     }
 
     pub fn backward_profiled<P: KernelProfiler>(
@@ -999,10 +1070,13 @@ impl<
         workspace: &mut GpuLlamaWorkspace<N, T, VOCAB, D, H, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        self.backward_profiled_with_probabilities(workspace, None, stream, tensor, llama, profiler)
+        self.backward_profiled_with_probabilities(
+            workspace, None, stream, tensor, gemm, llama, profiler,
+        )
     }
 
     /// Retained full-model baseline for same-process profiling and parity.
@@ -1012,6 +1086,7 @@ impl<
         classifier: &NaiveClassifierWorkspace<N, VOCAB>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
@@ -1020,6 +1095,7 @@ impl<
             Some(&classifier.probabilities),
             stream,
             tensor,
+            gemm,
             llama,
             profiler,
         )
@@ -1031,6 +1107,7 @@ impl<
         naive_probabilities: Option<&GpuTensor<f32, Rank2<N, VOCAB>>>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
         llama: &llama_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
@@ -1057,7 +1134,7 @@ impl<
             &workspace.logits,
             &mut workspace.d_model_0,
             stream,
-            tensor,
+            gemm,
             profiler,
             [
                 "backward.lm_head.weight_gemm",
@@ -1079,7 +1156,7 @@ impl<
             &workspace.d_model_1,
             &mut workspace.d_ff_0,
             stream,
-            tensor,
+            gemm,
             profiler,
             [
                 "backward.down_proj.weight_gemm",
@@ -1096,38 +1173,27 @@ impl<
             llama,
             profiler,
         )?;
-        self.gate_proj.backward_into(
+        profiler.measure(stream, "backward.gate_up_proj.join", || unsafe {
+            llama.join_group2(
+                stream,
+                LaunchConfig::for_num_elems((N * FF) as u32),
+                workspace.d_ff_1.as_device_buffer(),
+                workspace.d_ff_2.as_device_buffer(),
+                FF as u32,
+                workspace.gate_up.as_device_buffer_mut(),
+            )
+        })?;
+        self.gate_up_proj.backward_into(
             &workspace.ffn_normalized,
-            &workspace.d_ff_1,
-            &mut workspace.d_model_0,
-            stream,
-            tensor,
-            profiler,
-            [
-                "backward.gate_proj.weight_gemm",
-                "backward.gate_proj.input_gemm",
-            ],
-        )?;
-        self.up_proj.backward_into(
-            &workspace.ffn_normalized,
-            &workspace.d_ff_2,
-            &mut workspace.d_model_2,
-            stream,
-            tensor,
-            profiler,
-            [
-                "backward.up_proj.weight_gemm",
-                "backward.up_proj.input_gemm",
-            ],
-        )?;
-        add_into(
-            &workspace.d_model_0,
-            &workspace.d_model_2,
+            &workspace.gate_up,
             &mut workspace.d_model_3,
             stream,
-            tensor,
+            gemm,
             profiler,
-            "backward.ffn_projection_sum",
+            [
+                "backward.gate_up_proj.weight_gemm",
+                "backward.gate_up_proj.input_gemm",
+            ],
         )?;
         self.ffn_norm.backward_into(
             &workspace.ffn_input,
@@ -1153,7 +1219,7 @@ impl<
             &workspace.d_model_2,
             &mut workspace.d_model_0,
             stream,
-            tensor,
+            gemm,
             profiler,
             ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
         )?;
@@ -1188,50 +1254,28 @@ impl<
             profiler,
             "backward.k_rope",
         )?;
-        self.q_proj.backward_into(
+        profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
+            llama.join_group3(
+                stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                workspace.d_model_0.as_device_buffer(),
+                workspace.d_model_1.as_device_buffer(),
+                workspace.d_model_4.as_device_buffer(),
+                D as u32,
+                workspace.qkv.as_device_buffer_mut(),
+            )
+        })?;
+        self.qkv_proj.backward_into(
             &workspace.attention_normalized,
-            &workspace.d_model_0,
+            &workspace.qkv,
             &mut workspace.d_model_3,
             stream,
-            tensor,
+            gemm,
             profiler,
-            ["backward.q_proj.weight_gemm", "backward.q_proj.input_gemm"],
-        )?;
-        self.k_proj.backward_into(
-            &workspace.attention_normalized,
-            &workspace.d_model_1,
-            &mut workspace.d_model_0,
-            stream,
-            tensor,
-            profiler,
-            ["backward.k_proj.weight_gemm", "backward.k_proj.input_gemm"],
-        )?;
-        self.v_proj.backward_into(
-            &workspace.attention_normalized,
-            &workspace.d_model_4,
-            &mut workspace.d_model_1,
-            stream,
-            tensor,
-            profiler,
-            ["backward.v_proj.weight_gemm", "backward.v_proj.input_gemm"],
-        )?;
-        add_into(
-            &workspace.d_model_3,
-            &workspace.d_model_0,
-            &mut workspace.d_model_4,
-            stream,
-            tensor,
-            profiler,
-            "backward.qk_projection_sum",
-        )?;
-        add_into(
-            &workspace.d_model_4,
-            &workspace.d_model_1,
-            &mut workspace.d_model_3,
-            stream,
-            tensor,
-            profiler,
-            "backward.qkv_projection_sum",
+            [
+                "backward.qkv_proj.weight_gemm",
+                "backward.qkv_proj.input_gemm",
+            ],
         )?;
         self.attention_norm.backward_into(
             &workspace.attention_input,
@@ -1292,13 +1336,10 @@ impl<
         }
         zero!(embedding);
         zero!(attention_norm);
-        zero!(q_proj);
-        zero!(k_proj);
-        zero!(v_proj);
+        zero!(qkv_proj);
         zero!(o_proj);
         zero!(ffn_norm);
-        zero!(gate_proj);
-        zero!(up_proj);
+        zero!(gate_up_proj);
         zero!(down_proj);
         zero!(final_norm);
         zero!(lm_head);

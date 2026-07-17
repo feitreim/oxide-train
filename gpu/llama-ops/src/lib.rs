@@ -144,6 +144,100 @@ pub mod kernels {
     }
 
     #[kernel]
+    pub fn split_group2(
+        input: &[f32],
+        width: u32,
+        mut first: DisjointSlice<f32>,
+        mut second: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let width = width as usize;
+        let row = i / width;
+        let column = i % width;
+        let base = row * 2 * width + column;
+        if let Some(slot) = first.get_mut(thread::index_1d()) {
+            *slot = input[base];
+        }
+        if let Some(slot) = second.get_mut(thread::index_1d()) {
+            *slot = input[base + width];
+        }
+    }
+
+    #[kernel]
+    pub unsafe fn join_group2(
+        first: &[f32],
+        second: &[f32],
+        width: u32,
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        // Launches round up to whole blocks; excess threads must not write.
+        if 2 * i >= output.len() {
+            return;
+        }
+        let width = width as usize;
+        let row = i / width;
+        let column = i % width;
+        let base = row * 2 * width + column;
+        unsafe {
+            *output.get_unchecked_mut(base) = first[i];
+            *output.get_unchecked_mut(base + width) = second[i];
+        }
+    }
+
+    #[kernel]
+    pub fn split_group3(
+        input: &[f32],
+        width: u32,
+        mut first: DisjointSlice<f32>,
+        mut second: DisjointSlice<f32>,
+        mut third: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let width = width as usize;
+        let row = i / width;
+        let column = i % width;
+        let base = row * 3 * width + column;
+        if let Some(slot) = first.get_mut(thread::index_1d()) {
+            *slot = input[base];
+        }
+        if let Some(slot) = second.get_mut(thread::index_1d()) {
+            *slot = input[base + width];
+        }
+        if let Some(slot) = third.get_mut(thread::index_1d()) {
+            *slot = input[base + 2 * width];
+        }
+    }
+
+    #[kernel]
+    pub unsafe fn join_group3(
+        first: &[f32],
+        second: &[f32],
+        third: &[f32],
+        width: u32,
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        // Launches round up to whole blocks; excess threads must not write.
+        if 3 * i >= output.len() {
+            return;
+        }
+        let width = width as usize;
+        let row = i / width;
+        let column = i % width;
+        let base = row * 3 * width + column;
+        unsafe {
+            *output.get_unchecked_mut(base) = first[i];
+            *output.get_unchecked_mut(base + width) = second[i];
+            *output.get_unchecked_mut(base + 2 * width) = third[i];
+        }
+    }
+
+    #[kernel]
     pub fn embedding_forward(weight: &[f32], tokens: &[u32], dim: u32, mut y: DisjointSlice<f32>) {
         let index = thread::index_1d();
         let i = index.get();
