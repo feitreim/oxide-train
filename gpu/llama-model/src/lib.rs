@@ -467,23 +467,46 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> GpuLlamaAdamW<VOCAB, D
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
+        let mut profiler = NoopProfiler;
+        self.update_profiled(model, stream, kernels, &mut profiler)
+    }
+
+    pub fn update_profiled<
+        const N: usize,
+        const T: usize,
+        const H: usize,
+        const HD: usize,
+        P: KernelProfiler,
+    >(
+        &mut self,
+        model: &mut GpuLlama<N, T, VOCAB, D, H, HD, FF>,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
         self.step = self.step.checked_add(1).expect("AdamW step overflow");
         let (first_correction, second_correction) = self.config.bias_correction(self.step);
 
         macro_rules! update {
             ($field:ident, $weight_decay:expr) => {
-                model.$field.w.adamw_step(
-                    &model.$field.dw,
-                    &mut self.$field,
-                    self.config.learning_rate,
-                    self.config.beta1,
-                    self.config.beta2,
-                    self.config.epsilon,
-                    $weight_decay,
-                    first_correction,
-                    second_correction,
+                profiler.measure(
                     stream,
-                    kernels,
+                    concat!("optimizer.", stringify!($field), ".adamw"),
+                    || {
+                        model.$field.w.adamw_step(
+                            &model.$field.dw,
+                            &mut self.$field,
+                            self.config.learning_rate,
+                            self.config.beta1,
+                            self.config.beta2,
+                            self.config.epsilon,
+                            $weight_decay,
+                            first_correction,
+                            second_correction,
+                            stream,
+                            kernels,
+                        )
+                    },
                 )?;
             };
         }

@@ -177,6 +177,29 @@ the thing it checks.
   modal_app.py. GEMM work starts from cuda-oxide's `gemm_sol_final`
   (Blackwell SoL example) rather than from scratch.
 
+### 10.1 Full-step profiler usage
+
+- `./run.sh llama-model profile` is the canonical hotspot report. It requires
+  no shard and runs a fixed static configuration representative of the initial
+  model scale: `B=1`, `T=64`, `VOCAB=50,257`, `D=1536`, `H=24`, `HD=64`, and
+  `FF=4096` (182,705,664 parameters).
+- The binary performs two untimed `zero_grad + forward + backward + AdamW`
+  warmup steps, synchronizes, then records one complete step with CUDA events.
+  Every explicit kernel launch is named by phase (`forward.*`, `backward.*`,
+  `optimizer.*`). The normal training path uses `NoopProfiler`, so collecting
+  events is opt-in.
+- The full-step event interval includes gradient zeroing, allocations, and
+  input H2D copies. Work not enclosed by a named kernel span is reported as
+  `unattributed`; it must not be silently dropped when quoting step time.
+  Dataset mmap/batching, checkpoint I/O, and optional loss D2H logging are
+  outside the compute-step scope.
+- A standalone profile run is suitable for hotspot discovery and baseline
+  recording. A 7.x performance claim must execute the retained baseline path
+  and candidate path back-to-back in the same profiling process/container,
+  after equivalent warmups, and report both full-step totals plus affected
+  kernel rows. Comparing separate `run.sh` invocations is invalid because
+  Modal may assign different hardware or clock states.
+
 ## 11. Kernel fusion
 
 - **Fusion is explicit substitution, never a compiler.** A fused kernel is a
@@ -245,7 +268,7 @@ Each gated on tests; correctness before speed at every step.
    deterministic checkpoint/resume, and a 100-step real-Wikipedia run
 7. Perf — parallel tracks, each owning disjoint crates so PRs don't collide;
    integration is the one serialized step:
-   - **7a step profiler** (bench-util + train): per-kernel CUDA-event
+   - ✅ **7a step profiler** (bench-util + train): per-kernel CUDA-event
      breakdown of one full training step. Lands first — it gates every other
      7.x perf claim (see §11 measurement gate).
    - ✅ **7b GEMM ladder** (`gpu/gemm`, starting from cuda-oxide
