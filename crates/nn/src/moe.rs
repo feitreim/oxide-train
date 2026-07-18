@@ -180,7 +180,6 @@ impl<
 
     /// Deterministic scaled initialization. Each parameter gets its own seed.
     pub fn initialized(seed: u64, aux_coefficient: f32) -> Self {
-        Self::validate(aux_coefficient);
         let router_scale = (D as f32).sqrt().recip();
         Self::new(
             Linear::new(CpuTensor::uniform(seed).scale(router_scale)),
@@ -284,7 +283,6 @@ impl<
     type Ctx = MoeFfnCtx<N, D, FF, E, K, C>;
 
     fn forward(&self, x: Self::Input) -> (Self::Output, Self::Ctx) {
-        Self::validate(self.aux_coefficient);
         let (logits, router) = self.router.forward(x.clone());
         let probabilities = logits.softmax_rows();
         let (routing, mut expert_inputs) = Self::route(&probabilities);
@@ -354,7 +352,6 @@ impl<
     }
 
     fn backward(&mut self, ctx: Self::Ctx, dy: Self::Output) -> Self::Input {
-        Self::validate(self.aux_coefficient);
         let mut expert_output_gradients: [CpuTensor<f32, Rank2<C, D>>; E] =
             std::array::from_fn(|_| CpuTensor::zeros());
         let mut gate_gradients = vec![0.0f32; N * K];
