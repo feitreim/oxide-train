@@ -1,14 +1,14 @@
 //! CPU simulation of the GPU bf16 lm-head pipeline on the tiny overfit batch.
 //!
-//! Quantization points mirror gpu/llama-model exactly: head input, compute
+//! Quantization points mirror gpu/model exactly: head input, compute
 //! weights (rounded from an fp32 master), stored logits, dlogits, dw, and dx
 //! are all bf16-rounded; every accumulation is fp32; the master update sees
 //! the bf16-rounded gradients.
 
 use nn::{
-    CausalAttention, Llama, Module, Rope, SoftmaxCrossEntropy, SoftmaxCrossEntropyInput, SwiGlu,
+    CausalAttention, Dense, Module, Rope, SoftmaxCrossEntropy, SoftmaxCrossEntropyInput, SwiGlu,
 };
-use optim::{AdamWConfig, AdamWMoments, LlamaAdamW, adamw_step};
+use optim::{AdamWConfig, AdamWMoments, DenseAdamW, adamw_step};
 use tensor_core::{Rank2, Shape};
 use tensor_cpu::CpuTensor;
 
@@ -27,13 +27,13 @@ fn quantize<S: Shape>(tensor: &CpuTensor<f32, S>) -> CpuTensor<f32, S> {
 fn main() {
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
-    let mut model = Llama::<N, T, VOCAB, D, H, HD, FF>::new(100);
+    let mut model = Dense::<N, T, VOCAB, D, H, HD, FF>::new(100);
     let config = AdamWConfig {
         learning_rate: 0.03,
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
-    let mut optimizer = LlamaAdamW::new(config);
+    let mut optimizer = DenseAdamW::new(config);
     let mut master: CpuTensor<f32, Rank2<D, VOCAB>> = model.lm_head.w.clone();
     let mut master_moments = AdamWMoments::<Rank2<D, VOCAB>>::zeros();
     let mut step_count = 0u64;
@@ -41,7 +41,7 @@ fn main() {
     for step in 0..=420 {
         model.zero_grad();
 
-        // Forward, mirroring Llama::forward with a bf16 head.
+        // Forward, mirroring Dense::forward with a bf16 head.
         let (x, embedding_ctx) = model.embedding.forward(tokens);
         let attention_residual = x.clone();
         let (normalized, attention_norm_ctx) = model.attention_norm.forward(x);
@@ -85,7 +85,7 @@ fn main() {
             );
         }
 
-        // Backward, mirroring Llama::backward with the bf16 head.
+        // Backward, mirroring Dense::backward with the bf16 head.
         let mut loss_module = SoftmaxCrossEntropy::<N, VOCAB>;
         let dlogits = loss_module
             .backward(loss_ctx, CpuTensor::from_slice(&[1.0]))

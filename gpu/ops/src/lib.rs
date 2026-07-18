@@ -1,4 +1,4 @@
-//! Reference CUDA kernels for the first Llama modules.
+//! Reference CUDA kernels for the first Dense modules.
 //!
 //! These favor direct, auditable implementations over performance. They are
 //! the GPU correctness baseline that later optimized kernels must match.

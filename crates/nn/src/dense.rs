@@ -1,4 +1,4 @@
-//! A single-block Llama-style CPU reference model.
+//! A single-block Dense-style CPU reference model.
 //!
 //! This deliberately favors an explicit forward/backward over abstraction:
 //! every residual branch and saved activation is visible, making this the
@@ -17,7 +17,7 @@ use crate::{
 };
 
 /// One pre-norm decoder block with untied token embedding and language head.
-pub struct Llama<
+pub struct Dense<
     const N: usize,
     const T: usize,
     const VOCAB: usize,
@@ -40,7 +40,7 @@ pub struct Llama<
     pub lm_head: Linear<N, D, VOCAB>,
 }
 
-pub struct LlamaCtx<
+pub struct DenseCtx<
     const N: usize,
     const T: usize,
     const VOCAB: usize,
@@ -81,7 +81,7 @@ impl<
     const H: usize,
     const HD: usize,
     const FF: usize,
-> Llama<N, T, VOCAB, D, H, HD, FF>
+> Dense<N, T, VOCAB, D, H, HD, FF>
 {
     /// Deterministic scaled initialization suitable for small CPU tests.
     pub fn new(seed: u64) -> Self {
@@ -123,7 +123,7 @@ impl<
         &self,
         tokens: TokenIds<N>,
         targets: TokenIds<N>,
-    ) -> (CpuTensor<f32, Rank1<1>>, LlamaCtx<N, T, VOCAB, D, H, FF>) {
+    ) -> (CpuTensor<f32, Rank1<1>>, DenseCtx<N, T, VOCAB, D, H, FF>) {
         let (x, embedding) = self.embedding.forward(tokens);
 
         let attention_residual = x.clone();
@@ -152,7 +152,7 @@ impl<
 
         (
             loss,
-            LlamaCtx {
+            DenseCtx {
                 embedding,
                 attention_norm,
                 q_proj,
@@ -172,7 +172,7 @@ impl<
         )
     }
 
-    pub fn backward(&mut self, ctx: LlamaCtx<N, T, VOCAB, D, H, FF>) {
+    pub fn backward(&mut self, ctx: DenseCtx<N, T, VOCAB, D, H, FF>) {
         let mut loss = SoftmaxCrossEntropy::<N, VOCAB>;
         let dloss = CpuTensor::from_slice(&[1.0]);
         let dlogits = loss.backward(ctx.loss, dloss).logits;

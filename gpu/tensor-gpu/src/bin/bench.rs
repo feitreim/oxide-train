@@ -9,7 +9,7 @@ use tensor_cpu::CpuTensor;
 
 // `cargo oxide` embeds the CUDA artifact into the selected binary target, so
 // this binary includes the canonical kernel source as a module (the same
-// pattern as llama-ops) instead of importing the library crate.
+// pattern as ops) instead of importing the library crate.
 #[path = "../lib.rs"]
 #[allow(dead_code)]
 mod device;

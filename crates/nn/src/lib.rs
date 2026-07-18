@@ -14,25 +14,25 @@
 
 pub mod attention;
 pub mod cross_entropy;
+pub mod dense;
 pub mod embedding;
 pub mod gradcheck;
 pub mod linear;
-pub mod llama;
 pub mod module;
 pub mod moe;
-pub mod moe_llama;
+pub mod moe_dense;
 pub mod rms_norm;
 pub mod rope;
 pub mod swiglu;
 
 pub use attention::{AttentionInput, CausalAttention};
 pub use cross_entropy::{SoftmaxCrossEntropy, SoftmaxCrossEntropyInput};
+pub use dense::{Dense, DenseCtx};
 pub use embedding::{Embedding, TokenIds};
 pub use linear::Linear;
-pub use llama::{Llama, LlamaCtx};
 pub use module::{Chain, Module};
 pub use moe::{ExpertFfn, ExpertFfnCtx, MoeFfn, MoeFfnCtx, MoeRouting};
-pub use moe_llama::{MoeLlama, MoeLlamaCtx};
+pub use moe_dense::{MoeDense, MoeDenseCtx};
 pub use rms_norm::RmsNorm;
 pub use rope::Rope;
 pub use swiglu::SwiGlu;

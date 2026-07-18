@@ -1,4 +1,4 @@
-//! Bias-free linear layer (Llama-style): `y = x . W`.
+//! Bias-free linear layer (Dense-style): `y = x . W`.
 //!
 //! The first leaf module, and the template for all the others: params + grad
 //! buffers live in the module, `forward` moves its input into `Ctx`, and

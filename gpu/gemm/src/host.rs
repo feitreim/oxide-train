@@ -2,7 +2,7 @@
 //! launchers for the bf16 GEMM kernels.
 //!
 //! This file deliberately contains no `#[cuda_module]`. Binaries whose own
-//! device artifact must stay free of tcgen05 lowerings (gpu/llama-model: its
+//! device artifact must stay free of tcgen05 lowerings (gpu/model: its
 //! libdevice math forces the artifact through libNVVM, which rejects tcgen05
 //! constructs) include only this module and load the kernels from a
 //! `gemm.ptx` built separately by this crate, which takes the pure-PTX path.
@@ -246,7 +246,7 @@ impl Tcgen05Gemm {
         let module = ctx.load_module_from_file(path).map_err(|error| {
             format!(
                 "loading {path} failed ({error:?}); build gpu/gemm first so its \
-                 pure-PTX artifact exists (run.sh does this for llama-model)"
+                 pure-PTX artifact exists (run.sh does this for model)"
             )
         })?;
         Ok(Self {

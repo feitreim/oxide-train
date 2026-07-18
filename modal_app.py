@@ -151,9 +151,9 @@ def _proj(kernel: str) -> str:
 
 
 def _prepare_gemm_ptx(root: str) -> None:
-    """Prebuild gpu/gemm and stage its pure-PTX artifact for llama-model.
+    """Prebuild gpu/gemm and stage its pure-PTX artifact for model.
 
-    llama-model's own device artifact is NVVM IR (its kernels use libdevice
+    model's own device artifact is NVVM IR (its kernels use libdevice
     math), which cannot also carry tcgen05 lowerings; the model loads the
     tcgen05 GEMMs from this separately built gemm.ptx instead.
     """
@@ -161,7 +161,7 @@ def _prepare_gemm_ptx(root: str) -> None:
 
     gemm = f"{root}/gpu/gemm"
     _run(["cargo", "oxide", "build", "gemm"], cwd=gemm)
-    shutil.copy(f"{gemm}/gemm.ptx", f"{root}/gpu/llama-model/gemm.ptx")
+    shutil.copy(f"{gemm}/gemm.ptx", f"{root}/gpu/model/gemm.ptx")
 
 
 @app.function(
@@ -183,7 +183,7 @@ def run_kernel(
 ) -> None:
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     proj = _proj(kernel)
-    if kernel == "llama-model":
+    if kernel == "model":
         _prepare_gemm_ptx(PROJECT_DIR)
     cmd = ["cargo", "oxide", "run", kernel]
     if bin:
@@ -221,7 +221,7 @@ def compare_profile(kernel: str, baseline_ref: str) -> None:
 
     baseline = f"{baseline_root}/gpu/{kernel}"
     candidate = _proj(kernel)
-    if kernel == "llama-model":
+    if kernel == "model":
         # Baselines predating the staged tcgen05 PTX simply ignore the file.
         _prepare_gemm_ptx(baseline_root)
         _prepare_gemm_ptx(PROJECT_DIR)

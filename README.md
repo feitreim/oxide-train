@@ -20,7 +20,7 @@ B200 (Blackwell), with GPU kernels written in Rust via
   crate under `gpu/` with a correctness binary and a CUDA-event benchmark;
   tuning constants sweep via Modal *outside* of training.
 
-Plan: Llama-style model (RMSNorm, RoPE, SwiGLU, untied embeddings) at
+Plan: Dense-style model (RMSNorm, RoPE, SwiGLU, untied embeddings) at
 ~150-350M params, fp32 first then bf16 compute + fp32 master weights, AdamW
 then Muon, trained on English Wikipedia tokenized with tiktoken `r50k_base`
 (ids fit `u16`). MoE is next (SPEC milestone 8).
@@ -37,19 +37,19 @@ crates/                 CPU-side cargo workspace -- builds/tests on any machine
   nn/                   Module trait, Chain combinator, layers, gradcheck
   data/                 tiktoken r50k tokenizer, u16 token shards, mmap loader,
                         [B,T] batcher, prepare-wiki preprocessing binary
-  optim/                AdamW + Muon CPU references, typed Llama state/visitor
+  optim/                AdamW + Muon CPU references, typed Dense state/visitor
 gpu/                    standalone cuda-oxide crates -- built on Modal GPUs
   bench-util/           CUDA-event timing; re-exports the shared RNG
   vecadd/               toolchain smoke test (lib.rs kernel, main.rs check,
                         bin/bench.rs benchmark) -- the template for new kernels
-  llama-ops/            auditable fp32 RMSNorm, SwiGLU, embedding, and fused
+  ops/                  auditable fp32 RMSNorm, SwiGLU, embedding, and fused
                         classifier parity kernels (f32 + packed-bf16 variants)
   gemm/                 register-tiled fp32 + Blackwell tcgen05 bf16 GEMMs
   flash-attn/           fused fp32 causal attention forward/backward
   tensor-gpu/           GpuTensor, elementwise/reduction/GEMM, fused AdamW,
                         Muon momentum/apply kernels, packed-bf16
                         converts/transpose + master-weight AdamW
-  llama-model/          full model parity (fp32 + bf16 tcgen05 lm-head and
+  model/                full model parity (fp32 + bf16 tcgen05 lm-head and
                         block linears), Muon Newton–Schulz optimizer, tiny
                         overfit gates, shard trainer
 modal_app.py            Modal image (CUDA 13 + LLVM 21 + pinned nightly +
@@ -87,8 +87,8 @@ pip install modal && modal setup        # once
 modal run modal_app.py::doctor          # toolchain + GPU sanity check
 ./run.sh vecadd                         # correctness
 ./run.sh vecadd bench                   # throughput
-./run.sh llama-ops                      # Llama leaf-op CPU/GPU parity
-./run.sh llama-model profile            # ~183M-param full-step CUDA-event profile
+./run.sh ops                            # Dense leaf-op CPU/GPU parity
+./run.sh model profile                  # ~183M-param full-step CUDA-event profile
 SWEEP="BM=128 BN=128,BM=256 BN=64" ./run.sh gemm   # tuning sweep (one container)
 ```
 
@@ -101,7 +101,7 @@ part); later runs reuse it and only recompile the kernel. Default GPU is B200
 Run the dedicated profiler without a dataset shard:
 
 ```bash
-./run.sh llama-model profile
+./run.sh model profile
 ```
 
 The binary uses a fixed, compile-time performance configuration: `B=32`, `T=1024`,
@@ -125,7 +125,7 @@ not part of this compute-step profile. Kernel names are prefixed with
 training phase directly.
 
 Use a single run to find hotspots or record the current baseline. For a
-performance/fusion PR, run `BASELINE_REF=<git-ref> ./run.sh llama-model
+performance/fusion PR, run `BASELINE_REF=<git-ref> ./run.sh model
 profile`: it builds the pushed baseline ref and the mounted candidate in one
 container and profiles both back-to-back after equivalent warmups. Report both
 full-step times and the changed kernel rows. Two separate `./run.sh`
@@ -149,20 +149,20 @@ modal volume create rust-trainer-wiki
 modal volume put rust-trainer-wiki \
   data/wiki/wiki-val-00000.tok /wiki-val-00000.tok
 
-SHARD=/data/wiki-val-00000.tok STEPS=100 ./run.sh llama-model train
+SHARD=/data/wiki-val-00000.tok STEPS=100 ./run.sh model train
 LR=0.0003 WEIGHT_DECAY=0.1 LOG_EVERY=10 \
   SHARD=/data/wiki-val-00000.tok STEPS=1000 \
   CHECKPOINT=/data/checkpoints/wiki.ckpt CHECKPOINT_EVERY=100 \
-  ./run.sh llama-model train
+  ./run.sh model train
 
 # TRAIN_STEPS is the target global step when resuming.
 SHARD=/data/wiki-val-00000.tok STEPS=2000 \
   CHECKPOINT=/data/checkpoints/wiki.ckpt RESUME=1 \
-  ./run.sh llama-model train
+  ./run.sh model train
 ```
 
 Model and batch shapes remain compile-time constants in
-`gpu/llama-model/src/bin/train.rs`. Runtime settings are limited to the shard,
+`gpu/model/src/bin/train.rs`. Runtime settings are limited to the shard,
 step count, logging/checkpoint intervals, and AdamW scalars. Checkpoints include
 all parameters, AdamW moments/configuration, the global step, static shape
 metadata, and the next batch position; saves use atomic replacement.

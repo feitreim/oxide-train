@@ -1,11 +1,11 @@
-use nn::{Llama, MoeLlama};
+use nn::{Dense, MoeDense};
 
 #[test]
-fn llama_cpu_overfits_a_tiny_batch() {
-    type TinyLlama = Llama<4, 4, 4, 8, 2, 4, 12>;
+fn dense_cpu_overfits_a_tiny_batch() {
+    type TinyDense = Dense<4, 4, 4, 8, 2, 4, 12>;
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
-    let mut model = TinyLlama::new(100);
+    let mut model = TinyDense::new(100);
 
     let initial_loss = model.forward(tokens, targets).0.as_slice()[0];
     let mut final_loss = initial_loss;
@@ -28,11 +28,11 @@ fn llama_cpu_overfits_a_tiny_batch() {
 }
 
 #[test]
-fn moe_llama_cpu_overfits_a_tiny_batch_with_auxiliary_loss() {
-    type TinyMoeLlama = MoeLlama<4, 4, 4, 8, 2, 4, 12, 2, 1, 4>;
+fn moe_dense_cpu_overfits_a_tiny_batch_with_auxiliary_loss() {
+    type TinyMoeDense = MoeDense<4, 4, 4, 8, 2, 4, 12, 2, 1, 4>;
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
-    let mut model = TinyMoeLlama::new(100, 0.01);
+    let mut model = TinyMoeDense::new(100, 0.01);
 
     let initial_loss = model.forward(tokens, targets).0.as_slice()[0];
     let mut final_loss = initial_loss;

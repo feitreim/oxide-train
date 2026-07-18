@@ -1,9 +1,9 @@
-//! Parity checks against `llama-ops`' materialized-probability attention.
+//! Parity checks against `ops`' materialized-probability attention.
 //!
 //! Both kernel generations are checked at each shape: the per-row flash
 //! kernels and the FlashAttention-2 style tiled kernels. The shapes cover a
 //! `T` that is not a multiple of any tile size (partial query/key tiles plus
-//! the causal diagonal) and the tiny `T=4` configuration the llama-model
+//! the causal diagonal) and the tiny `T=4` configuration the model
 //! overfit gate trains at (a single mostly-padded tile).
 
 use bench_util::uniform_vec;
@@ -11,7 +11,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 
 #[path = "lib.rs"]
 mod flash;
-#[path = "../../llama-ops/src/lib.rs"]
+#[path = "../../ops/src/lib.rs"]
 mod naive;
 
 const HD: usize = 64;
@@ -127,7 +127,7 @@ fn check_shape(
     let mut actual_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut actual_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
 
-    println!("per-row flash parity against llama-ops [{b},{t},{h},{HD}]");
+    println!("per-row flash parity against ops [{b},{t},{h},{HD}]");
     flash_module.flash_attention_forward(
         stream,
         per_row_config(n, h),
@@ -192,7 +192,7 @@ fn check_shape(
         1e-4,
     );
 
-    println!("tiled flash parity against llama-ops [{b},{t},{h},{HD}]");
+    println!("tiled flash parity against ops [{b},{t},{h},{HD}]");
     let mut tiled_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut tiled_logsumexp = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
     let mut softmax_dot = DeviceBuffer::<f32>::zeroed(stream, n * h)?;

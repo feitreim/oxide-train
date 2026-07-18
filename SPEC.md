@@ -7,7 +7,7 @@ reflect current intent.
 
 ## 1. Goal
 
-Train a Llama-style LLM on English Wikipedia, forwards + backwards + optimizer,
+Train a Dense-style LLM on English Wikipedia, forwards + backwards + optimizer,
 on a **single NVIDIA B200** (Blackwell, sm_100a), with every GPU kernel written
 in Rust via [cuda-oxide](https://github.com/NVlabs/cuda-oxide). No PyTorch, no
 cuBLAS host libraries, no `.cu` files.
@@ -105,7 +105,7 @@ trait Module {
 
 ## 6. Model
 
-- Start: **Llama-style decoder** — RMSNorm (pre-norm), RoPE, SwiGLU FFN,
+- Start: **Dense-style decoder** — RMSNorm (pre-norm), RoPE, SwiGLU FFN,
   untied embedding/lm-head, no biases. ~150–350M params first; scale after
   the loop is proven.
 - Next (milestone 8): **MoE** (inkling-style thinking model is the eventual
@@ -195,7 +195,7 @@ the thing it checks.
 
 ### 10.1 Full-step profiler usage
 
-- `./run.sh llama-model profile` is the canonical hotspot report. It requires
+- `./run.sh model profile` is the canonical hotspot report. It requires
   no shard and runs a fixed static configuration representative of the initial
   model scale: `B=1`, `T=64`, `VOCAB=50,257`, `D=1536`, `H=24`, `HD=64`, and
   `FF=4096` (182,705,664 parameters).
@@ -213,7 +213,7 @@ the thing it checks.
   recording. A 7.x performance claim must execute the baseline and candidate
   back-to-back in the same container after equivalent warmups, and report
   both full-step totals plus affected kernel rows:
-  `BASELINE_REF=<git-ref> ./run.sh llama-model profile` builds the pushed
+  `BASELINE_REF=<git-ref> ./run.sh model profile` builds the pushed
   baseline ref and the mounted candidate in one container and profiles both.
   This replaced the in-model naive-oracle plumbing (7e5): the retained naive
   kernels stay in their crates as parity oracles, but historical step
@@ -256,23 +256,23 @@ crates/            CPU-side workspace (builds/tests anywhere, no CUDA)
   tensor-cpu/      CpuTensor + naive reference ops
   nn/              Module trait, combinators, layers, gradcheck
   data/            tokenizer, shard format, mmap loader, prepare-wiki binary
-  optim/           AdamW + Muon CPU references, typed Llama state, param
+  optim/           AdamW + Muon CPU references, typed Dense state, param
                    visitor, fp32 master weights
 gpu/               standalone cuda-oxide kernel crates (Modal-built)
   bench-util/      CUDA-event timing + shared-RNG re-export
   vecadd/          toolchain smoke test; template for new kernels
-  llama-ops/       direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
+  ops/             direct fp32 reference kernels + CPU/GPU parity for RMSNorm,
                    RoPE, causal attention, SwiGLU, embedding, and loss;
                    packed-bf16 fused classifier + block-parallel RMSNorm
   gemm/            register-tiled fp32 + Blackwell tcgen05 bf16 GEMMs,
                    packed-bf16 and fp32 store/accumulate variants; host-only
                    tcgen05 support (TMA maps, raw launchers) in src/host.rs
   flash-attn/      fused fp32 causal attention forward/backward, parity-tested
-                   against llama-ops without materialized probabilities;
+                   against ops without materialized probabilities;
                    FlashAttention-2 tiled kernels + per-row oracles
   tensor-gpu/      GpuTensor + elementwise/reduction kernels + naive/tiled
                    GEMM; packed-bf16 converts/transpose + master-weight AdamW
-  llama-model/     full GPU Llama forward/backward + CPU parity (fp32 with a
+  model/           full GPU Dense forward/backward + CPU parity (fp32 with a
                    bf16 tcgen05 lm-head), fused AdamW, tiny overfit gate,
                    TOK1 shard trainer, checkpoints
 modal_app.py       Modal image + run/bench/sweep/sanitize/baseline/ptx
@@ -301,11 +301,11 @@ Each gated on tests; correctness before speed at every step.
      `gemm_sol_final`): register-tiled fp32 → tcgen05 bf16; store +
      accumulate variants; tuned via SWEEP.
    - ✅ **7c flash attention** (`gpu/flash-attn`): fused online-softmax fp32
-     forward and recompute-softmax backward, parity-tested against llama-ops'
+     forward and recompute-softmax backward, parity-tested against ops'
      naive attention kernels without materializing the probability matrix.
    - ✅ **7d bf16 plumbing** (crates/tensor-core, tensor-cpu, optim): bf16
      `Element`, conversions, fp32 master weights — feeds 7b's tcgen05 phase.
-   - **7e integration/fusion pass** (gpu/llama-model): small serialized PRs,
+   - **7e integration/fusion pass** (gpu/model): small serialized PRs,
      each gated on a §10.1 same-process before/after at the 182.7M profile
      config. Ordered by the first real-scale profile (2026-07-16: full step
      261 ms; loss softmax 59.6%, unattributed alloc/zero-fill/copy 24.8%,
@@ -431,7 +431,7 @@ Each gated on tests; correctness before speed at every step.
        operands and the two transposes required by weight gradients.
        Non-tile-aligned correctness shapes retain the fp32 register-tiled
        oracle; the aligned tcgen05 path is gated end-to-end by a second
-       tile-aligned parity/overfit configuration in gpu/llama-model
+       tile-aligned parity/overfit configuration in gpu/model
        (128-aligned CPU parity at bf16 tolerances plus an overfit run,
        3.080031 → 0.000008). B200 same-container result vs post-7e8 main
        at B=32 T=1024: 484.21 → 152.14 ms full step (-68.6%, 3.18×); the
@@ -442,7 +442,7 @@ Each gated on tests; correctness before speed at every step.
        tail is now flash attention (57.5 ms combined, 37.8%) and the
        lm-head GEMM trio (54.2 ms, 35.6%).
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
-     ✅ GPU step (`GpuLlamaMuon`): fp32 register-GEMM Newton–Schulz with
+     ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on
      zeroth-power/optimizer parity vs the CPU reference plus tiny and
      tile-aligned Muon overfits. Train-loop/checkpoint wiring and a bf16
@@ -466,7 +466,7 @@ Each gated on tests; correctness before speed at every step.
      `learning_rate`; it rides the checkpoint header like `AdamWConfig` so
      resume can't silently change it. Only `E`/`K`/`C` are const generics —
      they determine shapes; the coefficient shapes nothing.
-   - ✅ **8b GPU routing** (gpu/llama-ops): top-k select + scatter/gather
+   - ✅ **8b GPU routing** (gpu/ops): top-k select + scatter/gather
      between token order and capacity-padded expert bins, CPU/GPU parity on
      shapes that force drops and underfull experts. The router is fp32
      end-to-end — logits GEMM, softmax, top-k, and gate weights — over
@@ -474,7 +474,7 @@ Each gated on tests; correctness before speed at every step.
      top-k boundary flips token assignment outright (the 7e7 two-logit
      tie was this failure mode in miniature), and the `[N,D]×[D,E]`
      router GEMM is too skinny for the tcgen05 tile contract anyway.
-   - ✅ **8c GPU expert compute** (gpu/llama-model): stacked fp32-master
+   - ✅ **8c GPU expert compute** (gpu/model): stacked fp32-master
      gate/up `[E,D,2FF]` and down `[E,FF,D]` weights with persistent packed-bf16
      compute copies; per-expert GEMM launches over capacity-padded bins on the
      7e9 tcgen05 fp32-store/accumulate path (`C` supplies tile alignment).
@@ -483,8 +483,8 @@ Each gated on tests; correctness before speed at every step.
      register-tiled fallback remains the non-aligned oracle; both paths are
      gated against CPU expert forward/backward, zero-row inertness, repeated
      gradient accumulation, and post-AdamW compute-copy refresh.
-   - ✅ **8d integration**: FFN swap in `GpuLlama` behind identical types
-     (dense retained as `GpuDenseLlama`), gated like 7e — full parity with
+   - ✅ **8d integration**: FFN swap in `GpuDense` behind identical types
+     (dense retained as `GpuDenseDense`), gated like 7e — full parity with
      forced drops/underfull experts on both the fp32-oracle and tcgen05
      paths, aligned MoE overfit under a scheduled aux loss, checkpoint v3
      (`E`/`K`/`C` + schedule + router/expert state), and a §10.1
@@ -507,7 +507,7 @@ Each gated on tests; correctness before speed at every step.
 | 6 | Backward accumulates grads | Micro-batch grad accumulation + shared params for free |
 | 7 | AdamW → Muon | AdamW trivial; Muon needs working GEMM; hidden/non-hidden routing is static |
 | 8 | fp32 → bf16+fp32-master | Gradcheck clarity first; tcgen05 wants bf16 |
-| 9 | Llama-style 150–350M first, MoE later | Proven architecture to validate engine; MoE = statically-shaped module w/ runtime routing |
+| 9 | Dense-style 150–350M first, MoE later | Proven architecture to validate engine; MoE = statically-shaped module w/ runtime routing |
 | 10 | tiktoken r50k_base | u16 ids halve shard size; sane embed/head fraction at this scale; solved problem via tiktoken-rs |
 | 11 | Offline tokenize → mmap u16 shards | Zero data-loading complexity in the hot loop (llm.c-style) |
 | 12 | Per-kernel crates + const sweeps on Modal | Kernels tuned/benched in isolation, outside training; sweep = same mechanism as compile-time shapes |
@@ -517,7 +517,7 @@ Each gated on tests; correctness before speed at every step.
 | 16 | Perf claims need same-container before/after | ~3× variance observed across Modal containers on identical code; sweeps already share one container for exactly this reason |
 | 17 | Optimization backlog is profile-ordered | First real-scale profile contradicted intuition (naive loss softmax 60%+ of step, tcgen05 GEMM integration nowhere near top); 7e sub-milestones follow measured step share and get re-ordered after each landing |
 | 18 | bf16 adopted head-first via padded NP/VP dims | lm-head ≈70% of the one-block model's GEMM FLOPs and the measured rock; zero-padding tokens→NP and vocab→VP keeps the tuned tcgen05 kernel's tile contract with provably inert padding (zero rows/columns never move), so no boundary-guard variants and byte-compatible checkpoints |
-| 19 | tcgen05 kernels ship as a second, pure-PTX artifact | One embedded artifact per binary, and libdevice math (`exp`/`ln`/`sqrt`) forces it through libNVVM, which rejects tcgen05 lowerings; llama-model loads `gemm.ptx` (prebuilt by gpu/gemm) through hand-written launchers in gemm/src/host.rs that mirror the generated marshalling |
+| 19 | tcgen05 kernels ship as a second, pure-PTX artifact | One embedded artifact per binary, and libdevice math (`exp`/`ln`/`sqrt`) forces it through libNVVM, which rejects tcgen05 lowerings; model loads `gemm.ptx` (prebuilt by gpu/gemm) through hand-written launchers in gemm/src/host.rs that mirror the generated marshalling |
 | 20 | Block tcgen05 keeps fp32 model tensors | Quantize operands into persistent scratch and use concrete fp32-output store/accumulate epilogues; buffers, optimizer/checkpoint layout, and the naive fp32 fallback stay fp32, though epilogue values are bf16-rounded (the drain reuses the packed-bf16 shared-memory staging, so each GEMM result carries bf16 mantissa precision after full-K fp32 accumulation — doubling SMEM_OUT for true fp32 staging wasn't warranted) |
 | 21 | MoE aux-loss coefficient is runtime config, not const | Const generics are reserved for values the compiler specializes on — `E`/`K`/`C` size buffers, bins, and launch grids; the coefficient is one scalar FMA that shapes nothing, needs a step schedule, and must be sweepable without a Modal rebuild (stable Rust also forbids f32 const generics). It flows host→kernel per step like `learning_rate` and is recorded in the checkpoint header like `AdamWConfig` |
 | 22 | MoE router is fp32 over bf16 experts | Routing is discrete: bf16 rounding near a top-k boundary doesn't perturb the output, it reassigns the token (the 7e7 bf16 two-logit tie showed how violently trajectories react to that). The router GEMM is `[N,D]×[D,E]` — skinny, off the tcgen05 tile contract, and a rounding-error share of step FLOPs — so fp32 costs nothing measurable while keeping gate weights and the aux loss in the precision gradcheck trusts |

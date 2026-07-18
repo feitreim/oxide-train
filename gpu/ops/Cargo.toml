@@ -1,8 +1,8 @@
 [package]
-name = "llama-ops"
+name = "ops"
 version = "0.1.0"
 edition = "2024"
-default-run = "llama-ops"
+default-run = "ops"
 
 [workspace]
 

@@ -5,7 +5,7 @@ use tensor_cpu::CpuTensor;
 
 use crate::Module;
 
-/// Applies Llama-style rotary position embeddings independently to every head.
+/// Applies Dense-style rotary position embeddings independently to every head.
 ///
 /// `N` is the flattened batch/sequence dimension. Rows are interpreted as
 /// contiguous sequences of length `T`; `D == H * HD` and `HD` must be even.

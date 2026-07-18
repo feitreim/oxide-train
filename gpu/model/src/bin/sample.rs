@@ -13,7 +13,7 @@ use data::TokenFile;
 
 #[path = "../lib.rs"]
 mod model;
-use model::GpuLlamaWorkspace;
+use model::GpuDenseWorkspace;
 
 const B: usize = 32;
 const T: usize = 1_024;
@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gemm = model::gemm_kernels::load(&cuda)?;
     let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&cuda, "gemm.ptx")?;
     let flash = model::flash_kernels::load(&cuda)?;
-    let llama = model::llama_kernels::load(&cuda)?;
+    let dense = model::dense_kernels::load(&cuda)?;
 
     let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>(
         &checkpoint_path,
@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "sampling checkpoint={checkpoint_path} step={} temperature={TEMPERATURE} top_k={TOP_K}",
         checkpoint.optimizer.step()
     );
-    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
+    let mut workspace = GpuDenseWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
 
     let shard = TokenFile::open(&shard_path)?;
     let mut rng = 0x5EED_5EED_5EED_5EEDu64;
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &gemm,
                 &gemm_bf16,
                 &flash,
-                &llama,
+                &dense,
             )?;
             let logits = workspace.logits_row(live - 1, &stream)?;
             window[live] = sample_top_k(&logits[..VOCAB], &mut rng);

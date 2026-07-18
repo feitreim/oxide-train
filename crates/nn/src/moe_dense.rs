@@ -1,4 +1,4 @@
-//! A single-block Llama CPU reference with [`MoeFfn`] substituted for its FFN.
+//! A single-block Dense CPU reference with [`MoeFfn`] substituted for its FFN.
 
 use tensor_core::{Rank1, Rank2, Shape};
 use tensor_cpu::CpuTensor;
@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// One pre-norm decoder block whose feed-forward branch is a mixture of experts.
-pub struct MoeLlama<
+pub struct MoeDense<
     const N: usize,
     const T: usize,
     const VOCAB: usize,
@@ -37,7 +37,7 @@ pub struct MoeLlama<
     pub lm_head: Linear<N, D, VOCAB>,
 }
 
-pub struct MoeLlamaCtx<
+pub struct MoeDenseCtx<
     const N: usize,
     const T: usize,
     const VOCAB: usize,
@@ -81,7 +81,7 @@ impl<
     const E: usize,
     const K: usize,
     const C: usize,
-> MoeLlama<N, T, VOCAB, D, H, HD, FF, E, K, C>
+> MoeDense<N, T, VOCAB, D, H, HD, FF, E, K, C>
 {
     /// Deterministic scaled initialization suitable for small CPU tests.
     pub fn new(seed: u64, aux_coefficient: f32) -> Self {
@@ -122,7 +122,7 @@ impl<
         targets: TokenIds<N>,
     ) -> (
         CpuTensor<f32, Rank1<1>>,
-        MoeLlamaCtx<N, T, VOCAB, D, H, FF, E, K, C>,
+        MoeDenseCtx<N, T, VOCAB, D, H, FF, E, K, C>,
     ) {
         let (x, embedding) = self.embedding.forward(tokens);
 
@@ -150,7 +150,7 @@ impl<
 
         (
             loss,
-            MoeLlamaCtx {
+            MoeDenseCtx {
                 embedding,
                 attention_norm,
                 q_proj,
@@ -167,7 +167,7 @@ impl<
         )
     }
 
-    pub fn backward(&mut self, ctx: MoeLlamaCtx<N, T, VOCAB, D, H, FF, E, K, C>) {
+    pub fn backward(&mut self, ctx: MoeDenseCtx<N, T, VOCAB, D, H, FF, E, K, C>) {
         let mut loss = SoftmaxCrossEntropy::<N, VOCAB>;
         let dloss = CpuTensor::from_slice(&[1.0]);
         let dlogits = loss.backward(ctx.loss, dloss).logits;

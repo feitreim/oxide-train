@@ -1,18 +1,18 @@
 //! CUDA-event breakdown of one full, realistically-sized GPU training step.
 //!
 //! This profiles the current integrated path only. Same-container 7.x
-//! before/after claims come from `BASELINE_REF=<git-ref> ./run.sh llama-model
+//! before/after claims come from `BASELINE_REF=<git-ref> ./run.sh model
 //! profile`, which builds and runs a retained baseline binary and this one
 //! back-to-back on the same GPU (SPEC §10.1).
 
 use bench_util::StepProfiler;
 use cuda_core::CudaContext;
-use nn::MoeLlama;
+use nn::MoeDense;
 use optim::{AdamWConfig, AuxLossSchedule};
 
 #[path = "../lib.rs"]
 mod model;
-use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace};
+use model::{GpuDense, GpuDenseAdamW, GpuDenseWorkspace};
 
 const B: usize = 32;
 const T: usize = 1_024;
@@ -63,14 +63,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gemm = model::gemm_kernels::load(&ctx)?;
     let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&ctx, "gemm.ptx")?;
     let flash = model::flash_kernels::load(&ctx)?;
-    let llama = model::llama_kernels::load(&ctx)?;
+    let dense = model::dense_kernels::load(&ctx)?;
 
     let aux_schedule = AuxLossSchedule::default();
-    let cpu = MoeLlama::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(42, aux_schedule.coefficient(0));
-    let mut gpu = GpuLlama::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>::from_cpu(&stream, &cpu)?;
+    let cpu = MoeDense::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(42, aux_schedule.coefficient(0));
+    let mut gpu = GpuDense::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>::from_cpu(&stream, &cpu)?;
     drop(cpu);
-    let mut optimizer = GpuLlamaAdamW::new(&stream, AdamWConfig::default(), aux_schedule)?;
-    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
+    let mut optimizer = GpuDenseAdamW::new(&stream, AdamWConfig::default(), aux_schedule)?;
+    let mut workspace = GpuDenseWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
     let tokens: Vec<usize> = (0..N).map(|i| (i * 7919 + 17) % VOCAB).collect();
     let targets: Vec<usize> = (0..N).map(|i| tokens[(i + 1) % N]).collect();
     let tokens: &[usize; N] = tokens.as_slice().try_into().expect("length N");
@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &gemm,
             &gemm_bf16,
             &flash,
-            &llama,
+            &dense,
         )?;
         gpu.backward(
             aux_coefficient,
@@ -99,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &gemm,
             &gemm_bf16,
             &flash,
-            &llama,
+            &dense,
         )?;
         optimizer.update(&mut gpu, &stream, &tensor)?;
     }
@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
-        &llama,
+        &dense,
         &mut profiler,
     )?;
     gpu.backward_profiled(
@@ -132,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
-        &llama,
+        &dense,
         &mut profiler,
     )?;
     optimizer.update_profiled(&mut gpu, &stream, &tensor, &mut profiler)?;

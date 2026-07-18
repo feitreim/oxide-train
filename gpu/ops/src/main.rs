@@ -1,4 +1,4 @@
-//! CPU/GPU parity checks for the reference Llama kernels.
+//! CPU/GPU parity checks for the reference Dense kernels.
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use nn::{
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_group_split_join(&stream, &module)?;
     check_moe_routing(&stream, &module)?;
 
-    println!("✓ llama-ops forward/backward parity checks passed");
+    println!("✓ ops forward/backward parity checks passed");
     Ok(())
 }
 

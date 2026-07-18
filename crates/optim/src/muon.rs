@@ -4,7 +4,7 @@
 //! orthogonalizes that update with a quintic Newton--Schulz iteration, and then
 //! performs a decoupled weight-decay update. Embeddings, normalization gains,
 //! and classifier heads are intentionally outside this module's matrix step;
-//! [`crate::LlamaMuon`] routes those parameters to AdamW.
+//! [`crate::DenseMuon`] routes those parameters to AdamW.
 
 use tensor_core::{Rank2, Shape};
 use tensor_cpu::CpuTensor;

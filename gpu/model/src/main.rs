@@ -1,4 +1,4 @@
-//! End-to-end forward/backward parity against `nn::Llama`.
+//! End-to-end forward/backward parity against `nn::Dense`.
 //!
 //! The network is fp32 except the bf16 tcgen05 lm-head, so quantities
 //! downstream of the logits carry bf16 tolerances while the fused-AdamW
@@ -15,9 +15,9 @@
 //! tcgen05 block-linear path (7e9).
 
 use cuda_core::{CudaContext, DeviceBuffer};
-use nn::{ExpertFfn, Llama, Module, MoeLlama};
+use nn::{Dense, ExpertFfn, Module, MoeDense};
 use optim::{
-    AdamWConfig, AuxLossSchedule, LlamaAdamW, LlamaMuon, MuonConfig, zeroth_power_via_newton_schulz,
+    AdamWConfig, AuxLossSchedule, DenseAdamW, DenseMuon, MuonConfig, zeroth_power_via_newton_schulz,
 };
 use tensor_core::{Rank2, Rank3, Rank4, Shape, bf16, rng::uniform_vec};
 use tensor_cpu::CpuTensor;
@@ -25,8 +25,8 @@ use tensor_cpu::CpuTensor;
 #[path = "lib.rs"]
 mod model;
 use model::{
-    GpuDenseLlama, GpuDenseLlamaAdamW, GpuExpertAdamW, GpuExpertFfn, GpuExpertWorkspace, GpuLlama,
-    GpuLlamaAdamW, GpuLlamaMuon, GpuLlamaWorkspace, GpuMuonScratch,
+    GpuDense, GpuDenseAdamW, GpuDenseDense, GpuDenseDenseAdamW, GpuDenseMuon, GpuDenseWorkspace,
+    GpuExpertAdamW, GpuExpertFfn, GpuExpertWorkspace, GpuMuonScratch,
 };
 
 const N: usize = 8;
@@ -217,7 +217,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
     tensor: &model::tensor_kernels::LoadedModule,
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
-    llama: &model::llama_kernels::LoadedModule,
+    dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut cpu: [ExpertFfn<C, D, FF>; E] =
         std::array::from_fn(|expert| ExpertFfn::initialized(700 + 3 * expert as u64));
@@ -254,7 +254,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
     let contexts = forward_pairs.map(|(_, context)| context);
 
     workspace.upload_bins(&bins, stream)?;
-    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
     let sparse_output = workspace.bin_output.to_host(stream)?;
     let (atol, rtol) = if aligned {
         (BF16_ATOL, BF16_RTOL)
@@ -296,7 +296,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
         }
     }
     workspace.upload_bins(&full_bins, stream)?;
-    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
     let full_output = workspace.bin_output.to_host(stream)?;
     for expert in 0..E {
         for slot in 0..live_slots {
@@ -313,7 +313,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
 
     // Restore the sparse forward state before backward.
     workspace.upload_bins(&bins, stream)?;
-    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
     let output_gradient: Vec<f32> = uniform_vec(E * C * D, 803)
         .into_iter()
         .map(|value| (value - 0.5) * 0.05)
@@ -333,7 +333,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
         expected_input_gradient[expert * C * D..(expert + 1) * C * D]
             .copy_from_slice(expected_input_gradients[expert].as_slice());
     }
-    gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
     assert_close_slices(
         &format!("{label} input gradient"),
         &workspace.d_bin_input.to_host(stream)?,
@@ -375,8 +375,8 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
             CpuTensor::from_slice(&output_gradient[start..start + C * D]),
         );
     }
-    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
-    gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
+    gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
     let (expected_gate_up, expected_down) = stacked_expert_gradients(&cpu);
     assert_close(
         &format!("{label} accumulated gate/up gradient"),
@@ -439,8 +439,8 @@ fn head_gradient(
 
 fn check_head_gradients(
     label: &str,
-    gpu: &GpuDenseLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
-    cpu: &Llama<N, T, VOCAB, D, H, HD, FF>,
+    gpu: &GpuDenseDense<N, NP, T, VOCAB, VP, D, H, HD, FF>,
+    cpu: &Dense<N, T, VOCAB, D, H, HD, FF>,
     stream: &cuda_core::CudaStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_close_slices(
@@ -521,17 +521,17 @@ fn muon_overfit_tiny_batch(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
-    llama: &model::llama_kernels::LoadedModule,
+    dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    type TinyLlama = Llama<4, 4, 4, 128, 2, 64, 12>;
+    type TinyDense = Dense<4, 4, 4, 128, 2, 64, 12>;
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
-    let cpu = TinyLlama::new(100);
-    let mut gpu = GpuDenseLlama::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
+    let cpu = TinyDense::new(100);
+    let mut gpu = GpuDenseDense::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
     // AdamW stays at the 0.02 the plain-AdamW gate settled on (0.03 is
     // knife-edge on this batch); Muon's default 0.02 handles the hidden
     // matrices.
-    let mut optimizer = GpuLlamaMuon::new(
+    let mut optimizer = GpuDenseMuon::new(
         stream,
         MuonConfig::default(),
         AdamWConfig {
@@ -540,7 +540,7 @@ fn muon_overfit_tiny_batch(
             ..AdamWConfig::default()
         },
     )?;
-    let mut workspace = GpuLlamaWorkspace::<4, 128, 4, 4, 128, 128, 2, 12>::new(stream)?;
+    let mut workspace = GpuDenseWorkspace::<4, 128, 4, 4, 128, 128, 2, 12>::new(stream)?;
     let mut initial_loss = None;
 
     for _ in 0..600 {
@@ -554,7 +554,7 @@ fn muon_overfit_tiny_batch(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
@@ -566,7 +566,7 @@ fn muon_overfit_tiny_batch(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         optimizer.update(&mut gpu, stream, tensor, gemm)?;
     }
@@ -580,7 +580,7 @@ fn muon_overfit_tiny_batch(
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -602,13 +602,13 @@ fn overfit_tiny_batch(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
-    llama: &model::llama_kernels::LoadedModule,
+    dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    type TinyLlama = Llama<4, 4, 4, 128, 2, 64, 12>;
+    type TinyDense = Dense<4, 4, 4, 128, 2, 64, 12>;
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
-    let cpu = TinyLlama::new(100);
-    let mut gpu = GpuDenseLlama::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
+    let cpu = TinyDense::new(100);
+    let mut gpu = GpuDenseDense::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
     // 0.03 is knife-edge on this batch: the bf16 two-logit tie's escape is
     // violently sensitive there, and a CPU sweep injecting +/-1-ulp-scale
     // noise (modelling kernel summation-order differences, 7e7) left ~1 in 8
@@ -620,8 +620,8 @@ fn overfit_tiny_batch(
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
-    let mut optimizer = GpuDenseLlamaAdamW::new(stream, config)?;
-    let mut workspace = GpuLlamaWorkspace::<4, 128, 4, 4, 128, 128, 2, 12>::new(stream)?;
+    let mut optimizer = GpuDenseDenseAdamW::new(stream, config)?;
+    let mut workspace = GpuDenseWorkspace::<4, 128, 4, 4, 128, 128, 2, 12>::new(stream)?;
     let mut initial_loss = None;
 
     // At this learning rate the CPU probe converges by ~step 60 across all
@@ -637,7 +637,7 @@ fn overfit_tiny_batch(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
@@ -649,7 +649,7 @@ fn overfit_tiny_batch(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
@@ -663,7 +663,7 @@ fn overfit_tiny_batch(
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -694,7 +694,7 @@ fn aligned_tcgen05_linears(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
-    llama: &model::llama_kernels::LoadedModule,
+    dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const NA: usize = 128;
     const TA: usize = 4;
@@ -704,9 +704,9 @@ fn aligned_tcgen05_linears(
     const HA: usize = 2;
     const FFA: usize = 128;
 
-    let mut cpu = Llama::<NA, TA, VA, DA, HA, HD, FFA>::new(7);
-    let mut gpu = GpuDenseLlama::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
-    let mut workspace = GpuLlamaWorkspace::<NA, NA, TA, VA, VPA, DA, HA, FFA>::new(stream)?;
+    let mut cpu = Dense::<NA, TA, VA, DA, HA, HD, FFA>::new(7);
+    let mut gpu = GpuDenseDense::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
+    let mut workspace = GpuDenseWorkspace::<NA, NA, TA, VA, VPA, DA, HA, FFA>::new(stream)?;
     assert!(
         workspace.tcgen05_linears_active(),
         "aligned gate is not exercising the tcgen05 block-linear path"
@@ -727,7 +727,7 @@ fn aligned_tcgen05_linears(
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
     assert_close(
         "aligned loss",
@@ -746,7 +746,7 @@ fn aligned_tcgen05_linears(
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
 
     macro_rules! grad {
@@ -790,7 +790,7 @@ fn aligned_tcgen05_linears(
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
-    let mut optimizer = GpuDenseLlamaAdamW::new(stream, config)?;
+    let mut optimizer = GpuDenseDenseAdamW::new(stream, config)?;
     let mut initial_loss = None;
     for _ in 0..600 {
         gpu.zero_grad(stream, tensor)?;
@@ -803,7 +803,7 @@ fn aligned_tcgen05_linears(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
@@ -815,7 +815,7 @@ fn aligned_tcgen05_linears(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
@@ -828,7 +828,7 @@ fn aligned_tcgen05_linears(
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -854,7 +854,7 @@ fn aligned_muon_overfit(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
-    llama: &model::llama_kernels::LoadedModule,
+    dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const NA: usize = 128;
     const TA: usize = 4;
@@ -864,9 +864,9 @@ fn aligned_muon_overfit(
     const HA: usize = 2;
     const FFA: usize = 128;
 
-    let cpu = Llama::<NA, TA, VA, DA, HA, HD, FFA>::new(7);
-    let mut gpu = GpuDenseLlama::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
-    let mut workspace = GpuLlamaWorkspace::<NA, NA, TA, VA, VPA, DA, HA, FFA>::new(stream)?;
+    let cpu = Dense::<NA, TA, VA, DA, HA, HD, FFA>::new(7);
+    let mut gpu = GpuDenseDense::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
+    let mut workspace = GpuDenseWorkspace::<NA, NA, TA, VA, VPA, DA, HA, FFA>::new(stream)?;
     assert!(
         workspace.tcgen05_linears_active(),
         "aligned Muon gate is not exercising the tcgen05 block-linear path"
@@ -874,7 +874,7 @@ fn aligned_muon_overfit(
     let tokens: [usize; NA] = std::array::from_fn(|i| (i * 7 + 3) % VA);
     let targets: [usize; NA] = std::array::from_fn(|i| (tokens[i] + 1) % VA);
 
-    let mut optimizer = GpuLlamaMuon::new(
+    let mut optimizer = GpuDenseMuon::new(
         stream,
         MuonConfig::default(),
         AdamWConfig {
@@ -895,7 +895,7 @@ fn aligned_muon_overfit(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
@@ -907,7 +907,7 @@ fn aligned_muon_overfit(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         optimizer.update(&mut gpu, stream, tensor, gemm)?;
     }
@@ -920,7 +920,7 @@ fn aligned_muon_overfit(
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -955,17 +955,17 @@ fn moe_model_parity<
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
-    llama: &model::llama_kernels::LoadedModule,
+    dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const AUX: f32 = 0.02;
-    let mut cpu = MoeLlama::<MN, MT, VOCAB, D, H, HD, MFF, ME, MK, MC>::new(71, AUX);
+    let mut cpu = MoeDense::<MN, MT, VOCAB, D, H, HD, MFF, ME, MK, MC>::new(71, AUX);
     // Deterministic ties force experts 0/1 over capacity while all remaining
     // experts stay underfull, covering both dispatch edge cases.
     cpu.ffn.router.w.as_mut_slice().fill(0.0);
     let mut gpu =
-        GpuLlama::<MN, MNP, MT, VOCAB, VP, D, H, HD, MFF, ME, MK, MC>::from_cpu(stream, &cpu)?;
+        GpuDense::<MN, MNP, MT, VOCAB, VP, D, H, HD, MFF, ME, MK, MC>::from_cpu(stream, &cpu)?;
     let mut workspace =
-        GpuLlamaWorkspace::<MN, MNP, MT, VOCAB, VP, D, H, MFF, ME, MK, MC>::new(stream)?;
+        GpuDenseWorkspace::<MN, MNP, MT, VOCAB, VP, D, H, MFF, ME, MK, MC>::new(stream)?;
     assert_eq!(workspace.tcgen05_linears_active(), expect_tcgen05);
     assert_eq!(
         workspace
@@ -988,7 +988,7 @@ fn moe_model_parity<
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
     assert_close(
         &format!("{label} loss"),
@@ -1007,7 +1007,7 @@ fn moe_model_parity<
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
 
     macro_rules! common_grad {
@@ -1086,7 +1086,7 @@ fn aligned_moe_overfit(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
-    llama: &model::llama_kernels::LoadedModule,
+    dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const ON: usize = 128;
     const OT: usize = 4;
@@ -1099,17 +1099,17 @@ fn aligned_moe_overfit(
         decay_horizon: 1_200.0,
     };
     let cpu =
-        MoeLlama::<ON, OT, VOCAB, D, H, HD, OFF, OE, OK, OC>::new(97, schedule.base_coefficient);
+        MoeDense::<ON, OT, VOCAB, D, H, HD, OFF, OE, OK, OC>::new(97, schedule.base_coefficient);
     let mut gpu =
-        GpuLlama::<ON, ON, OT, VOCAB, VP, D, H, HD, OFF, OE, OK, OC>::from_cpu(stream, &cpu)?;
+        GpuDense::<ON, ON, OT, VOCAB, VP, D, H, HD, OFF, OE, OK, OC>::from_cpu(stream, &cpu)?;
     let mut workspace =
-        GpuLlamaWorkspace::<ON, ON, OT, VOCAB, VP, D, H, OFF, OE, OK, OC>::new(stream)?;
+        GpuDenseWorkspace::<ON, ON, OT, VOCAB, VP, D, H, OFF, OE, OK, OC>::new(stream)?;
     let config = AdamWConfig {
         learning_rate: 0.02,
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
-    let mut optimizer = GpuLlamaAdamW::new(stream, config, schedule)?;
+    let mut optimizer = GpuDenseAdamW::new(stream, config, schedule)?;
     let tokens: [usize; ON] = std::array::from_fn(|i| (i * 7 + 3) % VOCAB);
     let targets: [usize; ON] = std::array::from_fn(|i| (tokens[i] + 1) % VOCAB);
     let mut initial_loss = None;
@@ -1126,7 +1126,7 @@ fn aligned_moe_overfit(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
@@ -1139,7 +1139,7 @@ fn aligned_moe_overfit(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
@@ -1153,7 +1153,7 @@ fn aligned_moe_overfit(
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
     let initial_loss = initial_loss.expect("training loop runs");
     let final_loss = workspace.loss().to_host(stream)?[0];
@@ -1174,7 +1174,7 @@ fn moe_checkpoint_gate(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
-    llama: &model::llama_kernels::LoadedModule,
+    dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const CN: usize = 4;
     const CT: usize = 4;
@@ -1192,12 +1192,12 @@ fn moe_checkpoint_gate(
         ..AdamWConfig::default()
     };
     let cpu =
-        MoeLlama::<CN, CT, VOCAB, D, H, HD, CFF, CE, CK, CC>::new(123, schedule.base_coefficient);
+        MoeDense::<CN, CT, VOCAB, D, H, HD, CFF, CE, CK, CC>::new(123, schedule.base_coefficient);
     let mut gpu =
-        GpuLlama::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC>::from_cpu(stream, &cpu)?;
-    let mut optimizer = GpuLlamaAdamW::new(stream, config, schedule)?;
+        GpuDense::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC>::from_cpu(stream, &cpu)?;
+    let mut optimizer = GpuDenseAdamW::new(stream, config, schedule)?;
     let mut workspace =
-        GpuLlamaWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC>::new(stream)?;
+        GpuDenseWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC>::new(stream)?;
     let tokens = [1, 5, 5, 2];
     let targets = [5, 5, 2, 7];
     let coefficient = optimizer.aux_coefficient();
@@ -1212,7 +1212,7 @@ fn moe_checkpoint_gate(
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
     gpu.backward(
         coefficient,
@@ -1222,7 +1222,7 @@ fn moe_checkpoint_gate(
         gemm,
         gemm_bf16,
         flash,
-        llama,
+        dense,
     )?;
     optimizer.update(&mut gpu, stream, tensor)?;
 
@@ -1242,7 +1242,7 @@ fn moe_checkpoint_gate(
     let mut resumed_gpu = loaded.model;
     let mut resumed_optimizer = loaded.optimizer;
     let mut resumed_workspace =
-        GpuLlamaWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC>::new(stream)?;
+        GpuDenseWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC>::new(stream)?;
 
     for (candidate, candidate_optimizer, candidate_workspace) in [
         (&mut gpu, &mut optimizer, &mut workspace),
@@ -1264,7 +1264,7 @@ fn moe_checkpoint_gate(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         candidate.backward(
             coefficient,
@@ -1274,7 +1274,7 @@ fn moe_checkpoint_gate(
             gemm,
             gemm_bf16,
             flash,
-            llama,
+            dense,
         )?;
         candidate_optimizer.update(candidate, stream, tensor)?;
     }
@@ -1338,11 +1338,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gemm = model::gemm_kernels::load(&ctx)?;
     let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&ctx, "gemm.ptx")?;
     let flash = model::flash_kernels::load(&ctx)?;
-    let llama = model::llama_kernels::load(&ctx)?;
+    let dense = model::dense_kernels::load(&ctx)?;
 
-    let mut cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
-    let mut gpu = GpuDenseLlama::<N, NP, T, VOCAB, VP, D, H, HD, FF>::from_cpu(&stream, &cpu)?;
-    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF>::new(&stream)?;
+    let mut cpu = Dense::<N, T, VOCAB, D, H, HD, FF>::new(42);
+    let mut gpu = GpuDenseDense::<N, NP, T, VOCAB, VP, D, H, HD, FF>::from_cpu(&stream, &cpu)?;
+    let mut workspace = GpuDenseWorkspace::<N, NP, T, VOCAB, VP, D, H, FF>::new(&stream)?;
     let tokens = [1, 5, 5, 2, 9, 3, 16, 0];
     let targets = [5, 5, 2, 7, 3, 16, 0, 4];
 
@@ -1356,7 +1356,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
-        &llama,
+        &dense,
     )?;
     assert_close(
         "loss",
@@ -1375,7 +1375,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
-        &llama,
+        &dense,
     )?;
 
     macro_rules! grad {
@@ -1433,7 +1433,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
-        &llama,
+        &dense,
     )?;
     assert_close(
         "loss (pass 2)",
@@ -1450,7 +1450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
-        &llama,
+        &dense,
     )?;
     grads!(" (pass 2)");
 
@@ -1482,8 +1482,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         weight_decay: 0.1,
         ..AdamWConfig::default()
     };
-    let mut cpu_optimizer = LlamaAdamW::new(config);
-    let mut gpu_optimizer = GpuDenseLlamaAdamW::new(&stream, config)?;
+    let mut cpu_optimizer = DenseAdamW::new(config);
+    let mut gpu_optimizer = GpuDenseDenseAdamW::new(&stream, config)?;
     cpu_optimizer.update(&mut cpu);
     gpu_optimizer.update(&mut gpu, &stream, &tensor)?;
 
@@ -1531,7 +1531,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     check_head_compute_copies(&gpu.lm_head, &stream)?;
 
-    println!("✓ full GPU Llama forward/backward and AdamW (bf16 lm-head) match CPU");
+    println!("✓ full GPU Dense forward/backward and AdamW (bf16 lm-head) match CPU");
 
     // Muon parity on the exact same GPU gradients: the hidden matrices take
     // the Newton–Schulz update while everything else takes a second AdamW
@@ -1543,8 +1543,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         weight_decay: 0.1,
         ..MuonConfig::default()
     };
-    let mut cpu_muon = LlamaMuon::new(muon_config, config);
-    let mut gpu_muon = GpuLlamaMuon::new(&stream, muon_config, config)?;
+    let mut cpu_muon = DenseMuon::new(muon_config, config);
+    let mut gpu_muon = GpuDenseMuon::new(&stream, muon_config, config)?;
     cpu_muon.update(&mut cpu);
     gpu_muon.update(&mut gpu, &stream, &tensor, &gemm)?;
 
@@ -1635,7 +1635,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &tensor,
         &gemm,
         &gemm_bf16,
-        &llama,
+        &dense,
     )?;
     expert_compute_parity::<2, 128, 128, 128>(
         "aligned tcgen05",
@@ -1644,7 +1644,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &tensor,
         &gemm,
         &gemm_bf16,
-        &llama,
+        &dense,
     )?;
     moe_model_parity::<8, 128, 4, 19, 3, 2, 3>(
         "fp32-oracle",
@@ -1654,7 +1654,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
-        &llama,
+        &dense,
     )?;
     moe_model_parity::<256, 256, 128, 128, 3, 2, 128>(
         "aligned tcgen05",
@@ -1664,17 +1664,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
-        &llama,
+        &dense,
     )?;
-    aligned_moe_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
-    moe_checkpoint_gate(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
+    aligned_moe_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
+    moe_checkpoint_gate(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
     // The parity helpers own temporary expert workspaces. Their device frees
     // are stream-ordered; complete those frees before the independent overfit
     // gates begin allocating models and workspaces of their own.
     stream.synchronize()?;
-    overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
-    muon_overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
-    aligned_tcgen05_linears(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
-    aligned_muon_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
+    overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
+    muon_overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
+    aligned_tcgen05_linears(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
+    aligned_muon_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
     Ok(())
 }

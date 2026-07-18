@@ -7,12 +7,12 @@ use std::env;
 
 use cuda_core::CudaContext;
 use data::{Batches, TokenFile};
-use nn::MoeLlama;
+use nn::MoeDense;
 use optim::{AdamWConfig, AuxLossSchedule};
 
 #[path = "../lib.rs"]
 mod model;
-use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaWorkspace};
+use model::{GpuDense, GpuDenseAdamW, GpuDenseWorkspace};
 
 const B: usize = 32;
 const T: usize = 1_024;
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gemm = model::gemm_kernels::load(&cuda)?;
     let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&cuda, "gemm.ptx")?;
     let flash = model::flash_kernels::load(&cuda)?;
-    let llama = model::llama_kernels::load(&cuda)?;
+    let dense = model::dense_kernels::load(&cuda)?;
     let config = AdamWConfig {
         learning_rate: env_parse("TRAIN_LEARNING_RATE", 3e-4),
         weight_decay: env_parse("TRAIN_WEIGHT_DECAY", 0.1),
@@ -119,15 +119,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     } else {
         let cpu =
-            MoeLlama::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(42, aux_schedule.coefficient(0));
+            MoeDense::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(42, aux_schedule.coefficient(0));
         (
-            GpuLlama::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>::from_cpu(&stream, &cpu)?,
-            GpuLlamaAdamW::new(&stream, config, aux_schedule)?,
+            GpuDense::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>::from_cpu(&stream, &cpu)?,
+            GpuDenseAdamW::new(&stream, config, aux_schedule)?,
             0,
         )
     };
     let starting_step = optimizer.step() as usize;
-    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
+    let mut workspace = GpuDenseWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
     if max_steps < starting_step {
         return Err(
             format!("TRAIN_STEPS={max_steps} is behind checkpoint step {starting_step}").into(),
@@ -168,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &gemm,
             &gemm_bf16,
             &flash,
-            &llama,
+            &dense,
         )?;
         let should_log = step == 1 || step % log_every == 0 || step == max_steps;
         if should_log {
@@ -186,7 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &gemm,
             &gemm_bf16,
             &flash,
-            &llama,
+            &dense,
         )?;
         optimizer.update(&mut gpu, &stream, &tensor)?;
 

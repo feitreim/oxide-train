@@ -11,12 +11,12 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use cuda_core::CudaStream;
-use nn::MoeLlama;
+use nn::MoeDense;
 use optim::{AdamWConfig, AuxLossSchedule};
 use tensor_core::{Rank2, Shape};
 
 use super::tensor_device::GpuTensor;
-use super::{GpuBf16Head, GpuLlama, GpuLlamaAdamW};
+use super::{GpuBf16Head, GpuDense, GpuDenseAdamW};
 
 const MAGIC: &[u8; 8] = b"RTCKPT01";
 const VERSION: u32 = 3;
@@ -36,8 +36,8 @@ pub struct LoadedCheckpoint<
     const K: usize,
     const C: usize,
 > {
-    pub model: GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>,
-    pub optimizer: GpuLlamaAdamW<VOCAB, VP, D, FF, E>,
+    pub model: GpuDense<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>,
+    pub optimizer: GpuDenseAdamW<VOCAB, VP, D, FF, E>,
     pub next_batch: u64,
 }
 
@@ -191,8 +191,8 @@ pub fn save<
     const C: usize,
 >(
     path: impl AsRef<Path>,
-    model: &GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>,
-    optimizer: &GpuLlamaAdamW<VOCAB, VP, D, FF, E>,
+    model: &GpuDense<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>,
+    optimizer: &GpuDenseAdamW<VOCAB, VP, D, FF, E>,
     next_batch: u64,
     stream: &CudaStream,
 ) -> Result<(), Box<dyn Error>> {
@@ -293,9 +293,9 @@ pub fn load<
     let next_batch = read_u64(&mut reader)?;
     let (config, aux_schedule) = read_config(&mut reader)?;
 
-    let cpu = MoeLlama::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(0, aux_schedule.base_coefficient);
-    let mut model = GpuLlama::from_cpu(stream, &cpu)?;
-    let mut optimizer = GpuLlamaAdamW::new(stream, config, aux_schedule)?;
+    let cpu = MoeDense::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(0, aux_schedule.base_coefficient);
+    let mut model = GpuDense::from_cpu(stream, &cpu)?;
+    let mut optimizer = GpuDenseAdamW::new(stream, config, aux_schedule)?;
 
     macro_rules! read_parameter {
         ($field:ident) => {

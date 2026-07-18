@@ -1,7 +1,7 @@
 //! Optimizers and statically typed optimizer state.
 //!
 //! The CPU implementation is the numerical reference for GPU optimizer
-//! kernels. `LlamaAdamW` and `LlamaMuon` mirror the model's parameter
+//! kernels. `DenseAdamW` and `DenseMuon` mirror the model's parameter
 //! structure, preserving each parameter shape in the type system without a
 //! type-erased parameter registry.
 
@@ -12,7 +12,7 @@ pub use muon::{
     NEWTON_SCHULZ_EPSILON, muon_step, zeroth_power_via_newton_schulz,
 };
 
-use nn::{Llama, MoeLlama};
+use nn::{Dense, MoeDense};
 use tensor_core::{Rank1, Rank2, Shape, bf16};
 use tensor_cpu::CpuTensor;
 
@@ -226,7 +226,7 @@ impl<
     const H: usize,
     const HD: usize,
     const FF: usize,
-> VisitCpuParameters for Llama<N, T, VOCAB, D, H, HD, FF>
+> VisitCpuParameters for Dense<N, T, VOCAB, D, H, HD, FF>
 {
     fn visit_cpu_parameters<V: CpuParameterVisitor>(&mut self, visitor: &mut V) {
         macro_rules! visit {
@@ -266,7 +266,7 @@ impl<
     const E: usize,
     const K: usize,
     const C: usize,
-> VisitCpuParameters for MoeLlama<N, T, VOCAB, D, H, HD, FF, E, K, C>
+> VisitCpuParameters for MoeDense<N, T, VOCAB, D, H, HD, FF, E, K, C>
 {
     fn visit_cpu_parameters<V: CpuParameterVisitor>(&mut self, visitor: &mut V) {
         macro_rules! visit {
@@ -328,8 +328,8 @@ impl<
     }
 }
 
-/// AdamW state for the single-block reference Llama.
-pub struct LlamaAdamW<const VOCAB: usize, const D: usize, const FF: usize> {
+/// AdamW state for the single-block reference Dense.
+pub struct DenseAdamW<const VOCAB: usize, const D: usize, const FF: usize> {
     config: AdamWConfig,
     step: u64,
     pub embedding: AdamWMoments<Rank2<VOCAB, D>>,
@@ -346,7 +346,7 @@ pub struct LlamaAdamW<const VOCAB: usize, const D: usize, const FF: usize> {
     pub lm_head: AdamWMoments<Rank2<D, VOCAB>>,
 }
 
-impl<const VOCAB: usize, const D: usize, const FF: usize> LlamaAdamW<VOCAB, D, FF> {
+impl<const VOCAB: usize, const D: usize, const FF: usize> DenseAdamW<VOCAB, D, FF> {
     pub fn new(config: AdamWConfig) -> Self {
         config.validate();
         Self {
@@ -373,7 +373,7 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> LlamaAdamW<VOCAB, D, F
 
     pub fn update<const N: usize, const T: usize, const H: usize, const HD: usize>(
         &mut self,
-        model: &mut Llama<N, T, VOCAB, D, H, HD, FF>,
+        model: &mut Dense<N, T, VOCAB, D, H, HD, FF>,
     ) {
         self.step = self.step.checked_add(1).expect("AdamW step overflow");
         let step = self.step;
@@ -407,11 +407,11 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> LlamaAdamW<VOCAB, D, F
     }
 }
 
-/// Mixed Muon/AdamW state for the single-block reference Llama.
+/// Mixed Muon/AdamW state for the single-block reference Dense.
 ///
 /// Hidden projection matrices use Muon. Embeddings, normalization gains, and
 /// the classifier head use AdamW, matching the routing prescribed by Muon.
-pub struct LlamaMuon<const VOCAB: usize, const D: usize, const FF: usize> {
+pub struct DenseMuon<const VOCAB: usize, const D: usize, const FF: usize> {
     muon_config: MuonConfig,
     adamw_config: AdamWConfig,
     step: u64,
@@ -429,7 +429,7 @@ pub struct LlamaMuon<const VOCAB: usize, const D: usize, const FF: usize> {
     pub lm_head: AdamWMoments<Rank2<D, VOCAB>>,
 }
 
-impl<const VOCAB: usize, const D: usize, const FF: usize> LlamaMuon<VOCAB, D, FF> {
+impl<const VOCAB: usize, const D: usize, const FF: usize> DenseMuon<VOCAB, D, FF> {
     pub fn new(muon_config: MuonConfig, adamw_config: AdamWConfig) -> Self {
         muon_config.validate();
         adamw_config.validate();
@@ -466,7 +466,7 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> LlamaMuon<VOCAB, D, FF
 
     pub fn update<const N: usize, const T: usize, const H: usize, const HD: usize>(
         &mut self,
-        model: &mut Llama<N, T, VOCAB, D, H, HD, FF>,
+        model: &mut Dense<N, T, VOCAB, D, H, HD, FF>,
     ) {
         self.step = self.step.checked_add(1).expect("Muon step overflow");
         let step = self.step;
@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn llama_visitor_reports_all_parameters_and_kinds() {
+    fn dense_visitor_reports_all_parameters_and_kinds() {
         struct Inventory {
             names: Vec<&'static str>,
             norm_elements: usize,
@@ -615,7 +615,7 @@ mod tests {
             }
         }
 
-        let mut model = Llama::<4, 4, 7, 8, 2, 4, 12>::new(7);
+        let mut model = Dense::<4, 4, 7, 8, 2, 4, 12>::new(7);
         let mut inventory = Inventory {
             names: Vec::new(),
             norm_elements: 0,
@@ -648,7 +648,7 @@ mod tests {
             }
         }
 
-        let mut model = MoeLlama::<4, 4, 7, 8, 2, 4, 6, 3, 2, 3>::new(7, 0.01);
+        let mut model = MoeDense::<4, 4, 7, 8, 2, 4, 6, 3, 2, 3>::new(7, 0.01);
         let mut inventory = Inventory {
             routers: 0,
             matrices: 0,
@@ -672,13 +672,13 @@ mod tests {
     }
 
     #[test]
-    fn llama_muon_routes_hidden_matrices_and_auxiliary_parameters() {
-        let mut model = Llama::<4, 4, 7, 8, 2, 4, 12>::new(7);
+    fn dense_muon_routes_hidden_matrices_and_auxiliary_parameters() {
+        let mut model = Dense::<4, 4, 7, 8, 2, 4, 12>::new(7);
         model.embedding.dw.as_mut_slice().fill(1.0);
         model.attention_norm.dw.as_mut_slice().fill(1.0);
         model.q_proj.dw.as_mut_slice().fill(1.0);
         model.lm_head.dw.as_mut_slice().fill(1.0);
-        let mut optimizer = LlamaMuon::new(MuonConfig::default(), AdamWConfig::default());
+        let mut optimizer = DenseMuon::new(MuonConfig::default(), AdamWConfig::default());
 
         optimizer.update(&mut model);
 
@@ -718,12 +718,12 @@ mod tests {
     }
 
     #[test]
-    fn adamw_overfits_the_tiny_llama_batch() {
-        type TinyLlama = Llama<4, 4, 4, 8, 2, 4, 12>;
+    fn adamw_overfits_the_tiny_dense_batch() {
+        type TinyDense = Dense<4, 4, 4, 8, 2, 4, 12>;
         let tokens = [0, 1, 2, 3];
         let targets = [1, 2, 3, 0];
-        let mut model = TinyLlama::new(100);
-        let mut optimizer = LlamaAdamW::new(AdamWConfig {
+        let mut model = TinyDense::new(100);
+        let mut optimizer = DenseAdamW::new(AdamWConfig {
             learning_rate: 0.03,
             weight_decay: 0.0,
             ..AdamWConfig::default()
@@ -746,12 +746,12 @@ mod tests {
     }
 
     #[test]
-    fn muon_overfits_the_tiny_llama_batch() {
-        type TinyLlama = Llama<4, 4, 4, 8, 2, 4, 12>;
+    fn muon_overfits_the_tiny_dense_batch() {
+        type TinyDense = Dense<4, 4, 4, 8, 2, 4, 12>;
         let tokens = [0, 1, 2, 3];
         let targets = [1, 2, 3, 0];
-        let mut model = TinyLlama::new(100);
-        let mut optimizer = LlamaMuon::new(
+        let mut model = TinyDense::new(100);
+        let mut optimizer = DenseMuon::new(
             MuonConfig {
                 learning_rate: 0.02,
                 ..MuonConfig::default()

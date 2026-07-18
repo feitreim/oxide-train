@@ -1,4 +1,4 @@
-//! Flash attention generations versus the `llama-ops` materialized baseline.
+//! Flash attention generations versus the `ops` materialized baseline.
 //!
 //! The shape matches the training sequence length (T=1024, H=24, HD=64) where
 //! the per-row kernels' serial key scan is the measured tail (7e7); `B` is
@@ -12,7 +12,7 @@ use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 
 #[path = "../lib.rs"]
 mod flash;
-#[path = "../../../llama-ops/src/lib.rs"]
+#[path = "../../../ops/src/lib.rs"]
 mod naive;
 
 const B: usize = 2;
