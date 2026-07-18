@@ -33,6 +33,9 @@ pub const NORM_THREADS: usize = 256;
 /// owned column, rather than one atomic per input element.
 pub const NORM_WEIGHT_ROWS_PER_BLOCK: usize = 256;
 
+/// Sentinel written by deterministic MoE binning for a capacity-dropped pair.
+pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -1278,6 +1281,467 @@ pub mod kernels {
                 value += probabilities[(query_row * h + head) * t + key_position]
                     * dy[query_row * h * hd + head * hd + dim];
             }
+            *slot = value;
+        }
+    }
+
+    /// Router logits for a skinny `[N,D] x [D,E]` fp32 matrix multiply.
+    ///
+    /// One block owns a token row and one lane owns each (small) expert.
+    #[kernel]
+    pub fn router_logits(
+        x: &[f32],
+        weight: &[f32],
+        dim: u32,
+        experts: u32,
+        mut logits: DisjointSlice<f32>,
+    ) {
+        let token = thread::blockIdx_x() as usize;
+        let expert = thread::threadIdx_x() as usize;
+        let d = dim as usize;
+        let e = experts as usize;
+        if expert >= e || token * e + expert >= logits.len() {
+            return;
+        }
+        let mut value = 0.0f32;
+        for column in 0..d {
+            value += x[token * d + column] * weight[column * e + expert];
+        }
+        if let Some(slot) = logits.get_mut(thread::index_1d()) {
+            *slot = value;
+        }
+    }
+
+    /// Per-token softmax, deterministic top-k, and selected-probability
+    /// renormalization. Ties select the lower expert index.
+    #[kernel]
+    pub unsafe fn router_softmax_topk(
+        logits: &[f32],
+        experts: u32,
+        top_k: u32,
+        mut probabilities: DisjointSlice<f32>,
+        mut selected_experts: DisjointSlice<u32>,
+        mut gate_weights: DisjointSlice<f32>,
+    ) {
+        let token = thread::index_1d().get();
+        let e = experts as usize;
+        let k = top_k as usize;
+        if e == 0
+            || k == 0
+            || k > e
+            || token * e + e > logits.len()
+            || token * e + e > probabilities.len()
+            || token * k + k > selected_experts.len()
+            || token * k + k > gate_weights.len()
+        {
+            return;
+        }
+
+        let mut maximum = f32::NEG_INFINITY;
+        for expert in 0..e {
+            maximum = maximum.max(logits[token * e + expert]);
+        }
+        let mut denominator = 0.0f32;
+        for expert in 0..e {
+            denominator += (logits[token * e + expert] - maximum).exp();
+        }
+        for expert in 0..e {
+            unsafe {
+                *probabilities.get_unchecked_mut(token * e + expert) =
+                    (logits[token * e + expert] - maximum).exp() / denominator;
+            }
+        }
+
+        for rank in 0..k {
+            let mut best_expert = 0usize;
+            let mut best_probability = f32::NEG_INFINITY;
+            for expert in 0..e {
+                let mut already_selected = false;
+                for previous_rank in 0..rank {
+                    if unsafe { *selected_experts.as_mut_ptr().add(token * k + previous_rank) }
+                        as usize
+                        == expert
+                    {
+                        already_selected = true;
+                    }
+                }
+                let probability = unsafe { *probabilities.as_mut_ptr().add(token * e + expert) };
+                if !already_selected
+                    && (probability > best_probability
+                        || (probability == best_probability && expert < best_expert))
+                {
+                    best_probability = probability;
+                    best_expert = expert;
+                }
+            }
+            unsafe {
+                *selected_experts.get_unchecked_mut(token * k + rank) = best_expert as u32;
+            }
+        }
+
+        let mut selected_sum = 0.0f32;
+        for rank in 0..k {
+            let expert = unsafe { *selected_experts.as_mut_ptr().add(token * k + rank) } as usize;
+            selected_sum += unsafe { *probabilities.as_mut_ptr().add(token * e + expert) };
+        }
+        for rank in 0..k {
+            let expert = unsafe { *selected_experts.as_mut_ptr().add(token * k + rank) } as usize;
+            unsafe {
+                *gate_weights.get_unchecked_mut(token * k + rank) =
+                    *probabilities.as_mut_ptr().add(token * e + expert) / selected_sum;
+            }
+        }
+    }
+
+    /// Deterministic capacity assignment: one block serially scans token order
+    /// for one expert, avoiding nondeterministic atomic slot claims.
+    #[kernel]
+    pub unsafe fn moe_bin_assign(
+        selected_experts: &[u32],
+        tokens: u32,
+        experts: u32,
+        top_k: u32,
+        capacity: u32,
+        mut slots: DisjointSlice<u32>,
+        mut assignment_counts: DisjointSlice<u32>,
+    ) {
+        if thread::threadIdx_x() != 0 {
+            return;
+        }
+        let expert = thread::blockIdx_x() as usize;
+        let n = tokens as usize;
+        let e = experts as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if expert >= e
+            || n * k > selected_experts.len()
+            || n * k > slots.len()
+            || expert >= assignment_counts.len()
+        {
+            return;
+        }
+
+        let mut count = 0usize;
+        for token in 0..n {
+            for rank in 0..k {
+                let pair = token * k + rank;
+                if selected_experts[pair] as usize == expert {
+                    unsafe {
+                        *slots.get_unchecked_mut(pair) = if count < c {
+                            count as u32
+                        } else {
+                            MOE_DROPPED_SLOT
+                        };
+                    }
+                    count += 1;
+                }
+            }
+        }
+        unsafe {
+            *assignment_counts.get_unchecked_mut(expert) = count as u32;
+        }
+    }
+
+    /// Copy surviving token rows into `[E,C,D]` capacity-padded expert bins.
+    /// The destination must be zeroed before launch so unused slots stay inert.
+    #[kernel]
+    pub unsafe fn moe_scatter(
+        x: &[f32],
+        selected_experts: &[u32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut expert_input: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        let pair = i / d;
+        let column = i % d;
+        if pair >= selected_experts.len() || pair >= slots.len() || d == 0 || k == 0 {
+            return;
+        }
+        let slot = slots[pair];
+        if slot == MOE_DROPPED_SLOT {
+            return;
+        }
+        let expert = selected_experts[pair] as usize;
+        let token = pair / k;
+        let output = (expert * c + slot as usize) * d + column;
+        if token * d + column >= x.len() || output >= expert_input.len() {
+            return;
+        }
+        // Deterministic bin assignment guarantees one writer per accepted slot.
+        unsafe {
+            *expert_input.get_unchecked_mut(output) = x[token * d + column];
+        }
+    }
+
+    /// Gather expert outputs to token order using the renormalized gate weights.
+    #[kernel]
+    pub fn moe_gather_combine(
+        expert_output: &[f32],
+        selected_experts: &[u32],
+        gate_weights: &[f32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if i >= output.len() || d == 0 || k == 0 {
+            return;
+        }
+        let token = i / d;
+        let column = i % d;
+        let mut value = 0.0f32;
+        for rank in 0..k {
+            let pair = token * k + rank;
+            if pair >= slots.len() || pair >= selected_experts.len() || pair >= gate_weights.len() {
+                return;
+            }
+            let slot = slots[pair];
+            if slot != MOE_DROPPED_SLOT {
+                let expert = selected_experts[pair] as usize;
+                let input = (expert * c + slot as usize) * d + column;
+                if input >= expert_output.len() {
+                    return;
+                }
+                value += gate_weights[pair] * expert_output[input];
+            }
+        }
+        if let Some(slot) = output.get_mut(index) {
+            *slot = value;
+        }
+    }
+
+    /// Scatter `gate * dy` to expert-output order and compute one gate gradient
+    /// dot product per accepted pair.
+    #[kernel]
+    pub unsafe fn moe_scatter_dy(
+        expert_output: &[f32],
+        dy: &[f32],
+        selected_experts: &[u32],
+        gate_weights: &[f32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut expert_output_gradient: DisjointSlice<f32>,
+        mut gate_gradients: DisjointSlice<f32>,
+    ) {
+        let pair = thread::index_1d().get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if pair >= selected_experts.len()
+            || pair >= gate_weights.len()
+            || pair >= slots.len()
+            || pair >= gate_gradients.len()
+            || d == 0
+            || k == 0
+        {
+            return;
+        }
+        let slot = slots[pair];
+        let mut gate_gradient = 0.0f32;
+        if slot != MOE_DROPPED_SLOT {
+            let token = pair / k;
+            let expert = selected_experts[pair] as usize;
+            let bin_base = (expert * c + slot as usize) * d;
+            let token_base = token * d;
+            if bin_base + d > expert_output.len()
+                || bin_base + d > expert_output_gradient.len()
+                || token_base + d > dy.len()
+            {
+                return;
+            }
+            for column in 0..d {
+                gate_gradient += expert_output[bin_base + column] * dy[token_base + column];
+                unsafe {
+                    *expert_output_gradient.get_unchecked_mut(bin_base + column) =
+                        gate_weights[pair] * dy[token_base + column];
+                }
+            }
+        }
+        unsafe {
+            *gate_gradients.get_unchecked_mut(pair) = gate_gradient;
+        }
+    }
+
+    /// Gather expert-input gradients back to token order, summing top-k paths.
+    #[kernel]
+    pub fn moe_gather_dx(
+        expert_input_gradient: &[f32],
+        selected_experts: &[u32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut dx: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if i >= dx.len() || d == 0 || k == 0 {
+            return;
+        }
+        let token = i / d;
+        let column = i % d;
+        let mut value = 0.0f32;
+        for rank in 0..k {
+            let pair = token * k + rank;
+            if pair >= selected_experts.len() || pair >= slots.len() {
+                return;
+            }
+            let slot = slots[pair];
+            if slot != MOE_DROPPED_SLOT {
+                let expert = selected_experts[pair] as usize;
+                let input = (expert * c + slot as usize) * d + column;
+                if input >= expert_input_gradient.len() {
+                    return;
+                }
+                value += expert_input_gradient[input];
+            }
+        }
+        if let Some(slot) = dx.get_mut(index) {
+            *slot = value;
+        }
+    }
+
+    /// Backward through selected-probability renormalization and router
+    /// softmax, including the Switch-style auxiliary loss gradient.
+    #[kernel]
+    pub unsafe fn router_backward(
+        probabilities: &[f32],
+        selected_experts: &[u32],
+        gate_weights: &[f32],
+        gate_gradients: &[f32],
+        assignment_counts: &[u32],
+        tokens: u32,
+        experts: u32,
+        top_k: u32,
+        aux_coefficient: f32,
+        mut dlogits: DisjointSlice<f32>,
+    ) {
+        let token = thread::index_1d().get();
+        let n = tokens as usize;
+        let e = experts as usize;
+        let k = top_k as usize;
+        if token >= n
+            || e == 0
+            || k == 0
+            || token * e + e > probabilities.len()
+            || token * e + e > dlogits.len()
+            || token * k + k > selected_experts.len()
+            || token * k + k > gate_weights.len()
+            || token * k + k > gate_gradients.len()
+            || e > assignment_counts.len()
+        {
+            return;
+        }
+
+        let mut weighted_gate_gradient = 0.0f32;
+        let mut selected_probability_sum = 0.0f32;
+        for rank in 0..k {
+            let pair = token * k + rank;
+            let expert = selected_experts[pair] as usize;
+            weighted_gate_gradient += gate_gradients[pair] * gate_weights[pair];
+            selected_probability_sum += probabilities[token * e + expert];
+        }
+
+        let mut softmax_dot = 0.0f32;
+        for expert in 0..e {
+            let mut probability_gradient = 0.0f32;
+            for rank in 0..k {
+                let pair = token * k + rank;
+                if selected_experts[pair] as usize == expert {
+                    probability_gradient +=
+                        (gate_gradients[pair] - weighted_gate_gradient) / selected_probability_sum;
+                }
+            }
+            let assignment_fraction = assignment_counts[expert] as f32 / (n * k) as f32;
+            probability_gradient += aux_coefficient * e as f32 * assignment_fraction / n as f32;
+            softmax_dot += probabilities[token * e + expert] * probability_gradient;
+        }
+
+        for expert in 0..e {
+            let mut probability_gradient = 0.0f32;
+            for rank in 0..k {
+                let pair = token * k + rank;
+                if selected_experts[pair] as usize == expert {
+                    probability_gradient +=
+                        (gate_gradients[pair] - weighted_gate_gradient) / selected_probability_sum;
+                }
+            }
+            let assignment_fraction = assignment_counts[expert] as f32 / (n * k) as f32;
+            probability_gradient += aux_coefficient * e as f32 * assignment_fraction / n as f32;
+            unsafe {
+                *dlogits.get_unchecked_mut(token * e + expert) =
+                    probabilities[token * e + expert] * (probability_gradient - softmax_dot);
+            }
+        }
+    }
+
+    /// Router linear backward with respect to its input.
+    #[kernel]
+    pub fn router_backward_input(
+        dlogits: &[f32],
+        weight: &[f32],
+        experts: u32,
+        mut dx: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let e = experts as usize;
+        if i >= dx.len() || e == 0 {
+            return;
+        }
+        let d = weight.len() / e;
+        let token = i / d;
+        let column = i % d;
+        let mut value = 0.0f32;
+        for expert in 0..e {
+            value += dlogits[token * e + expert] * weight[column * e + expert];
+        }
+        if let Some(slot) = dx.get_mut(index) {
+            *slot = value;
+        }
+    }
+
+    /// Router linear backward with respect to its weight.
+    #[kernel]
+    pub fn router_backward_weight(
+        x: &[f32],
+        dlogits: &[f32],
+        tokens: u32,
+        experts: u32,
+        mut dweight: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let n = tokens as usize;
+        let e = experts as usize;
+        if i >= dweight.len() || n == 0 || e == 0 {
+            return;
+        }
+        let d = dweight.len() / e;
+        let column = i / e;
+        let expert = i % e;
+        let mut value = 0.0f32;
+        for token in 0..n {
+            value += x[token * d + column] * dlogits[token * e + expert];
+        }
+        if let Some(slot) = dweight.get_mut(index) {
             *slot = value;
         }
     }

@@ -2,8 +2,8 @@
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use nn::{
-    CausalAttention, Embedding, Module, RmsNorm, Rope, SoftmaxCrossEntropy,
-    SoftmaxCrossEntropyInput, SwiGlu,
+    CausalAttention, Embedding, ExpertFfn, Linear, Module, MoeFfn, RmsNorm, Rope,
+    SoftmaxCrossEntropy, SoftmaxCrossEntropyInput, SwiGlu,
 };
 use tensor_core::{Rank1, Rank2, Rank3};
 use tensor_cpu::CpuTensor;
@@ -13,7 +13,9 @@ use tensor_cpu::CpuTensor;
 // as a module so this binary's embedded artifact contains the kernels.
 #[path = "lib.rs"]
 mod device;
-use device::{CLASSIFIER_THREADS, NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, kernels};
+use device::{
+    CLASSIFIER_THREADS, MOE_DROPPED_SLOT, NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, kernels,
+};
 use tensor_core::bf16;
 
 fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
@@ -40,8 +42,451 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_rope(&stream, &module)?;
     check_attention(&stream, &module)?;
     check_group_split_join(&stream, &module)?;
+    check_moe_routing(&stream, &module)?;
 
     println!("✓ llama-ops forward/backward parity checks passed");
+    Ok(())
+}
+
+fn check_moe_routing(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 6;
+    const D: usize = 4;
+    const FF: usize = 5;
+    const E: usize = 3;
+    const K: usize = 2;
+    const C: usize = 2;
+    const AUX: f32 = 0.17;
+
+    let x = CpuTensor::<f32, Rank2<N, D>>::from_slice(&[
+        1.0, 0.1, 0.2, 0.3, //
+        0.9, 0.3, 0.1, 0.2, //
+        1.1, 0.2, 0.4, 0.1, //
+        0.8, 0.4, 0.2, 0.5, //
+        1.2, 0.2, 0.3, 0.4, //
+        0.7, 0.5, 0.1, 0.3,
+    ]);
+    let router_weight = CpuTensor::<f32, Rank2<D, E>>::from_slice(&[
+        1.0, 0.7, -1.0, //
+        0.2, 0.4, -0.5, //
+        0.1, -0.2, -0.5, //
+        0.3, 0.1, -0.5,
+    ]);
+    let experts = std::array::from_fn(|expert| ExpertFfn::initialized(300 + 3 * expert as u64));
+    let mut cpu =
+        MoeFfn::<N, D, FF, E, K, C>::new(Linear::new(router_weight.clone()), experts, AUX);
+    let (cpu_output, cpu_ctx) = cpu.forward(x.clone());
+    assert!(
+        cpu_ctx.routing.slots.iter().any(Option::is_none),
+        "MoE parity shape must force capacity drops"
+    );
+    assert!(
+        cpu_ctx.routing.accepted_counts.contains(&0),
+        "MoE parity shape must leave an expert underfull"
+    );
+
+    let cpu_logits = x.matmul(&router_weight);
+    let cpu_probabilities = cpu_logits.softmax_rows();
+    let expected_selected: Vec<u32> = cpu_ctx
+        .routing
+        .selected_experts
+        .iter()
+        .map(|&expert| expert as u32)
+        .collect();
+    let expected_slots: Vec<u32> = cpu_ctx
+        .routing
+        .slots
+        .iter()
+        .map(|slot| slot.map_or(MOE_DROPPED_SLOT, |slot| slot as u32))
+        .collect();
+    let expected_counts: Vec<u32> = cpu_ctx
+        .routing
+        .assignment_counts
+        .iter()
+        .map(|&count| count as u32)
+        .collect();
+    let mut expert_outputs = Vec::with_capacity(E * C * D);
+    for expert in &cpu_ctx.expert_outputs {
+        expert_outputs.extend_from_slice(expert.as_slice());
+    }
+    let mut expected_expert_input = vec![0.0f32; E * C * D];
+    for token in 0..N {
+        for rank in 0..K {
+            let pair = token * K + rank;
+            let slot = expected_slots[pair];
+            if slot == MOE_DROPPED_SLOT {
+                continue;
+            }
+            let expert = expected_selected[pair] as usize;
+            let output = (expert * C + slot as usize) * D;
+            expected_expert_input[output..output + D]
+                .copy_from_slice(&x.as_slice()[token * D..(token + 1) * D]);
+        }
+    }
+
+    let x_dev = DeviceBuffer::from_host(stream, x.as_slice())?;
+    let weight_dev = DeviceBuffer::from_host(stream, router_weight.as_slice())?;
+    let mut logits_dev = DeviceBuffer::<f32>::zeroed(stream, N * E)?;
+    let mut probabilities_dev = DeviceBuffer::<f32>::zeroed(stream, N * E)?;
+    let mut selected_dev = DeviceBuffer::<u32>::zeroed(stream, N * K)?;
+    let mut gates_dev = DeviceBuffer::<f32>::zeroed(stream, N * K)?;
+    let mut slots_dev = DeviceBuffer::<u32>::zeroed(stream, N * K)?;
+    let mut counts_dev = DeviceBuffer::<u32>::zeroed(stream, E)?;
+    let mut expert_input_dev = DeviceBuffer::<f32>::zeroed(stream, E * C * D)?;
+    let expert_output_dev = DeviceBuffer::from_host(stream, &expert_outputs)?;
+    let mut output_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+
+    module.router_logits(
+        stream,
+        LaunchConfig {
+            grid_dim: (N as u32, 1, 1),
+            block_dim: (E as u32, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        &x_dev,
+        &weight_dev,
+        D as u32,
+        E as u32,
+        &mut logits_dev,
+    )?;
+    unsafe {
+        module.router_softmax_topk(
+            stream,
+            LaunchConfig::for_num_elems(N as u32),
+            &logits_dev,
+            E as u32,
+            K as u32,
+            &mut probabilities_dev,
+            &mut selected_dev,
+            &mut gates_dev,
+        )?;
+        module.moe_bin_assign(
+            stream,
+            LaunchConfig {
+                grid_dim: (E as u32, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &selected_dev,
+            N as u32,
+            E as u32,
+            K as u32,
+            C as u32,
+            &mut slots_dev,
+            &mut counts_dev,
+        )?;
+        module.moe_scatter(
+            stream,
+            LaunchConfig::for_num_elems((N * K * D) as u32),
+            &x_dev,
+            &selected_dev,
+            &slots_dev,
+            D as u32,
+            K as u32,
+            C as u32,
+            &mut expert_input_dev,
+        )?;
+    }
+    module.moe_gather_combine(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &expert_output_dev,
+        &selected_dev,
+        &gates_dev,
+        &slots_dev,
+        D as u32,
+        K as u32,
+        C as u32,
+        &mut output_dev,
+    )?;
+
+    assert_close(
+        "MoE router logits",
+        &logits_dev.to_host_vec(stream)?,
+        cpu_logits.as_slice(),
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "MoE router probabilities",
+        &probabilities_dev.to_host_vec(stream)?,
+        cpu_probabilities.as_slice(),
+        1e-6,
+        1e-6,
+    );
+    assert_eq!(selected_dev.to_host_vec(stream)?, expected_selected);
+    assert_close(
+        "MoE gate weights",
+        &gates_dev.to_host_vec(stream)?,
+        &cpu_ctx.routing.gate_weights,
+        1e-6,
+        1e-6,
+    );
+    assert_eq!(slots_dev.to_host_vec(stream)?, expected_slots);
+    assert_eq!(counts_dev.to_host_vec(stream)?, expected_counts);
+    assert_eq!(
+        expert_input_dev.to_host_vec(stream)?,
+        expected_expert_input,
+        "MoE scatter must preserve accepted rows and zero-fill unused slots"
+    );
+    let mut roundtrip_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    module.moe_gather_combine(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &expert_input_dev,
+        &selected_dev,
+        &gates_dev,
+        &slots_dev,
+        D as u32,
+        K as u32,
+        C as u32,
+        &mut roundtrip_dev,
+    )?;
+    let mut expected_roundtrip = vec![0.0f32; N * D];
+    for token in 0..N {
+        for rank in 0..K {
+            let pair = token * K + rank;
+            if expected_slots[pair] != MOE_DROPPED_SLOT {
+                for column in 0..D {
+                    expected_roundtrip[token * D + column] +=
+                        cpu_ctx.routing.gate_weights[pair] * x.as_slice()[token * D + column];
+                }
+            }
+        }
+    }
+    assert_close(
+        "MoE scatter/gather round trip",
+        &roundtrip_dev.to_host_vec(stream)?,
+        &expected_roundtrip,
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "MoE surviving-token round trip",
+        &expected_roundtrip[..2 * D],
+        &x.as_slice()[..2 * D],
+        1e-6,
+        1e-6,
+    );
+    assert_eq!(&expected_roundtrip[2 * D..], &[0.0; (N - 2) * D]);
+    assert_close(
+        "MoE gather/combine",
+        &output_dev.to_host_vec(stream)?,
+        cpu_output.as_slice(),
+        1e-6,
+        1e-6,
+    );
+
+    let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(400);
+    let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+    let mut expert_output_gradient_dev = DeviceBuffer::<f32>::zeroed(stream, E * C * D)?;
+    let mut gate_gradients_dev = DeviceBuffer::<f32>::zeroed(stream, N * K)?;
+    unsafe {
+        module.moe_scatter_dy(
+            stream,
+            LaunchConfig::for_num_elems((N * K) as u32),
+            &expert_output_dev,
+            &dy_dev,
+            &selected_dev,
+            &gates_dev,
+            &slots_dev,
+            D as u32,
+            K as u32,
+            C as u32,
+            &mut expert_output_gradient_dev,
+            &mut gate_gradients_dev,
+        )?;
+    }
+    let mut expected_expert_output_gradient = vec![0.0f32; E * C * D];
+    let mut expected_gate_gradients = vec![0.0f32; N * K];
+    for token in 0..N {
+        for rank in 0..K {
+            let pair = token * K + rank;
+            let slot = expected_slots[pair];
+            if slot == MOE_DROPPED_SLOT {
+                continue;
+            }
+            let expert = expected_selected[pair] as usize;
+            let bin_base = (expert * C + slot as usize) * D;
+            let token_base = token * D;
+            for column in 0..D {
+                expected_expert_output_gradient[bin_base + column] =
+                    cpu_ctx.routing.gate_weights[pair] * dy.as_slice()[token_base + column];
+                expected_gate_gradients[pair] +=
+                    expert_outputs[bin_base + column] * dy.as_slice()[token_base + column];
+            }
+        }
+    }
+    assert_close(
+        "MoE expert output gradient scatter",
+        &expert_output_gradient_dev.to_host_vec(stream)?,
+        &expected_expert_output_gradient,
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "MoE gate gradients",
+        &gate_gradients_dev.to_host_vec(stream)?,
+        &expected_gate_gradients,
+        1e-6,
+        1e-6,
+    );
+
+    let expert_input_gradient: Vec<f32> = (0..E * C * D)
+        .map(|index| index as f32 * 0.03125 - 0.5)
+        .collect();
+    let expert_input_gradient_dev = DeviceBuffer::from_host(stream, &expert_input_gradient)?;
+    let mut expert_dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    module.moe_gather_dx(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &expert_input_gradient_dev,
+        &selected_dev,
+        &slots_dev,
+        D as u32,
+        K as u32,
+        C as u32,
+        &mut expert_dx_dev,
+    )?;
+    let mut expected_expert_dx = vec![0.0f32; N * D];
+    for token in 0..N {
+        for rank in 0..K {
+            let pair = token * K + rank;
+            let slot = expected_slots[pair];
+            if slot == MOE_DROPPED_SLOT {
+                continue;
+            }
+            let expert = expected_selected[pair] as usize;
+            let bin_base = (expert * C + slot as usize) * D;
+            for column in 0..D {
+                expected_expert_dx[token * D + column] += expert_input_gradient[bin_base + column];
+            }
+        }
+    }
+    assert_eq!(
+        expert_dx_dev.to_host_vec(stream)?,
+        expected_expert_dx,
+        "MoE gather dx must sum surviving top-k paths and skip drops"
+    );
+
+    let mut dlogits_dev = DeviceBuffer::<f32>::zeroed(stream, N * E)?;
+    let mut router_dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    let mut router_dweight_dev = DeviceBuffer::<f32>::zeroed(stream, D * E)?;
+    unsafe {
+        module.router_backward(
+            stream,
+            LaunchConfig::for_num_elems(N as u32),
+            &probabilities_dev,
+            &selected_dev,
+            &gates_dev,
+            &gate_gradients_dev,
+            &counts_dev,
+            N as u32,
+            E as u32,
+            K as u32,
+            AUX,
+            &mut dlogits_dev,
+        )?;
+    }
+    module.router_backward_input(
+        stream,
+        LaunchConfig::for_num_elems((N * D) as u32),
+        &dlogits_dev,
+        &weight_dev,
+        E as u32,
+        &mut router_dx_dev,
+    )?;
+    module.router_backward_weight(
+        stream,
+        LaunchConfig::for_num_elems((D * E) as u32),
+        &x_dev,
+        &dlogits_dev,
+        N as u32,
+        E as u32,
+        &mut router_dweight_dev,
+    )?;
+    cpu.backward(cpu_ctx, dy);
+    assert_close(
+        "MoE router weight gradient including aux",
+        &router_dweight_dev.to_host_vec(stream)?,
+        cpu.router.dw.as_slice(),
+        2e-6,
+        2e-6,
+    );
+    let dlogits = CpuTensor::<f32, Rank2<N, E>>::from_slice(&dlogits_dev.to_host_vec(stream)?);
+    let expected_router_dx = dlogits.matmul_nt(&router_weight);
+    assert_close(
+        "MoE router input gradient",
+        &router_dx_dev.to_host_vec(stream)?,
+        expected_router_dx.as_slice(),
+        2e-6,
+        2e-6,
+    );
+
+    check_moe_tie_routing(stream, module)?;
+    Ok(())
+}
+
+fn check_moe_tie_routing(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 3;
+    const E: usize = 3;
+    const K: usize = 2;
+    const C: usize = 2;
+    let logits_dev = DeviceBuffer::from_host(stream, &[0.0f32; N * E])?;
+    let mut probabilities_dev = DeviceBuffer::<f32>::zeroed(stream, N * E)?;
+    let mut selected_dev = DeviceBuffer::<u32>::zeroed(stream, N * K)?;
+    let mut gates_dev = DeviceBuffer::<f32>::zeroed(stream, N * K)?;
+    let mut slots_dev = DeviceBuffer::<u32>::zeroed(stream, N * K)?;
+    let mut counts_dev = DeviceBuffer::<u32>::zeroed(stream, E)?;
+    unsafe {
+        module.router_softmax_topk(
+            stream,
+            LaunchConfig::for_num_elems(N as u32),
+            &logits_dev,
+            E as u32,
+            K as u32,
+            &mut probabilities_dev,
+            &mut selected_dev,
+            &mut gates_dev,
+        )?;
+        module.moe_bin_assign(
+            stream,
+            LaunchConfig {
+                grid_dim: (E as u32, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &selected_dev,
+            N as u32,
+            E as u32,
+            K as u32,
+            C as u32,
+            &mut slots_dev,
+            &mut counts_dev,
+        )?;
+    }
+    assert_eq!(
+        selected_dev.to_host_vec(stream)?,
+        [0, 1, 0, 1, 0, 1],
+        "MoE top-k ties must select lower expert indices"
+    );
+    assert_eq!(
+        slots_dev.to_host_vec(stream)?,
+        [0, 0, 1, 1, MOE_DROPPED_SLOT, MOE_DROPPED_SLOT],
+        "MoE tie shape must preserve token-order capacity assignment"
+    );
+    assert_close(
+        "MoE tie gate weights",
+        &gates_dev.to_host_vec(stream)?,
+        &[0.5; N * K],
+        0.0,
+        0.0,
+    );
     Ok(())
 }
 

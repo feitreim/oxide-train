@@ -132,7 +132,7 @@ pub struct MoeFfnCtx<
     probabilities: CpuTensor<f32, Rank2<N, E>>,
     pub mean_probabilities: [f32; E],
     pub routing: MoeRouting<E>,
-    expert_outputs: [CpuTensor<f32, Rank2<C, D>>; E],
+    pub expert_outputs: [CpuTensor<f32, Rank2<C, D>>; E],
     expert_contexts: [ExpertFfnCtx<C, D, FF>; E],
 }
 
