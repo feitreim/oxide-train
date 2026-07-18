@@ -23,7 +23,7 @@ B200 (Blackwell), with GPU kernels written in Rust via
 Plan: Llama-style model (RMSNorm, RoPE, SwiGLU, untied embeddings) at
 ~150-350M params, fp32 first then bf16 compute + fp32 master weights, AdamW
 then Muon, trained on English Wikipedia tokenized with tiktoken `r50k_base`
-(ids fit `u16`). MoE later.
+(ids fit `u16`). MoE is next (SPEC milestone 8).
 
 **See [SPEC.md](SPEC.md) for the full architecture, every design decision and
 its rationale, and the milestone plan.**

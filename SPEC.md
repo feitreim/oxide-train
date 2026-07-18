@@ -108,10 +108,11 @@ trait Module {
 - Start: **Llama-style decoder** — RMSNorm (pre-norm), RoPE, SwiGLU FFN,
   untied embedding/lm-head, no biases. ~150–350M params first; scale after
   the loop is proven.
-- Later: **MoE** (inkling-style thinking model is the eventual interest).
-  Design rule to keep that cheap: routing is a *runtime* decision inside a
-  statically-shaped module — expert count/capacity are const generics, token
-  assignment is data. FFN is shaped so SwiGLU → MoE is a type substitution.
+- Next (milestone 8): **MoE** (inkling-style thinking model is the eventual
+  interest). Design rule that keeps it cheap: routing is a *runtime* decision
+  inside a statically-shaped module — expert count/capacity are const
+  generics, token assignment is data. FFN is shaped so SwiGLU → MoE is a
+  type substitution.
 
 ## 7. Precision
 
@@ -445,7 +446,29 @@ Each gated on tests; correctness before speed at every step.
 
    Dependency shape: 7a/7b/7c/7d/7f can all run in parallel; 7e integrates
    their results into the model.
-8. Scale/stretch: bigger model, MoE, activation checkpointing, (much later)
+8. **MoE FFN** — next up. The §6 type substitution: swap the dense SwiGLU
+   FFN for a mixture of experts, statically shaped (expert count `E`, top-k
+   `K`, per-expert capacity `C` are const generics), with routing as runtime
+   data. Same ladder as the dense model — correctness on CPU first, GPU
+   parity second, speed last:
+   - **8a CPU reference** (crates/nn): softmax top-k router + `E` expert
+     SwiGLU FFNs behind the existing `Module` types, capacity-`C` dispatch
+     with dropped-token passthrough, auxiliary load-balancing loss folded
+     into the training loss; gradchecked (router included) and a tiny-batch
+     CPU overfit gate.
+   - **8b GPU routing** (gpu/llama-ops): top-k select + scatter/gather
+     between token order and capacity-padded expert bins, CPU/GPU parity on
+     shapes that force drops and underfull experts.
+   - **8c GPU expert compute** (gpu/llama-model): per-expert GEMMs over the
+     capacity-padded bins on the 7e9 bf16 tcgen05 path (bins are
+     tile-aligned by construction via `C`); fp32 register-tiled fallback
+     stays the oracle at non-aligned parity shapes.
+   - **8d integration**: FFN swap in `GpuLlama` behind identical types,
+     gated like 7e — full parity, aligned overfit, then a §10.1
+     same-container profile against the dense 152.1 ms baseline (MoE at
+     matched active params should approach it; the win is params/FLOP, not
+     step time).
+9. Scale/stretch: bigger model, activation checkpointing, (much later)
    multi-GPU
 
 ## 14. Decision log
