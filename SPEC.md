@@ -464,7 +464,12 @@ Each gated on tests; correctness before speed at every step.
      they determine shapes; the coefficient shapes nothing.
    - **8b GPU routing** (gpu/llama-ops): top-k select + scatter/gather
      between token order and capacity-padded expert bins, CPU/GPU parity on
-     shapes that force drops and underfull experts.
+     shapes that force drops and underfull experts. The router is fp32
+     end-to-end — logits GEMM, softmax, top-k, and gate weights — over
+     bf16 experts: routing decisions are discrete, so rounding near a
+     top-k boundary flips token assignment outright (the 7e7 two-logit
+     tie was this failure mode in miniature), and the `[N,D]×[D,E]`
+     router GEMM is too skinny for the tcgen05 tile contract anyway.
    - **8c GPU expert compute** (gpu/llama-model): per-expert GEMMs over the
      capacity-padded bins on the 7e9 bf16 tcgen05 path (bins are
      tile-aligned by construction via `C`); fp32 register-tiled fallback
@@ -502,3 +507,4 @@ Each gated on tests; correctness before speed at every step.
 | 19 | tcgen05 kernels ship as a second, pure-PTX artifact | One embedded artifact per binary, and libdevice math (`exp`/`ln`/`sqrt`) forces it through libNVVM, which rejects tcgen05 lowerings; llama-model loads `gemm.ptx` (prebuilt by gpu/gemm) through hand-written launchers in gemm/src/host.rs that mirror the generated marshalling |
 | 20 | Block tcgen05 keeps fp32 model tensors | Quantize operands into persistent scratch and use concrete fp32-output store/accumulate epilogues; buffers, optimizer/checkpoint layout, and the naive fp32 fallback stay fp32, though epilogue values are bf16-rounded (the drain reuses the packed-bf16 shared-memory staging, so each GEMM result carries bf16 mantissa precision after full-K fp32 accumulation — doubling SMEM_OUT for true fp32 staging wasn't warranted) |
 | 21 | MoE aux-loss coefficient is runtime config, not const | Const generics are reserved for values the compiler specializes on — `E`/`K`/`C` size buffers, bins, and launch grids; the coefficient is one scalar FMA that shapes nothing, needs a step schedule, and must be sweepable without a Modal rebuild (stable Rust also forbids f32 const generics). It flows host→kernel per step like `learning_rate` and is recorded in the checkpoint header like `AdamWConfig` |
+| 22 | MoE router is fp32 over bf16 experts | Routing is discrete: bf16 rounding near a top-k boundary doesn't perturb the output, it reassigns the token (the 7e7 bf16 two-logit tie showed how violently trajectories react to that). The router GEMM is `[N,D]×[D,E]` — skinny, off the tcgen05 tile contract, and a rounding-error share of step FLOPs — so fp32 costs nothing measurable while keeping gate weights and the aux loss in the precision gradcheck trusts |
