@@ -48,8 +48,8 @@ gpu/                    standalone cuda-oxide crates -- built on Modal GPUs
   flash-attn/           fused fp32 causal attention forward/backward
   tensor-gpu/           GpuTensor, elementwise/reduction/GEMM, fused AdamW,
                         packed-bf16 converts/transpose + master-weight AdamW
-  llama-model/          full model parity (fp32 + bf16 tcgen05 lm-head),
-                        tiny overfit gate, shard trainer
+  llama-model/          full model parity (fp32 + bf16 tcgen05 lm-head and
+                        block linears), tiny overfit gates, shard trainer
 modal_app.py            Modal image (CUDA 13 + LLVM 21 + pinned nightly +
                         cuda-oxide backend) and run/bench/sweep/sanitize entrypoints
 run.sh                  thin wrapper over `modal run`
@@ -102,7 +102,7 @@ Run the dedicated profiler without a dataset shard:
 ./run.sh llama-model profile
 ```
 
-The binary uses a fixed, compile-time performance configuration: `B=1`, `T=64`,
+The binary uses a fixed, compile-time performance configuration: `B=32`, `T=1024`,
 `VOCAB=50,257` (padded to 50,304 for the bf16 tcgen05 lm-head), `D=1536`,
 `H=24`, `HD=64`, and `FF=4096` (about 182.7M parameters). It runs two complete
 warmup steps, synchronizes the stream, and then measures one `zero_grad +
@@ -140,7 +140,7 @@ rewrite them.
 
 The milestone-6 trainer reads `TOK1` shards from the `rust-trainer-wiki` Modal
 volume. Upload a prepared shard once, then launch the small reference
-configuration (fp32 with the bf16 tcgen05 lm-head):
+configuration (fp32 masters with the bf16 tcgen05 lm-head and block linears):
 
 ```bash
 modal volume create rust-trainer-wiki
