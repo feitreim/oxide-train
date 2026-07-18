@@ -455,7 +455,13 @@ Each gated on tests; correctness before speed at every step.
      SwiGLU FFNs behind the existing `Module` types, capacity-`C` dispatch
      with dropped-token passthrough, auxiliary load-balancing loss folded
      into the training loss; gradchecked (router included) and a tiny-batch
-     CPU overfit gate.
+     CPU overfit gate. The aux-loss coefficient is runtime config, not a
+     const generic: the host evaluates its schedule from the global step
+     each iteration (balancing pressure wants to be strongest early,
+     against routing collapse) and passes the scalar to the kernel like
+     `learning_rate`; it rides the checkpoint header like `AdamWConfig` so
+     resume can't silently change it. Only `E`/`K`/`C` are const generics —
+     they determine shapes; the coefficient shapes nothing.
    - **8b GPU routing** (gpu/llama-ops): top-k select + scatter/gather
      between token order and capacity-padded expert bins, CPU/GPU parity on
      shapes that force drops and underfull experts.
@@ -495,3 +501,4 @@ Each gated on tests; correctness before speed at every step.
 | 18 | bf16 adopted head-first via padded NP/VP dims | lm-head ≈70% of the one-block model's GEMM FLOPs and the measured rock; zero-padding tokens→NP and vocab→VP keeps the tuned tcgen05 kernel's tile contract with provably inert padding (zero rows/columns never move), so no boundary-guard variants and byte-compatible checkpoints |
 | 19 | tcgen05 kernels ship as a second, pure-PTX artifact | One embedded artifact per binary, and libdevice math (`exp`/`ln`/`sqrt`) forces it through libNVVM, which rejects tcgen05 lowerings; llama-model loads `gemm.ptx` (prebuilt by gpu/gemm) through hand-written launchers in gemm/src/host.rs that mirror the generated marshalling |
 | 20 | Block tcgen05 keeps fp32 model tensors | Quantize operands into persistent scratch and use concrete fp32-output store/accumulate epilogues; buffers, optimizer/checkpoint layout, and the naive fp32 fallback stay fp32, though epilogue values are bf16-rounded (the drain reuses the packed-bf16 shared-memory staging, so each GEMM result carries bf16 mantissa precision after full-K fp32 accumulation — doubling SMEM_OUT for true fp32 staging wasn't warranted) |
+| 21 | MoE aux-loss coefficient is runtime config, not const | Const generics are reserved for values the compiler specializes on — `E`/`K`/`C` size buffers, bins, and launch grids; the coefficient is one scalar FMA that shapes nothing, needs a step schedule, and must be sweepable without a Modal rebuild (stable Rust also forbids f32 const generics). It flows host→kernel per step like `learning_rate` and is recorded in the checkpoint header like `AdamWConfig` |
