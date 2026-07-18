@@ -9,10 +9,11 @@
 use tensor_core::{Rank2, Shape};
 use tensor_cpu::CpuTensor;
 
-const NEWTON_SCHULZ_A: f32 = 3.4445;
-const NEWTON_SCHULZ_B: f32 = -4.7750;
-const NEWTON_SCHULZ_C: f32 = 2.0315;
-const NEWTON_SCHULZ_EPSILON: f32 = 1e-7;
+/// Quintic iteration coefficients, shared with the GPU implementation.
+pub const NEWTON_SCHULZ_A: f32 = 3.4445;
+pub const NEWTON_SCHULZ_B: f32 = -4.7750;
+pub const NEWTON_SCHULZ_C: f32 = 2.0315;
+pub const NEWTON_SCHULZ_EPSILON: f32 = 1e-7;
 
 /// Hyperparameters for Muon updates over hidden matrices.
 #[derive(Clone, Copy, Debug, PartialEq)]

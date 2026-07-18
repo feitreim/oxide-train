@@ -107,6 +107,155 @@ pub mod kernels {
         *parameter -= learning_rate * update;
     }
 
+    /// Muon's EMA momentum update: `m = beta * m + (1 - beta) * g`.
+    #[kernel]
+    pub fn ema_momentum(gradient: &[f32], beta: f32, mut momentum: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = momentum.get_mut(index) {
+            *slot = beta * *slot + (1.0 - beta) * gradient[i];
+        }
+    }
+
+    /// `out = alpha * a + beta * b` over the first `len` elements.
+    ///
+    /// All three buffers may be longer than `len` (Muon scratch prefixes);
+    /// elements past `len` are untouched.
+    #[kernel]
+    pub fn scaled_sum(
+        alpha: f32,
+        a: &[f32],
+        beta: f32,
+        b: &[f32],
+        len: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= len as usize {
+            return;
+        }
+        if let Some(slot) = out.get_mut(index) {
+            *slot = alpha * a[i] + beta * b[i];
+        }
+    }
+
+    /// Sum of squares of the first `len` elements, accumulated in f64 to
+    /// match the CPU reference's Frobenius-norm accumulator.
+    #[kernel]
+    pub fn sum_squares(a: &[f32], len: u32, mut out: DisjointSlice<f32>) {
+        static mut PARTIALS: SharedArray<f64, REDUCE_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let mut i = tid;
+        let mut partial = 0.0f64;
+        while i < len as usize {
+            let value = a[i] as f64;
+            partial += value * value;
+            i += REDUCE_THREADS;
+        }
+        unsafe {
+            PARTIALS[tid] = partial;
+        }
+        thread::sync_threads();
+
+        let mut stride = REDUCE_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    PARTIALS[tid] += PARTIALS[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+
+        let index = thread::index_1d();
+        if tid == 0
+            && let Some(slot) = out.get_mut(index)
+        {
+            unsafe {
+                *slot = PARTIALS[0] as f32;
+            }
+        }
+    }
+
+    /// `out = input / (sqrt(sum_squares[0]) + epsilon)` over the first `len`
+    /// elements: Muon's Newton–Schulz pre-normalization, with the norm left
+    /// device-resident so no step synchronizes the stream.
+    #[kernel]
+    pub fn scale_by_inv_norm(
+        input: &[f32],
+        sum_squares: &[f32],
+        epsilon: f32,
+        len: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= len as usize {
+            return;
+        }
+        let scale = 1.0 / (sum_squares[0].sqrt() + epsilon);
+        if let Some(slot) = out.get_mut(index) {
+            *slot = input[i] * scale;
+        }
+    }
+
+    /// Copy group `group` of a `[rows, groups, width]` tensor into a dense
+    /// `[rows, width]` prefix of `out`. `len` is `rows * width`. With
+    /// `groups = 1` this is a plain device copy.
+    #[kernel]
+    pub fn gather_group(
+        input: &[f32],
+        groups: u32,
+        group: u32,
+        width: u32,
+        len: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= len as usize {
+            return;
+        }
+        let row = i / width as usize;
+        let column = i % width as usize;
+        if let Some(slot) = out.get_mut(index) {
+            *slot = input[(row * groups as usize + group as usize) * width as usize + column];
+        }
+    }
+
+    /// Muon's fused parameter update for one group of a `[rows, groups,
+    /// width]` parameter: `p = decay * p - scale * update`, where `update` is
+    /// the dense `[rows, width]` orthogonalized matrix and `len` is
+    /// `rows * width`.
+    #[kernel]
+    pub unsafe fn muon_apply_group(
+        update: &[f32],
+        decay: f32,
+        scale: f32,
+        groups: u32,
+        group: u32,
+        width: u32,
+        len: u32,
+        mut parameter: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= len as usize {
+            return;
+        }
+        let row = i / width as usize;
+        let column = i % width as usize;
+        let target = (row * groups as usize + group as usize) * width as usize + column;
+        // SAFETY: distinct `i` map to distinct `target` for a fixed `group`,
+        // and the caller launches one group at a time.
+        unsafe {
+            let slot = parameter.get_unchecked_mut(target);
+            *slot = decay * *slot - scale * update[i];
+        }
+    }
+
     #[inline(always)]
     fn bf16_bits_to_f32(bits: u16) -> f32 {
         f32::from_bits((bits as u32) << 16)
@@ -533,6 +682,19 @@ impl<S: Shape> GpuAdamWMoments<S> {
         Ok(Self {
             first: GpuTensor::zeros(stream)?,
             second: GpuTensor::zeros(stream)?,
+        })
+    }
+}
+
+/// GPU-resident Muon momentum buffer for one parameter tensor.
+pub struct GpuMuonMomentum<S: Shape> {
+    pub momentum: GpuTensor<f32, S>,
+}
+
+impl<S: Shape> GpuMuonMomentum<S> {
+    pub fn zeros(stream: &CudaStream) -> Result<Self, DriverError> {
+        Ok(Self {
+            momentum: GpuTensor::zeros(stream)?,
         })
     }
 }

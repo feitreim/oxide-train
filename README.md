@@ -47,9 +47,11 @@ gpu/                    standalone cuda-oxide crates -- built on Modal GPUs
   gemm/                 register-tiled fp32 + Blackwell tcgen05 bf16 GEMMs
   flash-attn/           fused fp32 causal attention forward/backward
   tensor-gpu/           GpuTensor, elementwise/reduction/GEMM, fused AdamW,
-                        packed-bf16 converts/transpose + master-weight AdamW
+                        Muon momentum/apply kernels, packed-bf16
+                        converts/transpose + master-weight AdamW
   llama-model/          full model parity (fp32 + bf16 tcgen05 lm-head and
-                        block linears), tiny overfit gates, shard trainer
+                        block linears), Muon Newton–Schulz optimizer, tiny
+                        overfit gates, shard trainer
 modal_app.py            Modal image (CUDA 13 + LLVM 21 + pinned nightly +
                         cuda-oxide backend) and run/bench/sweep/sanitize entrypoints
 run.sh                  thin wrapper over `modal run`

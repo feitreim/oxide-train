@@ -25,7 +25,10 @@ use std::error::Error;
 use bench_util::{KernelProfiler, NoopProfiler};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, DriverError, LaunchConfig, PinnedHostBuffer};
 use nn::Llama;
-use optim::AdamWConfig;
+use optim::{
+    AdamWConfig, MuonConfig, NEWTON_SCHULZ_A, NEWTON_SCHULZ_B, NEWTON_SCHULZ_C,
+    NEWTON_SCHULZ_EPSILON,
+};
 use tensor_core::{Rank1, Rank2, Rank3, Shape, bf16};
 
 // cuda-oxide collects kernels from the selected binary target. The binary
@@ -62,7 +65,7 @@ use gemm_host::{
     Bf16PairsTmaMap, TC_TILE, create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix,
     tcgen05_launch_config,
 };
-use tensor_device::{GpuAdamWMoments, GpuTensor, transpose_pairs_config};
+use tensor_device::{GpuAdamWMoments, GpuMuonMomentum, GpuTensor, transpose_pairs_config};
 
 pub mod checkpoint;
 
@@ -1324,6 +1327,436 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
             model.lm_head.sync_transposed(stream, kernels)
         })?;
         Ok(())
+    }
+}
+
+/// Device scratch for Muon's Newton–Schulz orthogonalization.
+///
+/// Every buffer is sized once for the largest hidden matrix and reused for
+/// all of them via prefixes, so a steady-state Muon step performs no device
+/// allocation. Gram-side buffers hold `min(rows, cols)^2` elements, which the
+/// model bounds by `D^2`.
+pub struct GpuMuonScratch {
+    update: DeviceBuffer<f32>,
+    x: DeviceBuffer<f32>,
+    x_next: DeviceBuffer<f32>,
+    product: DeviceBuffer<f32>,
+    gram: DeviceBuffer<f32>,
+    gram_squared: DeviceBuffer<f32>,
+    polynomial: DeviceBuffer<f32>,
+    sum_squares: DeviceBuffer<f32>,
+}
+
+impl GpuMuonScratch {
+    pub fn new(
+        stream: &CudaStream,
+        max_update_elements: usize,
+        max_matrix_elements: usize,
+        max_gram_side: usize,
+    ) -> Result<Self, DriverError> {
+        Ok(Self {
+            update: DeviceBuffer::zeroed(stream, max_update_elements)?,
+            x: DeviceBuffer::zeroed(stream, max_matrix_elements)?,
+            x_next: DeviceBuffer::zeroed(stream, max_matrix_elements)?,
+            product: DeviceBuffer::zeroed(stream, max_matrix_elements)?,
+            gram: DeviceBuffer::zeroed(stream, max_gram_side * max_gram_side)?,
+            gram_squared: DeviceBuffer::zeroed(stream, max_gram_side * max_gram_side)?,
+            polynomial: DeviceBuffer::zeroed(stream, max_gram_side * max_gram_side)?,
+            sum_squares: DeviceBuffer::zeroed(stream, 1)?,
+        })
+    }
+
+    /// Test hook mirroring `optim::zeroth_power_via_newton_schulz`: copy
+    /// `input` (a dense `[rows, cols]` matrix) through the iteration and read
+    /// the result back. Parity-binary only; other binaries see dead code.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn zeroth_power(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        rows: usize,
+        cols: usize,
+        steps: usize,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+    ) -> Result<Vec<f32>, DriverError> {
+        let elements = rows * cols;
+        tensor.gather_group(
+            stream,
+            pairs_config(elements),
+            input,
+            1,
+            0,
+            cols as u32,
+            elements as u32,
+            &mut self.x,
+        )?;
+        newton_schulz_orthogonalize(self, rows, cols, steps, stream, tensor, gemm)?;
+        let mut values = self.x.to_host_vec(stream)?;
+        values.truncate(elements);
+        Ok(values)
+    }
+}
+
+/// Orthogonalize the `[rows, cols]` prefix of `scratch.x` in place with the
+/// quintic Newton–Schulz iteration, matching the CPU reference's math.
+///
+/// The Gram matrix always lives on the smaller axis. For wide matrices the
+/// iteration is the reference's `X = aX + (bA + cA^2) X` with `A = X X^T`.
+/// For tall matrices the reference transposes, iterates, and transposes back;
+/// since `A = X^T X` and its polynomial `B` are symmetric, that whole
+/// round-trip collapses to `X = aX + X B`, so no f32 transpose kernel exists.
+fn newton_schulz_orthogonalize(
+    scratch: &mut GpuMuonScratch,
+    rows: usize,
+    cols: usize,
+    steps: usize,
+    stream: &CudaStream,
+    tensor: &tensor_kernels::LoadedModule,
+    gemm: &gemm_kernels::LoadedModule,
+) -> Result<(), DriverError> {
+    assert!(steps < 100, "Newton-Schulz steps must be less than 100");
+    assert!(rows > 0 && cols > 0, "Muon matrices must be non-empty");
+    let elements = rows * cols;
+    let gram_side = rows.min(cols);
+    let gram_elements = gram_side * gram_side;
+
+    tensor.sum_squares(
+        stream,
+        reduction_config(),
+        &scratch.x,
+        elements as u32,
+        &mut scratch.sum_squares,
+    )?;
+    tensor.scale_by_inv_norm(
+        stream,
+        pairs_config(elements),
+        &scratch.x,
+        &scratch.sum_squares,
+        NEWTON_SCHULZ_EPSILON,
+        elements as u32,
+        &mut scratch.x_next,
+    )?;
+    std::mem::swap(&mut scratch.x, &mut scratch.x_next);
+
+    for _ in 0..steps {
+        if rows <= cols {
+            // A = X X^T
+            unsafe {
+                gemm.register_gemm_nt_store(
+                    stream,
+                    fp32_launch_config(rows, rows),
+                    rows,
+                    rows,
+                    cols,
+                    &scratch.x,
+                    &scratch.x,
+                    &mut scratch.gram,
+                )?;
+            }
+        } else {
+            // A = X^T X; the fp32 family has no TN store, so zero + accumulate.
+            tensor.fill(stream, pairs_config(gram_elements), 0.0, &mut scratch.gram)?;
+            unsafe {
+                gemm.register_gemm_tn_accumulate(
+                    stream,
+                    fp32_launch_config(gram_side, gram_side),
+                    gram_side,
+                    gram_side,
+                    rows,
+                    &scratch.x,
+                    &scratch.x,
+                    &mut scratch.gram,
+                )?;
+            }
+        }
+        unsafe {
+            gemm.register_gemm_store(
+                stream,
+                fp32_launch_config(gram_side, gram_side),
+                gram_side,
+                gram_side,
+                gram_side,
+                &scratch.gram,
+                &scratch.gram,
+                &mut scratch.gram_squared,
+            )?;
+        }
+        // B = b A + c A^2
+        tensor.scaled_sum(
+            stream,
+            pairs_config(gram_elements),
+            NEWTON_SCHULZ_B,
+            &scratch.gram,
+            NEWTON_SCHULZ_C,
+            &scratch.gram_squared,
+            gram_elements as u32,
+            &mut scratch.polynomial,
+        )?;
+        if rows <= cols {
+            // X = a X + B X
+            unsafe {
+                gemm.register_gemm_store(
+                    stream,
+                    fp32_launch_config(rows, cols),
+                    rows,
+                    cols,
+                    rows,
+                    &scratch.polynomial,
+                    &scratch.x,
+                    &mut scratch.product,
+                )?;
+            }
+        } else {
+            // X = a X + X B
+            unsafe {
+                gemm.register_gemm_store(
+                    stream,
+                    fp32_launch_config(rows, cols),
+                    rows,
+                    cols,
+                    cols,
+                    &scratch.x,
+                    &scratch.polynomial,
+                    &mut scratch.product,
+                )?;
+            }
+        }
+        tensor.scaled_sum(
+            stream,
+            pairs_config(elements),
+            NEWTON_SCHULZ_A,
+            &scratch.x,
+            1.0,
+            &scratch.product,
+            elements as u32,
+            &mut scratch.x_next,
+        )?;
+        std::mem::swap(&mut scratch.x, &mut scratch.x_next);
+    }
+    Ok(())
+}
+
+/// One Muon update over a `[rows, groups, cols]` parameter whose groups are
+/// independent `[rows, cols]` matrices (`groups = 1` for plain linears).
+///
+/// Momentum and the Nesterov interpolation are elementwise and run over the
+/// whole interleaved buffer; orthogonalization and the fused decay/apply then
+/// run per group so each projection is orthogonalized on its own, matching
+/// the CPU reference's separate `q/k/v` and `gate/up` matrices.
+#[allow(clippy::too_many_arguments)]
+fn muon_step_raw(
+    parameter: &mut DeviceBuffer<f32>,
+    gradient: &DeviceBuffer<f32>,
+    momentum: &mut DeviceBuffer<f32>,
+    rows: usize,
+    groups: usize,
+    cols: usize,
+    config: MuonConfig,
+    scratch: &mut GpuMuonScratch,
+    stream: &CudaStream,
+    tensor: &tensor_kernels::LoadedModule,
+    gemm: &gemm_kernels::LoadedModule,
+) -> Result<(), DriverError> {
+    let total = rows * groups * cols;
+    let per_group = rows * cols;
+    tensor.ema_momentum(
+        stream,
+        pairs_config(total),
+        gradient,
+        config.momentum,
+        momentum,
+    )?;
+    let (gradient_weight, momentum_weight) = if config.nesterov {
+        (1.0 - config.momentum, config.momentum)
+    } else {
+        (0.0, 1.0)
+    };
+    tensor.scaled_sum(
+        stream,
+        pairs_config(total),
+        gradient_weight,
+        gradient,
+        momentum_weight,
+        momentum,
+        total as u32,
+        &mut scratch.update,
+    )?;
+
+    let aspect_ratio_scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
+    let decay = 1.0 - config.learning_rate * config.weight_decay;
+    let update_scale = config.learning_rate * aspect_ratio_scale;
+    for group in 0..groups {
+        tensor.gather_group(
+            stream,
+            pairs_config(per_group),
+            &scratch.update,
+            groups as u32,
+            group as u32,
+            cols as u32,
+            per_group as u32,
+            &mut scratch.x,
+        )?;
+        newton_schulz_orthogonalize(
+            scratch,
+            rows,
+            cols,
+            config.newton_schulz_steps,
+            stream,
+            tensor,
+            gemm,
+        )?;
+        unsafe {
+            tensor.muon_apply_group(
+                stream,
+                pairs_config(per_group),
+                &scratch.x,
+                decay,
+                update_scale,
+                groups as u32,
+                group as u32,
+                cols as u32,
+                per_group as u32,
+                parameter,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// GPU-resident mixed Muon/AdamW state mirroring `optim::LlamaMuon`'s
+/// routing: hidden projection matrices take Muon, while the embedding,
+/// norms, and lm-head keep AdamW (the lm-head over its padded `[D, VP]`
+/// master, exactly as in [`GpuLlamaAdamW`]).
+pub struct GpuLlamaMuon<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize> {
+    muon_config: MuonConfig,
+    adamw_config: AdamWConfig,
+    step: u64,
+    scratch: GpuMuonScratch,
+    pub embedding: GpuAdamWMoments<Rank2<VOCAB, D>>,
+    pub attention_norm: GpuAdamWMoments<Rank1<D>>,
+    pub qkv_proj: GpuMuonMomentum<Rank3<D, 3, D>>,
+    pub o_proj: GpuMuonMomentum<Rank2<D, D>>,
+    pub ffn_norm: GpuAdamWMoments<Rank1<D>>,
+    pub gate_up_proj: GpuMuonMomentum<Rank3<D, 2, FF>>,
+    pub down_proj: GpuMuonMomentum<Rank2<FF, D>>,
+    pub final_norm: GpuAdamWMoments<Rank1<D>>,
+    pub lm_head: GpuAdamWMoments<Rank2<D, VP>>,
+}
+
+impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
+    GpuLlamaMuon<VOCAB, VP, D, FF>
+{
+    pub fn new(
+        stream: &CudaStream,
+        muon_config: MuonConfig,
+        adamw_config: AdamWConfig,
+    ) -> Result<Self, DriverError> {
+        muon_config.validate();
+        adamw_config.validate();
+        // Largest interleaved hidden parameter, largest single matrix, and
+        // the Gram side (min dimension), which every hidden matrix bounds by D.
+        let max_update_elements = (3 * D * D).max(2 * D * FF);
+        let max_matrix_elements = (D * D).max(D * FF);
+        Ok(Self {
+            muon_config,
+            adamw_config,
+            step: 0,
+            scratch: GpuMuonScratch::new(stream, max_update_elements, max_matrix_elements, D)?,
+            embedding: GpuAdamWMoments::zeros(stream)?,
+            attention_norm: GpuAdamWMoments::zeros(stream)?,
+            qkv_proj: GpuMuonMomentum::zeros(stream)?,
+            o_proj: GpuMuonMomentum::zeros(stream)?,
+            ffn_norm: GpuAdamWMoments::zeros(stream)?,
+            gate_up_proj: GpuMuonMomentum::zeros(stream)?,
+            down_proj: GpuMuonMomentum::zeros(stream)?,
+            final_norm: GpuAdamWMoments::zeros(stream)?,
+            lm_head: GpuAdamWMoments::zeros(stream)?,
+        })
+    }
+
+    pub fn step(&self) -> u64 {
+        self.step
+    }
+
+    pub fn muon_config(&self) -> MuonConfig {
+        self.muon_config
+    }
+
+    pub fn adamw_config(&self) -> AdamWConfig {
+        self.adamw_config
+    }
+
+    pub fn update<
+        const N: usize,
+        const NP: usize,
+        const T: usize,
+        const H: usize,
+        const HD: usize,
+    >(
+        &mut self,
+        model: &mut GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        self.step = self.step.checked_add(1).expect("Muon step overflow");
+        let (first_correction, second_correction) = self.adamw_config.bias_correction(self.step);
+
+        macro_rules! adamw {
+            ($field:ident, $weight_decay:expr) => {
+                model.$field.w.adamw_step(
+                    &model.$field.dw,
+                    &mut self.$field,
+                    self.adamw_config.learning_rate,
+                    self.adamw_config.beta1,
+                    self.adamw_config.beta2,
+                    self.adamw_config.epsilon,
+                    $weight_decay,
+                    first_correction,
+                    second_correction,
+                    stream,
+                    tensor,
+                )?;
+            };
+        }
+        macro_rules! muon {
+            ($field:ident, $rows:expr, $groups:expr, $cols:expr) => {
+                muon_step_raw(
+                    model.$field.w.as_device_buffer_mut(),
+                    model.$field.dw.as_device_buffer(),
+                    self.$field.momentum.as_device_buffer_mut(),
+                    $rows,
+                    $groups,
+                    $cols,
+                    self.muon_config,
+                    &mut self.scratch,
+                    stream,
+                    tensor,
+                    gemm,
+                )?;
+            };
+        }
+
+        adamw!(embedding, self.adamw_config.weight_decay);
+        adamw!(attention_norm, 0.0);
+        muon!(qkv_proj, D, 3, D);
+        muon!(o_proj, D, 1, D);
+        adamw!(ffn_norm, 0.0);
+        muon!(gate_up_proj, D, 2, FF);
+        muon!(down_proj, FF, 1, D);
+        adamw!(final_norm, 0.0);
+        model.sync_linear_compute(stream, tensor)?;
+        model.lm_head.adamw_step(
+            &mut self.lm_head,
+            self.adamw_config,
+            first_correction,
+            second_correction,
+            stream,
+            tensor,
+        )?;
+        model.lm_head.sync_transposed(stream, tensor)
     }
 }
 
