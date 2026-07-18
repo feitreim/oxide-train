@@ -43,6 +43,19 @@ fn encode_bf16_tma_map(
     width: usize,
     height: usize,
 ) -> Result<DeviceBuffer<u64>, Box<dyn Error>> {
+    encode_bf16_tma_map_strided(stream, base, width, height, width)
+}
+
+/// Encode a bf16 tensor map whose logical rows are prefixes of wider physical
+/// rows. This addresses one expert inside a globally transposed stacked
+/// weight or activation buffer.
+fn encode_bf16_tma_map_strided(
+    stream: &CudaStream,
+    base: u64,
+    width: usize,
+    height: usize,
+    row_stride: usize,
+) -> Result<DeviceBuffer<u64>, Box<dyn Error>> {
     use cuda_core::sys::{
         CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
@@ -54,9 +67,10 @@ fn encode_bf16_tma_map(
 
     assert!(width.is_multiple_of(TC_BK));
     assert!(height.is_multiple_of(TC_TILE));
+    assert!(row_stride >= width);
     let mut tensor_map = MaybeUninit::<cuda_core::sys::CUtensorMap>::uninit();
     let global_dimensions = [width as u64, height as u64];
-    let global_strides = [(width * 2) as u64];
+    let global_strides = [(row_stride * 2) as u64];
     let box_dimensions = [TC_BK as u32, TC_TILE as u32];
     let element_strides = [1u32, 1u32];
     let status = unsafe {
@@ -166,6 +180,53 @@ pub unsafe fn create_bf16_pairs_tma_map_prefix(
     })
 }
 
+/// Build a tensor map over a rectangular region of packed-pair bf16 storage.
+///
+/// `word_offset` locates the first logical element pair and `row_stride` is
+/// measured in bf16 elements. A stride larger than `width` permits one expert
+/// to be addressed inside a globally transposed `[height, E * width]` buffer.
+///
+/// # Safety
+///
+/// `matrix` must remain at the same address and the described strided region
+/// must stay within the allocation for every launch using the returned map.
+pub unsafe fn create_bf16_pairs_tma_map_region(
+    stream: &CudaStream,
+    matrix: &DeviceBuffer<u32>,
+    word_offset: usize,
+    width: usize,
+    height: usize,
+    row_stride: usize,
+) -> Result<Bf16PairsTmaMap, Box<dyn Error>> {
+    assert!(width.is_multiple_of(2));
+    assert!(row_stride.is_multiple_of(2));
+    assert!(row_stride >= width);
+    let required_bf16 = if height == 0 {
+        0
+    } else {
+        (height - 1)
+            .checked_mul(row_stride)
+            .and_then(|prefix| prefix.checked_add(width))
+            .expect("bf16 TMA region size overflow")
+    };
+    assert!(
+        word_offset
+            .checked_add(required_bf16 / 2)
+            .is_some_and(|end| end <= matrix.len()),
+        "bf16 TMA region exceeds its packed allocation"
+    );
+    let byte_offset = word_offset
+        .checked_mul(std::mem::size_of::<u32>())
+        .expect("bf16 TMA region byte offset overflow");
+    let base = matrix
+        .cu_deviceptr()
+        .checked_add(byte_offset as u64)
+        .expect("bf16 TMA region device pointer overflow");
+    Ok(Bf16PairsTmaMap {
+        descriptor: encode_bf16_tma_map_strided(stream, base, width, height, row_stride)?,
+    })
+}
+
 /// The two tcgen05 bf16 GEMM kernels, loaded from a `gemm.ptx` built by this
 /// crate rather than from the calling binary's embedded artifact.
 ///
@@ -254,7 +315,57 @@ impl Tcgen05Gemm {
         n: u32,
         k: u32,
     ) -> Result<(), DriverError> {
-        unsafe { launch_tcgen05_f32(&self.f32_store, stream, config, a_tma, b_tma, output, n, k) }
+        let output_elements = output.len();
+        unsafe {
+            launch_tcgen05_f32(
+                &self.f32_store,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                0,
+                output_elements,
+                n,
+                k,
+            )
+        }
+    }
+
+    /// Offset form of [`Tcgen05Gemm::f32_store`] for one matrix inside a
+    /// stacked fp32 output allocation.
+    ///
+    /// # Safety
+    ///
+    /// The TMA maps must match the launch dimensions and the selected output
+    /// region must contain exactly one `m * n` matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_store_at(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<f32>,
+        output_offset: usize,
+        output_elements: usize,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            launch_tcgen05_f32(
+                &self.f32_store,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                output_offset,
+                output_elements,
+                n,
+                k,
+            )
+        }
     }
 
     /// Blackwell bf16 `C += A B^T` with row-major fp32 output.
@@ -273,6 +384,7 @@ impl Tcgen05Gemm {
         n: u32,
         k: u32,
     ) -> Result<(), DriverError> {
+        let output_elements = output.len();
         unsafe {
             launch_tcgen05_f32(
                 &self.f32_accumulate,
@@ -281,6 +393,43 @@ impl Tcgen05Gemm {
                 a_tma,
                 b_tma,
                 output,
+                0,
+                output_elements,
+                n,
+                k,
+            )
+        }
+    }
+
+    /// Offset form of [`Tcgen05Gemm::f32_accumulate`] for one matrix inside a
+    /// stacked fp32 gradient allocation.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Tcgen05Gemm::f32_store_at`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_accumulate_at(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<f32>,
+        output_offset: usize,
+        output_elements: usize,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            launch_tcgen05_f32(
+                &self.f32_accumulate,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                output_offset,
+                output_elements,
                 n,
                 k,
             )
@@ -326,13 +475,26 @@ unsafe fn launch_tcgen05_f32(
     mut a_tma: *const TmaDescriptor,
     mut b_tma: *const TmaDescriptor,
     output: &mut DeviceBuffer<f32>,
+    output_offset: usize,
+    output_elements: usize,
     mut n: u32,
     mut k: u32,
 ) -> Result<(), DriverError> {
+    let output_end = output_offset
+        .checked_add(output_elements)
+        .expect("tcgen05 fp32 output region overflow");
+    assert!(output_end <= output.len());
     let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
     cuda_host::push_kernel_scalar(&mut args, &mut a_tma);
     cuda_host::push_kernel_scalar(&mut args, &mut b_tma);
-    let (mut output_ptr, mut output_len) = cuda_host::writable_device_buffer_arg(output);
+    let byte_offset = output_offset
+        .checked_mul(std::mem::size_of::<f32>())
+        .expect("tcgen05 fp32 output byte offset overflow");
+    let mut output_ptr = output
+        .cu_deviceptr()
+        .checked_add(byte_offset as u64)
+        .expect("tcgen05 fp32 output device pointer overflow");
+    let mut output_len = output_elements as u64;
     cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
     cuda_host::push_kernel_scalar(&mut args, &mut n);
     cuda_host::push_kernel_scalar(&mut args, &mut k);
