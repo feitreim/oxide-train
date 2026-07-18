@@ -455,7 +455,7 @@ Each gated on tests; correctness before speed at every step.
    `K`, per-expert capacity `C` are const generics), with routing as runtime
    data. Same ladder as the dense model — correctness on CPU first, GPU
    parity second, speed last:
-   - **8a CPU reference** (crates/nn): softmax top-k router + `E` expert
+   - ✅ **8a CPU reference** (crates/nn): softmax top-k router + `E` expert
      SwiGLU FFNs behind the existing `Module` types, capacity-`C` dispatch
      with dropped-token passthrough, auxiliary load-balancing loss folded
      into the training loss; gradchecked (router included) and a tiny-batch
