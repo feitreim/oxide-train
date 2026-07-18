@@ -11,16 +11,16 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use cuda_core::CudaStream;
-use nn::Llama;
-use optim::AdamWConfig;
+use nn::MoeLlama;
+use optim::{AdamWConfig, AuxLossSchedule};
 use tensor_core::{Rank2, Shape};
 
 use super::tensor_device::GpuTensor;
 use super::{GpuBf16Head, GpuLlama, GpuLlamaAdamW};
 
 const MAGIC: &[u8; 8] = b"RTCKPT01";
-const VERSION: u32 = 2;
-const CONFIG_FLOATS: usize = 5;
+const VERSION: u32 = 3;
+const CONFIG_FLOATS: usize = 7;
 
 pub struct LoadedCheckpoint<
     const N: usize,
@@ -32,9 +32,12 @@ pub struct LoadedCheckpoint<
     const H: usize,
     const HD: usize,
     const FF: usize,
+    const E: usize,
+    const K: usize,
+    const C: usize,
 > {
-    pub model: GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
-    pub optimizer: GpuLlamaAdamW<VOCAB, VP, D, FF>,
+    pub model: GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>,
+    pub optimizer: GpuLlamaAdamW<VOCAB, VP, D, FF, E>,
     pub next_batch: u64,
 }
 
@@ -128,20 +131,26 @@ fn read_head_values<const D: usize, const VP: usize>(
     Ok(padded)
 }
 
-fn write_config(writer: &mut impl Write, config: AdamWConfig) -> io::Result<()> {
+fn write_config(
+    writer: &mut impl Write,
+    config: AdamWConfig,
+    aux_schedule: AuxLossSchedule,
+) -> io::Result<()> {
     for value in [
         config.learning_rate,
         config.beta1,
         config.beta2,
         config.epsilon,
         config.weight_decay,
+        aux_schedule.base_coefficient,
+        aux_schedule.decay_horizon,
     ] {
         write_f32(writer, value)?;
     }
     Ok(())
 }
 
-fn read_config(reader: &mut impl Read) -> io::Result<AdamWConfig> {
+fn read_config(reader: &mut impl Read) -> io::Result<(AdamWConfig, AuxLossSchedule)> {
     let mut values = [0.0; CONFIG_FLOATS];
     for value in &mut values {
         *value = read_f32(reader)?;
@@ -153,8 +162,17 @@ fn read_config(reader: &mut impl Read) -> io::Result<AdamWConfig> {
         epsilon: values[3],
         weight_decay: values[4],
     };
-    config.validate();
-    Ok(config)
+    if !config.is_valid() {
+        return Err(invalid("invalid AdamW checkpoint config"));
+    }
+    let aux_schedule = AuxLossSchedule {
+        base_coefficient: values[5],
+        decay_horizon: values[6],
+    };
+    if !aux_schedule.is_valid() {
+        return Err(invalid("invalid auxiliary-loss checkpoint schedule"));
+    }
+    Ok((config, aux_schedule))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -168,10 +186,13 @@ pub fn save<
     const H: usize,
     const HD: usize,
     const FF: usize,
+    const E: usize,
+    const K: usize,
+    const C: usize,
 >(
     path: impl AsRef<Path>,
-    model: &GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
-    optimizer: &GpuLlamaAdamW<VOCAB, VP, D, FF>,
+    model: &GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>,
+    optimizer: &GpuLlamaAdamW<VOCAB, VP, D, FF, E>,
     next_batch: u64,
     stream: &CudaStream,
 ) -> Result<(), Box<dyn Error>> {
@@ -186,12 +207,12 @@ pub fn save<
 
     writer.write_all(MAGIC)?;
     write_u32(&mut writer, VERSION)?;
-    for dimension in [N, T, VOCAB, D, H, HD, FF] {
+    for dimension in [N, T, VOCAB, D, H, HD, FF, E, K, C] {
         write_u64(&mut writer, dimension as u64)?;
     }
     write_u64(&mut writer, optimizer.step())?;
     write_u64(&mut writer, next_batch)?;
-    write_config(&mut writer, optimizer.config())?;
+    write_config(&mut writer, optimizer.config(), optimizer.aux_schedule())?;
 
     macro_rules! write_parameter {
         ($field:ident) => {
@@ -205,8 +226,15 @@ pub fn save<
     write_parameter!(qkv_proj);
     write_parameter!(o_proj);
     write_parameter!(ffn_norm);
-    write_parameter!(gate_up_proj);
-    write_parameter!(down_proj);
+    write_tensor(&mut writer, &model.router, stream)?;
+    write_tensor(&mut writer, &optimizer.router.first, stream)?;
+    write_tensor(&mut writer, &optimizer.router.second, stream)?;
+    write_tensor(&mut writer, &model.experts.gate_up, stream)?;
+    write_tensor(&mut writer, &optimizer.expert_gate_up.first, stream)?;
+    write_tensor(&mut writer, &optimizer.expert_gate_up.second, stream)?;
+    write_tensor(&mut writer, &model.experts.down, stream)?;
+    write_tensor(&mut writer, &optimizer.expert_down.first, stream)?;
+    write_tensor(&mut writer, &optimizer.expert_down.second, stream)?;
     write_parameter!(final_norm);
     write_head_tensor::<D, VP>(&mut writer, &model.lm_head.master, VOCAB, stream)?;
     write_head_tensor::<D, VP>(&mut writer, &optimizer.lm_head.first, VOCAB, stream)?;
@@ -229,11 +257,14 @@ pub fn load<
     const H: usize,
     const HD: usize,
     const FF: usize,
+    const E: usize,
+    const K: usize,
+    const C: usize,
 >(
     path: impl AsRef<Path>,
     stream: &CudaStream,
     tensor: &super::tensor_kernels::LoadedModule,
-) -> Result<LoadedCheckpoint<N, NP, T, VOCAB, VP, D, H, HD, FF>, Box<dyn Error>> {
+) -> Result<LoadedCheckpoint<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>, Box<dyn Error>> {
     const { assert!(cfg!(target_endian = "little")) };
     let mut reader = BufReader::new(File::open(path)?);
     let mut magic = [0; MAGIC.len()];
@@ -245,8 +276,8 @@ pub fn load<
     if version != VERSION {
         return Err(invalid(format!("unsupported checkpoint version {version}")).into());
     }
-    let expected = [N, T, VOCAB, D, H, HD, FF];
-    for (name, expected) in ["N", "T", "VOCAB", "D", "H", "HD", "FF"]
+    let expected = [N, T, VOCAB, D, H, HD, FF, E, K, C];
+    for (name, expected) in ["N", "T", "VOCAB", "D", "H", "HD", "FF", "E", "K", "C"]
         .into_iter()
         .zip(expected)
     {
@@ -260,11 +291,11 @@ pub fn load<
     }
     let step = read_u64(&mut reader)?;
     let next_batch = read_u64(&mut reader)?;
-    let config = read_config(&mut reader)?;
+    let (config, aux_schedule) = read_config(&mut reader)?;
 
-    let cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(0);
+    let cpu = MoeLlama::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(0, aux_schedule.base_coefficient);
     let mut model = GpuLlama::from_cpu(stream, &cpu)?;
-    let mut optimizer = GpuLlamaAdamW::new(stream, config)?;
+    let mut optimizer = GpuLlamaAdamW::new(stream, config, aux_schedule)?;
 
     macro_rules! read_parameter {
         ($field:ident) => {
@@ -278,10 +309,17 @@ pub fn load<
     read_parameter!(qkv_proj);
     read_parameter!(o_proj);
     read_parameter!(ffn_norm);
-    read_parameter!(gate_up_proj);
-    read_parameter!(down_proj);
+    model.router = read_tensor(&mut reader, stream)?;
+    optimizer.router.first = read_tensor(&mut reader, stream)?;
+    optimizer.router.second = read_tensor(&mut reader, stream)?;
+    model.experts.gate_up = read_tensor(&mut reader, stream)?;
+    optimizer.expert_gate_up.first = read_tensor(&mut reader, stream)?;
+    optimizer.expert_gate_up.second = read_tensor(&mut reader, stream)?;
+    model.experts.down = read_tensor(&mut reader, stream)?;
+    optimizer.expert_down.first = read_tensor(&mut reader, stream)?;
+    optimizer.expert_down.second = read_tensor(&mut reader, stream)?;
     read_parameter!(final_norm);
-    model.sync_linear_compute(stream, tensor)?;
+    model.sync_compute(stream, tensor)?;
     model.lm_head =
         GpuBf16Head::from_master_values(stream, &read_head_values::<D, VP>(&mut reader, VOCAB)?)?;
     optimizer.lm_head.first =

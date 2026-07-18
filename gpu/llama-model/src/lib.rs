@@ -24,9 +24,9 @@ use std::error::Error;
 
 use bench_util::{KernelProfiler, NoopProfiler};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, DriverError, LaunchConfig, PinnedHostBuffer};
-use nn::Llama;
+use nn::{Llama, MoeLlama};
 use optim::{
-    AdamWConfig, MuonConfig, NEWTON_SCHULZ_A, NEWTON_SCHULZ_B, NEWTON_SCHULZ_C,
+    AdamWConfig, AuxLossSchedule, MuonConfig, NEWTON_SCHULZ_A, NEWTON_SCHULZ_B, NEWTON_SCHULZ_C,
     NEWTON_SCHULZ_EPSILON,
 };
 use tensor_core::{Rank1, Rank2, Rank3, Rank4, Shape, bf16};
@@ -2154,7 +2154,7 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
     }
 }
 
-pub struct GpuLlama<
+pub struct GpuDenseLlama<
     const N: usize,
     const NP: usize,
     const T: usize,
@@ -2180,7 +2180,8 @@ pub struct GpuLlama<
 ///
 /// The lm-head moments span the padded `[D, VP]` master; padded columns hold
 /// zeros forever because their gradients are exactly zero.
-pub struct GpuLlamaAdamW<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize> {
+pub struct GpuDenseLlamaAdamW<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
+{
     config: AdamWConfig,
     step: u64,
     pub embedding: GpuAdamWMoments<Rank2<VOCAB, D>>,
@@ -2195,7 +2196,7 @@ pub struct GpuLlamaAdamW<const VOCAB: usize, const VP: usize, const D: usize, co
 }
 
 impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
-    GpuLlamaAdamW<VOCAB, VP, D, FF>
+    GpuDenseLlamaAdamW<VOCAB, VP, D, FF>
 {
     pub fn new(stream: &CudaStream, config: AdamWConfig) -> Result<Self, DriverError> {
         config.validate();
@@ -2234,7 +2235,7 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         const HD: usize,
     >(
         &mut self,
-        model: &mut GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
+        model: &mut GpuDenseLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
@@ -2251,7 +2252,7 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         P: KernelProfiler,
     >(
         &mut self,
-        model: &mut GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
+        model: &mut GpuDenseLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
         profiler: &mut P,
@@ -2318,6 +2319,252 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
             model.lm_head.sync_transposed(stream, kernels)
         })?;
         Ok(())
+    }
+}
+
+/// Single-block Llama with the dense SwiGLU branch substituted by a statically
+/// shaped mixture of experts. Routing remains runtime data.
+pub struct GpuLlama<
+    const N: usize,
+    const NP: usize,
+    const T: usize,
+    const VOCAB: usize,
+    const VP: usize,
+    const D: usize,
+    const H: usize,
+    const HD: usize,
+    const FF: usize,
+    const E: usize,
+    const K: usize,
+    const C: usize,
+> {
+    pub embedding: GpuEmbedding<VOCAB, D>,
+    pub attention_norm: GpuRmsNorm<D>,
+    pub qkv_proj: GpuGroupedLinear<D, 3, D>,
+    pub o_proj: GpuLinear<D, D>,
+    pub ffn_norm: GpuRmsNorm<D>,
+    pub router: GpuTensor<f32, Rank2<D, E>>,
+    pub d_router: GpuTensor<f32, Rank2<D, E>>,
+    pub experts: GpuExpertFfn<E, D, FF>,
+    pub final_norm: GpuRmsNorm<D>,
+    pub lm_head: GpuBf16Head<D, VP>,
+}
+
+/// AdamW state for every MoE model parameter. The router remains on AdamW
+/// regardless of future hidden-matrix Muon routing.
+pub struct GpuLlamaAdamW<
+    const VOCAB: usize,
+    const VP: usize,
+    const D: usize,
+    const FF: usize,
+    const E: usize,
+> {
+    config: AdamWConfig,
+    aux_schedule: AuxLossSchedule,
+    step: u64,
+    pub embedding: GpuAdamWMoments<Rank2<VOCAB, D>>,
+    pub attention_norm: GpuAdamWMoments<Rank1<D>>,
+    pub qkv_proj: GpuAdamWMoments<Rank3<D, 3, D>>,
+    pub o_proj: GpuAdamWMoments<Rank2<D, D>>,
+    pub ffn_norm: GpuAdamWMoments<Rank1<D>>,
+    pub router: GpuAdamWMoments<Rank2<D, E>>,
+    pub expert_gate_up: GpuAdamWMoments<Rank4<E, D, 2, FF>>,
+    pub expert_down: GpuAdamWMoments<Rank3<E, FF, D>>,
+    pub final_norm: GpuAdamWMoments<Rank1<D>>,
+    pub lm_head: GpuAdamWMoments<Rank2<D, VP>>,
+}
+
+impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize, const E: usize>
+    GpuLlamaAdamW<VOCAB, VP, D, FF, E>
+{
+    pub fn new(
+        stream: &CudaStream,
+        config: AdamWConfig,
+        aux_schedule: AuxLossSchedule,
+    ) -> Result<Self, DriverError> {
+        config.validate();
+        aux_schedule.validate();
+        Ok(Self {
+            config,
+            aux_schedule,
+            step: 0,
+            embedding: GpuAdamWMoments::zeros(stream)?,
+            attention_norm: GpuAdamWMoments::zeros(stream)?,
+            qkv_proj: GpuAdamWMoments::zeros(stream)?,
+            o_proj: GpuAdamWMoments::zeros(stream)?,
+            ffn_norm: GpuAdamWMoments::zeros(stream)?,
+            router: GpuAdamWMoments::zeros(stream)?,
+            expert_gate_up: GpuAdamWMoments::zeros(stream)?,
+            expert_down: GpuAdamWMoments::zeros(stream)?,
+            final_norm: GpuAdamWMoments::zeros(stream)?,
+            lm_head: GpuAdamWMoments::zeros(stream)?,
+        })
+    }
+
+    pub fn step(&self) -> u64 {
+        self.step
+    }
+
+    pub fn config(&self) -> AdamWConfig {
+        self.config
+    }
+
+    pub fn aux_schedule(&self) -> AuxLossSchedule {
+        self.aux_schedule
+    }
+
+    pub fn aux_coefficient(&self) -> f32 {
+        self.aux_schedule.coefficient(self.step)
+    }
+
+    pub(crate) fn restore_step(&mut self, step: u64) {
+        self.step = step;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update<
+        const N: usize,
+        const NP: usize,
+        const T: usize,
+        const H: usize,
+        const HD: usize,
+        const K: usize,
+        const C: usize,
+    >(
+        &mut self,
+        model: &mut GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        let mut profiler = NoopProfiler;
+        self.update_profiled(model, stream, kernels, &mut profiler)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_profiled<
+        const N: usize,
+        const NP: usize,
+        const T: usize,
+        const H: usize,
+        const HD: usize,
+        const K: usize,
+        const C: usize,
+        P: KernelProfiler,
+    >(
+        &mut self,
+        model: &mut GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        self.step = self.step.checked_add(1).expect("AdamW step overflow");
+        let (first_correction, second_correction) = self.config.bias_correction(self.step);
+
+        macro_rules! update {
+            ($name:literal, $parameter:expr, $gradient:expr, $moments:expr, $decay:expr) => {
+                profiler.measure(stream, $name, || {
+                    $parameter.adamw_step(
+                        $gradient,
+                        $moments,
+                        self.config.learning_rate,
+                        self.config.beta1,
+                        self.config.beta2,
+                        self.config.epsilon,
+                        $decay,
+                        first_correction,
+                        second_correction,
+                        stream,
+                        kernels,
+                    )
+                })?;
+            };
+        }
+
+        update!(
+            "optimizer.embedding.adamw",
+            model.embedding.w,
+            &model.embedding.dw,
+            &mut self.embedding,
+            self.config.weight_decay
+        );
+        update!(
+            "optimizer.attention_norm.adamw",
+            model.attention_norm.w,
+            &model.attention_norm.dw,
+            &mut self.attention_norm,
+            0.0
+        );
+        update!(
+            "optimizer.qkv_proj.adamw",
+            model.qkv_proj.w,
+            &model.qkv_proj.dw,
+            &mut self.qkv_proj,
+            self.config.weight_decay
+        );
+        update!(
+            "optimizer.o_proj.adamw",
+            model.o_proj.w,
+            &model.o_proj.dw,
+            &mut self.o_proj,
+            self.config.weight_decay
+        );
+        update!(
+            "optimizer.ffn_norm.adamw",
+            model.ffn_norm.w,
+            &model.ffn_norm.dw,
+            &mut self.ffn_norm,
+            0.0
+        );
+        update!(
+            "optimizer.router.adamw",
+            model.router,
+            &model.d_router,
+            &mut self.router,
+            self.config.weight_decay
+        );
+        update!(
+            "optimizer.experts.gate_up.adamw",
+            model.experts.gate_up,
+            &model.experts.d_gate_up,
+            &mut self.expert_gate_up,
+            self.config.weight_decay
+        );
+        update!(
+            "optimizer.experts.down.adamw",
+            model.experts.down,
+            &model.experts.d_down,
+            &mut self.expert_down,
+            self.config.weight_decay
+        );
+        update!(
+            "optimizer.final_norm.adamw",
+            model.final_norm.w,
+            &model.final_norm.dw,
+            &mut self.final_norm,
+            0.0
+        );
+        profiler.measure(stream, "optimizer.qkv_proj.sync_compute", || {
+            model.qkv_proj.sync_compute(stream, kernels)
+        })?;
+        profiler.measure(stream, "optimizer.o_proj.sync_compute", || {
+            model.o_proj.sync_compute(stream, kernels)
+        })?;
+        profiler.measure(stream, "optimizer.experts.sync_compute", || {
+            model.experts.sync_compute(stream, kernels)
+        })?;
+        profiler.measure(stream, "optimizer.lm_head.adamw", || {
+            model.lm_head.adamw_step(
+                &mut self.lm_head,
+                self.config,
+                first_correction,
+                second_correction,
+                stream,
+                kernels,
+            )
+        })?;
+        profiler.measure(stream, "optimizer.lm_head.sync_w_t", || {
+            model.lm_head.sync_transposed(stream, kernels)
+        })
     }
 }
 
@@ -2619,7 +2866,7 @@ fn muon_step_raw(
 /// GPU-resident mixed Muon/AdamW state mirroring `optim::LlamaMuon`'s
 /// routing: hidden projection matrices take Muon, while the embedding,
 /// norms, and lm-head keep AdamW (the lm-head over its padded `[D, VP]`
-/// master, exactly as in [`GpuLlamaAdamW`]).
+/// master, exactly as in [`GpuDenseLlamaAdamW`]).
 pub struct GpuLlamaMuon<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize> {
     muon_config: MuonConfig,
     adamw_config: AdamWConfig,
@@ -2687,7 +2934,7 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         const HD: usize,
     >(
         &mut self,
-        model: &mut GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
+        model: &mut GpuDenseLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
@@ -2781,9 +3028,42 @@ impl<const N: usize> InputStaging<N> {
 /// of `logits` always hold zeros: the forward GEMM computes them from the
 /// zero input rows and the classifier backward never touches them.
 ///
-/// `E` and `C` default to zero for the dense model. MoE workspaces set both
-/// and receive the capacity-binned expert buffers alongside the dense
-/// activations, ready for the 8d routing/integration substitution.
+struct GpuMoeRoutingWorkspace<const N: usize, const D: usize, const E: usize, const K: usize> {
+    logits: GpuTensor<f32, Rank2<N, E>>,
+    probabilities: GpuTensor<f32, Rank2<N, E>>,
+    selected_experts: GpuTensor<u32, Rank2<N, K>>,
+    gate_weights: GpuTensor<f32, Rank2<N, K>>,
+    slots: GpuTensor<u32, Rank2<N, K>>,
+    assignment_counts: GpuTensor<u32, Rank1<E>>,
+    probability_sums: GpuTensor<f32, Rank1<E>>,
+    gate_gradients: GpuTensor<f32, Rank2<N, K>>,
+    dlogits: GpuTensor<f32, Rank2<N, E>>,
+    router_dx: GpuTensor<f32, Rank2<N, D>>,
+}
+
+impl<const N: usize, const D: usize, const E: usize, const K: usize>
+    GpuMoeRoutingWorkspace<N, D, E, K>
+{
+    fn new(stream: &CudaStream) -> Result<Self, DriverError> {
+        assert!(E > 0, "MoE must have at least one expert");
+        assert!(K > 0 && K <= E, "MoE top-k must be in 1..=E");
+        Ok(Self {
+            logits: GpuTensor::zeros(stream)?,
+            probabilities: GpuTensor::zeros(stream)?,
+            selected_experts: GpuTensor::zeros(stream)?,
+            gate_weights: GpuTensor::zeros(stream)?,
+            slots: GpuTensor::zeros(stream)?,
+            assignment_counts: GpuTensor::zeros(stream)?,
+            probability_sums: GpuTensor::zeros(stream)?,
+            gate_gradients: GpuTensor::zeros(stream)?,
+            dlogits: GpuTensor::zeros(stream)?,
+            router_dx: GpuTensor::zeros(stream)?,
+        })
+    }
+}
+
+/// `E`, `K`, and `C` default to zero for the dense model. MoE workspaces set
+/// all three and receive routing plus capacity-binned expert buffers.
 pub struct GpuLlamaWorkspace<
     const N: usize,
     const NP: usize,
@@ -2794,6 +3074,7 @@ pub struct GpuLlamaWorkspace<
     const H: usize,
     const FF: usize,
     const E: usize = 0,
+    const K: usize = 0,
     const C: usize = 0,
 > {
     tokens: GpuTensor<u32, Rank1<N>>,
@@ -2840,6 +3121,7 @@ pub struct GpuLlamaWorkspace<
     d_ff_0: GpuTensor<f32, Rank2<N, FF>>,
     d_ff_1: GpuTensor<f32, Rank2<N, FF>>,
     d_ff_2: GpuTensor<f32, Rank2<N, FF>>,
+    routing: Option<GpuMoeRoutingWorkspace<N, D, E, K>>,
     experts: Option<GpuExpertWorkspace<E, C, D, FF>>,
 }
 
@@ -2853,8 +3135,9 @@ impl<
     const H: usize,
     const FF: usize,
     const E: usize,
+    const K: usize,
     const C: usize,
-> GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF, E, C>
+> GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>
 {
     pub fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
         let head_input = DeviceBuffer::zeroed(stream, NP * D / 2)?;
@@ -2919,10 +3202,15 @@ impl<
             d_ff_0: GpuTensor::zeros(stream)?,
             d_ff_1: GpuTensor::zeros(stream)?,
             d_ff_2: GpuTensor::zeros(stream)?,
-            experts: if E == 0 && C == 0 {
+            routing: if E == 0 && K == 0 && C == 0 {
                 None
             } else {
-                assert!(E > 0 && C > 0, "MoE workspace requires both E and C");
+                assert!(E > 0 && K > 0 && C > 0, "MoE workspace requires E, K, C");
+                Some(GpuMoeRoutingWorkspace::new(stream)?)
+            },
+            experts: if E == 0 && K == 0 && C == 0 {
+                None
+            } else {
                 Some(GpuExpertWorkspace::new(stream)?)
             },
         })
@@ -3039,7 +3327,711 @@ impl<
     const H: usize,
     const HD: usize,
     const FF: usize,
-> GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>
+    const E: usize,
+    const K: usize,
+    const C: usize,
+> GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>
+{
+    pub fn from_cpu(
+        stream: &CudaStream,
+        model: &MoeLlama<N, T, VOCAB, D, H, HD, FF, E, K, C>,
+    ) -> Result<Self, Box<dyn Error>> {
+        assert!(N <= u32::MAX as usize);
+        assert_eq!(N % T, 0);
+        assert_eq!(D, H * HD);
+        assert_eq!(NP, N.next_multiple_of(TC_TILE));
+        assert!(VP >= VOCAB);
+        assert_eq!(VP % TC_TILE, 0);
+        assert_eq!(D % TC_TILE, 0);
+        assert!(E > 0 && K > 0 && K <= E && C > 0);
+        Ok(Self {
+            embedding: GpuEmbedding::from_cpu(stream, &model.embedding)?,
+            attention_norm: GpuRmsNorm::from_cpu(stream, &model.attention_norm)?,
+            qkv_proj: GpuGroupedLinear::from_cpu(
+                stream,
+                [&model.q_proj, &model.k_proj, &model.v_proj],
+            )?,
+            o_proj: GpuLinear::from_cpu(stream, &model.o_proj)?,
+            ffn_norm: GpuRmsNorm::from_cpu(stream, &model.ffn_norm)?,
+            router: GpuTensor::from_host(stream, model.ffn.router.w.as_slice())?,
+            d_router: GpuTensor::zeros(stream)?,
+            experts: GpuExpertFfn::from_cpu(stream, &model.ffn.experts)?,
+            final_norm: GpuRmsNorm::from_cpu(stream, &model.final_norm)?,
+            lm_head: GpuBf16Head::from_cpu(stream, &model.lm_head)?,
+        })
+    }
+
+    pub(crate) fn sync_compute(
+        &mut self,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        self.qkv_proj.sync_compute(stream, kernels)?;
+        self.o_proj.sync_compute(stream, kernels)?;
+        self.experts.sync_compute(stream, kernels)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        tokens: &[usize; N],
+        targets: &[usize; N],
+        aux_coefficient: f32,
+        workspace: &mut GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
+        flash: &flash_kernels::LoadedModule,
+        llama: &llama_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        let mut profiler = NoopProfiler;
+        self.forward_profiled(
+            tokens,
+            targets,
+            aux_coefficient,
+            workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
+            &mut profiler,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_profiled<P: KernelProfiler>(
+        &self,
+        tokens: &[usize; N],
+        targets: &[usize; N],
+        aux_coefficient: f32,
+        workspace: &mut GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
+        flash: &flash_kernels::LoadedModule,
+        llama: &llama_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        assert!(aux_coefficient.is_finite() && aux_coefficient >= 0.0);
+        workspace.upload_inputs(tokens, targets, stream)?;
+        self.embedding.forward_into(
+            &workspace.tokens,
+            &mut workspace.attention_input,
+            stream,
+            llama,
+            profiler,
+            "forward.embedding",
+        )?;
+        self.attention_norm.forward_into(
+            &workspace.attention_input,
+            &mut workspace.attention_normalized,
+            stream,
+            llama,
+            profiler,
+            "forward.attention_norm",
+        )?;
+        self.qkv_proj.forward_into(
+            &workspace.attention_normalized,
+            &mut workspace.qkv,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            workspace.linear_scratch.as_mut(),
+            profiler,
+            "forward.qkv_proj.gemm",
+        )?;
+        profiler.measure(stream, "forward.qkv_proj.split", || {
+            llama.split_group3(
+                stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                workspace.qkv.as_device_buffer(),
+                D as u32,
+                workspace.q.as_device_buffer_mut(),
+                workspace.k.as_device_buffer_mut(),
+                workspace.v.as_device_buffer_mut(),
+            )
+        })?;
+        rope_into::<N, T, D, H, HD, P>(
+            &workspace.q,
+            &mut workspace.d_model_0,
+            false,
+            stream,
+            llama,
+            profiler,
+            "forward.q_rope",
+        )?;
+        std::mem::swap(&mut workspace.q, &mut workspace.d_model_0);
+        rope_into::<N, T, D, H, HD, P>(
+            &workspace.k,
+            &mut workspace.d_model_0,
+            false,
+            stream,
+            llama,
+            profiler,
+            "forward.k_rope",
+        )?;
+        std::mem::swap(&mut workspace.k, &mut workspace.d_model_0);
+        flash_attention_forward_into::<N, T, D, H, HD, P>(
+            &workspace.q,
+            &workspace.k,
+            &workspace.v,
+            &mut workspace.attended,
+            &mut workspace.attention_logsumexp,
+            stream,
+            flash,
+            profiler,
+        )?;
+        self.o_proj.forward_into(
+            &workspace.attended,
+            &mut workspace.projection_output,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            workspace.linear_scratch.as_mut(),
+            profiler,
+            "forward.o_proj.gemm",
+        )?;
+        add_into(
+            &workspace.attention_input,
+            &workspace.projection_output,
+            &mut workspace.ffn_input,
+            stream,
+            tensor,
+            profiler,
+            "forward.attention_residual",
+        )?;
+        self.ffn_norm.forward_into(
+            &workspace.ffn_input,
+            &mut workspace.ffn_normalized,
+            stream,
+            llama,
+            profiler,
+            "forward.ffn_norm",
+        )?;
+
+        let routing = workspace.routing.as_mut().expect("MoE routing workspace");
+        let experts = workspace.experts.as_mut().expect("MoE expert workspace");
+        profiler.measure(stream, "forward.router.logits", || {
+            llama.router_logits(
+                stream,
+                LaunchConfig {
+                    grid_dim: (N as u32, 1, 1),
+                    block_dim: (E as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                workspace.ffn_normalized.as_device_buffer(),
+                self.router.as_device_buffer(),
+                D as u32,
+                E as u32,
+                routing.logits.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, "forward.router.topk", || unsafe {
+            llama.router_softmax_topk(
+                stream,
+                LaunchConfig::for_num_elems(N as u32),
+                routing.logits.as_device_buffer(),
+                E as u32,
+                K as u32,
+                routing.probabilities.as_device_buffer_mut(),
+                routing.selected_experts.as_device_buffer_mut(),
+                routing.gate_weights.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, "forward.router.assign", || unsafe {
+            llama.moe_bin_assign(
+                stream,
+                LaunchConfig {
+                    grid_dim: (E as u32, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                routing.selected_experts.as_device_buffer(),
+                N as u32,
+                E as u32,
+                K as u32,
+                C as u32,
+                routing.slots.as_device_buffer_mut(),
+                routing.assignment_counts.as_device_buffer_mut(),
+            )
+        })?;
+        fill_zero(
+            &mut experts.bin_input,
+            stream,
+            tensor,
+            profiler,
+            "forward.router.zero_bins",
+        )?;
+        profiler.measure(stream, "forward.router.scatter", || unsafe {
+            llama.moe_scatter(
+                stream,
+                LaunchConfig::for_num_elems((N * K * D) as u32),
+                workspace.ffn_normalized.as_device_buffer(),
+                routing.selected_experts.as_device_buffer(),
+                routing.slots.as_device_buffer(),
+                D as u32,
+                K as u32,
+                C as u32,
+                experts.bin_input.as_device_buffer_mut(),
+            )
+        })?;
+        self.experts
+            .forward_profiled(experts, stream, tensor, gemm, gemm_bf16, llama, profiler)?;
+        profiler.measure(stream, "forward.router.gather", || {
+            llama.moe_gather_combine(
+                stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                experts.bin_output.as_device_buffer(),
+                routing.selected_experts.as_device_buffer(),
+                routing.gate_weights.as_device_buffer(),
+                routing.slots.as_device_buffer(),
+                D as u32,
+                K as u32,
+                C as u32,
+                workspace.projection_output.as_device_buffer_mut(),
+            )
+        })?;
+        add_into(
+            &workspace.ffn_input,
+            &workspace.projection_output,
+            &mut workspace.final_input,
+            stream,
+            tensor,
+            profiler,
+            "forward.ffn_residual",
+        )?;
+        self.final_norm.forward_into(
+            &workspace.final_input,
+            &mut workspace.final_normalized,
+            stream,
+            llama,
+            profiler,
+            "forward.final_norm",
+        )?;
+        profiler.measure(stream, "forward.lm_head.quantize", || {
+            tensor.convert_f32_to_bf16_pairs(
+                stream,
+                pairs_config(N * D / 2),
+                workspace.final_normalized.as_device_buffer(),
+                &mut workspace.head_input,
+            )
+        })?;
+        self.lm_head.forward_into::<NP, P>(
+            &workspace.head_input_tma,
+            &mut workspace.logits,
+            stream,
+            gemm_bf16,
+            profiler,
+            "forward.lm_head.gemm",
+        )?;
+        cross_entropy_into::<N, VOCAB, VP, P>(
+            &workspace.logits,
+            &workspace.targets,
+            &mut workspace.losses,
+            &mut workspace.loss_sum,
+            &mut workspace.loss,
+            stream,
+            tensor,
+            llama,
+            profiler,
+        )?;
+        fill_zero(
+            &mut routing.probability_sums,
+            stream,
+            tensor,
+            profiler,
+            "forward.router.zero_probability_sums",
+        )?;
+        profiler.measure(stream, "forward.router.aux_probability_sums", || unsafe {
+            llama.moe_probability_sums(
+                stream,
+                LaunchConfig {
+                    grid_dim: (E as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                routing.probabilities.as_device_buffer(),
+                N as u32,
+                E as u32,
+                routing.probability_sums.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, "forward.router.aux_loss", || unsafe {
+            llama.moe_aux_loss(
+                stream,
+                LaunchConfig::for_num_elems(1),
+                routing.probability_sums.as_device_buffer(),
+                routing.assignment_counts.as_device_buffer(),
+                N as u32,
+                E as u32,
+                K as u32,
+                aux_coefficient,
+                workspace.loss.as_device_buffer_mut(),
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward(
+        &mut self,
+        aux_coefficient: f32,
+        workspace: &mut GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
+        flash: &flash_kernels::LoadedModule,
+        llama: &llama_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        let mut profiler = NoopProfiler;
+        self.backward_profiled(
+            aux_coefficient,
+            workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
+            &mut profiler,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_profiled<P: KernelProfiler>(
+        &mut self,
+        aux_coefficient: f32,
+        workspace: &mut GpuLlamaWorkspace<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        gemm: &gemm_kernels::LoadedModule,
+        gemm_bf16: &Tcgen05Gemm,
+        flash: &flash_kernels::LoadedModule,
+        llama: &llama_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        assert!(aux_coefficient.is_finite() && aux_coefficient >= 0.0);
+        cross_entropy_backward_into::<N, VOCAB, VP, P>(
+            &workspace.targets,
+            &mut workspace.logits,
+            stream,
+            llama,
+            profiler,
+        )?;
+        profiler.measure(stream, "backward.lm_head.transpose_input", || unsafe {
+            tensor.transpose_bf16_pairs(
+                stream,
+                transpose_pairs_config(NP, D),
+                &workspace.head_input,
+                NP as u32,
+                D as u32,
+                &mut workspace.head_input_t,
+            )
+        })?;
+        profiler.measure(stream, "backward.lm_head.transpose_dlogits", || unsafe {
+            tensor.transpose_bf16_pairs(
+                stream,
+                transpose_pairs_config(NP, VP),
+                &workspace.logits,
+                NP as u32,
+                VP as u32,
+                &mut workspace.dlogits_t,
+            )
+        })?;
+        self.lm_head.backward_weight::<NP, P>(
+            &workspace.head_input_t_tma,
+            &workspace.dlogits_t_tma,
+            stream,
+            gemm_bf16,
+            profiler,
+            "backward.lm_head.weight_gemm",
+        )?;
+        self.lm_head.backward_input::<NP, P>(
+            &workspace.logits_tma,
+            &mut workspace.d_head_input,
+            stream,
+            gemm_bf16,
+            profiler,
+            "backward.lm_head.input_gemm",
+        )?;
+        profiler.measure(stream, "backward.lm_head.dequantize", || {
+            tensor.convert_bf16_pairs_to_f32(
+                stream,
+                elementwise_config::<Rank2<N, D>>(),
+                &workspace.d_head_input,
+                workspace.d_model_0.as_device_buffer_mut(),
+            )
+        })?;
+        self.final_norm.backward_into(
+            &workspace.final_input,
+            &workspace.d_model_0,
+            &mut workspace.d_model_1,
+            &mut workspace.norm_backward_inv,
+            stream,
+            llama,
+            profiler,
+            ["backward.final_norm.input", "backward.final_norm.weight"],
+        )?;
+
+        let routing = workspace.routing.as_mut().expect("MoE routing workspace");
+        let experts = workspace.experts.as_mut().expect("MoE expert workspace");
+        fill_zero(
+            &mut experts.d_bin_output,
+            stream,
+            tensor,
+            profiler,
+            "backward.router.zero_dy_bins",
+        )?;
+        profiler.measure(stream, "backward.router.scatter_dy", || unsafe {
+            llama.moe_scatter_dy(
+                stream,
+                LaunchConfig::for_num_elems((N * K) as u32),
+                experts.bin_output.as_device_buffer(),
+                workspace.d_model_1.as_device_buffer(),
+                routing.selected_experts.as_device_buffer(),
+                routing.gate_weights.as_device_buffer(),
+                routing.slots.as_device_buffer(),
+                D as u32,
+                K as u32,
+                C as u32,
+                experts.d_bin_output.as_device_buffer_mut(),
+                routing.gate_gradients.as_device_buffer_mut(),
+            )
+        })?;
+        self.experts
+            .backward_profiled(experts, stream, tensor, gemm, gemm_bf16, llama, profiler)?;
+        profiler.measure(stream, "backward.router.gather_dx", || {
+            llama.moe_gather_dx(
+                stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                experts.d_bin_input.as_device_buffer(),
+                routing.selected_experts.as_device_buffer(),
+                routing.slots.as_device_buffer(),
+                D as u32,
+                K as u32,
+                C as u32,
+                workspace.d_model_3.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, "backward.router.softmax", || unsafe {
+            llama.router_backward(
+                stream,
+                LaunchConfig::for_num_elems(N as u32),
+                routing.probabilities.as_device_buffer(),
+                routing.selected_experts.as_device_buffer(),
+                routing.gate_weights.as_device_buffer(),
+                routing.gate_gradients.as_device_buffer(),
+                routing.assignment_counts.as_device_buffer(),
+                N as u32,
+                E as u32,
+                K as u32,
+                aux_coefficient,
+                routing.dlogits.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, "backward.router.input", || {
+            llama.router_backward_input(
+                stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                routing.dlogits.as_device_buffer(),
+                self.router.as_device_buffer(),
+                E as u32,
+                routing.router_dx.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, "backward.router.weight", || {
+            llama.router_backward_weight(
+                stream,
+                LaunchConfig::for_num_elems((D * E) as u32),
+                workspace.ffn_normalized.as_device_buffer(),
+                routing.dlogits.as_device_buffer(),
+                N as u32,
+                E as u32,
+                self.d_router.as_device_buffer_mut(),
+            )
+        })?;
+        add_into(
+            &workspace.d_model_3,
+            &routing.router_dx,
+            &mut workspace.d_model_4,
+            stream,
+            tensor,
+            profiler,
+            "backward.router.combine_dx",
+        )?;
+        self.ffn_norm.backward_into(
+            &workspace.ffn_input,
+            &workspace.d_model_4,
+            &mut workspace.d_model_0,
+            &mut workspace.norm_backward_inv,
+            stream,
+            llama,
+            profiler,
+            ["backward.ffn_norm.input", "backward.ffn_norm.weight"],
+        )?;
+        add_into(
+            &workspace.d_model_1,
+            &workspace.d_model_0,
+            &mut workspace.d_model_2,
+            stream,
+            tensor,
+            profiler,
+            "backward.ffn_residual",
+        )?;
+        self.o_proj.backward_into(
+            &workspace.attended,
+            &workspace.d_model_2,
+            &mut workspace.d_model_0,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            workspace.linear_scratch.as_mut(),
+            profiler,
+            ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
+        )?;
+        flash_attention_backward_into::<N, T, D, H, HD, P>(
+            &workspace.q,
+            &workspace.k,
+            &workspace.v,
+            &workspace.attended,
+            &workspace.attention_logsumexp,
+            &mut workspace.attention_dot,
+            &workspace.d_model_0,
+            &mut workspace.d_model_1,
+            &mut workspace.d_model_3,
+            &mut workspace.d_model_4,
+            stream,
+            flash,
+            profiler,
+        )?;
+        rope_into::<N, T, D, H, HD, P>(
+            &workspace.d_model_1,
+            &mut workspace.d_model_0,
+            true,
+            stream,
+            llama,
+            profiler,
+            "backward.q_rope",
+        )?;
+        rope_into::<N, T, D, H, HD, P>(
+            &workspace.d_model_3,
+            &mut workspace.d_model_1,
+            true,
+            stream,
+            llama,
+            profiler,
+            "backward.k_rope",
+        )?;
+        profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
+            llama.join_group3(
+                stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                workspace.d_model_0.as_device_buffer(),
+                workspace.d_model_1.as_device_buffer(),
+                workspace.d_model_4.as_device_buffer(),
+                D as u32,
+                workspace.qkv.as_device_buffer_mut(),
+            )
+        })?;
+        self.qkv_proj.backward_into(
+            &workspace.attention_normalized,
+            &workspace.qkv,
+            &mut workspace.d_model_3,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            workspace.linear_scratch.as_mut(),
+            profiler,
+            [
+                "backward.qkv_proj.weight_gemm",
+                "backward.qkv_proj.input_gemm",
+            ],
+        )?;
+        self.attention_norm.backward_into(
+            &workspace.attention_input,
+            &workspace.d_model_3,
+            &mut workspace.d_model_0,
+            &mut workspace.norm_backward_inv,
+            stream,
+            llama,
+            profiler,
+            [
+                "backward.attention_norm.input",
+                "backward.attention_norm.weight",
+            ],
+        )?;
+        add_into(
+            &workspace.d_model_2,
+            &workspace.d_model_0,
+            &mut workspace.d_model_1,
+            stream,
+            tensor,
+            profiler,
+            "backward.attention_residual",
+        )?;
+        self.embedding.backward(
+            &workspace.tokens,
+            &workspace.d_model_1,
+            stream,
+            llama,
+            profiler,
+            "backward.embedding",
+        )
+    }
+
+    pub fn zero_grad(
+        &mut self,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        let mut profiler = NoopProfiler;
+        self.zero_grad_profiled(stream, tensor, &mut profiler)
+    }
+
+    pub fn zero_grad_profiled<P: KernelProfiler>(
+        &mut self,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+        profiler: &mut P,
+    ) -> Result<(), DriverError> {
+        macro_rules! zero {
+            ($name:literal, $gradient:expr) => {
+                fill_zero($gradient, stream, tensor, profiler, $name)?;
+            };
+        }
+        zero!("zero_grad.embedding", &mut self.embedding.dw);
+        zero!("zero_grad.attention_norm", &mut self.attention_norm.dw);
+        zero!("zero_grad.qkv_proj", &mut self.qkv_proj.dw);
+        zero!("zero_grad.o_proj", &mut self.o_proj.dw);
+        zero!("zero_grad.ffn_norm", &mut self.ffn_norm.dw);
+        zero!("zero_grad.router", &mut self.d_router);
+        zero!("zero_grad.experts.gate_up", &mut self.experts.d_gate_up);
+        zero!("zero_grad.experts.down", &mut self.experts.d_down);
+        zero!("zero_grad.final_norm", &mut self.final_norm.dw);
+        self.lm_head
+            .zero_grad(stream, tensor, profiler, "zero_grad.lm_head")
+    }
+}
+
+impl<
+    const N: usize,
+    const NP: usize,
+    const T: usize,
+    const VOCAB: usize,
+    const VP: usize,
+    const D: usize,
+    const H: usize,
+    const HD: usize,
+    const FF: usize,
+> GpuDenseLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>
 {
     pub fn from_cpu(
         stream: &CudaStream,

@@ -15,16 +15,18 @@
 //! tcgen05 block-linear path (7e9).
 
 use cuda_core::{CudaContext, DeviceBuffer};
-use nn::{ExpertFfn, Llama, Module};
-use optim::{AdamWConfig, LlamaAdamW, LlamaMuon, MuonConfig, zeroth_power_via_newton_schulz};
+use nn::{ExpertFfn, Llama, Module, MoeLlama};
+use optim::{
+    AdamWConfig, AuxLossSchedule, LlamaAdamW, LlamaMuon, MuonConfig, zeroth_power_via_newton_schulz,
+};
 use tensor_core::{Rank2, Rank3, Rank4, Shape, bf16, rng::uniform_vec};
 use tensor_cpu::CpuTensor;
 
 #[path = "lib.rs"]
 mod model;
 use model::{
-    GpuExpertAdamW, GpuExpertFfn, GpuExpertWorkspace, GpuLlama, GpuLlamaAdamW, GpuLlamaMuon,
-    GpuLlamaWorkspace, GpuMuonScratch,
+    GpuDenseLlama, GpuDenseLlamaAdamW, GpuExpertAdamW, GpuExpertFfn, GpuExpertWorkspace, GpuLlama,
+    GpuLlamaAdamW, GpuLlamaMuon, GpuLlamaWorkspace, GpuMuonScratch,
 };
 
 const N: usize = 8;
@@ -437,7 +439,7 @@ fn head_gradient(
 
 fn check_head_gradients(
     label: &str,
-    gpu: &GpuLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
+    gpu: &GpuDenseLlama<N, NP, T, VOCAB, VP, D, H, HD, FF>,
     cpu: &Llama<N, T, VOCAB, D, H, HD, FF>,
     stream: &cuda_core::CudaStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -525,7 +527,7 @@ fn muon_overfit_tiny_batch(
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
     let cpu = TinyLlama::new(100);
-    let mut gpu = GpuLlama::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
+    let mut gpu = GpuDenseLlama::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
     // AdamW stays at the 0.02 the plain-AdamW gate settled on (0.03 is
     // knife-edge on this batch); Muon's default 0.02 handles the hidden
     // matrices.
@@ -606,7 +608,7 @@ fn overfit_tiny_batch(
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
     let cpu = TinyLlama::new(100);
-    let mut gpu = GpuLlama::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
+    let mut gpu = GpuDenseLlama::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
     // 0.03 is knife-edge on this batch: the bf16 two-logit tie's escape is
     // violently sensitive there, and a CPU sweep injecting +/-1-ulp-scale
     // noise (modelling kernel summation-order differences, 7e7) left ~1 in 8
@@ -618,7 +620,7 @@ fn overfit_tiny_batch(
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
-    let mut optimizer = GpuLlamaAdamW::new(stream, config)?;
+    let mut optimizer = GpuDenseLlamaAdamW::new(stream, config)?;
     let mut workspace = GpuLlamaWorkspace::<4, 128, 4, 4, 128, 128, 2, 12>::new(stream)?;
     let mut initial_loss = None;
 
@@ -703,7 +705,7 @@ fn aligned_tcgen05_linears(
     const FFA: usize = 128;
 
     let mut cpu = Llama::<NA, TA, VA, DA, HA, HD, FFA>::new(7);
-    let mut gpu = GpuLlama::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
+    let mut gpu = GpuDenseLlama::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
     let mut workspace = GpuLlamaWorkspace::<NA, NA, TA, VA, VPA, DA, HA, FFA>::new(stream)?;
     assert!(
         workspace.tcgen05_linears_active(),
@@ -788,7 +790,7 @@ fn aligned_tcgen05_linears(
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
-    let mut optimizer = GpuLlamaAdamW::new(stream, config)?;
+    let mut optimizer = GpuDenseLlamaAdamW::new(stream, config)?;
     let mut initial_loss = None;
     for _ in 0..600 {
         gpu.zero_grad(stream, tensor)?;
@@ -863,7 +865,7 @@ fn aligned_muon_overfit(
     const FFA: usize = 128;
 
     let cpu = Llama::<NA, TA, VA, DA, HA, HD, FFA>::new(7);
-    let mut gpu = GpuLlama::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
+    let mut gpu = GpuDenseLlama::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
     let mut workspace = GpuLlamaWorkspace::<NA, NA, TA, VA, VPA, DA, HA, FFA>::new(stream)?;
     assert!(
         workspace.tcgen05_linears_active(),
@@ -936,6 +938,399 @@ fn aligned_muon_overfit(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn moe_model_parity<
+    const MN: usize,
+    const MNP: usize,
+    const MT: usize,
+    const MFF: usize,
+    const ME: usize,
+    const MK: usize,
+    const MC: usize,
+>(
+    label: &str,
+    expect_tcgen05: bool,
+    stream: &cuda_core::CudaStream,
+    tensor: &model::tensor_kernels::LoadedModule,
+    gemm: &model::gemm_kernels::LoadedModule,
+    gemm_bf16: &model::Tcgen05Gemm,
+    flash: &model::flash_kernels::LoadedModule,
+    llama: &model::llama_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const AUX: f32 = 0.02;
+    let mut cpu = MoeLlama::<MN, MT, VOCAB, D, H, HD, MFF, ME, MK, MC>::new(71, AUX);
+    // Deterministic ties force experts 0/1 over capacity while all remaining
+    // experts stay underfull, covering both dispatch edge cases.
+    cpu.ffn.router.w.as_mut_slice().fill(0.0);
+    let mut gpu =
+        GpuLlama::<MN, MNP, MT, VOCAB, VP, D, H, HD, MFF, ME, MK, MC>::from_cpu(stream, &cpu)?;
+    let mut workspace =
+        GpuLlamaWorkspace::<MN, MNP, MT, VOCAB, VP, D, H, MFF, ME, MK, MC>::new(stream)?;
+    assert_eq!(workspace.tcgen05_linears_active(), expect_tcgen05);
+    assert_eq!(
+        workspace
+            .expert_workspace()
+            .expect("MoE expert workspace")
+            .tcgen05_active(),
+        expect_tcgen05
+    );
+    let tokens: [usize; MN] = std::array::from_fn(|i| (i * 7 + 3) % VOCAB);
+    let targets: [usize; MN] = std::array::from_fn(|i| (tokens[i] + 1) % VOCAB);
+
+    let (cpu_loss, cpu_ctx) = cpu.forward(tokens, targets);
+    gpu.forward(
+        &tokens,
+        &targets,
+        AUX,
+        &mut workspace,
+        stream,
+        tensor,
+        gemm,
+        gemm_bf16,
+        flash,
+        llama,
+    )?;
+    assert_close(
+        &format!("{label} loss"),
+        workspace.loss(),
+        &cpu_loss,
+        stream,
+        BF16_ATOL,
+        BF16_RTOL,
+    )?;
+    cpu.backward(cpu_ctx);
+    gpu.backward(
+        AUX,
+        &mut workspace,
+        stream,
+        tensor,
+        gemm,
+        gemm_bf16,
+        flash,
+        llama,
+    )?;
+
+    macro_rules! common_grad {
+        ($field:ident) => {
+            assert_close(
+                concat!(stringify!($field), ".dw"),
+                &gpu.$field.dw,
+                &cpu.$field.dw,
+                stream,
+                BF16_ATOL,
+                BF16_RTOL,
+            )?;
+        };
+    }
+    common_grad!(embedding);
+    common_grad!(attention_norm);
+    assert_grouped_close(
+        "MoE qkv_proj.dw",
+        &gpu.qkv_proj.dw,
+        [&cpu.q_proj.dw, &cpu.k_proj.dw, &cpu.v_proj.dw],
+        stream,
+        BF16_ATOL,
+        BF16_RTOL,
+    )?;
+    common_grad!(o_proj);
+    common_grad!(ffn_norm);
+    assert_close(
+        "MoE router.dw",
+        &gpu.d_router,
+        &cpu.ffn.router.dw,
+        stream,
+        BF16_ATOL,
+        BF16_RTOL,
+    )?;
+    let mut expected_gate_up = Vec::with_capacity(ME * D * 2 * MFF);
+    let mut expected_down = Vec::with_capacity(ME * MFF * D);
+    for expert in &cpu.ffn.experts {
+        for input in 0..D {
+            expected_gate_up
+                .extend_from_slice(&expert.gate_proj.dw.as_slice()[input * MFF..(input + 1) * MFF]);
+            expected_gate_up
+                .extend_from_slice(&expert.up_proj.dw.as_slice()[input * MFF..(input + 1) * MFF]);
+        }
+        expected_down.extend_from_slice(expert.down_proj.dw.as_slice());
+    }
+    assert_close_slices(
+        "MoE expert gate/up gradients",
+        &gpu.experts.d_gate_up.to_host(stream)?,
+        &expected_gate_up,
+        BF16_ATOL,
+        BF16_RTOL,
+    );
+    assert_close_slices(
+        "MoE expert down gradients",
+        &gpu.experts.d_down.to_host(stream)?,
+        &expected_down,
+        BF16_ATOL,
+        BF16_RTOL,
+    );
+    common_grad!(final_norm);
+    assert_close_slices(
+        "MoE lm_head.dw",
+        &head_gradient(&gpu.lm_head, stream)?,
+        cpu.lm_head.dw.as_slice(),
+        BF16_ATOL,
+        BF16_RTOL,
+    );
+    println!("✓ {label} substituted MoE model matches CPU with drops and underfull experts");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aligned_moe_overfit(
+    stream: &cuda_core::CudaStream,
+    tensor: &model::tensor_kernels::LoadedModule,
+    gemm: &model::gemm_kernels::LoadedModule,
+    gemm_bf16: &model::Tcgen05Gemm,
+    flash: &model::flash_kernels::LoadedModule,
+    llama: &model::llama_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const ON: usize = 128;
+    const OT: usize = 4;
+    const OFF: usize = 128;
+    const OE: usize = 2;
+    const OK: usize = 1;
+    const OC: usize = 128;
+    let schedule = AuxLossSchedule {
+        base_coefficient: 0.01,
+        decay_horizon: 1_200.0,
+    };
+    let cpu =
+        MoeLlama::<ON, OT, VOCAB, D, H, HD, OFF, OE, OK, OC>::new(97, schedule.base_coefficient);
+    let mut gpu =
+        GpuLlama::<ON, ON, OT, VOCAB, VP, D, H, HD, OFF, OE, OK, OC>::from_cpu(stream, &cpu)?;
+    let mut workspace =
+        GpuLlamaWorkspace::<ON, ON, OT, VOCAB, VP, D, H, OFF, OE, OK, OC>::new(stream)?;
+    let config = AdamWConfig {
+        learning_rate: 0.02,
+        weight_decay: 0.0,
+        ..AdamWConfig::default()
+    };
+    let mut optimizer = GpuLlamaAdamW::new(stream, config, schedule)?;
+    let tokens: [usize; ON] = std::array::from_fn(|i| (i * 7 + 3) % VOCAB);
+    let targets: [usize; ON] = std::array::from_fn(|i| (tokens[i] + 1) % VOCAB);
+    let mut initial_loss = None;
+    for _ in 0..1_200 {
+        let coefficient = optimizer.aux_coefficient();
+        gpu.zero_grad(stream, tensor)?;
+        gpu.forward(
+            &tokens,
+            &targets,
+            coefficient,
+            &mut workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
+        )?;
+        if initial_loss.is_none() {
+            initial_loss = Some(workspace.loss().to_host(stream)?[0]);
+        }
+        gpu.backward(
+            coefficient,
+            &mut workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
+        )?;
+        optimizer.update(&mut gpu, stream, tensor)?;
+    }
+    gpu.forward(
+        &tokens,
+        &targets,
+        optimizer.aux_coefficient(),
+        &mut workspace,
+        stream,
+        tensor,
+        gemm,
+        gemm_bf16,
+        flash,
+        llama,
+    )?;
+    let initial_loss = initial_loss.expect("training loop runs");
+    let final_loss = workspace.loss().to_host(stream)?[0];
+    assert!(
+        final_loss < 0.05 && final_loss < initial_loss * 0.05,
+        "aligned MoE did not overfit: initial={initial_loss}, final={final_loss}"
+    );
+    println!(
+        "✓ aligned tcgen05 MoE overfits with scheduled aux loss ({initial_loss:.6} -> {final_loss:.6})"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn moe_checkpoint_gate(
+    stream: &cuda_core::CudaStream,
+    tensor: &model::tensor_kernels::LoadedModule,
+    gemm: &model::gemm_kernels::LoadedModule,
+    gemm_bf16: &model::Tcgen05Gemm,
+    flash: &model::flash_kernels::LoadedModule,
+    llama: &model::llama_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const CN: usize = 4;
+    const CT: usize = 4;
+    const CFF: usize = 19;
+    const CE: usize = 3;
+    const CK: usize = 2;
+    const CC: usize = 3;
+    let schedule = AuxLossSchedule {
+        base_coefficient: 0.02,
+        decay_horizon: 100.0,
+    };
+    let config = AdamWConfig {
+        learning_rate: 0.01,
+        weight_decay: 0.1,
+        ..AdamWConfig::default()
+    };
+    let cpu =
+        MoeLlama::<CN, CT, VOCAB, D, H, HD, CFF, CE, CK, CC>::new(123, schedule.base_coefficient);
+    let mut gpu =
+        GpuLlama::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC>::from_cpu(stream, &cpu)?;
+    let mut optimizer = GpuLlamaAdamW::new(stream, config, schedule)?;
+    let mut workspace =
+        GpuLlamaWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC>::new(stream)?;
+    let tokens = [1, 5, 5, 2];
+    let targets = [5, 5, 2, 7];
+    let coefficient = optimizer.aux_coefficient();
+    gpu.zero_grad(stream, tensor)?;
+    gpu.forward(
+        &tokens,
+        &targets,
+        coefficient,
+        &mut workspace,
+        stream,
+        tensor,
+        gemm,
+        gemm_bf16,
+        flash,
+        llama,
+    )?;
+    gpu.backward(
+        coefficient,
+        &mut workspace,
+        stream,
+        tensor,
+        gemm,
+        gemm_bf16,
+        flash,
+        llama,
+    )?;
+    optimizer.update(&mut gpu, stream, tensor)?;
+
+    let base = std::env::temp_dir().join(format!("oxide-train-{}", std::process::id()));
+    let checkpoint_path = base.with_extension("ckpt");
+    let continued_path = base.with_extension("continued-a");
+    let resumed_path = base.with_extension("continued-b");
+    let tampered_path = base.with_extension("tampered");
+    model::checkpoint::save(&checkpoint_path, &gpu, &optimizer, 7, stream)?;
+    let loaded = model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC>(
+        &checkpoint_path,
+        stream,
+        tensor,
+    )?;
+    assert_eq!(loaded.next_batch, 7);
+    assert_eq!(loaded.optimizer.aux_schedule(), schedule);
+    let mut resumed_gpu = loaded.model;
+    let mut resumed_optimizer = loaded.optimizer;
+    let mut resumed_workspace =
+        GpuLlamaWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC>::new(stream)?;
+
+    for (candidate, candidate_optimizer, candidate_workspace) in [
+        (&mut gpu, &mut optimizer, &mut workspace),
+        (
+            &mut resumed_gpu,
+            &mut resumed_optimizer,
+            &mut resumed_workspace,
+        ),
+    ] {
+        let coefficient = candidate_optimizer.aux_coefficient();
+        candidate.zero_grad(stream, tensor)?;
+        candidate.forward(
+            &tokens,
+            &targets,
+            coefficient,
+            candidate_workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
+        )?;
+        candidate.backward(
+            coefficient,
+            candidate_workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
+        )?;
+        candidate_optimizer.update(candidate, stream, tensor)?;
+    }
+    model::checkpoint::save(&continued_path, &gpu, &optimizer, 8, stream)?;
+    model::checkpoint::save(&resumed_path, &resumed_gpu, &resumed_optimizer, 8, stream)?;
+    assert_eq!(
+        std::fs::read(&continued_path)?,
+        std::fs::read(&resumed_path)?,
+        "checkpoint resume changed the continued trajectory"
+    );
+
+    assert!(
+        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, 4, CK, CC>(
+            &checkpoint_path,
+            stream,
+            tensor
+        )
+        .is_err()
+    );
+    assert!(
+        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, 1, CC>(
+            &checkpoint_path,
+            stream,
+            tensor
+        )
+        .is_err()
+    );
+    assert!(
+        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, 4>(
+            &checkpoint_path,
+            stream,
+            tensor
+        )
+        .is_err()
+    );
+
+    let mut tampered = std::fs::read(&checkpoint_path)?;
+    const AUX_BASE_OFFSET: usize = 8 + 4 + 10 * 8 + 2 * 8 + 5 * 4;
+    tampered[AUX_BASE_OFFSET..AUX_BASE_OFFSET + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+    std::fs::write(&tampered_path, tampered)?;
+    assert!(
+        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC>(
+            &tampered_path,
+            stream,
+            tensor
+        )
+        .is_err(),
+        "tampered aux-loss schedule was accepted"
+    );
+    for path in [checkpoint_path, continued_path, resumed_path, tampered_path] {
+        let _ = std::fs::remove_file(path);
+    }
+    println!("✓ checkpoint v3 resumes bit-identically and rejects E/K/C or schedule mismatches");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
@@ -946,7 +1341,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let llama = model::llama_kernels::load(&ctx)?;
 
     let mut cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
-    let mut gpu = GpuLlama::<N, NP, T, VOCAB, VP, D, H, HD, FF>::from_cpu(&stream, &cpu)?;
+    let mut gpu = GpuDenseLlama::<N, NP, T, VOCAB, VP, D, H, HD, FF>::from_cpu(&stream, &cpu)?;
     let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF>::new(&stream)?;
     let tokens = [1, 5, 5, 2, 9, 3, 16, 0];
     let targets = [5, 5, 2, 7, 3, 16, 0, 4];
@@ -1088,7 +1483,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..AdamWConfig::default()
     };
     let mut cpu_optimizer = LlamaAdamW::new(config);
-    let mut gpu_optimizer = GpuLlamaAdamW::new(&stream, config)?;
+    let mut gpu_optimizer = GpuDenseLlamaAdamW::new(&stream, config)?;
     cpu_optimizer.update(&mut cpu);
     gpu_optimizer.update(&mut gpu, &stream, &tensor)?;
 
@@ -1251,6 +1646,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm_bf16,
         &llama,
     )?;
+    moe_model_parity::<8, 128, 4, 19, 3, 2, 3>(
+        "fp32-oracle",
+        false,
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &llama,
+    )?;
+    moe_model_parity::<256, 256, 128, 128, 3, 2, 128>(
+        "aligned tcgen05",
+        true,
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &llama,
+    )?;
+    aligned_moe_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
+    moe_checkpoint_gate(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
     // The parity helpers own temporary expert workspaces. Their device frees
     // are stream-ordered; complete those frees before the independent overfit
     // gates begin allocating models and workspaces of their own.

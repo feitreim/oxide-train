@@ -7,8 +7,8 @@ use std::env;
 
 use cuda_core::CudaContext;
 use data::{Batches, TokenFile};
-use nn::Llama;
-use optim::AdamWConfig;
+use nn::MoeLlama;
+use optim::{AdamWConfig, AuxLossSchedule};
 
 #[path = "../lib.rs"]
 mod model;
@@ -23,7 +23,10 @@ const VP: usize = 50_304;
 const D: usize = 1_536;
 const H: usize = 24;
 const HD: usize = 64;
-const FF: usize = 4_096;
+const FF: usize = 2_048;
+const E: usize = 8;
+const K: usize = 2;
+const C: usize = 8_192;
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
     env::var(name)
@@ -76,8 +79,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         weight_decay: env_parse("TRAIN_WEIGHT_DECAY", 0.1),
         ..AdamWConfig::default()
     };
+    let aux_schedule = AuxLossSchedule {
+        base_coefficient: env_parse("TRAIN_AUX_COEFFICIENT", 1e-2),
+        decay_horizon: env_parse("TRAIN_AUX_DECAY_HORIZON", 10_000.0),
+    };
+    aux_schedule.validate();
     let (mut gpu, mut optimizer, mut next_batch) = if resume {
-        let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF>(
+        let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>(
             checkpoint_path.as_deref().expect("validated above"),
             &stream,
             &tensor,
@@ -87,6 +95,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "checkpoint optimizer config {:?} does not match requested {:?}",
                 checkpoint.optimizer.config(),
                 config
+            )
+            .into());
+        }
+        if checkpoint.optimizer.aux_schedule() != aux_schedule {
+            return Err(format!(
+                "checkpoint aux-loss schedule {:?} does not match requested {:?}",
+                checkpoint.optimizer.aux_schedule(),
+                aux_schedule
             )
             .into());
         }
@@ -102,15 +118,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             checkpoint.next_batch,
         )
     } else {
-        let cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
+        let cpu =
+            MoeLlama::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(42, aux_schedule.coefficient(0));
         (
-            GpuLlama::<N, NP, T, VOCAB, VP, D, H, HD, FF>::from_cpu(&stream, &cpu)?,
-            GpuLlamaAdamW::new(&stream, config)?,
+            GpuLlama::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>::from_cpu(&stream, &cpu)?,
+            GpuLlamaAdamW::new(&stream, config, aux_schedule)?,
             0,
         )
     };
     let starting_step = optimizer.step() as usize;
-    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF>::new(&stream)?;
+    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
     if max_steps < starting_step {
         return Err(
             format!("TRAIN_STEPS={max_steps} is behind checkpoint step {starting_step}").into(),
@@ -140,9 +157,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let targets: &[usize; N] = targets.as_slice().try_into().expect("length N");
 
         gpu.zero_grad(&stream, &tensor)?;
+        let aux_coefficient = optimizer.aux_coefficient();
         gpu.forward(
             inputs,
             targets,
+            aux_coefficient,
             &mut workspace,
             &stream,
             &tensor,
@@ -160,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         gpu.backward(
+            aux_coefficient,
             &mut workspace,
             &stream,
             &tensor,
