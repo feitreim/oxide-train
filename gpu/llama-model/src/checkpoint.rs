@@ -232,6 +232,7 @@ pub fn load<
 >(
     path: impl AsRef<Path>,
     stream: &CudaStream,
+    tensor: &super::tensor_kernels::LoadedModule,
 ) -> Result<LoadedCheckpoint<N, NP, T, VOCAB, VP, D, H, HD, FF>, Box<dyn Error>> {
     const { assert!(cfg!(target_endian = "little")) };
     let mut reader = BufReader::new(File::open(path)?);
@@ -280,6 +281,7 @@ pub fn load<
     read_parameter!(gate_up_proj);
     read_parameter!(down_proj);
     read_parameter!(final_norm);
+    model.sync_linear_compute(stream, tensor)?;
     model.lm_head =
         GpuBf16Head::from_master_values(stream, &read_head_values::<D, VP>(&mut reader, VOCAB)?)?;
     optimizer.lm_head.first =

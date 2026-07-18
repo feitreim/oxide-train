@@ -82,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF>(
         &checkpoint_path,
         &stream,
+        &tensor,
     )?;
     let gpu = checkpoint.model;
     println!(

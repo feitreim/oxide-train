@@ -120,14 +120,15 @@ trait Module {
    (tcgen05 GEMMs want bf16 inputs). Loss scaling not expected to be needed
    for bf16; revisit if grads underflow.
 
-Phase 2 is adopted head-first (7e5): the lm-head — ~70% of this one-block
-model's GEMM FLOPs and the profile's named bf16 target — runs bf16 tcgen05
-against fp32 master weights, while the block linears stay fp32 until a
-profile puts them above noise. Device-side bf16 is stored as packed pairs
-(`u32` = two adjacent row elements), matching the tcgen05 epilogue. The
-master-weight mechanism is observable: the tiny overfit gate plateaus while
-per-step updates are below one bf16 ulp of the compute weights, then escapes
-once the fp32 master crosses a rounding boundary
+Phase 2 was adopted head-first (7e5), then extended to the block linears after
+the post-7e7 profile put their fp32 GEMMs at 47.3% of the step (7e9). The
+lm-head keeps packed-bf16 outputs/gradients; block linears use bf16 operands
+with fp32 store/accumulate tcgen05 epilogues so activations, gradient
+accumulation, AdamW state, and checkpoints remain fp32. Device-side bf16 is
+stored as packed pairs (`u32` = two adjacent row elements). The master-weight
+mechanism is observable: the tiny overfit gate plateaus while per-step updates
+are below one bf16 ulp of the compute weights, then escapes once the fp32
+master crosses a rounding boundary
 (`crates/optim/examples/overfit_probe.rs` reproduces this on CPU).
 
 CPU reference reductions accumulate in f64 so the reference never loses to
@@ -263,7 +264,7 @@ gpu/               standalone cuda-oxide kernel crates (Modal-built)
                    RoPE, causal attention, SwiGLU, embedding, and loss;
                    packed-bf16 fused classifier + block-parallel RMSNorm
   gemm/            register-tiled fp32 + Blackwell tcgen05 bf16 GEMMs,
-                   store/accumulate variants, sweep benchmarks; host-only
+                   packed-bf16 and fp32 store/accumulate variants; host-only
                    tcgen05 support (TMA maps, raw launchers) in src/host.rs
   flash-attn/      fused fp32 causal attention forward/backward, parity-tested
                    against llama-ops without materialized probabilities;
@@ -421,6 +422,24 @@ Each gated on tests; correctness before speed at every step.
        rows combined 267.99 → 1.08 ms (~248×). The three forwards fell
        88.34 → 0.38 ms, input backward plus inverse 163.77 → 0.45 ms, and
        weight backward 15.88 → 0.25 ms.
+     - ✅ **7e9 tcgen05 block linears**: add fp32-output store/accumulate
+       epilogues to the bf16 tcgen05 kernel and use them for QKV, output,
+       gate/up, and down projections. Persistent packed-bf16 compute
+       weights are refreshed from fp32 masters after AdamW; three reusable
+       workspace buffers (~512 MB each at N=32,768) hold quantized row
+       operands and the two transposes required by weight gradients.
+       Non-tile-aligned correctness shapes retain the fp32 register-tiled
+       oracle; the aligned tcgen05 path is gated end-to-end by a second
+       tile-aligned parity/overfit configuration in gpu/llama-model
+       (128-aligned CPU parity at bf16 tolerances plus an overfit run,
+       3.080031 → 0.000008). B200 same-container result vs post-7e8 main
+       at B=32 T=1024: 484.21 → 152.14 ms full step (-68.6%, 3.18×); the
+       twelve block-linear GEMM rows, including conversion/transpose work,
+       fell 355.89 → 23.81 ms (14.9×), and the four post-AdamW
+       sync_compute rows total 0.11 ms. Combined with 7e8, the step is
+       751.9 → 152.1 ms (~4.9×) since the post-7e7 profile. The measured
+       tail is now flash attention (57.5 ms combined, 37.8%) and the
+       lm-head GEMM trio (54.2 ms, 35.6%).
    - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
      time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
 
@@ -452,3 +471,4 @@ Each gated on tests; correctness before speed at every step.
 | 17 | Optimization backlog is profile-ordered | First real-scale profile contradicted intuition (naive loss softmax 60%+ of step, tcgen05 GEMM integration nowhere near top); 7e sub-milestones follow measured step share and get re-ordered after each landing |
 | 18 | bf16 adopted head-first via padded NP/VP dims | lm-head ≈70% of the one-block model's GEMM FLOPs and the measured rock; zero-padding tokens→NP and vocab→VP keeps the tuned tcgen05 kernel's tile contract with provably inert padding (zero rows/columns never move), so no boundary-guard variants and byte-compatible checkpoints |
 | 19 | tcgen05 kernels ship as a second, pure-PTX artifact | One embedded artifact per binary, and libdevice math (`exp`/`ln`/`sqrt`) forces it through libNVVM, which rejects tcgen05 lowerings; llama-model loads `gemm.ptx` (prebuilt by gpu/gemm) through hand-written launchers in gemm/src/host.rs that mirror the generated marshalling |
+| 20 | Block tcgen05 keeps fp32 model tensors | Quantize operands into persistent scratch and use concrete fp32-output store/accumulate epilogues; buffers, optimizer/checkpoint layout, and the naive fp32 fallback stay fp32, though epilogue values are bf16-rounded (the drain reuses the packed-bf16 shared-memory staging, so each GEMM result carries bf16 mantissa precision after full-K fp32 accumulation — doubling SMEM_OUT for true fp32 staging wasn't warranted) |

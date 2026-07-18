@@ -80,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF>(
             checkpoint_path.as_deref().expect("validated above"),
             &stream,
+            &tensor,
         )?;
         if checkpoint.optimizer.config() != config {
             return Err(format!(

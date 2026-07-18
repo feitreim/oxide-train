@@ -121,6 +121,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         .map_err(Into::into)
     })?;
+    let mut bf16_f32_c = DeviceBuffer::<f32>::zeroed(&stream, BF16_M * BF16_N)?;
+    let bf16_f32_store_ms = time_gpu_iters(&stream, 5, 20, || {
+        unsafe {
+            module.gemm_tcgen05_bf16_f32_store(
+                &stream,
+                bf16_config,
+                a_tma.as_ptr(),
+                b_tma.as_ptr(),
+                &mut bf16_f32_c,
+                BF16_N as u32,
+                BF16_K as u32,
+            )
+        }
+        .map_err(Into::into)
+    })?;
+    let mut bf16_f32_accumulate_c = DeviceBuffer::<f32>::zeroed(&stream, BF16_M * BF16_N)?;
+    let bf16_f32_accumulate_ms = time_gpu_iters(&stream, 5, 20, || {
+        unsafe {
+            module.gemm_tcgen05_bf16_f32_accumulate(
+                &stream,
+                bf16_config,
+                a_tma.as_ptr(),
+                b_tma.as_ptr(),
+                &mut bf16_f32_accumulate_c,
+                BF16_N as u32,
+                BF16_K as u32,
+            )
+        }
+        .map_err(Into::into)
+    })?;
 
     println!("bf16 tcgen05 128x128x64, fp32 TMEM accumulate");
     println!(
@@ -132,6 +162,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "  accumulate [{BF16_M},{BF16_K}]x[{BF16_N},{BF16_K}]^T: \
          {bf16_accumulate_ms:8.3} ms  {:8.2} TFLOP/s",
         tflops(BF16_M, BF16_N, BF16_K, bf16_accumulate_ms)
+    );
+    println!(
+        "  f32 store  [{BF16_M},{BF16_K}]x[{BF16_N},{BF16_K}]^T: \
+         {bf16_f32_store_ms:8.3} ms  {:8.2} TFLOP/s",
+        tflops(BF16_M, BF16_N, BF16_K, bf16_f32_store_ms)
+    );
+    println!(
+        "  f32 accum  [{BF16_M},{BF16_K}]x[{BF16_N},{BF16_K}]^T: \
+         {bf16_f32_accumulate_ms:8.3} ms  {:8.2} TFLOP/s",
+        tflops(BF16_M, BF16_N, BF16_K, bf16_f32_accumulate_ms)
     );
     Ok(())
 }

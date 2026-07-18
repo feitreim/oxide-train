@@ -290,5 +290,45 @@ fn check_tcgen05_bf16(
         0.04,
         0.015,
     );
+
+    let mut f32_store = DeviceBuffer::<f32>::zeroed(stream, M * N)?;
+    unsafe {
+        module.gemm_tcgen05_bf16_f32_store(
+            stream,
+            config,
+            a_tma.as_ptr(),
+            b_tma.as_ptr(),
+            &mut f32_store,
+            N as u32,
+            K as u32,
+        )
+    }?;
+    assert_close(
+        "tcgen05 bf16 f32 store",
+        &f32_store.to_host_vec(stream)?,
+        &expected,
+        0.03,
+        0.01,
+    );
+
+    let mut f32_accumulate = DeviceBuffer::from_host(stream, &initial)?;
+    unsafe {
+        module.gemm_tcgen05_bf16_f32_accumulate(
+            stream,
+            config,
+            a_tma.as_ptr(),
+            b_tma.as_ptr(),
+            &mut f32_accumulate,
+            N as u32,
+            K as u32,
+        )
+    }?;
+    assert_close(
+        "tcgen05 bf16 f32 accumulate",
+        &f32_accumulate.to_host_vec(stream)?,
+        &expected_accumulate,
+        0.03,
+        0.01,
+    );
     Ok(())
 }
