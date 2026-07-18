@@ -12,7 +12,7 @@ pub use muon::{
     NEWTON_SCHULZ_EPSILON, muon_step, zeroth_power_via_newton_schulz,
 };
 
-use nn::Llama;
+use nn::{Llama, MoeLlama};
 use tensor_core::{Rank1, Rank2, Shape, bf16};
 use tensor_cpu::CpuTensor;
 
@@ -27,6 +27,19 @@ pub struct AdamWConfig {
 }
 
 impl AdamWConfig {
+    pub fn is_valid(self) -> bool {
+        self.learning_rate.is_finite()
+            && self.learning_rate >= 0.0
+            && self.beta1.is_finite()
+            && (0.0..1.0).contains(&self.beta1)
+            && self.beta2.is_finite()
+            && (0.0..1.0).contains(&self.beta2)
+            && self.epsilon.is_finite()
+            && self.epsilon > 0.0
+            && self.weight_decay.is_finite()
+            && self.weight_decay >= 0.0
+    }
+
     pub fn validate(self) {
         assert!(
             self.learning_rate.is_finite() && self.learning_rate >= 0.0,
@@ -65,6 +78,51 @@ impl AdamWConfig {
             1.0 / (1.0 - self.beta1.powi(step)),
             1.0 / (1.0 - self.beta2.powi(step)),
         )
+    }
+}
+
+/// Host-side schedule for the MoE load-balancing loss coefficient.
+///
+/// The coefficient decays linearly from `base_coefficient` at step zero to
+/// zero at `decay_horizon`. Both parameters are checkpointed so resuming can
+/// re-evaluate the schedule from the restored global step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AuxLossSchedule {
+    pub base_coefficient: f32,
+    pub decay_horizon: f32,
+}
+
+impl AuxLossSchedule {
+    pub fn is_valid(self) -> bool {
+        self.base_coefficient.is_finite()
+            && self.base_coefficient >= 0.0
+            && self.decay_horizon.is_finite()
+            && self.decay_horizon > 0.0
+    }
+
+    pub fn validate(self) {
+        assert!(
+            self.base_coefficient.is_finite() && self.base_coefficient >= 0.0,
+            "auxiliary loss base coefficient must be finite and non-negative"
+        );
+        assert!(
+            self.decay_horizon.is_finite() && self.decay_horizon > 0.0,
+            "auxiliary loss decay horizon must be finite and positive"
+        );
+    }
+
+    pub fn coefficient(self, step: u64) -> f32 {
+        self.validate();
+        self.base_coefficient * (1.0 - step as f32 / self.decay_horizon).max(0.0)
+    }
+}
+
+impl Default for AuxLossSchedule {
+    fn default() -> Self {
+        Self {
+            base_coefficient: 1e-2,
+            decay_horizon: 10_000.0,
+        }
     }
 }
 
@@ -132,6 +190,8 @@ pub enum ParameterKind {
     Embedding,
     Norm,
     Matrix,
+    /// Skinny fp32 MoE routing matrix; intentionally remains on AdamW.
+    Router,
     Head,
 }
 
@@ -184,6 +244,79 @@ impl<
         visit!(down_proj, Matrix);
         visit!(final_norm, Norm);
         visit!(lm_head, Head);
+    }
+}
+
+impl<
+    const N: usize,
+    const T: usize,
+    const VOCAB: usize,
+    const D: usize,
+    const H: usize,
+    const HD: usize,
+    const FF: usize,
+    const E: usize,
+    const K: usize,
+    const C: usize,
+> VisitCpuParameters for MoeLlama<N, T, VOCAB, D, H, HD, FF, E, K, C>
+{
+    fn visit_cpu_parameters<V: CpuParameterVisitor>(&mut self, visitor: &mut V) {
+        macro_rules! visit {
+            ($name:literal, $parameter:expr, $gradient:expr, $kind:ident) => {
+                visitor.visit($name, ParameterKind::$kind, $parameter, $gradient);
+            };
+        }
+
+        visit!(
+            "embedding",
+            &mut self.embedding.w,
+            &self.embedding.dw,
+            Embedding
+        );
+        visit!(
+            "attention_norm",
+            &mut self.attention_norm.w,
+            &self.attention_norm.dw,
+            Norm
+        );
+        visit!("q_proj", &mut self.q_proj.w, &self.q_proj.dw, Matrix);
+        visit!("k_proj", &mut self.k_proj.w, &self.k_proj.dw, Matrix);
+        visit!("v_proj", &mut self.v_proj.w, &self.v_proj.dw, Matrix);
+        visit!("o_proj", &mut self.o_proj.w, &self.o_proj.dw, Matrix);
+        visit!("ffn_norm", &mut self.ffn_norm.w, &self.ffn_norm.dw, Norm);
+        visit!(
+            "ffn.router",
+            &mut self.ffn.router.w,
+            &self.ffn.router.dw,
+            Router
+        );
+        for expert in &mut self.ffn.experts {
+            visit!(
+                "ffn.expert.gate_proj",
+                &mut expert.gate_proj.w,
+                &expert.gate_proj.dw,
+                Matrix
+            );
+            visit!(
+                "ffn.expert.up_proj",
+                &mut expert.up_proj.w,
+                &expert.up_proj.dw,
+                Matrix
+            );
+            visit!(
+                "ffn.expert.down_proj",
+                &mut expert.down_proj.w,
+                &expert.down_proj.dw,
+                Matrix
+            );
+        }
+        visit!(
+            "final_norm",
+            &mut self.final_norm.w,
+            &self.final_norm.dw,
+            Norm
+        );
+        visit!("lm_head", &mut self.lm_head.w, &self.lm_head.dw, Head);
     }
 }
 
@@ -485,6 +618,49 @@ mod tests {
         assert_eq!(inventory.norm_elements, 3 * 8);
         assert_eq!(inventory.names[0], "embedding");
         assert_eq!(inventory.names[11], "lm_head");
+    }
+
+    #[test]
+    fn moe_visitor_keeps_router_out_of_hidden_matrices() {
+        struct Inventory {
+            routers: usize,
+            matrices: usize,
+        }
+
+        impl CpuParameterVisitor for Inventory {
+            fn visit<S: Shape>(
+                &mut self,
+                _name: &'static str,
+                kind: ParameterKind,
+                _parameter: &mut CpuTensor<f32, S>,
+                _gradient: &CpuTensor<f32, S>,
+            ) {
+                self.routers += usize::from(kind == ParameterKind::Router);
+                self.matrices += usize::from(kind == ParameterKind::Matrix);
+            }
+        }
+
+        let mut model = MoeLlama::<4, 4, 7, 8, 2, 4, 6, 3, 2, 3>::new(7, 0.01);
+        let mut inventory = Inventory {
+            routers: 0,
+            matrices: 0,
+        };
+        model.visit_cpu_parameters(&mut inventory);
+
+        assert_eq!(inventory.routers, 1);
+        assert_eq!(inventory.matrices, 4 + 3 * 3);
+    }
+
+    #[test]
+    fn aux_loss_schedule_decays_from_global_step() {
+        let schedule = AuxLossSchedule {
+            base_coefficient: 0.2,
+            decay_horizon: 100.0,
+        };
+        assert_eq!(schedule.coefficient(0), 0.2);
+        assert!((schedule.coefficient(25) - 0.15).abs() < 1e-7);
+        assert_eq!(schedule.coefficient(100), 0.0);
+        assert_eq!(schedule.coefficient(101), 0.0);
     }
 
     #[test]

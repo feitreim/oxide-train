@@ -24,7 +24,10 @@ const VP: usize = 50_304;
 const D: usize = 1_536;
 const H: usize = 24;
 const HD: usize = 64;
-const FF: usize = 4_096;
+const FF: usize = 2_048;
+const E: usize = 8;
+const K: usize = 2;
+const C: usize = 8_192;
 
 const EOT: usize = 50_256;
 const PROMPT_TOKENS: usize = 32;
@@ -79,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flash = model::flash_kernels::load(&cuda)?;
     let llama = model::llama_kernels::load(&cuda)?;
 
-    let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF>(
+    let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>(
         &checkpoint_path,
         &stream,
         &tensor,
@@ -89,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "sampling checkpoint={checkpoint_path} step={} temperature={TEMPERATURE} top_k={TOP_K}",
         checkpoint.optimizer.step()
     );
-    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF>::new(&stream)?;
+    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
 
     let shard = TokenFile::open(&shard_path)?;
     let mut rng = 0x5EED_5EED_5EED_5EEDu64;
@@ -109,6 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gpu.forward(
                 window.as_slice().try_into().expect("length N"),
                 zero_targets,
+                0.0,
                 &mut workspace,
                 &stream,
                 &tensor,

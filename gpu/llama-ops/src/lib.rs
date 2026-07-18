@@ -1442,6 +1442,66 @@ pub mod kernels {
         }
     }
 
+    /// Parallel token reduction for each expert's mean routing probability.
+    ///
+    /// One block owns an expert. Each lane accumulates a strided token slice and
+    /// performs one atomic add, keeping the contention bounded by block size.
+    #[kernel]
+    pub unsafe fn moe_probability_sums(
+        probabilities: &[f32],
+        tokens: u32,
+        experts: u32,
+        mut probability_sums: DisjointSlice<f32>,
+    ) {
+        let expert = thread::blockIdx_x() as usize;
+        let lane = thread::threadIdx_x() as usize;
+        let stride = thread::blockDim_x() as usize;
+        let n = tokens as usize;
+        let e = experts as usize;
+        if expert >= e || expert >= probability_sums.len() || probabilities.len() < n * e {
+            return;
+        }
+        let mut sum = 0.0f32;
+        let mut token = lane;
+        while token < n {
+            sum += probabilities[token * e + expert];
+            token += stride;
+        }
+        let slot = unsafe { DeviceAtomicF32::from_ptr(probability_sums.as_mut_ptr().add(expert)) };
+        slot.fetch_add(sum, AtomicOrdering::Relaxed);
+    }
+
+    /// Add the weighted Switch-style load-balancing loss to the scalar training
+    /// loss from the already-reduced expert probability sums.
+    #[kernel]
+    pub unsafe fn moe_aux_loss(
+        probability_sums: &[f32],
+        assignment_counts: &[u32],
+        tokens: u32,
+        experts: u32,
+        top_k: u32,
+        coefficient: f32,
+        mut loss: DisjointSlice<f32>,
+    ) {
+        if thread::index_1d().get() != 0 || loss.is_empty() {
+            return;
+        }
+        let n = tokens as usize;
+        let e = experts as usize;
+        let k = top_k as usize;
+        if n == 0 || e == 0 || k == 0 || probability_sums.len() < e || assignment_counts.len() < e {
+            return;
+        }
+        let mut auxiliary = 0.0f32;
+        for expert in 0..e {
+            let assignment_fraction = assignment_counts[expert] as f32 / (n * k) as f32;
+            auxiliary += assignment_fraction * probability_sums[expert] / n as f32;
+        }
+        unsafe {
+            *loss.get_unchecked_mut(0) += coefficient * e as f32 * auxiliary;
+        }
+    }
+
     /// Copy surviving token rows into `[E,C,D]` capacity-padded expert bins.
     /// The destination must be zeroed before launch so unused slots stay inert.
     #[kernel]
@@ -1742,7 +1802,7 @@ pub mod kernels {
             value += x[token * d + column] * dlogits[token * e + expert];
         }
         if let Some(slot) = dweight.get_mut(index) {
-            *slot = value;
+            *slot += value;
         }
     }
 }

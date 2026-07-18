@@ -7,8 +7,8 @@
 
 use bench_util::StepProfiler;
 use cuda_core::CudaContext;
-use nn::Llama;
-use optim::AdamWConfig;
+use nn::MoeLlama;
+use optim::{AdamWConfig, AuxLossSchedule};
 
 #[path = "../lib.rs"]
 mod model;
@@ -23,21 +23,24 @@ const VP: usize = 50_304;
 const D: usize = 1_536;
 const H: usize = 24;
 const HD: usize = 64;
-const FF: usize = 4_096;
+const FF: usize = 2_048;
+const E: usize = 8;
+const K: usize = 2;
+const C: usize = 8_192;
 const WARMUP_STEPS: usize = 2;
 
 const fn parameter_count() -> usize {
-    // Untied embedding/lm-head, four attention projections, three FFN
-    // projections, and the three RMSNorm weights in this reference model.
+    // Untied embedding/lm-head, four attention projections, router, all expert
+    // projections, and the three RMSNorm weights.
     // Padded lm-head vocabulary columns are frozen zeros, not parameters.
-    2 * VOCAB * D + 4 * D * D + 3 * D * FF + 3 * D
+    2 * VOCAB * D + 4 * D * D + D * E + E * 3 * D * FF + 3 * D
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(N, B * T);
     assert_eq!(D, H * HD);
     println!(
-        "config: params={} ({:.1}M) B={} T={} vocab={} (padded {}) D={} H={} HD={} FF={}",
+        "config: params={} ({:.1}M) B={} T={} vocab={} (padded {}) D={} H={} HD={} E={} K={} FF_expert={} C={} active_FF={}",
         parameter_count(),
         parameter_count() as f64 / 1_000_000.0,
         B,
@@ -47,7 +50,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         D,
         H,
         HD,
+        E,
+        K,
         FF,
+        C,
+        K * FF,
     );
 
     let ctx = CudaContext::new(0)?;
@@ -58,21 +65,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flash = model::flash_kernels::load(&ctx)?;
     let llama = model::llama_kernels::load(&ctx)?;
 
-    let cpu = Llama::<N, T, VOCAB, D, H, HD, FF>::new(42);
-    let mut gpu = GpuLlama::<N, NP, T, VOCAB, VP, D, H, HD, FF>::from_cpu(&stream, &cpu)?;
+    let aux_schedule = AuxLossSchedule::default();
+    let cpu = MoeLlama::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(42, aux_schedule.coefficient(0));
+    let mut gpu = GpuLlama::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>::from_cpu(&stream, &cpu)?;
     drop(cpu);
-    let mut optimizer = GpuLlamaAdamW::new(&stream, AdamWConfig::default())?;
-    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF>::new(&stream)?;
+    let mut optimizer = GpuLlamaAdamW::new(&stream, AdamWConfig::default(), aux_schedule)?;
+    let mut workspace = GpuLlamaWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
     let tokens: Vec<usize> = (0..N).map(|i| (i * 7919 + 17) % VOCAB).collect();
     let targets: Vec<usize> = (0..N).map(|i| tokens[(i + 1) % N]).collect();
     let tokens: &[usize; N] = tokens.as_slice().try_into().expect("length N");
     let targets: &[usize; N] = targets.as_slice().try_into().expect("length N");
 
     for _ in 0..WARMUP_STEPS {
+        let aux_coefficient = optimizer.aux_coefficient();
         gpu.zero_grad(&stream, &tensor)?;
         gpu.forward(
             tokens,
             targets,
+            aux_coefficient,
             &mut workspace,
             &stream,
             &tensor,
@@ -82,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &llama,
         )?;
         gpu.backward(
+            aux_coefficient,
             &mut workspace,
             &stream,
             &tensor,
@@ -99,9 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deliberately inside the full-step interval and appear as unattributed
     // device time rather than being mislabeled as kernels.
     gpu.zero_grad_profiled(&stream, &tensor, &mut profiler)?;
+    let aux_coefficient = optimizer.aux_coefficient();
     gpu.forward_profiled(
         tokens,
         targets,
+        aux_coefficient,
         &mut workspace,
         &stream,
         &tensor,
@@ -112,6 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut profiler,
     )?;
     gpu.backward_profiled(
+        aux_coefficient,
         &mut workspace,
         &stream,
         &tensor,
@@ -124,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     optimizer.update_profiled(&mut gpu, &stream, &tensor, &mut profiler)?;
     let profile = profiler.finish(&stream)?;
 
-    println!("bf16 tcgen05 block linears/lm-head + fast norm and atomic embedding backward");
+    println!("fp32 top-k routing + bf16 tcgen05 experts/block linears/lm-head");
     println!("{profile}");
     println!();
     println!("scope: in-place zero_grad + forward + backward + AdamW");
