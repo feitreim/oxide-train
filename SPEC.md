@@ -483,11 +483,15 @@ Each gated on tests; correctness before speed at every step.
      register-tiled fallback remains the non-aligned oracle; both paths are
      gated against CPU expert forward/backward, zero-row inertness, repeated
      gradient accumulation, and post-AdamW compute-copy refresh.
-   - **8d integration**: FFN swap in `GpuLlama` behind identical types,
-     gated like 7e — full parity, aligned overfit, then a §10.1
-     same-container profile against the dense 152.1 ms baseline (MoE at
-     matched active params should approach it; the win is params/FLOP, not
-     step time).
+   - ✅ **8d integration**: FFN swap in `GpuLlama` behind identical types
+     (dense retained as `GpuDenseLlama`), gated like 7e — full parity with
+     forced drops/underfull experts on both the fp32-oracle and tcgen05
+     paths, aligned MoE overfit under a scheduled aux loss, checkpoint v3
+     (`E`/`K`/`C` + schedule + router/expert state), and a §10.1
+     same-container profile against the dense 152.3 ms baseline: 171.8 ms
+     at matched active params (+12.7%; the win is params/FLOP, not step
+     time). Profile-ordered follow-up: deterministic bin assignment
+     (7.0 ms), then router weight backward (4.8 ms).
 9. Scale/stretch: bigger model, activation checkpointing, (much later)
    multi-GPU
 
