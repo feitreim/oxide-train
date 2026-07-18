@@ -15,14 +15,17 @@
 //! tcgen05 block-linear path (7e9).
 
 use cuda_core::{CudaContext, DeviceBuffer};
-use nn::Llama;
+use nn::{ExpertFfn, Llama, Module};
 use optim::{AdamWConfig, LlamaAdamW, LlamaMuon, MuonConfig, zeroth_power_via_newton_schulz};
-use tensor_core::{Rank2, Rank3, Shape, bf16, rng::uniform_vec};
+use tensor_core::{Rank2, Rank3, Rank4, Shape, bf16, rng::uniform_vec};
 use tensor_cpu::CpuTensor;
 
 #[path = "lib.rs"]
 mod model;
-use model::{GpuLlama, GpuLlamaAdamW, GpuLlamaMuon, GpuLlamaWorkspace, GpuMuonScratch};
+use model::{
+    GpuExpertAdamW, GpuExpertFfn, GpuExpertWorkspace, GpuLlama, GpuLlamaAdamW, GpuLlamaMuon,
+    GpuLlamaWorkspace, GpuMuonScratch,
+};
 
 const N: usize = 8;
 const NP: usize = 128;
@@ -132,6 +135,280 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
         .collect()
 }
 
+fn stacked_expert_gradients<const E: usize, const C: usize, const D: usize, const FF: usize>(
+    experts: &[ExpertFfn<C, D, FF>; E],
+) -> (
+    CpuTensor<f32, Rank4<E, D, 2, FF>>,
+    CpuTensor<f32, Rank3<E, FF, D>>,
+) {
+    let mut gate_up = vec![0.0; E * D * 2 * FF];
+    let mut down = vec![0.0; E * FF * D];
+    for (expert, source) in experts.iter().enumerate() {
+        for input in 0..D {
+            let destination = (expert * D + input) * 2 * FF;
+            gate_up[destination..destination + FF]
+                .copy_from_slice(&source.gate_proj.dw.as_slice()[input * FF..(input + 1) * FF]);
+            gate_up[destination + FF..destination + 2 * FF]
+                .copy_from_slice(&source.up_proj.dw.as_slice()[input * FF..(input + 1) * FF]);
+        }
+        down[expert * FF * D..(expert + 1) * FF * D]
+            .copy_from_slice(source.down_proj.dw.as_slice());
+    }
+    (
+        CpuTensor::from_slice(&gate_up),
+        CpuTensor::from_slice(&down),
+    )
+}
+
+fn expected_global_transpose_words(values: &[f32], rows: usize, columns: usize) -> Vec<u32> {
+    let rounded = unpack_bf16(&pack_bf16(values));
+    let mut transposed = vec![0.0; values.len()];
+    for row in 0..rows {
+        for column in 0..columns {
+            transposed[column * rows + row] = rounded[row * columns + column];
+        }
+    }
+    pack_bf16(&transposed)
+}
+
+fn check_expert_compute_copies<const E: usize, const D: usize, const FF: usize>(
+    experts: &GpuExpertFfn<E, D, FF>,
+    stream: &cuda_core::CudaStream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let gate_up_master = experts.gate_up.to_host(stream)?;
+    let (gate_up, gate_up_t) = experts
+        .gate_up_compute_words()
+        .expect("aligned experts must own gate/up compute weights");
+    assert_eq!(
+        gate_up.to_host_vec(stream)?,
+        pack_bf16(&gate_up_master),
+        "expert gate/up compute copy is not the rounded master"
+    );
+    assert_eq!(
+        gate_up_t.to_host_vec(stream)?,
+        expected_global_transpose_words(&gate_up_master, E * D, 2 * FF),
+        "expert gate/up transposed compute copy is stale"
+    );
+
+    let down_master = experts.down.to_host(stream)?;
+    let (down, down_t) = experts
+        .down_compute_words()
+        .expect("aligned experts must own down compute weights");
+    assert_eq!(
+        down.to_host_vec(stream)?,
+        pack_bf16(&down_master),
+        "expert down compute copy is not the rounded master"
+    );
+    assert_eq!(
+        down_t.to_host_vec(stream)?,
+        expected_global_transpose_words(&down_master, E * FF, D),
+        "expert down transposed compute copy is stale"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const FF: usize>(
+    label: &str,
+    aligned: bool,
+    stream: &cuda_core::CudaStream,
+    tensor: &model::tensor_kernels::LoadedModule,
+    gemm: &model::gemm_kernels::LoadedModule,
+    gemm_bf16: &model::Tcgen05Gemm,
+    llama: &model::llama_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cpu: [ExpertFfn<C, D, FF>; E] =
+        std::array::from_fn(|expert| ExpertFfn::initialized(700 + 3 * expert as u64));
+    let mut gpu = GpuExpertFfn::from_cpu(stream, &cpu)?;
+    let mut workspace = GpuExpertWorkspace::<E, C, D, FF>::new(stream)?;
+    assert_eq!(
+        workspace.tcgen05_active(),
+        aligned,
+        "{label}: workspace selected the wrong expert GEMM path"
+    );
+    gpu.zero_grad(stream, tensor)?;
+
+    let live_slots = C.saturating_sub(2).max(1);
+    let mut bins: Vec<f32> = uniform_vec(E * C * D, 801)
+        .into_iter()
+        .map(|value| value - 0.5)
+        .collect();
+    for expert in 0..E {
+        for slot in live_slots..C {
+            bins[(expert * C + slot) * D..(expert * C + slot + 1) * D].fill(0.0);
+        }
+    }
+
+    let forward_pairs: [(CpuTensor<f32, Rank2<C, D>>, nn::ExpertFfnCtx<C, D, FF>); E] =
+        std::array::from_fn(|expert| {
+            let start = expert * C * D;
+            cpu[expert].forward(CpuTensor::from_slice(&bins[start..start + C * D]))
+        });
+    let mut expected_output = vec![0.0; E * C * D];
+    for expert in 0..E {
+        expected_output[expert * C * D..(expert + 1) * C * D]
+            .copy_from_slice(forward_pairs[expert].0.as_slice());
+    }
+    let contexts = forward_pairs.map(|(_, context)| context);
+
+    workspace.upload_bins(&bins, stream)?;
+    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    let sparse_output = workspace.bin_output.to_host(stream)?;
+    let (atol, rtol) = if aligned {
+        (BF16_ATOL, BF16_RTOL)
+    } else {
+        (1e-5, 1e-5)
+    };
+    assert_close_slices(
+        &format!("{label} forward"),
+        &sparse_output,
+        &expected_output,
+        atol,
+        rtol,
+    );
+
+    for expert in 0..E {
+        for slot in live_slots..C {
+            for feature in 0..D {
+                let index = (expert * C + slot) * D + feature;
+                assert_eq!(
+                    sparse_output[index].to_bits(),
+                    0.0f32.to_bits(),
+                    "{label}: dead bin row produced a non-zero output at {index}"
+                );
+            }
+        }
+    }
+
+    // Filling the formerly dead rows makes every expert exactly full. Since
+    // rows do not interact, all original live outputs must remain bit-identical.
+    let mut full_bins = bins.clone();
+    let fill: Vec<f32> = uniform_vec(E * C * D, 802)
+        .into_iter()
+        .map(|value| value - 0.5)
+        .collect();
+    for expert in 0..E {
+        for slot in live_slots..C {
+            let start = (expert * C + slot) * D;
+            full_bins[start..start + D].copy_from_slice(&fill[start..start + D]);
+        }
+    }
+    workspace.upload_bins(&full_bins, stream)?;
+    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    let full_output = workspace.bin_output.to_host(stream)?;
+    for expert in 0..E {
+        for slot in 0..live_slots {
+            for feature in 0..D {
+                let index = (expert * C + slot) * D + feature;
+                assert_eq!(
+                    sparse_output[index].to_bits(),
+                    full_output[index].to_bits(),
+                    "{label}: live output changed when dead rows were filled at {index}"
+                );
+            }
+        }
+    }
+
+    // Restore the sparse forward state before backward.
+    workspace.upload_bins(&bins, stream)?;
+    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    let output_gradient: Vec<f32> = uniform_vec(E * C * D, 803)
+        .into_iter()
+        .map(|value| (value - 0.5) * 0.05)
+        .collect();
+    workspace.upload_output_gradient(&output_gradient, stream)?;
+
+    let mut contexts = contexts.into_iter();
+    let expected_input_gradients: [_; E] = std::array::from_fn(|expert| {
+        let start = expert * C * D;
+        cpu[expert].backward(
+            contexts.next().unwrap(),
+            CpuTensor::from_slice(&output_gradient[start..start + C * D]),
+        )
+    });
+    let mut expected_input_gradient = vec![0.0; E * C * D];
+    for expert in 0..E {
+        expected_input_gradient[expert * C * D..(expert + 1) * C * D]
+            .copy_from_slice(expected_input_gradients[expert].as_slice());
+    }
+    gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    assert_close_slices(
+        &format!("{label} input gradient"),
+        &workspace.d_bin_input.to_host(stream)?,
+        &expected_input_gradient,
+        atol,
+        rtol,
+    );
+    let (expected_gate_up, expected_down) = stacked_expert_gradients(&cpu);
+    assert_close(
+        &format!("{label} gate/up gradient"),
+        &gpu.d_gate_up,
+        &expected_gate_up,
+        stream,
+        atol,
+        rtol,
+    )?;
+    assert_close(
+        &format!("{label} down gradient"),
+        &gpu.d_down,
+        &expected_down,
+        stream,
+        atol,
+        rtol,
+    )?;
+
+    // A second backward without zero_grad must accumulate into both stacked
+    // gradient entries, matching the CPU module's += contract.
+    let second_pairs: [(CpuTensor<f32, Rank2<C, D>>, nn::ExpertFfnCtx<C, D, FF>); E] =
+        std::array::from_fn(|expert| {
+            let start = expert * C * D;
+            cpu[expert].forward(CpuTensor::from_slice(&bins[start..start + C * D]))
+        });
+    let second_contexts = second_pairs.map(|(_, context)| context);
+    let mut second_contexts = second_contexts.into_iter();
+    for expert in 0..E {
+        let start = expert * C * D;
+        cpu[expert].backward(
+            second_contexts.next().unwrap(),
+            CpuTensor::from_slice(&output_gradient[start..start + C * D]),
+        );
+    }
+    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, llama)?;
+    let (expected_gate_up, expected_down) = stacked_expert_gradients(&cpu);
+    assert_close(
+        &format!("{label} accumulated gate/up gradient"),
+        &gpu.d_gate_up,
+        &expected_gate_up,
+        stream,
+        2.0 * atol,
+        rtol,
+    )?;
+    assert_close(
+        &format!("{label} accumulated down gradient"),
+        &gpu.d_down,
+        &expected_down,
+        stream,
+        2.0 * atol,
+        rtol,
+    )?;
+
+    if aligned {
+        let mut optimizer = GpuExpertAdamW::new(
+            stream,
+            AdamWConfig {
+                learning_rate: 1e-3,
+                ..AdamWConfig::default()
+            },
+        )?;
+        optimizer.update(&mut gpu, stream, tensor)?;
+        check_expert_compute_copies(&gpu, stream)?;
+    }
+
+    println!("✓ {label} expert forward/backward, zero rows, accumulation, and compute sync");
+    Ok(())
+}
+
 /// `[D, VP]` values -> `[D, VOCAB]`, asserting the padded columns are zero.
 fn strip_vocab_padding(name: &str, padded: &[f32]) -> Vec<f32> {
     assert_eq!(padded.len(), D * VP);
@@ -221,8 +498,7 @@ fn newton_schulz_parity(
             .iter()
             .map(|&value| value - 0.5)
             .collect();
-        let expected =
-            zeroth_power_via_newton_schulz::<R, C>(&CpuTensor::from_slice(&values), 5);
+        let expected = zeroth_power_via_newton_schulz::<R, C>(&CpuTensor::from_slice(&values), 5);
         let input = DeviceBuffer::from_host(stream, &values)?;
         let mut scratch = GpuMuonScratch::new(stream, R * C, R * C, R.min(C))?;
         let actual = scratch.zeroth_power(&input, R, C, 5, stream, tensor, gemm)?;
@@ -441,7 +717,15 @@ fn aligned_tcgen05_linears(
 
     let (cpu_loss, cpu_ctx) = cpu.forward(tokens, targets);
     gpu.forward(
-        &tokens, &targets, &mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama,
+        &tokens,
+        &targets,
+        &mut workspace,
+        stream,
+        tensor,
+        gemm,
+        gemm_bf16,
+        flash,
+        llama,
     )?;
     assert_close(
         "aligned loss",
@@ -453,7 +737,15 @@ fn aligned_tcgen05_linears(
     )?;
 
     cpu.backward(cpu_ctx);
-    gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama)?;
+    gpu.backward(
+        &mut workspace,
+        stream,
+        tensor,
+        gemm,
+        gemm_bf16,
+        flash,
+        llama,
+    )?;
 
     macro_rules! grad {
         ($field:ident) => {
@@ -501,16 +793,40 @@ fn aligned_tcgen05_linears(
     for _ in 0..600 {
         gpu.zero_grad(stream, tensor)?;
         gpu.forward(
-            &tokens, &targets, &mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama,
+            &tokens,
+            &targets,
+            &mut workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
         }
-        gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama)?;
+        gpu.backward(
+            &mut workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
+        )?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
     gpu.forward(
-        &tokens, &targets, &mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama,
+        &tokens,
+        &targets,
+        &mut workspace,
+        stream,
+        tensor,
+        gemm,
+        gemm_bf16,
+        flash,
+        llama,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -522,9 +838,7 @@ fn aligned_tcgen05_linears(
         final_loss < initial_loss * 0.05,
         "aligned tcgen05 loss did not fall enough: initial={initial_loss}, final={final_loss}"
     );
-    println!(
-        "✓ aligned tcgen05 block linears overfit ({initial_loss:.6} -> {final_loss:.6})"
-    );
+    println!("✓ aligned tcgen05 block linears overfit ({initial_loss:.6} -> {final_loss:.6})");
     Ok(())
 }
 
@@ -571,16 +885,40 @@ fn aligned_muon_overfit(
     for _ in 0..600 {
         gpu.zero_grad(stream, tensor)?;
         gpu.forward(
-            &tokens, &targets, &mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama,
+            &tokens,
+            &targets,
+            &mut workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
         }
-        gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama)?;
+        gpu.backward(
+            &mut workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            llama,
+        )?;
         optimizer.update(&mut gpu, stream, tensor, gemm)?;
     }
     gpu.forward(
-        &tokens, &targets, &mut workspace, stream, tensor, gemm, gemm_bf16, flash, llama,
+        &tokens,
+        &targets,
+        &mut workspace,
+        stream,
+        tensor,
+        gemm,
+        gemm_bf16,
+        flash,
+        llama,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -592,7 +930,9 @@ fn aligned_muon_overfit(
         final_loss < initial_loss * 0.05,
         "aligned tcgen05 Muon loss did not fall enough: initial={initial_loss}, final={final_loss}"
     );
-    println!("✓ aligned tcgen05 block linears overfit with Muon ({initial_loss:.6} -> {final_loss:.6})");
+    println!(
+        "✓ aligned tcgen05 block linears overfit with Muon ({initial_loss:.6} -> {final_loss:.6})"
+    );
     Ok(())
 }
 
@@ -893,6 +1233,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ full GPU Muon update (Newton–Schulz hidden matrices) matches CPU");
 
     newton_schulz_parity(&stream, &tensor, &gemm)?;
+    expert_compute_parity::<3, 5, 128, 19>(
+        "fp32 oracle",
+        false,
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &llama,
+    )?;
+    expert_compute_parity::<2, 128, 128, 128>(
+        "aligned tcgen05",
+        true,
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &llama,
+    )?;
+    // The parity helpers own temporary expert workspaces. Their device frees
+    // are stream-ordered; complete those frees before the independent overfit
+    // gates begin allocating models and workspaces of their own.
+    stream.synchronize()?;
     overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
     muon_overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;
     aligned_tcgen05_linears(&stream, &tensor, &gemm, &gemm_bf16, &flash, &llama)?;

@@ -474,10 +474,15 @@ Each gated on tests; correctness before speed at every step.
      top-k boundary flips token assignment outright (the 7e7 two-logit
      tie was this failure mode in miniature), and the `[N,D]×[D,E]`
      router GEMM is too skinny for the tcgen05 tile contract anyway.
-   - **8c GPU expert compute** (gpu/llama-model): per-expert GEMMs over the
-     capacity-padded bins on the 7e9 bf16 tcgen05 path (bins are
-     tile-aligned by construction via `C`); fp32 register-tiled fallback
-     stays the oracle at non-aligned parity shapes.
+   - ✅ **8c GPU expert compute** (gpu/llama-model): stacked fp32-master
+     gate/up `[E,D,2FF]` and down `[E,FF,D]` weights with persistent packed-bf16
+     compute copies; per-expert GEMM launches over capacity-padded bins on the
+     7e9 tcgen05 fp32-store/accumulate path (`C` supplies tile alignment).
+     One global transpose plus strided per-expert TMA maps keeps refresh and
+     weight-gradient staging allocation-wide rather than per expert. The fp32
+     register-tiled fallback remains the non-aligned oracle; both paths are
+     gated against CPU expert forward/backward, zero-row inertness, repeated
+     gradient accumulation, and post-AdamW compute-copy refresh.
    - **8d integration**: FFN swap in `GpuLlama` behind identical types,
      gated like 7e — full parity, aligned overfit, then a §10.1
      same-container profile against the dense 152.1 ms baseline (MoE at
