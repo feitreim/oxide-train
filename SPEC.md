@@ -466,7 +466,7 @@ Each gated on tests; correctness before speed at every step.
      `learning_rate`; it rides the checkpoint header like `AdamWConfig` so
      resume can't silently change it. Only `E`/`K`/`C` are const generics —
      they determine shapes; the coefficient shapes nothing.
-   - **8b GPU routing** (gpu/llama-ops): top-k select + scatter/gather
+   - ✅ **8b GPU routing** (gpu/llama-ops): top-k select + scatter/gather
      between token order and capacity-padded expert bins, CPU/GPU parity on
      shapes that force drops and underfull experts. The router is fp32
      end-to-end — logits GEMM, softmax, top-k, and gate weights — over
