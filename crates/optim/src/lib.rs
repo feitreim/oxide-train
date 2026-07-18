@@ -27,40 +27,41 @@ pub struct AdamWConfig {
 }
 
 impl AdamWConfig {
+    /// The single source of truth for both [`Self::is_valid`] and
+    /// [`Self::validate`].
+    fn checks(self) -> [(bool, &'static str); 5] {
+        [
+            (
+                self.learning_rate.is_finite() && self.learning_rate >= 0.0,
+                "learning rate must be finite and non-negative",
+            ),
+            (
+                self.beta1.is_finite() && (0.0..1.0).contains(&self.beta1),
+                "beta1 must be in [0, 1)",
+            ),
+            (
+                self.beta2.is_finite() && (0.0..1.0).contains(&self.beta2),
+                "beta2 must be in [0, 1)",
+            ),
+            (
+                self.epsilon.is_finite() && self.epsilon > 0.0,
+                "epsilon must be finite and positive",
+            ),
+            (
+                self.weight_decay.is_finite() && self.weight_decay >= 0.0,
+                "weight decay must be finite and non-negative",
+            ),
+        ]
+    }
+
     pub fn is_valid(self) -> bool {
-        self.learning_rate.is_finite()
-            && self.learning_rate >= 0.0
-            && self.beta1.is_finite()
-            && (0.0..1.0).contains(&self.beta1)
-            && self.beta2.is_finite()
-            && (0.0..1.0).contains(&self.beta2)
-            && self.epsilon.is_finite()
-            && self.epsilon > 0.0
-            && self.weight_decay.is_finite()
-            && self.weight_decay >= 0.0
+        self.checks().iter().all(|&(ok, _)| ok)
     }
 
     pub fn validate(self) {
-        assert!(
-            self.learning_rate.is_finite() && self.learning_rate >= 0.0,
-            "learning rate must be finite and non-negative"
-        );
-        assert!(
-            self.beta1.is_finite() && (0.0..1.0).contains(&self.beta1),
-            "beta1 must be in [0, 1)"
-        );
-        assert!(
-            self.beta2.is_finite() && (0.0..1.0).contains(&self.beta2),
-            "beta2 must be in [0, 1)"
-        );
-        assert!(
-            self.epsilon.is_finite() && self.epsilon > 0.0,
-            "epsilon must be finite and positive"
-        );
-        assert!(
-            self.weight_decay.is_finite() && self.weight_decay >= 0.0,
-            "weight decay must be finite and non-negative"
-        );
+        for (ok, message) in self.checks() {
+            assert!(ok, "{message}");
+        }
     }
 
     pub fn without_weight_decay(self) -> Self {
@@ -93,22 +94,29 @@ pub struct AuxLossSchedule {
 }
 
 impl AuxLossSchedule {
+    /// The single source of truth for both [`Self::is_valid`] and
+    /// [`Self::validate`].
+    fn checks(self) -> [(bool, &'static str); 2] {
+        [
+            (
+                self.base_coefficient.is_finite() && self.base_coefficient >= 0.0,
+                "auxiliary loss base coefficient must be finite and non-negative",
+            ),
+            (
+                self.decay_horizon.is_finite() && self.decay_horizon > 0.0,
+                "auxiliary loss decay horizon must be finite and positive",
+            ),
+        ]
+    }
+
     pub fn is_valid(self) -> bool {
-        self.base_coefficient.is_finite()
-            && self.base_coefficient >= 0.0
-            && self.decay_horizon.is_finite()
-            && self.decay_horizon > 0.0
+        self.checks().iter().all(|&(ok, _)| ok)
     }
 
     pub fn validate(self) {
-        assert!(
-            self.base_coefficient.is_finite() && self.base_coefficient >= 0.0,
-            "auxiliary loss base coefficient must be finite and non-negative"
-        );
-        assert!(
-            self.decay_horizon.is_finite() && self.decay_horizon > 0.0,
-            "auxiliary loss decay horizon must be finite and positive"
-        );
+        for (ok, message) in self.checks() {
+            assert!(ok, "{message}");
+        }
     }
 
     pub fn coefficient(self, step: u64) -> f32 {
