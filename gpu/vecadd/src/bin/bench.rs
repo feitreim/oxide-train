@@ -25,7 +25,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let avg_ms = time_gpu_iters(&stream, WARMUP, ITERS, || {
         module
-            .vecadd(&stream, LaunchConfig::for_num_elems(N as u32), &a, &b, &mut c)
+            .vecadd(
+                &stream,
+                LaunchConfig::for_num_elems(N as u32),
+                &a,
+                &b,
+                &mut c,
+            )
             .map_err(Into::into)
     })?;
 

@@ -117,8 +117,7 @@ fn main() -> Result<()> {
         articles += texts.len() as u64;
 
         for chunk in texts.chunks(DOC_BATCH) {
-            let docs: Vec<Vec<u16>> =
-                chunk.par_iter().map(|t| tokenizer.encode_doc(t)).collect();
+            let docs: Vec<Vec<u16>> = chunk.par_iter().map(|t| tokenizer.encode_doc(t)).collect();
             for doc in &docs {
                 // Fill the val shard first, then stream everything to train.
                 if val.total_tokens() < args.val_tokens {

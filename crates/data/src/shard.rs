@@ -48,19 +48,22 @@ pub struct ShardWriter {
 impl ShardWriter {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let file = File::create(&path)
-            .with_context(|| format!("create shard {}", path.display()))?;
+        let file =
+            File::create(&path).with_context(|| format!("create shard {}", path.display()))?;
         let mut out = BufWriter::new(file);
         // Placeholder header; rewritten with the real count in finish().
         out.write_all(&encode_header(0))?;
-        Ok(Self { path, out, num_tokens: 0 })
+        Ok(Self {
+            path,
+            out,
+            num_tokens: 0,
+        })
     }
 
     pub fn write_tokens(&mut self, tokens: &[u16]) -> Result<()> {
         // Safe cast: &[u16] -> &[u8] view for a bulk little-endian write.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(tokens.as_ptr().cast::<u8>(), tokens.len() * 2)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(tokens.as_ptr().cast::<u8>(), tokens.len() * 2) };
         self.out.write_all(bytes)?;
         self.num_tokens += tokens.len() as u64;
         Ok(())
@@ -99,14 +102,25 @@ impl TokenFile {
 
         let field = |i: usize| u32::from_le_bytes(header[i..i + 4].try_into().unwrap());
         ensure!(field(0) == MAGIC, "bad magic in {}", path.display());
-        ensure!(field(4) == VERSION, "unsupported shard version in {}", path.display());
-        ensure!(field(8) == DTYPE_U16, "unsupported dtype in {}", path.display());
+        ensure!(
+            field(4) == VERSION,
+            "unsupported shard version in {}",
+            path.display()
+        );
+        ensure!(
+            field(8) == DTYPE_U16,
+            "unsupported dtype in {}",
+            path.display()
+        );
         let num_tokens = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
 
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("mmap shard {}", path.display()))?;
         if mmap.len() < HEADER_BYTES + num_tokens * 2 {
-            bail!("shard {} truncated: header claims {num_tokens} tokens", path.display());
+            bail!(
+                "shard {} truncated: header claims {num_tokens} tokens",
+                path.display()
+            );
         }
         Ok(Self { mmap, num_tokens })
     }
@@ -251,7 +265,10 @@ mod tests {
         let shards = w.finish().unwrap();
         assert_eq!(shards.len(), 3);
 
-        let lens: Vec<usize> = shards.iter().map(|p| TokenFile::open(p).unwrap().len()).collect();
+        let lens: Vec<usize> = shards
+            .iter()
+            .map(|p| TokenFile::open(p).unwrap().len())
+            .collect();
         assert_eq!(lens, [1000, 1000, 100]);
 
         // Stream order is preserved across the roll boundary.

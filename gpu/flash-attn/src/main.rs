@@ -170,9 +170,27 @@ fn check_shape(
         &mut actual_dv,
     )?;
     assert_close("y", &actual_y.to_host_vec(stream)?, &expected_y, 5e-5, 5e-5);
-    assert_close("dq", &actual_dq.to_host_vec(stream)?, &expected_dq, 1e-4, 1e-4);
-    assert_close("dk", &actual_dk.to_host_vec(stream)?, &expected_dk, 1e-4, 1e-4);
-    assert_close("dv", &actual_dv.to_host_vec(stream)?, &expected_dv, 1e-4, 1e-4);
+    assert_close(
+        "dq",
+        &actual_dq.to_host_vec(stream)?,
+        &expected_dq,
+        1e-4,
+        1e-4,
+    );
+    assert_close(
+        "dk",
+        &actual_dk.to_host_vec(stream)?,
+        &expected_dk,
+        1e-4,
+        1e-4,
+    );
+    assert_close(
+        "dv",
+        &actual_dv.to_host_vec(stream)?,
+        &expected_dv,
+        1e-4,
+        1e-4,
+    );
 
     println!("tiled flash parity against llama-ops [{b},{t},{h},{HD}]");
     let mut tiled_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
@@ -235,9 +253,27 @@ fn check_shape(
         5e-5,
         5e-5,
     );
-    assert_close("dq", &tiled_dq.to_host_vec(stream)?, &expected_dq, 1e-4, 1e-4);
-    assert_close("dk", &tiled_dk.to_host_vec(stream)?, &expected_dk, 1e-4, 1e-4);
-    assert_close("dv", &tiled_dv.to_host_vec(stream)?, &expected_dv, 1e-4, 1e-4);
+    assert_close(
+        "dq",
+        &tiled_dq.to_host_vec(stream)?,
+        &expected_dq,
+        1e-4,
+        1e-4,
+    );
+    assert_close(
+        "dk",
+        &tiled_dk.to_host_vec(stream)?,
+        &expected_dk,
+        1e-4,
+        1e-4,
+    );
+    assert_close(
+        "dv",
+        &tiled_dv.to_host_vec(stream)?,
+        &expected_dv,
+        1e-4,
+        1e-4,
+    );
 
     // DIAGNOSTIC: training reuses gradient scratch buffers, so any output
     // element the tiled kernels skip writing leaks stale data. Seed every

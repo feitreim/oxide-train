@@ -32,9 +32,10 @@ impl Tokenizer {
     pub fn encode_doc(&self, text: &str) -> Vec<u16> {
         let toks = self.bpe.encode_ordinary(text);
         let mut out = Vec::with_capacity(toks.len() + 1);
-        out.extend(toks.into_iter().map(|t| {
-            u16::try_from(t).expect("r50k token id exceeds u16")
-        }));
+        out.extend(
+            toks.into_iter()
+                .map(|t| u16::try_from(t).expect("r50k token id exceeds u16")),
+        );
         out.push(EOT_TOKEN);
         out
     }

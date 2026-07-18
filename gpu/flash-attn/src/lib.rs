@@ -759,12 +759,10 @@ pub mod kernels {
             for col in 0..FWD_BK {
                 let mut value = [0.0f32; FWD_TD];
                 for d in 0..FWD_TD {
-                    value[d] =
-                        unsafe { V_TILE[col * TILE_HD + fragment_col * FWD_TD + d] };
+                    value[d] = unsafe { V_TILE[col * TILE_HD + fragment_col * FWD_TD + d] };
                 }
                 for i in 0..FWD_TM {
-                    let probability =
-                        unsafe { P_TILE[(fragment_row * FWD_TM + i) * FWD_BK + col] };
+                    let probability = unsafe { P_TILE[(fragment_row * FWD_TM + i) * FWD_BK + col] };
                     for d in 0..FWD_TD {
                         out_acc[i][d] += probability * value[d];
                     }
@@ -976,8 +974,7 @@ pub mod kernels {
                     let col = fragment_col * BWQ_TN + j;
                     let key_row = key_start + col;
                     let dscore = if key_row <= query_row && key_row < t && query_row < t {
-                        let probability =
-                            unsafe { (scores[i][j] * scale - ROW_LSE[row]).exp() };
+                        let probability = unsafe { (scores[i][j] * scale - ROW_LSE[row]).exp() };
                         probability * (dp[i][j] - unsafe { ROW_DOT[row] }) * scale
                     } else {
                         0.0
@@ -992,12 +989,10 @@ pub mod kernels {
             for col in 0..BWQ_BK {
                 let mut key_value = [0.0f32; BWQ_TD];
                 for d in 0..BWQ_TD {
-                    key_value[d] =
-                        unsafe { K_TILE[col * TILE_HD + fragment_col * BWQ_TD + d] };
+                    key_value[d] = unsafe { K_TILE[col * TILE_HD + fragment_col * BWQ_TD + d] };
                 }
                 for i in 0..BWQ_TM {
-                    let dscore =
-                        unsafe { DS_TILE[(fragment_row * BWQ_TM + i) * BWQ_BK + col] };
+                    let dscore = unsafe { DS_TILE[(fragment_row * BWQ_TM + i) * BWQ_BK + col] };
                     for d in 0..BWQ_TD {
                         dq_acc[i][d] += dscore * key_value[d];
                     }
@@ -1217,11 +1212,7 @@ fn tiled_config(
     assert!(query_or_key_blocks <= u32::MAX as usize);
     assert!(heads <= u16::MAX as usize && sequences <= u16::MAX as usize);
     LaunchConfig {
-        grid_dim: (
-            query_or_key_blocks as u32,
-            heads as u32,
-            sequences as u32,
-        ),
+        grid_dim: (query_or_key_blocks as u32, heads as u32, sequences as u32),
         block_dim: (threads as u32, 1, 1),
         shared_mem_bytes: 0,
     }

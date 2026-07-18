@@ -122,7 +122,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             live += 1;
         }
         let ids: Vec<String> = window[..live].iter().map(|t| t.to_string()).collect();
-        println!("prompt{index} prompt_len={PROMPT_TOKENS} ids: {}", ids.join(" "));
+        println!(
+            "prompt{index} prompt_len={PROMPT_TOKENS} ids: {}",
+            ids.join(" ")
+        );
     }
     Ok(())
 }
