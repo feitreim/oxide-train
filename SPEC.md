@@ -256,8 +256,8 @@ crates/            CPU-side workspace (builds/tests anywhere, no CUDA)
   tensor-cpu/      CpuTensor + naive reference ops
   nn/              Module trait, combinators, layers, gradcheck
   data/            tokenizer, shard format, mmap loader, prepare-wiki binary
-  optim/           AdamW CPU reference, typed Llama state, param visitor,
-                   fp32 master weights (Muon planned)
+  optim/           AdamW + Muon CPU references, typed Llama state, param
+                   visitor, fp32 master weights
 gpu/               standalone cuda-oxide kernel crates (Modal-built)
   bench-util/      CUDA-event timing + shared-RNG re-export
   vecadd/          toolchain smoke test; template for new kernels
@@ -441,8 +441,8 @@ Each gated on tests; correctness before speed at every step.
        751.9 → 152.1 ms (~4.9×) since the post-7e7 profile. The measured
        tail is now flash attention (57.5 ms combined, 37.8%) and the
        lm-head GEMM trio (54.2 ms, 35.6%).
-   - **7f Muon** (crates/optim): CPU reference + orthogonality tests any
-     time after milestone 6; GPU Newton–Schulz step once 7b's GEMM is fast.
+   - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
+     GPU Newton–Schulz step remains, now that 7b's GEMM is fast.
 
    Dependency shape: 7a/7b/7c/7d/7f can all run in parallel; 7e integrates
    their results into the model.

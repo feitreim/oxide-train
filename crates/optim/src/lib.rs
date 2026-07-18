@@ -1,9 +1,13 @@
 //! Optimizers and statically typed optimizer state.
 //!
 //! The CPU implementation is the numerical reference for GPU optimizer
-//! kernels. `LlamaAdamW` mirrors the model's parameter structure, preserving
-//! each parameter shape in the type system without a type-erased parameter
-//! registry.
+//! kernels. `LlamaAdamW` and `LlamaMuon` mirror the model's parameter
+//! structure, preserving each parameter shape in the type system without a
+//! type-erased parameter registry.
+
+mod muon;
+
+pub use muon::{MuonConfig, MuonMomentum, muon_step, zeroth_power_via_newton_schulz};
 
 use nn::Llama;
 use tensor_core::{Rank1, Rank2, Shape, bf16};
@@ -259,6 +263,109 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> LlamaAdamW<VOCAB, D, F
     }
 }
 
+/// Mixed Muon/AdamW state for the single-block reference Llama.
+///
+/// Hidden projection matrices use Muon. Embeddings, normalization gains, and
+/// the classifier head use AdamW, matching the routing prescribed by Muon.
+pub struct LlamaMuon<const VOCAB: usize, const D: usize, const FF: usize> {
+    muon_config: MuonConfig,
+    adamw_config: AdamWConfig,
+    step: u64,
+    pub embedding: AdamWMoments<Rank2<VOCAB, D>>,
+    pub attention_norm: AdamWMoments<Rank1<D>>,
+    pub q_proj: MuonMomentum<Rank2<D, D>>,
+    pub k_proj: MuonMomentum<Rank2<D, D>>,
+    pub v_proj: MuonMomentum<Rank2<D, D>>,
+    pub o_proj: MuonMomentum<Rank2<D, D>>,
+    pub ffn_norm: AdamWMoments<Rank1<D>>,
+    pub gate_proj: MuonMomentum<Rank2<D, FF>>,
+    pub up_proj: MuonMomentum<Rank2<D, FF>>,
+    pub down_proj: MuonMomentum<Rank2<FF, D>>,
+    pub final_norm: AdamWMoments<Rank1<D>>,
+    pub lm_head: AdamWMoments<Rank2<D, VOCAB>>,
+}
+
+impl<const VOCAB: usize, const D: usize, const FF: usize> LlamaMuon<VOCAB, D, FF> {
+    pub fn new(muon_config: MuonConfig, adamw_config: AdamWConfig) -> Self {
+        muon_config.validate();
+        adamw_config.validate();
+        Self {
+            muon_config,
+            adamw_config,
+            step: 0,
+            embedding: AdamWMoments::zeros(),
+            attention_norm: AdamWMoments::zeros(),
+            q_proj: MuonMomentum::zeros(),
+            k_proj: MuonMomentum::zeros(),
+            v_proj: MuonMomentum::zeros(),
+            o_proj: MuonMomentum::zeros(),
+            ffn_norm: AdamWMoments::zeros(),
+            gate_proj: MuonMomentum::zeros(),
+            up_proj: MuonMomentum::zeros(),
+            down_proj: MuonMomentum::zeros(),
+            final_norm: AdamWMoments::zeros(),
+            lm_head: AdamWMoments::zeros(),
+        }
+    }
+
+    pub fn step(&self) -> u64 {
+        self.step
+    }
+
+    pub fn muon_config(&self) -> MuonConfig {
+        self.muon_config
+    }
+
+    pub fn adamw_config(&self) -> AdamWConfig {
+        self.adamw_config
+    }
+
+    pub fn update<const N: usize, const T: usize, const H: usize, const HD: usize>(
+        &mut self,
+        model: &mut Llama<N, T, VOCAB, D, H, HD, FF>,
+    ) {
+        self.step = self.step.checked_add(1).expect("Muon step overflow");
+        let step = self.step;
+        let decay = self.adamw_config;
+        let no_decay = self.adamw_config.without_weight_decay();
+
+        macro_rules! adamw {
+            ($field:ident, $config:expr) => {
+                adamw_step(
+                    &mut model.$field.w,
+                    &model.$field.dw,
+                    &mut self.$field,
+                    $config,
+                    step,
+                );
+            };
+        }
+        macro_rules! muon {
+            ($field:ident) => {
+                muon_step(
+                    &mut model.$field.w,
+                    &model.$field.dw,
+                    &mut self.$field,
+                    self.muon_config,
+                );
+            };
+        }
+
+        adamw!(embedding, decay);
+        adamw!(attention_norm, no_decay);
+        muon!(q_proj);
+        muon!(k_proj);
+        muon!(v_proj);
+        muon!(o_proj);
+        adamw!(ffn_norm, no_decay);
+        muon!(gate_proj);
+        muon!(up_proj);
+        muon!(down_proj);
+        adamw!(final_norm, no_decay);
+        adamw!(lm_head, decay);
+    }
+}
+
 /// Full-precision source of truth for a bf16 compute parameter.
 ///
 /// `S` is shared by the master and compute tensors, so synchronizing tensors
@@ -378,6 +485,52 @@ mod tests {
     }
 
     #[test]
+    fn llama_muon_routes_hidden_matrices_and_auxiliary_parameters() {
+        let mut model = Llama::<4, 4, 7, 8, 2, 4, 12>::new(7);
+        model.embedding.dw.as_mut_slice().fill(1.0);
+        model.attention_norm.dw.as_mut_slice().fill(1.0);
+        model.q_proj.dw.as_mut_slice().fill(1.0);
+        model.lm_head.dw.as_mut_slice().fill(1.0);
+        let mut optimizer = LlamaMuon::new(MuonConfig::default(), AdamWConfig::default());
+
+        optimizer.update(&mut model);
+
+        assert_eq!(optimizer.step(), 1);
+        assert!(
+            optimizer
+                .q_proj
+                .momentum
+                .as_slice()
+                .iter()
+                .all(|&value| (value - 0.05).abs() < 1e-6)
+        );
+        assert!(
+            optimizer
+                .embedding
+                .first
+                .as_slice()
+                .iter()
+                .all(|&value| (value - 0.1).abs() < 1e-6)
+        );
+        assert!(
+            optimizer
+                .attention_norm
+                .second
+                .as_slice()
+                .iter()
+                .all(|&value| (value - 0.001).abs() < 1e-6)
+        );
+        assert!(
+            optimizer
+                .lm_head
+                .first
+                .as_slice()
+                .iter()
+                .all(|&value| (value - 0.1).abs() < 1e-6)
+        );
+    }
+
+    #[test]
     fn adamw_overfits_the_tiny_llama_batch() {
         type TinyLlama = Llama<4, 4, 4, 8, 2, 4, 12>;
         let tokens = [0, 1, 2, 3];
@@ -401,6 +554,40 @@ mod tests {
         assert!(
             final_loss < 0.05,
             "tiny batch did not overfit: initial={initial_loss}, final={final_loss}"
+        );
+        assert!(final_loss < initial_loss * 0.05);
+    }
+
+    #[test]
+    fn muon_overfits_the_tiny_llama_batch() {
+        type TinyLlama = Llama<4, 4, 4, 8, 2, 4, 12>;
+        let tokens = [0, 1, 2, 3];
+        let targets = [1, 2, 3, 0];
+        let mut model = TinyLlama::new(100);
+        let mut optimizer = LlamaMuon::new(
+            MuonConfig {
+                learning_rate: 0.02,
+                ..MuonConfig::default()
+            },
+            AdamWConfig {
+                learning_rate: 0.03,
+                weight_decay: 0.0,
+                ..AdamWConfig::default()
+            },
+        );
+        let initial_loss = model.forward(tokens, targets).0.as_slice()[0];
+
+        for _ in 0..200 {
+            model.zero_grad();
+            let (_, ctx) = model.forward(tokens, targets);
+            model.backward(ctx);
+            optimizer.update(&mut model);
+        }
+        let final_loss = model.forward(tokens, targets).0.as_slice()[0];
+
+        assert!(
+            final_loss < 0.05,
+            "tiny batch did not overfit with Muon: initial={initial_loss}, final={final_loss}"
         );
         assert!(final_loss < initial_loss * 0.05);
     }
