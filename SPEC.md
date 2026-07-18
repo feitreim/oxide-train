@@ -442,7 +442,11 @@ Each gated on tests; correctness before speed at every step.
        tail is now flash attention (57.5 ms combined, 37.8%) and the
        lm-head GEMM trio (54.2 ms, 35.6%).
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
-     GPU Newton–Schulz step remains, now that 7b's GEMM is fast.
+     ✅ GPU step (`GpuLlamaMuon`): fp32 register-GEMM Newton–Schulz with
+     per-group orthogonalization of the fused qkv/gate-up weights, gated on
+     zeroth-power/optimizer parity vs the CPU reference plus tiny and
+     tile-aligned Muon overfits. Train-loop/checkpoint wiring and a bf16
+     tcgen05 Newton–Schulz remain follow-ups.
 
    Dependency shape: 7a/7b/7c/7d/7f can all run in parallel; 7e integrates
    their results into the model.

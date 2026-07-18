@@ -7,7 +7,10 @@
 
 mod muon;
 
-pub use muon::{MuonConfig, MuonMomentum, muon_step, zeroth_power_via_newton_schulz};
+pub use muon::{
+    MuonConfig, MuonMomentum, NEWTON_SCHULZ_A, NEWTON_SCHULZ_B, NEWTON_SCHULZ_C,
+    NEWTON_SCHULZ_EPSILON, muon_step, zeroth_power_via_newton_schulz,
+};
 
 use nn::Llama;
 use tensor_core::{Rank1, Rank2, Shape, bf16};
