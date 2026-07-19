@@ -34,6 +34,11 @@ use tensor_core::{Rank1, Rank2, Rank3, Rank4, Shape, bf16};
 // cuda-oxide collects kernels from the selected binary target. The binary
 // includes this file as a module, which in turn includes each canonical kernel
 // source here instead of copying definitions or relying on dependency PTX.
+// (`autolib = false` in Cargo.toml keeps this file from also being compiled
+// as an inferred library target; since cuda-oxide rev 2409204 a library
+// crate's device artifact is pinned by a link-anchor symbol instead of being
+// linker-dropped, so a lib target would double-define every kernel wrapper
+// and fail the fat-LTO link.)
 //
 // The tcgen05 GEMM kernels are the one exception: this binary's kernels use
 // libdevice math (`exp`/`ln`/`sqrt`), which forces its device artifact

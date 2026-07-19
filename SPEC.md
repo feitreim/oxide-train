@@ -28,7 +28,14 @@ bindings.
   launcher is `unsafe fn` unless the kernel declares a `#[launch_contract]`;
   we absorb that with `unsafe { }` + SAFETY comments at each launch site
   rather than adopting contracts (our launch shapes are already asserted by
-  the `*_config` helpers).
+  the `*_config` helpers). The generated-intrinsics catalog lowers stmatrix
+  and friends to `llvm.nvvm.*` calls on the pure-PTX path, so the Modal
+  image ships the apt.llvm.org **LLVM 22 snapshot** `llc`/`opt`
+  (`CUDA_OXIDE_LLC=/usr/bin/llc-22`; released LLVM 21 lacks those
+  intrinsics and yields PTX with unresolvable `.extern .func llvm.nvvm...`
+  → DriverError(218) at JIT). The image also pre-seeds cargo-oxide's
+  backend-source cache at CUDA_OXIDE_REF so the codegen backend is built
+  from the pinned rev instead of a floating `main` clone.
 - **Pinned nightly** `nightly-2026-04-03` everywhere (rust-toolchain.toml =
   Modal image), because the codegen backend and cuda-oxide's proc macros
   require it. Bump both together with CUDA_OXIDE_REF.
@@ -538,4 +545,4 @@ Each gated on tests; correctness before speed at every step.
 | 20 | Block tcgen05 keeps fp32 model tensors | Quantize operands into persistent scratch and use concrete fp32-output store/accumulate epilogues; buffers, optimizer/checkpoint layout, and the naive fp32 fallback stay fp32, though epilogue values are bf16-rounded (the drain reuses the packed-bf16 shared-memory staging, so each GEMM result carries bf16 mantissa precision after full-K fp32 accumulation — doubling SMEM_OUT for true fp32 staging wasn't warranted) |
 | 21 | MoE aux-loss coefficient is runtime config, not const | Const generics are reserved for values the compiler specializes on — `E`/`K`/`C` size buffers, bins, and launch grids; the coefficient is one scalar FMA that shapes nothing, needs a step schedule, and must be sweepable without a Modal rebuild (stable Rust also forbids f32 const generics). It flows host→kernel per step like `learning_rate` and is recorded in the checkpoint header like `AdamWConfig` |
 | 22 | MoE router is fp32 over bf16 experts | Routing is discrete: bf16 rounding near a top-k boundary doesn't perturb the output, it reassigns the token (the 7e7 bf16 two-logit tie showed how violently trajectories react to that). The router GEMM is `[N,D]×[D,E]` — skinny, off the tcgen05 tile contract, and a rounding-error share of step FLOPs — so fp32 costs nothing measurable while keeping gate weights and the aux loss in the precision gradcheck trusts |
-| 23 | cuda-oxide pinned to `main` rev `2409204` (2026-07-18), off `v0.2.1` | The FA4-shaped flash-attention plan needs a register→TMEM `tcgen05.st` the June tag lacks; this rev still lacks it but ships the generated-intrinsics path (upstream #406) that makes adding it — locally or upstream — cheap. Also picks up the rustc-independent PTX backend (#314), typed launch contracts (#318, absorbed as `unsafe` launch sites), and `--no-fmad` codegen fixes (#326). Toolchain nightly unchanged; `Cargo.toml` rev and `CUDA_OXIDE_REF` move together per §2 |
+| 23 | cuda-oxide pinned to `main` rev `2409204` (2026-07-18), off `v0.2.1` | The FA4-shaped flash-attention plan needs a register→TMEM `tcgen05.st` the June tag lacks; this rev still lacks it but ships the generated-intrinsics path (upstream #406) that makes adding it — locally or upstream — cheap. Also picks up the rustc-independent PTX backend (#314), typed launch contracts (#318, absorbed as `unsafe` launch sites), and `--no-fmad` codegen fixes (#326). Toolchain nightly unchanged but the pure-PTX path now needs the LLVM 22 snapshot `llc` (§2); gpu/model's `autolib = false` (from the tiled-router PR) matters at this rev because the link-anchor symbol keeps library device artifacts alive, so an inferred lib target would double-define every kernel under fat LTO; `Cargo.toml` rev and `CUDA_OXIDE_REF` move together per §2 |
