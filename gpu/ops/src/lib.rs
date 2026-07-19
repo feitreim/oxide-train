@@ -33,6 +33,24 @@ pub const NORM_THREADS: usize = 256;
 /// owned column, rather than one atomic per input element.
 pub const NORM_WEIGHT_ROWS_PER_BLOCK: usize = 256;
 
+/// Threads in one expert's deterministic MoE capacity-assignment block.
+///
+/// Each lane owns one contiguous range of token/rank pairs. A block-wide
+/// prefix sum then gives every range its exact token-order starting slot.
+pub const MOE_ASSIGN_THREADS: usize = 256;
+
+/// Router weight-gradient output rows computed by one block.
+pub const ROUTER_WEIGHT_ROWS: usize = 2;
+/// Router weight-gradient expert columns computed by one block.
+pub const ROUTER_WEIGHT_EXPERTS: usize = 8;
+/// Token rows staged by each router weight-gradient iteration.
+pub const ROUTER_WEIGHT_K: usize = 64;
+/// Fixed token partitions reduced for each router weight-gradient output.
+pub const ROUTER_WEIGHT_SPLITS: usize = 16;
+/// Threads in the skinny router weight-gradient kernel.
+pub const ROUTER_WEIGHT_THREADS: usize =
+    ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_EXPERTS * ROUTER_WEIGHT_SPLITS;
+
 /// Sentinel written by deterministic MoE binning for a capacity-dropped pair.
 pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
 
@@ -1442,6 +1460,101 @@ pub mod kernels {
         }
     }
 
+    /// Block-parallel deterministic capacity assignment.
+    ///
+    /// One block owns an expert and partitions the flattened token/rank order
+    /// into contiguous lane ranges. The exclusive prefix of each range's match
+    /// count is its first slot, preserving the serial kernel's exact ordering,
+    /// capacity-drop behavior, and assignment counts without atomic claims.
+    #[kernel]
+    pub unsafe fn moe_bin_assign_parallel(
+        selected_experts: &[u32],
+        tokens: u32,
+        experts: u32,
+        top_k: u32,
+        capacity: u32,
+        mut slots: DisjointSlice<u32>,
+        mut assignment_counts: DisjointSlice<u32>,
+    ) {
+        static mut RANGE_COUNTS: SharedArray<u32, MOE_ASSIGN_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != MOE_ASSIGN_THREADS {
+            return;
+        }
+        let expert = thread::blockIdx_x() as usize;
+        let n = tokens as usize;
+        let e = experts as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        let pairs = n * k;
+        if expert >= e
+            || pairs > selected_experts.len()
+            || pairs > slots.len()
+            || expert >= assignment_counts.len()
+        {
+            return;
+        }
+
+        let pairs_per_lane = pairs.div_ceil(MOE_ASSIGN_THREADS);
+        let start = (tid * pairs_per_lane).min(pairs);
+        let end = (start + pairs_per_lane).min(pairs);
+        let mut range_count = 0u32;
+        for pair in start..end {
+            if selected_experts[pair] as usize == expert {
+                range_count += 1;
+            }
+        }
+        unsafe {
+            RANGE_COUNTS[tid] = range_count;
+        }
+        thread::sync_threads();
+
+        // Inclusive Hillis-Steele scan. The barrier before each write keeps
+        // every lane's read on the previous iteration's shared-memory state.
+        let mut offset = 1usize;
+        while offset < MOE_ASSIGN_THREADS {
+            let preceding = if tid >= offset {
+                unsafe { RANGE_COUNTS[tid - offset] }
+            } else {
+                0
+            };
+            thread::sync_threads();
+            if tid >= offset {
+                unsafe {
+                    RANGE_COUNTS[tid] += preceding;
+                }
+            }
+            thread::sync_threads();
+            offset *= 2;
+        }
+
+        let range_start = if tid == 0 {
+            0
+        } else {
+            unsafe { RANGE_COUNTS[tid - 1] }
+        };
+        let mut local_count = 0u32;
+        for pair in start..end {
+            if selected_experts[pair] as usize == expert {
+                let slot = range_start + local_count;
+                unsafe {
+                    *slots.get_unchecked_mut(pair) = if slot < c as u32 {
+                        slot
+                    } else {
+                        MOE_DROPPED_SLOT
+                    };
+                }
+                local_count += 1;
+            }
+        }
+        if tid == 0 {
+            unsafe {
+                *assignment_counts.get_unchecked_mut(expert) = RANGE_COUNTS[MOE_ASSIGN_THREADS - 1];
+            }
+        }
+    }
+
     /// Parallel token reduction for each expert's mean routing probability.
     ///
     /// One block owns an expert. Each lane accumulates a strided token slice and
@@ -1803,6 +1916,122 @@ pub mod kernels {
         }
         if let Some(slot) = dweight.get_mut(index) {
             *slot += value;
+        }
+    }
+
+    /// Tiled router weight gradient for skinny expert dimensions.
+    ///
+    /// A block owns a `[ROUTER_WEIGHT_ROWS, ROUTER_WEIGHT_EXPERTS]` output tile.
+    /// `ROUTER_WEIGHT_SPLITS` lanes cooperate on each output by accumulating
+    /// fixed interleaved token positions, then lane zero combines those partials
+    /// in a fixed order. This exposes 256-way parallelism per tile without
+    /// atomics or nondeterministic accumulation.
+    #[kernel]
+    pub unsafe fn router_backward_weight_tiled(
+        x: &[f32],
+        dlogits: &[f32],
+        tokens: u32,
+        experts: u32,
+        mut dweight: DisjointSlice<f32>,
+    ) {
+        static mut TILE_X: SharedArray<f32, { ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_K }> =
+            SharedArray::UNINIT;
+        static mut TILE_DLOGITS: SharedArray<f32, { ROUTER_WEIGHT_K * ROUTER_WEIGHT_EXPERTS }> =
+            SharedArray::UNINIT;
+        static mut PARTIALS: SharedArray<f32, ROUTER_WEIGHT_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != ROUTER_WEIGHT_THREADS {
+            return;
+        }
+        if !ROUTER_WEIGHT_K.is_multiple_of(ROUTER_WEIGHT_SPLITS) {
+            return;
+        }
+        let n = tokens as usize;
+        let e = experts as usize;
+        if n == 0 || e == 0 || !dweight.len().is_multiple_of(e) || n * e > dlogits.len() {
+            return;
+        }
+        let d = dweight.len() / e;
+        if n * d > x.len() {
+            return;
+        }
+
+        let row_base = thread::blockIdx_x() as usize * ROUTER_WEIGHT_ROWS;
+        let expert_base = thread::blockIdx_y() as usize * ROUTER_WEIGHT_EXPERTS;
+        let outputs_per_tile = ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_EXPERTS;
+        let output = tid % outputs_per_tile;
+        let split = tid / outputs_per_tile;
+        let tile_row = output / ROUTER_WEIGHT_EXPERTS;
+        let tile_expert = output % ROUTER_WEIGHT_EXPERTS;
+        let mut accumulator = 0.0f32;
+
+        let mut token_base = 0usize;
+        while token_base < n {
+            let mut local = tid;
+            while local < ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_K {
+                // Traverse X in its physical `[N,D]` order, then scatter it
+                // into the logical transposed `[D,N]` shared-memory tile.
+                let staged_row = local % ROUTER_WEIGHT_ROWS;
+                let staged_token = local / ROUTER_WEIGHT_ROWS;
+                let global_row = row_base + staged_row;
+                let global_token = token_base + staged_token;
+                unsafe {
+                    TILE_X[staged_row * ROUTER_WEIGHT_K + staged_token] =
+                        if global_row < d && global_token < n {
+                            x[global_token * d + global_row]
+                        } else {
+                            0.0
+                        };
+                }
+                local += ROUTER_WEIGHT_THREADS;
+            }
+
+            local = tid;
+            while local < ROUTER_WEIGHT_K * ROUTER_WEIGHT_EXPERTS {
+                let staged_token = local / ROUTER_WEIGHT_EXPERTS;
+                let staged_expert = local % ROUTER_WEIGHT_EXPERTS;
+                let global_token = token_base + staged_token;
+                let global_expert = expert_base + staged_expert;
+                unsafe {
+                    TILE_DLOGITS[local] = if global_token < n && global_expert < e {
+                        dlogits[global_token * e + global_expert]
+                    } else {
+                        0.0
+                    };
+                }
+                local += ROUTER_WEIGHT_THREADS;
+            }
+            thread::sync_threads();
+
+            let mut inner = split;
+            while inner < ROUTER_WEIGHT_K {
+                unsafe {
+                    accumulator += TILE_X[tile_row * ROUTER_WEIGHT_K + inner]
+                        * TILE_DLOGITS[inner * ROUTER_WEIGHT_EXPERTS + tile_expert];
+                }
+                inner += ROUTER_WEIGHT_SPLITS;
+            }
+            thread::sync_threads();
+            token_base += ROUTER_WEIGHT_K;
+        }
+
+        unsafe {
+            PARTIALS[tid] = accumulator;
+        }
+        thread::sync_threads();
+        if split == 0 {
+            let global_row = row_base + tile_row;
+            let global_expert = expert_base + tile_expert;
+            if global_row < d && global_expert < e {
+                let mut value = 0.0f32;
+                for partition in 0..ROUTER_WEIGHT_SPLITS {
+                    value += unsafe { PARTIALS[partition * outputs_per_tile + output] };
+                }
+                unsafe {
+                    *dweight.get_unchecked_mut(global_row * e + global_expert) += value;
+                }
+            }
         }
     }
 }

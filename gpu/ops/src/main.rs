@@ -14,7 +14,9 @@ use tensor_cpu::CpuTensor;
 #[path = "lib.rs"]
 mod device;
 use device::{
-    CLASSIFIER_THREADS, MOE_DROPPED_SLOT, NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, kernels,
+    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, NORM_THREADS,
+    NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_WEIGHT_EXPERTS, ROUTER_WEIGHT_ROWS, ROUTER_WEIGHT_THREADS,
+    kernels,
 };
 use tensor_core::bf16;
 
@@ -134,6 +136,8 @@ fn check_moe_routing(
     let mut gates_dev = DeviceBuffer::<f32>::zeroed(stream, N * K)?;
     let mut slots_dev = DeviceBuffer::<u32>::zeroed(stream, N * K)?;
     let mut counts_dev = DeviceBuffer::<u32>::zeroed(stream, E)?;
+    let mut serial_slots_dev = DeviceBuffer::<u32>::zeroed(stream, N * K)?;
+    let mut serial_counts_dev = DeviceBuffer::<u32>::zeroed(stream, E)?;
     let mut expert_input_dev = DeviceBuffer::<f32>::zeroed(stream, E * C * D)?;
     let expert_output_dev = DeviceBuffer::from_host(stream, &expert_outputs)?;
     let mut output_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
@@ -167,6 +171,21 @@ fn check_moe_routing(
             LaunchConfig {
                 grid_dim: (E as u32, 1, 1),
                 block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &selected_dev,
+            N as u32,
+            E as u32,
+            K as u32,
+            C as u32,
+            &mut serial_slots_dev,
+            &mut serial_counts_dev,
+        )?;
+        module.moe_bin_assign_parallel(
+            stream,
+            LaunchConfig {
+                grid_dim: (E as u32, 1, 1),
+                block_dim: (MOE_ASSIGN_THREADS as u32, 1, 1),
                 shared_mem_bytes: 0,
             },
             &selected_dev,
@@ -217,6 +236,16 @@ fn check_moe_routing(
         1e-6,
     );
     assert_eq!(selected_dev.to_host_vec(stream)?, expected_selected);
+    assert_eq!(
+        slots_dev.to_host_vec(stream)?,
+        serial_slots_dev.to_host_vec(stream)?,
+        "parallel MoE assignment slots must match the serial GPU oracle"
+    );
+    assert_eq!(
+        counts_dev.to_host_vec(stream)?,
+        serial_counts_dev.to_host_vec(stream)?,
+        "parallel MoE assignment counts must match the serial GPU oracle"
+    );
     assert_close(
         "MoE gate weights",
         &gates_dev.to_host_vec(stream)?,
@@ -374,6 +403,7 @@ fn check_moe_routing(
     let mut dlogits_dev = DeviceBuffer::<f32>::zeroed(stream, N * E)?;
     let mut router_dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut router_dweight_dev = DeviceBuffer::<f32>::zeroed(stream, D * E)?;
+    let mut serial_router_dweight_dev = DeviceBuffer::<f32>::zeroed(stream, D * E)?;
     unsafe {
         module.router_backward(
             stream,
@@ -405,8 +435,34 @@ fn check_moe_routing(
         &dlogits_dev,
         N as u32,
         E as u32,
-        &mut router_dweight_dev,
+        &mut serial_router_dweight_dev,
     )?;
+    unsafe {
+        module.router_backward_weight_tiled(
+            stream,
+            LaunchConfig {
+                grid_dim: (
+                    D.div_ceil(ROUTER_WEIGHT_ROWS) as u32,
+                    E.div_ceil(ROUTER_WEIGHT_EXPERTS) as u32,
+                    1,
+                ),
+                block_dim: (ROUTER_WEIGHT_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &x_dev,
+            &dlogits_dev,
+            N as u32,
+            E as u32,
+            &mut router_dweight_dev,
+        )?;
+    }
+    assert_close(
+        "tiled MoE router weight gradient vs serial GPU oracle",
+        &router_dweight_dev.to_host_vec(stream)?,
+        &serial_router_dweight_dev.to_host_vec(stream)?,
+        2e-6,
+        2e-6,
+    );
     cpu.backward(cpu_ctx, dy);
     assert_close(
         "MoE router weight gradient including aux",
@@ -454,11 +510,11 @@ fn check_moe_tie_routing(
             &mut selected_dev,
             &mut gates_dev,
         )?;
-        module.moe_bin_assign(
+        module.moe_bin_assign_parallel(
             stream,
             LaunchConfig {
                 grid_dim: (E as u32, 1, 1),
-                block_dim: (1, 1, 1),
+                block_dim: (MOE_ASSIGN_THREADS as u32, 1, 1),
                 shared_mem_bytes: 0,
             },
             &selected_dev,
