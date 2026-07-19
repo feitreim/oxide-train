@@ -313,13 +313,22 @@ def run_sweep(kernel: str, configs: str) -> None:
         for source, src in contents.items():
             source.write_text(src)
         print(f"=== config {cfg} ===", flush=True)
-        for cmd in (
-            ["cargo", "oxide", "run", kernel],
-            ["cargo", "oxide", "run", kernel, "--bin", "bench"],
-        ):
+        if kernel == "flash-attn":
+            # The tuning consts live in the pure-PTX device module, so the
+            # flash.ptx artifact must be rebuilt per config; the flash bin
+            # is the correctness gate and the bench in one.
+            commands = [["cargo", "oxide", "run", kernel, "--bin", "flash"]]
+        else:
+            commands = [
+                ["cargo", "oxide", "run", kernel],
+                ["cargo", "oxide", "run", kernel, "--bin", "bench"],
+            ]
+        for cmd in commands:
             try:
+                if kernel == "flash-attn":
+                    _prepare_flash_ptx(PROJECT_DIR)
                 _run(cmd, cwd=proj)
-            except subprocess.CalledProcessError as e:
+            except (subprocess.CalledProcessError, SystemExit) as e:
                 print(f"config failed: {e}", flush=True)
                 break
 
@@ -361,7 +370,11 @@ def run_sanitizer(kernel: str, bin: str | None = None, tool: str = "memcheck") -
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     proj = _proj(kernel)
     name = bin or kernel
-    _run(["cargo", "oxide", "build", kernel], cwd=proj)
+    # `build` (unlike `run`) does not auto-detect the GPU arch, and the
+    # oracle binaries' libdevice math + device atomics are rejected by the
+    # legacy NVVM IR path. Pin the container default (B200); revisit if a
+    # sanitizer run ever targets another GPU class.
+    _run(["cargo", "oxide", "build", kernel, "--arch", "sm_100a"], cwd=proj)
     candidates = []
     for root, _, files in os.walk(f"{proj}/target"):
         for f in files:
