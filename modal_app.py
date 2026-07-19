@@ -370,7 +370,11 @@ def run_sanitizer(kernel: str, bin: str | None = None, tool: str = "memcheck") -
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     proj = _proj(kernel)
     name = bin or kernel
-    _run(["cargo", "oxide", "build", kernel], cwd=proj)
+    # `build` (unlike `run`) does not auto-detect the GPU arch, and the
+    # oracle binaries' libdevice math + device atomics are rejected by the
+    # legacy NVVM IR path. Pin the container default (B200); revisit if a
+    # sanitizer run ever targets another GPU class.
+    _run(["cargo", "oxide", "build", kernel, "--arch", "sm_100a"], cwd=proj)
     candidates = []
     for root, _, files in os.walk(f"{proj}/target"):
         for f in files:
