@@ -39,6 +39,14 @@ pub const FLASH_PIPELINE_SMEM_BYTES: u32 = ((3 + 2 * 4) * FLASH_TILE * FLASH_HD 
 /// Threads of the pipelined forward: the 128-thread softmax warpgroup plus
 /// the TMA-load warp and the MMA-issue warp. Mirrors `FLASH_PIPELINE_BLOCK`.
 pub const FLASH_PIPELINE_BLOCK_THREADS: u32 = (FLASH_TILE + 64) as u32;
+/// Dynamic shared allocation for the persistent ping-pong forward: two Q
+/// tiles, K/V rings sized for its 3-stage ceiling (`PERSISTENT_STAGES` caps
+/// there), and one two-subtile P buffer per workstream. The flash bin
+/// asserts the kernel's `FLASH_PERSISTENT_SMEM` fits.
+pub const FLASH_PERSISTENT_SMEM_BYTES: u32 = ((2 + 2 * 3 + 4) * FLASH_TILE * FLASH_HD * 2) as u32;
+/// Threads of the persistent forward: two softmax warpgroups plus the
+/// TMA-load warp and the MMA-issue warp. Mirrors `FLASH_PERSISTENT_BLOCK`.
+pub const FLASH_PERSISTENT_BLOCK_THREADS: u32 = (2 * FLASH_TILE + 64) as u32;
 
 /// Launch for the synchronous tcgen05 forward over `batches` packed
 /// sequences.
@@ -69,6 +77,57 @@ pub fn flash_pipelined_config(
         grid_dim: base.grid_dim,
         block_dim: (FLASH_PIPELINE_BLOCK_THREADS, 1, 1),
         shared_mem_bytes: FLASH_PIPELINE_SMEM_BYTES,
+    }
+}
+
+/// Work items of the persistent forward — one per (query-tile pair, head,
+/// batch) — and elements of the per-workstream correction-count buffer.
+pub fn flash_work_items(batches: usize, sequence_length: usize, heads: usize) -> usize {
+    assert!(sequence_length.is_multiple_of(FLASH_TILE));
+    (sequence_length / FLASH_TILE).div_ceil(2) * heads * batches
+}
+
+/// Elements of the correction-count output shared by all tcgen05 forwards:
+/// one word per (batch, head, query tile) workstream.
+pub fn correction_count_len(batches: usize, sequence_length: usize, heads: usize) -> usize {
+    batches * heads * (sequence_length / FLASH_TILE)
+}
+
+/// SM count of the device backing `ctx`, for sizing the persistent grid.
+pub fn device_sm_count(ctx: &CudaContext) -> Result<usize, Box<dyn Error>> {
+    use cuda_core::sys::{
+        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuDeviceGetAttribute,
+        cudaError_enum_CUDA_SUCCESS,
+    };
+    let mut count = 0i32;
+    let status = unsafe {
+        cuDeviceGetAttribute(
+            &mut count,
+            CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            ctx.cu_device(),
+        )
+    };
+    if status != cudaError_enum_CUDA_SUCCESS {
+        return Err(format!("cuDeviceGetAttribute(multiprocessor count) failed: {status:?}").into());
+    }
+    Ok(count as usize)
+}
+
+/// Launch for the persistent ping-pong forward: a 1-D grid of `cta_count`
+/// CTAs (normally the SM count; clamped to the work-item count, so passing
+/// the item count degenerates to one item per CTA for hang debugging).
+pub fn flash_persistent_config(
+    batches: usize,
+    sequence_length: usize,
+    heads: usize,
+    cta_count: usize,
+) -> LaunchConfig {
+    let items = flash_work_items(batches, sequence_length, heads);
+    assert!(items > 0 && items <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (items.min(cta_count.max(1)) as u32, 1, 1),
+        block_dim: (FLASH_PERSISTENT_BLOCK_THREADS, 1, 1),
+        shared_mem_bytes: FLASH_PERSISTENT_SMEM_BYTES,
     }
 }
 
@@ -186,6 +245,7 @@ fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dy
 pub struct Tcgen05Flash {
     forward: CudaFunction,
     forward_pipelined: CudaFunction,
+    forward_persistent: CudaFunction,
     transpose_probe: CudaFunction,
     swizzle_probe: CudaFunction,
     exp2: CudaFunction,
@@ -203,13 +263,16 @@ impl Tcgen05Flash {
         })?;
         let forward = module.load_function("flash_forward_tcgen05")?;
         let forward_pipelined = module.load_function("flash_forward_pipelined")?;
+        let forward_persistent = module.load_function("flash_forward_persistent")?;
         let transpose_probe = module.load_function("transpose_b_probe")?;
         opt_in_dynamic_smem(&forward, FLASH_DYNAMIC_SMEM_BYTES)?;
         opt_in_dynamic_smem(&forward_pipelined, FLASH_PIPELINE_SMEM_BYTES)?;
+        opt_in_dynamic_smem(&forward_persistent, FLASH_PERSISTENT_SMEM_BYTES)?;
         opt_in_dynamic_smem(&transpose_probe, PROBE_DYNAMIC_SMEM_BYTES)?;
         Ok(Self {
             forward,
             forward_pipelined,
+            forward_persistent,
             transpose_probe,
             swizzle_probe: module.load_function("swizzle_probe")?,
             exp2: module.load_function("software_exp2")?,
@@ -224,8 +287,9 @@ impl Tcgen05Flash {
     /// # Safety
     ///
     /// The maps must describe live `[B*H, T, 64]` staging buffers matching
-    /// the launch config, `output` must hold `B*T*H*64` elements and
-    /// `logsumexp` `B*T*H` elements.
+    /// the launch config, `output` must hold `B*T*H*64` elements,
+    /// `logsumexp` `B*T*H` elements, and `correction_counts`
+    /// `correction_count_len` elements.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
@@ -238,6 +302,7 @@ impl Tcgen05Flash {
         heads: u32,
         output: &mut DeviceBuffer<f32>,
         logsumexp: &mut DeviceBuffer<f32>,
+        correction_counts: &mut DeviceBuffer<u32>,
     ) -> Result<(), DriverError> {
         unsafe {
             self.launch_forward(
@@ -249,8 +314,10 @@ impl Tcgen05Flash {
                 v_tma,
                 sequence_length,
                 heads,
+                None,
                 output,
                 logsumexp,
+                correction_counts,
             )
         }
     }
@@ -273,6 +340,7 @@ impl Tcgen05Flash {
         heads: u32,
         output: &mut DeviceBuffer<f32>,
         logsumexp: &mut DeviceBuffer<f32>,
+        correction_counts: &mut DeviceBuffer<u32>,
     ) -> Result<(), DriverError> {
         unsafe {
             self.launch_forward(
@@ -284,8 +352,51 @@ impl Tcgen05Flash {
                 v_tma,
                 sequence_length,
                 heads,
+                None,
                 output,
                 logsumexp,
+                correction_counts,
+            )
+        }
+    }
+
+    /// Persistent two-Q-tile ping-pong forward (issue #35, phase 3):
+    /// identical operand/output contract, launched with
+    /// `flash_persistent_config` (which needs `batches` again here for the
+    /// work-item decomposition).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as `forward`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_persistent(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        sequence_length: u32,
+        heads: u32,
+        batches: u32,
+        output: &mut DeviceBuffer<f32>,
+        logsumexp: &mut DeviceBuffer<f32>,
+        correction_counts: &mut DeviceBuffer<u32>,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            self.launch_forward(
+                &self.forward_persistent,
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                sequence_length,
+                heads,
+                Some(batches),
+                output,
+                logsumexp,
+                correction_counts,
             )
         }
     }
@@ -301,24 +412,33 @@ impl Tcgen05Flash {
         v_tma: *const TmaDescriptor,
         sequence_length: u32,
         heads: u32,
+        batches: Option<u32>,
         output: &mut DeviceBuffer<f32>,
         logsumexp: &mut DeviceBuffer<f32>,
+        correction_counts: &mut DeviceBuffer<u32>,
     ) -> Result<(), DriverError> {
         let mut q_tma = q_tma;
         let mut k_tma = k_tma;
         let mut v_tma = v_tma;
         let mut sequence_length = sequence_length;
         let mut heads = heads;
+        let mut batches = batches;
         let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
         cuda_host::push_kernel_scalar(&mut args, &mut q_tma);
         cuda_host::push_kernel_scalar(&mut args, &mut k_tma);
         cuda_host::push_kernel_scalar(&mut args, &mut v_tma);
         cuda_host::push_kernel_scalar(&mut args, &mut sequence_length);
         cuda_host::push_kernel_scalar(&mut args, &mut heads);
+        if let Some(batches) = batches.as_mut() {
+            cuda_host::push_kernel_scalar(&mut args, batches);
+        }
         let (mut output_ptr, mut output_len) = cuda_host::writable_device_buffer_arg(output);
         cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
         let (mut lse_ptr, mut lse_len) = cuda_host::writable_device_buffer_arg(logsumexp);
         cuda_host::push_kernel_device_slice(&mut args, &mut lse_ptr, &mut lse_len);
+        let (mut counts_ptr, mut counts_len) =
+            cuda_host::writable_device_buffer_arg(correction_counts);
+        cuda_host::push_kernel_device_slice(&mut args, &mut counts_ptr, &mut counts_len);
         unsafe {
             cuda_core::launch_kernel_on_stream(
                 function,
