@@ -24,7 +24,67 @@ mod tcgen05_device;
 
 use host::{
     FLASH_HD, FLASH_TILE, Tcgen05Flash, create_flash_head_tma_map, flash_forward_config,
+    flash_pipelined_config,
 };
+
+/// Which forward kernel a gate or bench exercises; both share the operand
+/// and output contract, so everything downstream of the launch is common.
+#[derive(Clone, Copy)]
+enum Forward {
+    Sync,
+    Pipelined,
+}
+
+impl Forward {
+    fn name(self) -> &'static str {
+        match self {
+            Forward::Sync => "sync",
+            Forward::Pipelined => "pipelined",
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        self,
+        flash: &Tcgen05Flash,
+        stream: &Arc<CudaStream>,
+        b: usize,
+        t: usize,
+        h: usize,
+        q_tma: &host::FlashHeadTmaMap,
+        k_tma: &host::FlashHeadTmaMap,
+        v_tma: &host::FlashHeadTmaMap,
+        y: &mut DeviceBuffer<f32>,
+        lse: &mut DeviceBuffer<f32>,
+    ) -> Result<(), cuda_core::DriverError> {
+        unsafe {
+            match self {
+                Forward::Sync => flash.forward(
+                    stream,
+                    flash_forward_config(b, t, h),
+                    q_tma.as_ptr(),
+                    k_tma.as_ptr(),
+                    v_tma.as_ptr(),
+                    t as u32,
+                    h as u32,
+                    y,
+                    lse,
+                ),
+                Forward::Pipelined => flash.forward_pipelined(
+                    stream,
+                    flash_pipelined_config(b, t, h),
+                    q_tma.as_ptr(),
+                    k_tma.as_ptr(),
+                    v_tma.as_ptr(),
+                    t as u32,
+                    h as u32,
+                    y,
+                    lse,
+                ),
+            }
+        }
+    }
+}
 
 const LOG2_E: f32 = std::f32::consts::LOG2_E;
 const LN_2: f64 = std::f64::consts::LN_2;
@@ -235,6 +295,7 @@ fn check_transpose_probe(
 fn check_forward(
     stream: &Arc<CudaStream>,
     flash: &Tcgen05Flash,
+    kernel: Forward,
     b: usize,
     t: usize,
     h: usize,
@@ -291,19 +352,12 @@ fn check_forward(
     let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
     unsafe {
-        flash.forward(
-            stream,
-            flash_forward_config(b, t, h),
-            q_tma.as_ptr(),
-            k_tma.as_ptr(),
-            v_tma.as_ptr(),
-            t as u32,
-            h as u32,
-            &mut y,
-            &mut lse,
-        )?;
+        kernel.launch(flash, stream, b, t, h, &q_tma, &k_tma, &v_tma, &mut y, &mut lse)?;
     }
-    println!("tcgen05 forward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]");
+    println!(
+        "tcgen05 {} forward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]",
+        kernel.name()
+    );
     let y_host = y.to_host_vec(stream)?;
     let lse_host = lse.to_host_vec(stream)?;
     // Diagnostic slice (batch 0, head 0): one y feature and the LSE per
@@ -326,7 +380,9 @@ fn check_forward(
     Ok(())
 }
 
-/// Kernel-only TFLOP/s at the post-7e9 profile shape (B=32, T=1024, H=24).
+/// Kernel-only TFLOP/s at the post-7e9 profile shape (B=32, T=1024, H=24),
+/// for both forwards in the same container — the sync/pipelined delta is
+/// the direct measure of what the phase-2 overlap bought.
 fn bench(
     stream: &Arc<CudaStream>,
     flash: &Tcgen05Flash,
@@ -347,33 +403,24 @@ fn bench(
     let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
 
-    let config = flash_forward_config(b, t, h);
-    let milliseconds = time_gpu_iters(stream, 3, 20, || {
-        unsafe {
-            flash.forward(
-                stream,
-                config,
-                q_tma.as_ptr(),
-                k_tma.as_ptr(),
-                v_tma.as_ptr(),
-                t as u32,
-                h as u32,
-                &mut y,
-                &mut lse,
-            )?;
-        }
-        Ok(())
-    })?;
-
     // Issued MMA work: per key-tile visit one 128x128x64 S GEMM and one
     // 128x64x128 O GEMM; causal tiling visits nt*(nt+1)/2 tiles per (b,h).
     let tiles = t / FLASH_TILE;
     let visits = (b * h * tiles * (tiles + 1) / 2) as f64;
     let flop = visits * 2.0 * (2.0 * 128.0 * 128.0 * 64.0);
-    println!(
-        "tcgen05 forward [{b},{t},{h},{FLASH_HD}]: {milliseconds:.3} ms, {:.1} TFLOP/s",
-        flop / (milliseconds * 1.0e-3) / 1.0e12
-    );
+    for kernel in [Forward::Sync, Forward::Pipelined] {
+        let milliseconds = time_gpu_iters(stream, 3, 20, || {
+            unsafe {
+                kernel.launch(flash, stream, b, t, h, &q_tma, &k_tma, &v_tma, &mut y, &mut lse)?;
+            }
+            Ok(())
+        })?;
+        println!(
+            "tcgen05 {} forward [{b},{t},{h},{FLASH_HD}]: {milliseconds:.3} ms, {:.1} TFLOP/s",
+            kernel.name(),
+            flop / (milliseconds * 1.0e-3) / 1.0e12
+        );
+    }
     Ok(())
 }
 
@@ -382,6 +429,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host::FLASH_DYNAMIC_SMEM_BYTES as usize,
         tcgen05_device::FLASH_DYNAMIC_SMEM,
         "host.rs and tcgen05.rs disagree on the dynamic shared plan"
+    );
+    assert!(
+        tcgen05_device::FLASH_PIPELINE_SMEM <= host::FLASH_PIPELINE_SMEM_BYTES as usize,
+        "PIPELINE_STAGES overflows the host-side shared-memory ceiling"
+    );
+    assert_eq!(
+        host::FLASH_PIPELINE_BLOCK_THREADS as usize,
+        tcgen05_device::FLASH_PIPELINE_BLOCK,
+        "host.rs and tcgen05.rs disagree on the pipelined block width"
     );
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
@@ -393,9 +449,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_swizzle_layout(&stream, &flash)?;
     println!("transpose_b operand probe");
     check_transpose_probe(&stream, &flash)?;
-    check_forward(&stream, &flash, 2, 128, 3)?;
-    check_forward(&stream, &flash, 1, 256, 2)?;
-    check_forward(&stream, &flash, 1, 512, 2)?;
+    for kernel in [Forward::Sync, Forward::Pipelined] {
+        check_forward(&stream, &flash, kernel, 2, 128, 3)?;
+        check_forward(&stream, &flash, kernel, 1, 256, 2)?;
+        check_forward(&stream, &flash, kernel, 1, 512, 2)?;
+    }
     println!("✓ tcgen05 parity passed");
     bench(&stream, &flash)?;
     Ok(())

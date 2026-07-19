@@ -20,7 +20,9 @@ mod flash;
 #[path = "../../ops/src/lib.rs"]
 mod naive;
 
-use flash::host::{Tcgen05Flash, create_flash_head_tma_map, flash_forward_config};
+use flash::host::{
+    Tcgen05Flash, create_flash_head_tma_map, flash_forward_config, flash_pipelined_config,
+};
 
 const HD: usize = 64;
 const LOG2_E: f32 = std::f32::consts::LOG2_E;
@@ -149,35 +151,52 @@ fn check_tcgen05_shape(
     let q_tma = unsafe { create_flash_head_tma_map(stream, &q_staged, t, b * h)? };
     let k_tma = unsafe { create_flash_head_tma_map(stream, &k_staged, t, b * h)? };
     let v_tma = unsafe { create_flash_head_tma_map(stream, &v_staged, t, b * h)? };
-    let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-    unsafe {
-        tcgen05.forward(
-            stream,
-            flash_forward_config(b, t, h),
-            q_tma.as_ptr(),
-            k_tma.as_ptr(),
-            v_tma.as_ptr(),
-            t as u32,
-            h as u32,
-            &mut y,
-            &mut lse,
-        )?;
-    }
+    let naive_y_host = naive_y.to_host_vec(stream)?;
+    let tiled_y_host = tiled_y.to_host_vec(stream)?;
+    let tiled_lse_host = tiled_lse.to_host_vec(stream)?;
+    // Both forwards run the same math over the same staged operands; gating
+    // each against the oracles makes a pipelined failure a pipelining bug
+    // by construction whenever the sync kernel still passes.
+    for pipelined in [false, true] {
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        unsafe {
+            if pipelined {
+                tcgen05.forward_pipelined(
+                    stream,
+                    flash_pipelined_config(b, t, h),
+                    q_tma.as_ptr(),
+                    k_tma.as_ptr(),
+                    v_tma.as_ptr(),
+                    t as u32,
+                    h as u32,
+                    &mut y,
+                    &mut lse,
+                )?;
+            } else {
+                tcgen05.forward(
+                    stream,
+                    flash_forward_config(b, t, h),
+                    q_tma.as_ptr(),
+                    k_tma.as_ptr(),
+                    v_tma.as_ptr(),
+                    t as u32,
+                    h as u32,
+                    &mut y,
+                    &mut lse,
+                )?;
+            }
+        }
 
-    println!("tcgen05 parity against both oracles [{b},{t},{h},{HD}]");
-    // Measured maxima vs the fp32 oracles: y 2.4e-3, lse 8.9e-4 (T up to
-    // 1024) — dominated by bf16 operand quantization; ~4x headroom.
-    let y_host = y.to_host_vec(stream)?;
-    assert_close("y/naive", &y_host, &naive_y.to_host_vec(stream)?, 1.0e-2, 1.0e-2);
-    assert_close("y/tiled", &y_host, &tiled_y.to_host_vec(stream)?, 1.0e-2, 1.0e-2);
-    assert_close(
-        "lse",
-        &lse.to_host_vec(stream)?,
-        &tiled_lse.to_host_vec(stream)?,
-        5.0e-3,
-        0.0,
-    );
+        let name = if pipelined { "pipelined" } else { "sync" };
+        println!("tcgen05 {name} parity against both oracles [{b},{t},{h},{HD}]");
+        // Measured maxima vs the fp32 oracles: y 2.4e-3, lse 8.9e-4 (T up
+        // to 1024) — dominated by bf16 operand quantization; ~4x headroom.
+        let y_host = y.to_host_vec(stream)?;
+        assert_close("y/naive", &y_host, &naive_y_host, 1.0e-2, 1.0e-2);
+        assert_close("y/tiled", &y_host, &tiled_y_host, 1.0e-2, 1.0e-2);
+        assert_close("lse", &lse.to_host_vec(stream)?, &tiled_lse_host, 5.0e-3, 0.0);
+    }
     Ok(())
 }
 

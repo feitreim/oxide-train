@@ -22,13 +22,26 @@ use cuda_device::tma::TmaDescriptor;
 pub const FLASH_TILE: usize = 128;
 /// The only head width the tcgen05 forward supports.
 pub const FLASH_HD: usize = 64;
-/// Dynamic shared bytes of the forward kernel: Q, K, V tiles plus the two
-/// stacked P subtiles. Mirrors `FLASH_DYNAMIC_SMEM` in `tcgen05.rs`.
+/// Dynamic shared bytes of the synchronous forward kernel: Q, K, V tiles
+/// plus the two stacked P subtiles. Mirrors `FLASH_DYNAMIC_SMEM` in
+/// `tcgen05.rs`.
 pub const FLASH_DYNAMIC_SMEM_BYTES: u32 = (5 * FLASH_TILE * FLASH_HD * 2) as u32;
 /// Dynamic shared bytes of the transpose_b probe: A (two subtiles) plus B.
 pub const PROBE_DYNAMIC_SMEM_BYTES: u32 = (3 * FLASH_TILE * FLASH_HD * 2) as u32;
+/// Dynamic shared allocation for the pipelined forward: Q + K/V rings sized
+/// for the deepest supported `PIPELINE_STAGES` (4) + the two P subtiles.
+/// The kernel's actual plan (`FLASH_PIPELINE_SMEM`, a function of the swept
+/// `PIPELINE_STAGES` in `tcgen05.rs`) must stay at or under this; the flash
+/// bin asserts it. Allocating the ceiling keeps stage sweeps a one-const
+/// edit, and costs nothing: TMEM (512 columns per CTA against a 512-column
+/// SM budget) already pins occupancy to one CTA per SM.
+pub const FLASH_PIPELINE_SMEM_BYTES: u32 = ((3 + 2 * 4) * FLASH_TILE * FLASH_HD * 2) as u32;
+/// Threads of the pipelined forward: the 128-thread softmax warpgroup plus
+/// the TMA-load warp and the MMA-issue warp. Mirrors `FLASH_PIPELINE_BLOCK`.
+pub const FLASH_PIPELINE_BLOCK_THREADS: u32 = (FLASH_TILE + 64) as u32;
 
-/// Launch for the tcgen05 forward over `batches` packed sequences.
+/// Launch for the synchronous tcgen05 forward over `batches` packed
+/// sequences.
 pub fn flash_forward_config(batches: usize, sequence_length: usize, heads: usize) -> LaunchConfig {
     assert!(sequence_length.is_multiple_of(FLASH_TILE));
     assert!(batches <= u16::MAX as usize && heads <= u16::MAX as usize);
@@ -41,6 +54,21 @@ pub fn flash_forward_config(batches: usize, sequence_length: usize, heads: usize
         ),
         block_dim: (FLASH_TILE as u32, 1, 1),
         shared_mem_bytes: FLASH_DYNAMIC_SMEM_BYTES,
+    }
+}
+
+/// Launch for the warp-specialized pipelined forward: same grid, the wider
+/// block, the ring-sized dynamic shared allocation.
+pub fn flash_pipelined_config(
+    batches: usize,
+    sequence_length: usize,
+    heads: usize,
+) -> LaunchConfig {
+    let base = flash_forward_config(batches, sequence_length, heads);
+    LaunchConfig {
+        grid_dim: base.grid_dim,
+        block_dim: (FLASH_PIPELINE_BLOCK_THREADS, 1, 1),
+        shared_mem_bytes: FLASH_PIPELINE_SMEM_BYTES,
     }
 }
 
@@ -157,6 +185,7 @@ fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dy
 /// marshalling exactly.
 pub struct Tcgen05Flash {
     forward: CudaFunction,
+    forward_pipelined: CudaFunction,
     transpose_probe: CudaFunction,
     swizzle_probe: CudaFunction,
     exp2: CudaFunction,
@@ -173,11 +202,14 @@ impl Tcgen05Flash {
             )
         })?;
         let forward = module.load_function("flash_forward_tcgen05")?;
+        let forward_pipelined = module.load_function("flash_forward_pipelined")?;
         let transpose_probe = module.load_function("transpose_b_probe")?;
         opt_in_dynamic_smem(&forward, FLASH_DYNAMIC_SMEM_BYTES)?;
+        opt_in_dynamic_smem(&forward_pipelined, FLASH_PIPELINE_SMEM_BYTES)?;
         opt_in_dynamic_smem(&transpose_probe, PROBE_DYNAMIC_SMEM_BYTES)?;
         Ok(Self {
             forward,
+            forward_pipelined,
             transpose_probe,
             swizzle_probe: module.load_function("swizzle_probe")?,
             exp2: module.load_function("software_exp2")?,
@@ -186,7 +218,8 @@ impl Tcgen05Flash {
         })
     }
 
-    /// tcgen05 causal attention forward over bf16 head-panel staging buffers.
+    /// Synchronous tcgen05 causal attention forward over bf16 head-panel
+    /// staging buffers. Launch with `flash_forward_config`.
     ///
     /// # Safety
     ///
@@ -196,6 +229,71 @@ impl Tcgen05Flash {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        sequence_length: u32,
+        heads: u32,
+        output: &mut DeviceBuffer<f32>,
+        logsumexp: &mut DeviceBuffer<f32>,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            self.launch_forward(
+                &self.forward,
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                sequence_length,
+                heads,
+                output,
+                logsumexp,
+            )
+        }
+    }
+
+    /// Warp-specialized pipelined forward (issue #35, phase 2): identical
+    /// contract to `forward`, launched with `flash_pipelined_config`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as `forward`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_pipelined(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        sequence_length: u32,
+        heads: u32,
+        output: &mut DeviceBuffer<f32>,
+        logsumexp: &mut DeviceBuffer<f32>,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            self.launch_forward(
+                &self.forward_pipelined,
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                sequence_length,
+                heads,
+                output,
+                logsumexp,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_forward(
+        &self,
+        function: &CudaFunction,
         stream: &CudaStream,
         config: LaunchConfig,
         q_tma: *const TmaDescriptor,
@@ -223,7 +321,7 @@ impl Tcgen05Flash {
         cuda_host::push_kernel_device_slice(&mut args, &mut lse_ptr, &mut lse_len);
         unsafe {
             cuda_core::launch_kernel_on_stream(
-                &self.forward,
+                function,
                 config.grid_dim,
                 config.block_dim,
                 config.shared_mem_bytes,
