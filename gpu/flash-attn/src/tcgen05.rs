@@ -1,4 +1,4 @@
-//! FA4-shaped tcgen05 attention forward (issue #35, phases 1–2).
+//! FA4-shaped tcgen05 attention forward (issue #35, phases 1–3).
 //!
 //! This module compiles ONLY into `src/bin/flash.rs`, whose device artifact
 //! takes the pure-PTX path and ships as `flash.ptx`. It must never be reached
@@ -18,17 +18,21 @@
 //! - outputs keep the existing contract: fp32 `y[B*T, H*HD]` and fp32
 //!   `logsumexp[B*T, H]` in natural-log units.
 //!
-//! One CTA owns a 128-query tile of one `(batch, head)` and streams 128-key
-//! tiles: TMA loads Q/K/V into swizzled shared tiles, `S = Q·Kᵀ` accumulates
-//! in fp32 TMEM, a register softmax (mask → running max → software exp2 →
-//! running sum) packs bf16 probabilities back to shared memory with swizzled
-//! `stmatrix` stores, and `O += P·V` accumulates in a second TMEM region that
-//! is drained and rescale-merged into per-thread registers every tile (the
-//! "always drain" form of FA4's conditional correction; conditional segments
-//! land in phase 3).
+//! One CTA workstream owns a 128-query tile of one `(batch, head)` and
+//! streams 128-key tiles: TMA loads Q/K/V into swizzled shared tiles,
+//! `S = Q·Kᵀ` accumulates in fp32 TMEM, a register softmax (mask → row max →
+//! software exp2 → running sum) packs bf16 probabilities back to shared
+//! memory with swizzled `stmatrix` stores, and `O += P·V` accumulates in a
+//! TMEM *segment* under a fixed per-row max reference (`enable_d` across
+//! tiles). FA4's conditional correction, adapted for the missing
+//! `tcgen05.st`: only when some row's tile max climbs more than
+//! `CORRECTION_THRESHOLD` above the reference does the warpgroup drain the
+//! segment into per-thread registers, rescale, and restart it — otherwise
+//! the segment just keeps accumulating and the softmax warpgroup never
+//! touches O TMEM.
 //!
-//! Two kernels share that per-tile math (`softmax_tile` / `merge_output_tile`
-//! / `store_outputs`):
+//! Three kernels share the per-tile math (`softmax_tile` /
+//! `merge_output_tile` / `store_outputs`):
 //! - `flash_forward_tcgen05` — the phase-1 synchronous form, one stage of
 //!   everything, block-wide `sync_threads` between stages. Kept as the
 //!   in-artifact oracle and the debug fallback for pipeline hangs.
@@ -41,6 +45,10 @@
 //!   the output accumulator lives in its registers and TMEM lane ownership
 //!   pins the drains to warps 0–3 — a separate correction warpgroup only
 //!   becomes possible with `tcgen05.st` (#34).
+//! - `flash_forward_persistent` — the phase-3 form: two softmax warpgroups
+//!   ping-pong adjacent query tiles over one shared K/V ring and one MMA
+//!   warp, and CTAs run a static persistent work-item loop. See the kernel
+//!   doc for the scheduling and barrier story.
 
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{
@@ -80,6 +88,23 @@ pub const FLASH_PIPELINE_SMEM: usize = (3 + 2 * PIPELINE_STAGES) * TILE_BYTES;
 /// Threads of the pipelined kernel: the softmax/correction/epilogue
 /// warpgroup plus the TMA-load warp and the MMA-issue warp.
 pub const FLASH_PIPELINE_BLOCK: usize = TILE + 64;
+
+/// Base-2 slack a tile's row max may climb above the O segment's reference
+/// before the warpgroup forces a correction (SWEEP knob). P values reach at
+/// most `2^CORRECTION_THRESHOLD`, comfortably inside bf16 range and the fp32
+/// accumulation headroom of a full key stream.
+pub const CORRECTION_THRESHOLD: f32 = 8.0;
+
+/// K/V ring depth of the persistent kernel: `PIPELINE_STAGES` capped at 3 so
+/// the doubled Q/P footprint of two workstreams stays inside the ~227 KiB
+/// shared-memory budget.
+pub const PERSISTENT_STAGES: usize = if PIPELINE_STAGES < 3 { PIPELINE_STAGES } else { 3 };
+/// Dynamic shared plan of the persistent kernel: two Q tiles, the K and V
+/// rings, and one two-subtile P buffer per workstream.
+pub const FLASH_PERSISTENT_SMEM: usize = (2 + 2 * PERSISTENT_STAGES + 4) * TILE_BYTES;
+/// Threads of the persistent kernel: two softmax warpgroups plus the
+/// TMA-load warp and the MMA-issue warp.
+pub const FLASH_PERSISTENT_BLOCK: usize = 2 * TILE + 64;
 
 /// Finite stand-in for "masked" in the base-2 score domain; far enough below
 /// any real score that `exp2` flushes it to a subnormal-scale value while the
@@ -172,18 +197,31 @@ pub mod kernels {
         value + warp::shuffle_xor_f32(value, 2)
     }
 
-    /// One key tile of register softmax, shared by both forward kernels.
+    /// One key tile of register softmax, shared by the three forward
+    /// kernels. `warp_id` and every row coordinate are warpgroup-local: the
+    /// persistent kernel's second warpgroup passes `warp::warp_id() - 4`.
     ///
     /// Drains `S[128, 128]` from `s_tmem` twice — pass 1 for masked row
-    /// maxima, pass 2 to exponentiate against the merged running max — and
-    /// stores bf16 probabilities into the two stacked SWIZZLE_128B P
-    /// subtiles via `stmatrix` (the per-row addresses apply the
-    /// 16-byte-chunk XOR the TMA swizzle would have produced, folding in
-    /// the tile base's absolute 128-byte row phase, so the O-MMA
-    /// descriptors read P exactly like a TMA-loaded operand). On return the
-    /// row statistics are merged and `out_acc` is rescaled, ready for the
-    /// O-segment drain; the caller still owns proxy fencing and whatever
-    /// synchronization hands P to the MMA.
+    /// maxima, pass 2 to exponentiate against the O segment's per-row max
+    /// reference `m_ref` — and stores bf16 probabilities into the two
+    /// stacked SWIZZLE_128B P subtiles via `stmatrix` (the per-row
+    /// addresses apply the 16-byte-chunk XOR the TMA swizzle would have
+    /// produced, folding in the tile base's absolute 128-byte row phase, so
+    /// the O-MMA descriptors read P exactly like a TMA-loaded operand).
+    ///
+    /// Between the passes sits FA4's conditional correction, adapted to the
+    /// missing `tcgen05.st`: the O TMEM segment keeps accumulating under
+    /// `m_ref` (the caller issues `O = P·V` with `enable_d` set) until some
+    /// row's tile max exceeds `m_ref + CORRECTION_THRESHOLD`. A segment
+    /// restart is collective — one row over the line forces every row — so
+    /// the decision is a per-warp `vote.any` published in
+    /// `votes[(tile & 1) * 4 + warp]` and made warpgroup-wide by one
+    /// 128-count phase of `vote_barrier`. On a correction the warpgroup
+    /// drains the segment (tiles `.. tile`, complete because the caller
+    /// waited out the previous tile's O MMA) into `out_acc`, rescales
+    /// `out_acc`/`running_sum` to the new reference, and returns `true` so
+    /// the caller restarts the segment on this tile's O MMA. Tile 0 always
+    /// votes yes — it starts the first segment — but skips the drain.
     ///
     /// Per-thread fragment ownership (base-LDTM 16x256b): for each 16-row
     /// half-warp block this thread owns rows `lane/4` and `lane/4 + 8`,
@@ -194,15 +232,19 @@ pub mod kernels {
     #[inline(always)]
     unsafe fn softmax_tile(
         s_tmem: u32,
+        o_tmem: u32,
+        tile: u32,
         diagonal: bool,
         warp_id: u32,
         lane: u32,
         p_smem: *mut u8,
         p_phase: usize,
-        running_max: &mut [f32; 4],
+        votes: *mut u32,
+        vote_barrier: *const Barrier,
+        m_ref: &mut [f32; 4],
         running_sum: &mut [f32; 4],
         out_acc: &mut [[f32; 16]; 4],
-    ) {
+    ) -> bool {
         unsafe {
             let quad = (lane % 4) as usize;
             let row_in_16 = (lane / 4) as usize;
@@ -257,19 +299,54 @@ pub mod kernels {
                 }
                 row_block += 1;
             }
-            let mut factor = [0.0f32; 4];
+            let mut row_max = [0.0f32; 4];
+            let mut exceed = false;
             let mut slot = 0usize;
             while slot < 4 {
-                let tile = quad_max(tile_max[slot]);
-                let next = fmax(running_max[slot], tile);
-                factor[slot] = exp2_approx(running_max[slot] - next);
-                running_max[slot] = next;
+                row_max[slot] = quad_max(tile_max[slot]);
+                exceed = exceed || row_max[slot] > m_ref[slot] + CORRECTION_THRESHOLD;
                 slot += 1;
             }
 
-            // Pass 2: probabilities — re-drain S, exponentiate, accumulate
-            // row sums, and store bf16 P through the swizzle-aware stmatrix
-            // addresses.
+            // Collective correction vote (tile 0 always trips it: m_ref
+            // still sits at MASKED_SCORE). One word per warp, one barrier
+            // phase per tile.
+            let parity = tile & 1;
+            let warp_vote = warp::any(exceed);
+            if lane == 0 {
+                *votes.add((parity * 4 + warp_id) as usize) = warp_vote as u32;
+            }
+            mbarrier_arrive(vote_barrier);
+            while !mbarrier_try_wait_parity(vote_barrier, parity) {}
+            let base = (parity * 4) as usize;
+            let correction = (*votes.add(base)
+                | *votes.add(base + 1)
+                | *votes.add(base + 2)
+                | *votes.add(base + 3))
+                != 0;
+
+            if correction {
+                if tile > 0 {
+                    merge_output_tile(o_tmem, warp_id, out_acc);
+                }
+                let mut slot = 0usize;
+                while slot < 4 {
+                    let next = fmax(m_ref[slot], row_max[slot]);
+                    let factor = exp2_approx(m_ref[slot] - next);
+                    m_ref[slot] = next;
+                    running_sum[slot] *= factor;
+                    let mut value = 0usize;
+                    while value < 16 {
+                        out_acc[slot][value] *= factor;
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+            }
+
+            // Pass 2: probabilities — re-drain S, exponentiate against the
+            // segment reference, accumulate row sums, and store bf16 P
+            // through the swizzle-aware stmatrix addresses.
             let mut tile_sum = [0.0f32; 4];
             let mut row_block = 0u32;
             while row_block < 2 {
@@ -295,14 +372,14 @@ pub mod kernels {
                     let s_b1 = if !diagonal || col + 1 <= row_b { low[3] } else { MASKED_SCORE };
                     let s_b8 = if !diagonal || col + 8 <= row_b { high[2] } else { MASKED_SCORE };
                     let s_b9 = if !diagonal || col + 9 <= row_b { high[3] } else { MASKED_SCORE };
-                    let p_a0 = exp2_approx(s_a0 - running_max[slot_a]);
-                    let p_a1 = exp2_approx(s_a1 - running_max[slot_a]);
-                    let p_a8 = exp2_approx(s_a8 - running_max[slot_a]);
-                    let p_a9 = exp2_approx(s_a9 - running_max[slot_a]);
-                    let p_b0 = exp2_approx(s_b0 - running_max[slot_b]);
-                    let p_b1 = exp2_approx(s_b1 - running_max[slot_b]);
-                    let p_b8 = exp2_approx(s_b8 - running_max[slot_b]);
-                    let p_b9 = exp2_approx(s_b9 - running_max[slot_b]);
+                    let p_a0 = exp2_approx(s_a0 - m_ref[slot_a]);
+                    let p_a1 = exp2_approx(s_a1 - m_ref[slot_a]);
+                    let p_a8 = exp2_approx(s_a8 - m_ref[slot_a]);
+                    let p_a9 = exp2_approx(s_a9 - m_ref[slot_a]);
+                    let p_b0 = exp2_approx(s_b0 - m_ref[slot_b]);
+                    let p_b1 = exp2_approx(s_b1 - m_ref[slot_b]);
+                    let p_b8 = exp2_approx(s_b8 - m_ref[slot_b]);
+                    let p_b9 = exp2_approx(s_b9 - m_ref[slot_b]);
                     tile_sum[slot_a] += p_a0 + p_a1 + p_a8 + p_a9;
                     tile_sum[slot_b] += p_b0 + p_b1 + p_b8 + p_b9;
 
@@ -332,20 +409,17 @@ pub mod kernels {
             }
             let mut slot = 0usize;
             while slot < 4 {
-                let sum = quad_sum(tile_sum[slot]);
-                running_sum[slot] = running_sum[slot] * factor[slot] + sum;
-                let mut value = 0usize;
-                while value < 16 {
-                    out_acc[slot][value] *= factor[slot];
-                    value += 1;
-                }
+                running_sum[slot] += quad_sum(tile_sum[slot]);
                 slot += 1;
             }
+            correction
         }
     }
 
-    /// Drain one `O = P·V` TMEM segment and add it into the per-thread
-    /// output accumulator (which `softmax_tile` already rescaled).
+    /// Drain the `O = P·V` TMEM segment and add it into the per-thread
+    /// output accumulator. Called by `softmax_tile` on a correction (which
+    /// then rescales the merged accumulator to the new reference) and by
+    /// the epilogue for the final segment. `warp_id` is warpgroup-local.
     #[inline(always)]
     unsafe fn merge_output_tile(o_tmem: u32, warp_id: u32, out_acc: &mut [[f32; 16]; 4]) {
         unsafe {
@@ -379,6 +453,10 @@ pub mod kernels {
 
     /// Normalize the accumulated output and store fp32 `y` plus the
     /// natural-log LSE straight to global memory through the fragment map.
+    /// `max_ref` is whatever per-row reference `running_sum` is relative to
+    /// (the final segment's `m_ref`), so the LSE is exact even when the
+    /// reference trails the true row max by up to the correction threshold.
+    /// `warp_id` is warpgroup-local.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn store_outputs(
@@ -389,7 +467,7 @@ pub mod kernels {
         query_tile: u32,
         warp_id: u32,
         lane: u32,
-        running_max: &[f32; 4],
+        max_ref: &[f32; 4],
         running_sum: &[f32; 4],
         out_acc: &[[f32; 16]; 4],
         output: &mut DisjointSlice<f32>,
@@ -422,9 +500,24 @@ pub mod kernels {
                 }
                 if quad == 0 {
                     *logsumexp.get_unchecked_mut(global_row * h as usize + head as usize) =
-                        LN2 * (running_max[slot] + log2_approx(running_sum[slot]));
+                        LN2 * (max_ref[slot] + log2_approx(running_sum[slot]));
                 }
                 slot += 1;
+            }
+        }
+    }
+
+    /// Issue one `S = Q·Kᵀ` tile (M128_N128, four chained K=16 MMAs) from
+    /// the current leader thread; the caller owns the commit.
+    #[inline(always)]
+    unsafe fn score_mma(s_tmem: u32, q_smem: *mut u8, k_smem: *mut u8, s_instruction: u32) {
+        unsafe {
+            let mut chunk = 0u64;
+            while chunk < 4 {
+                let a_descriptor = smem_descriptor(q_smem as u64 + chunk * 32);
+                let b_descriptor = smem_descriptor(k_smem as u64 + chunk * 32);
+                tcgen05_mma_f16(s_tmem, a_descriptor, b_descriptor, s_instruction, chunk > 0);
+                chunk += 1;
             }
         }
     }
@@ -614,6 +707,9 @@ pub mod kernels {
     /// Synchronous tcgen05 causal attention forward. Launch with
     /// `host::flash_forward_config`: grid `(T/128, H, B)`, 128 threads,
     /// `FLASH_DYNAMIC_SMEM` dynamic shared bytes (opted in by the loader).
+    /// `correction_counts` gets one word per CTA (`plane * tiles +
+    /// query_tile`): how many mid-stream O-segment corrections the key
+    /// stream triggered.
     #[kernel]
     pub unsafe fn flash_forward_tcgen05(
         q_tma: *const TmaDescriptor,
@@ -623,11 +719,14 @@ pub mod kernels {
         heads: u32,
         mut output: DisjointSlice<f32>,
         mut logsumexp: DisjointSlice<f32>,
+        mut correction_counts: DisjointSlice<u32>,
     ) {
         unsafe {
             static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
             static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
             static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
+            static mut VOTE_BARRIER: Barrier = Barrier::UNINIT;
+            static mut VOTES: SharedArray<u32, 8, 4> = SharedArray::UNINIT;
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let q_smem = smem;
@@ -653,6 +752,7 @@ pub mod kernels {
             if is_leader {
                 mbarrier_init(&raw mut TMA_BARRIER, 1);
                 mbarrier_init(&raw mut MMA_BARRIER, 1);
+                mbarrier_init(&raw mut VOTE_BARRIER, TILE as u32);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
@@ -693,9 +793,10 @@ pub mod kernels {
             while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
             thread::sync_threads();
 
-            let mut running_max = [MASKED_SCORE; 4];
+            let mut m_ref = [MASKED_SCORE; 4];
             let mut running_sum = [0.0f32; 4];
             let mut out_acc = [[0.0f32; 16]; 4];
+            let mut corrections = 0u32;
 
             // The 128B swizzle XORs *absolute* shared-address bits [9:7], not
             // tile-relative rows. Dynamic shared memory starts just past the
@@ -736,30 +837,31 @@ pub mod kernels {
                 // S = Q·Kᵀ, fresh accumulation each tile.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    let mut chunk = 0u64;
-                    while chunk < 4 {
-                        let a_descriptor = smem_descriptor(q_smem as u64 + chunk * 32);
-                        let b_descriptor = smem_descriptor(k_smem as u64 + chunk * 32);
-                        tcgen05_mma_f16(s_tmem, a_descriptor, b_descriptor, s_instruction, chunk > 0);
-                        chunk += 1;
-                    }
+                    score_mma(s_tmem, q_smem, k_smem, s_instruction);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
                 mma_phase += 1;
                 thread::sync_threads();
 
-                softmax_tile(
+                let correction = softmax_tile(
                     s_tmem,
+                    o_tmem,
+                    key_tile,
                     key_tile == query_tile,
                     warp_id,
                     lane,
                     p_smem,
                     p_phase,
-                    &mut running_max,
+                    &raw mut VOTES as *mut u32,
+                    &raw const VOTE_BARRIER,
+                    &mut m_ref,
                     &mut running_sum,
                     &mut out_acc,
                 );
+                if key_tile > 0 && correction {
+                    corrections += 1;
+                }
 
                 // P was written through the generic proxy; fence before the
                 // async-proxy MMA consumes it.
@@ -767,7 +869,9 @@ pub mod kernels {
                 tcgen05_fence_before_thread_sync();
                 thread::sync_threads();
 
-                // O = P·V for this tile (fresh segment; merged in registers).
+                // O = P·V: continue the TMEM segment, or restart it when
+                // this tile's vote drained it (`correction` is uniform
+                // across the block, so the leader's copy is the vote).
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
                     let mut chunk = 0u64;
@@ -776,21 +880,26 @@ pub mod kernels {
                             p_smem as u64 + (chunk / 4) * TILE_BYTES as u64 + (chunk % 4) * 32,
                         );
                         let b_descriptor = smem_descriptor(v_smem as u64 + chunk * 2048);
-                        tcgen05_mma_f16(o_tmem, a_descriptor, b_descriptor, o_instruction, chunk > 0);
+                        tcgen05_mma_f16(
+                            o_tmem,
+                            a_descriptor,
+                            b_descriptor,
+                            o_instruction,
+                            chunk > 0 || !correction,
+                        );
                         chunk += 1;
                     }
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
                 mma_phase += 1;
-                thread::sync_threads();
-
-                merge_output_tile(o_tmem, warp_id, &mut out_acc);
 
                 tcgen05_fence_before_thread_sync();
                 thread::sync_threads();
                 key_tile += 1;
             }
+
+            merge_output_tile(o_tmem, warp_id, &mut out_acc);
 
             store_outputs(
                 batch,
@@ -800,13 +909,20 @@ pub mod kernels {
                 query_tile,
                 warp_id,
                 lane,
-                &running_max,
+                &m_ref,
                 &running_sum,
                 &out_acc,
                 &mut output,
                 &mut logsumexp,
             );
+            if is_leader {
+                let tiles = t as usize / TILE;
+                *correction_counts
+                    .get_unchecked_mut(plane as usize * tiles + query_tile as usize) =
+                    corrections;
+            }
 
+            tcgen05_fence_before_thread_sync();
             thread::sync_threads();
             if warp_id == 0 {
                 tcgen05_dealloc(tmem, 512);
@@ -814,36 +930,126 @@ pub mod kernels {
             if is_leader {
                 mbarrier_inval(&raw mut TMA_BARRIER);
                 mbarrier_inval(&raw mut MMA_BARRIER);
+                mbarrier_inval(&raw mut VOTE_BARRIER);
             }
         }
     }
 
     /// Issue one tile's `O = P·V` from the MMA warp: wait for the softmax
-    /// warpgroup to publish P, chain the eight K=16 MMAs as a fresh segment,
-    /// and commit completion into `o_full`.
+    /// warpgroup to publish P, chain the eight K=16 MMAs — continuing the
+    /// TMEM segment, or starting a fresh one when the warpgroup's restart
+    /// flag for this tile says its vote drained it — and commit completion
+    /// into `o_full`. The flag read is ordered by the `p_full` wait (the
+    /// warpgroup writes it before arriving).
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn output_mma(
         tile: u32,
+        stages: usize,
         o_tmem: u32,
         p_smem: *mut u8,
         v_ring: *mut u8,
         o_instruction: u32,
         p_full: *const Barrier,
         o_full: *mut Barrier,
+        restart: *const u32,
     ) {
         unsafe {
             while !mbarrier_try_wait_parity(p_full, tile & 1) {}
-            let v_smem = v_ring.add((tile as usize % PIPELINE_STAGES) * TILE_BYTES);
+            let fresh = *restart.add((tile & 1) as usize) != 0;
+            let v_smem = v_ring.add((tile as usize % stages) * TILE_BYTES);
             let mut chunk = 0u64;
             while chunk < 8 {
                 let a_descriptor = smem_descriptor(
                     p_smem as u64 + (chunk / 4) * TILE_BYTES as u64 + (chunk % 4) * 32,
                 );
                 let b_descriptor = smem_descriptor(v_smem as u64 + chunk * 2048);
-                tcgen05_mma_f16(o_tmem, a_descriptor, b_descriptor, o_instruction, chunk > 0);
+                tcgen05_mma_f16(
+                    o_tmem,
+                    a_descriptor,
+                    b_descriptor,
+                    o_instruction,
+                    chunk > 0 || !fresh,
+                );
                 chunk += 1;
             }
             tcgen05_commit_shared_cluster(o_full as *mut u64);
+        }
+    }
+
+    /// One softmax-warpgroup tile step, shared by the pipelined and
+    /// persistent forwards: wait for S, run `softmax_tile` (with the
+    /// correction vote), publish the segment-restart flag and P, then wait
+    /// out this tile's O MMA and recycle the K/V stage. Callers pass
+    /// `diagonal` as a literal so the mask logic folds out of the full-tile
+    /// loop, and `double_s` as a literal to select the pipelined kernel's
+    /// double-buffered S phase arithmetic. `tid_in_group`/`warp_id` are
+    /// warpgroup-local.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn warpgroup_tile(
+        i: u32,
+        diagonal: bool,
+        stages: usize,
+        double_s: bool,
+        tid_in_group: u32,
+        warp_id: u32,
+        lane: u32,
+        s_tmem: u32,
+        o_tmem: u32,
+        p_smem: *mut u8,
+        p_phase: usize,
+        votes: *mut u32,
+        vote_barrier: *const Barrier,
+        restart: *mut u32,
+        s_full: *mut Barrier,
+        s_free: *mut Barrier,
+        p_full: *const Barrier,
+        o_full: *const Barrier,
+        kv_free: *mut Barrier,
+        m_ref: &mut [f32; 4],
+        running_sum: &mut [f32; 4],
+        out_acc: &mut [[f32; 16]; 4],
+        corrections: &mut u32,
+    ) {
+        unsafe {
+            let (buffer, s_parity) = if double_s {
+                ((i & 1) as usize, (i / 2) & 1)
+            } else {
+                (0usize, i & 1)
+            };
+            while !mbarrier_try_wait_parity(s_full.add(buffer), s_parity) {}
+            let correction = softmax_tile(
+                s_tmem + (buffer as u32) * 128,
+                o_tmem,
+                i,
+                diagonal,
+                warp_id,
+                lane,
+                p_smem,
+                p_phase,
+                votes,
+                vote_barrier,
+                m_ref,
+                running_sum,
+                out_acc,
+            );
+            if i > 0 && correction {
+                *corrections += 1;
+            }
+            if tid_in_group == 0 {
+                *restart.add((i & 1) as usize) = correction as u32;
+            }
+            // Both S passes are drained and P is fenced into the async
+            // proxy: release the S buffer and publish P (which also
+            // releases the restart flag to the MMA warp).
+            fence_proxy_async_shared_cta();
+            mbarrier_arrive(s_free.add(buffer));
+            mbarrier_arrive(p_full);
+            while !mbarrier_try_wait_parity(o_full, i & 1) {}
+            if tid_in_group == 0 {
+                mbarrier_arrive(kv_free.add(i as usize % stages));
+            }
         }
     }
 
@@ -865,10 +1071,11 @@ pub mod kernels {
     ///   stage, `S-MMA(i)`'s wait for `kv_full` would precede the
     ///   `O-MMA(i-1)` whose completion recycles the stage.
     /// - warps 0–3 are the softmax warpgroup: wait `s_full`, run
-    ///   `softmax_tile`, release `s_free` and `p_full`, wait `o_full`,
-    ///   merge the O segment. Correction and epilogue stay fused here — the
-    ///   output accumulator lives in these registers and TMEM lane
-    ///   ownership pins every drain to warps 0–3.
+    ///   `softmax_tile` (which only drains the O segment on a correction
+    ///   vote), release `s_free` and `p_full`, wait `o_full`, recycle the
+    ///   K/V stage. Correction and epilogue stay fused here — the output
+    ///   accumulator lives in these registers and TMEM lane ownership pins
+    ///   every drain to warps 0–3.
     ///
     /// P stays single-buffered: the warpgroup's `o_full(i)` wait proves
     /// O-MMA(i) has finished reading P before pass 2 of tile `i+1`
@@ -888,6 +1095,7 @@ pub mod kernels {
         heads: u32,
         mut output: DisjointSlice<f32>,
         mut logsumexp: DisjointSlice<f32>,
+        mut correction_counts: DisjointSlice<u32>,
     ) {
         unsafe {
             static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
@@ -899,6 +1107,9 @@ pub mod kernels {
             static mut S_FREE: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
             static mut P_FULL: Barrier = Barrier::UNINIT;
             static mut O_FULL: Barrier = Barrier::UNINIT;
+            static mut VOTE_BARRIER: Barrier = Barrier::UNINIT;
+            static mut VOTES: SharedArray<u32, 8, 4> = SharedArray::UNINIT;
+            static mut RESTART: SharedArray<u32, 2, 4> = SharedArray::UNINIT;
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let q_smem = smem;
@@ -939,6 +1150,7 @@ pub mod kernels {
                 mbarrier_init(s_free.add(1), TILE as u32);
                 mbarrier_init(&raw mut P_FULL, TILE as u32);
                 mbarrier_init(&raw mut O_FULL, 1);
+                mbarrier_init(&raw mut VOTE_BARRIER, TILE as u32);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
@@ -950,38 +1162,71 @@ pub mod kernels {
             let o_tmem = tmem + 256;
 
             if tid < TILE as u32 {
-                // Softmax / correction / epilogue warpgroup.
+                // Softmax / correction / epilogue warpgroup. The key loop
+                // is split so the diagonal tile is the only one paying for
+                // mask logic (the full-tile calls fold `diagonal = false`).
                 let p_phase = (p_smem as usize >> 7) & 7;
-                let mut running_max = [MASKED_SCORE; 4];
+                let votes = &raw mut VOTES as *mut u32;
+                let restart = &raw mut RESTART as *mut u32;
+                let mut m_ref = [MASKED_SCORE; 4];
                 let mut running_sum = [0.0f32; 4];
                 let mut out_acc = [[0.0f32; 16]; 4];
+                let mut corrections = 0u32;
                 let mut i = 0u32;
-                while i < key_tiles {
-                    let buffer = (i & 1) as usize;
-                    while !mbarrier_try_wait_parity(s_full.add(buffer), (i / 2) & 1) {}
-                    softmax_tile(
-                        tmem + (buffer as u32) * 128,
-                        i == query_tile,
+                while i + 1 < key_tiles {
+                    warpgroup_tile(
+                        i,
+                        false,
+                        PIPELINE_STAGES,
+                        true,
+                        tid,
                         warp_id,
                         lane,
+                        tmem,
+                        o_tmem,
                         p_smem,
                         p_phase,
-                        &mut running_max,
+                        votes,
+                        &raw const VOTE_BARRIER,
+                        restart,
+                        s_full,
+                        s_free,
+                        &raw const P_FULL,
+                        &raw const O_FULL,
+                        kv_free,
+                        &mut m_ref,
                         &mut running_sum,
                         &mut out_acc,
+                        &mut corrections,
                     );
-                    // Both S passes are drained and P is fenced into the
-                    // async proxy: release the S buffer and publish P.
-                    fence_proxy_async_shared_cta();
-                    mbarrier_arrive(s_free.add(buffer));
-                    mbarrier_arrive(&raw const P_FULL);
-                    while !mbarrier_try_wait_parity(&raw const O_FULL, i & 1) {}
-                    if tid == 0 {
-                        mbarrier_arrive(kv_free.add((i as usize) % PIPELINE_STAGES));
-                    }
-                    merge_output_tile(o_tmem, warp_id, &mut out_acc);
                     i += 1;
                 }
+                warpgroup_tile(
+                    i,
+                    true,
+                    PIPELINE_STAGES,
+                    true,
+                    tid,
+                    warp_id,
+                    lane,
+                    tmem,
+                    o_tmem,
+                    p_smem,
+                    p_phase,
+                    votes,
+                    &raw const VOTE_BARRIER,
+                    restart,
+                    s_full,
+                    s_free,
+                    &raw const P_FULL,
+                    &raw const O_FULL,
+                    kv_free,
+                    &mut m_ref,
+                    &mut running_sum,
+                    &mut out_acc,
+                    &mut corrections,
+                );
+                merge_output_tile(o_tmem, warp_id, &mut out_acc);
                 store_outputs(
                     batch,
                     t,
@@ -990,12 +1235,18 @@ pub mod kernels {
                     query_tile,
                     warp_id,
                     lane,
-                    &running_max,
+                    &m_ref,
                     &running_sum,
                     &out_acc,
                     &mut output,
                     &mut logsumexp,
                 );
+                if tid == 0 {
+                    let tiles = t as usize / TILE;
+                    *correction_counts.get_unchecked_mut(
+                        (batch * h + head) as usize * tiles + query_tile as usize,
+                    ) = corrections;
+                }
             } else if tid == TILE as u32 {
                 // TMA load warp leader: Q once, then the K/V ring.
                 let mut i = 0u32;
@@ -1064,37 +1315,38 @@ pub mod kernels {
                     if i >= 2 {
                         while !mbarrier_try_wait_parity(s_free.add(buffer), (i / 2 - 1) & 1) {}
                     }
-                    let s_tmem = tmem + (buffer as u32) * 128;
-                    let k_smem = k_ring.add(stage * TILE_BYTES);
-                    let mut chunk = 0u64;
-                    while chunk < 4 {
-                        let a_descriptor = smem_descriptor(q_smem as u64 + chunk * 32);
-                        let b_descriptor = smem_descriptor(k_smem as u64 + chunk * 32);
-                        tcgen05_mma_f16(s_tmem, a_descriptor, b_descriptor, s_instruction, chunk > 0);
-                        chunk += 1;
-                    }
+                    score_mma(
+                        tmem + (buffer as u32) * 128,
+                        q_smem,
+                        k_ring.add(stage * TILE_BYTES),
+                        s_instruction,
+                    );
                     tcgen05_commit_shared_cluster(s_full.add(buffer) as *mut u64);
                     if i > 0 {
                         output_mma(
                             i - 1,
+                            PIPELINE_STAGES,
                             o_tmem,
                             p_smem,
                             v_ring,
                             o_instruction,
                             &raw const P_FULL,
                             &raw mut O_FULL,
+                            &raw const RESTART as *const u32,
                         );
                     }
                     i += 1;
                 }
                 output_mma(
                     key_tiles - 1,
+                    PIPELINE_STAGES,
                     o_tmem,
                     p_smem,
                     v_ring,
                     o_instruction,
                     &raw const P_FULL,
                     &raw mut O_FULL,
+                    &raw const RESTART as *const u32,
                 );
             }
 
@@ -1116,6 +1368,539 @@ pub mod kernels {
                 mbarrier_inval(s_free.add(1));
                 mbarrier_inval(&raw mut P_FULL);
                 mbarrier_inval(&raw mut O_FULL);
+                mbarrier_inval(&raw mut VOTE_BARRIER);
+            }
+        }
+    }
+
+    /// One full workstream of the persistent forward, run by one softmax
+    /// warpgroup: the split full-tile/diagonal key loop, the final segment
+    /// drain, and the outputs. All indices (`tid_in_group`, `warp_id`) are
+    /// warpgroup-local; the barrier pointers are this stream's own set
+    /// except `kv_free`, which both streams share (each arrives once per
+    /// tile it consumed).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn persistent_stream(
+        query_tile: u32,
+        batch: u32,
+        t: u32,
+        h: u32,
+        head: u32,
+        tid_in_group: u32,
+        warp_id: u32,
+        lane: u32,
+        s_tmem: u32,
+        o_tmem: u32,
+        p_smem: *mut u8,
+        votes: *mut u32,
+        vote_barrier: *const Barrier,
+        restart: *mut u32,
+        s_full: *mut Barrier,
+        s_free: *mut Barrier,
+        p_full: *const Barrier,
+        o_full: *const Barrier,
+        kv_free: *mut Barrier,
+        output: &mut DisjointSlice<f32>,
+        logsumexp: &mut DisjointSlice<f32>,
+        correction_counts: &mut DisjointSlice<u32>,
+    ) {
+        unsafe {
+            let p_phase = (p_smem as usize >> 7) & 7;
+            let key_tiles = query_tile + 1;
+            let mut m_ref = [MASKED_SCORE; 4];
+            let mut running_sum = [0.0f32; 4];
+            let mut out_acc = [[0.0f32; 16]; 4];
+            let mut corrections = 0u32;
+            let mut i = 0u32;
+            while i + 1 < key_tiles {
+                warpgroup_tile(
+                    i,
+                    false,
+                    PERSISTENT_STAGES,
+                    false,
+                    tid_in_group,
+                    warp_id,
+                    lane,
+                    s_tmem,
+                    o_tmem,
+                    p_smem,
+                    p_phase,
+                    votes,
+                    vote_barrier,
+                    restart,
+                    s_full,
+                    s_free,
+                    p_full,
+                    o_full,
+                    kv_free,
+                    &mut m_ref,
+                    &mut running_sum,
+                    &mut out_acc,
+                    &mut corrections,
+                );
+                i += 1;
+            }
+            warpgroup_tile(
+                i,
+                true,
+                PERSISTENT_STAGES,
+                false,
+                tid_in_group,
+                warp_id,
+                lane,
+                s_tmem,
+                o_tmem,
+                p_smem,
+                p_phase,
+                votes,
+                vote_barrier,
+                restart,
+                s_full,
+                s_free,
+                p_full,
+                o_full,
+                kv_free,
+                &mut m_ref,
+                &mut running_sum,
+                &mut out_acc,
+                &mut corrections,
+            );
+            merge_output_tile(o_tmem, warp_id, &mut out_acc);
+            store_outputs(
+                batch,
+                t,
+                h,
+                head,
+                query_tile,
+                warp_id,
+                lane,
+                &m_ref,
+                &running_sum,
+                &out_acc,
+                output,
+                logsumexp,
+            );
+            if tid_in_group == 0 {
+                let tiles = t as usize / TILE;
+                *correction_counts.get_unchecked_mut(
+                    (batch * h + head) as usize * tiles + query_tile as usize,
+                ) = corrections;
+            }
+        }
+    }
+
+    /// (Re)initialize the persistent kernel's barrier set for one work
+    /// item. `kv_free` counts one arrival per active consumer stream.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn persistent_barriers_init(
+        kv_full: *mut Barrier,
+        kv_free: *mut Barrier,
+        s_full: *mut Barrier,
+        s_free: *mut Barrier,
+        p_full: *mut Barrier,
+        o_full: *mut Barrier,
+        vote_barrier: *mut Barrier,
+        kv_consumers: u32,
+    ) {
+        unsafe {
+            let mut stage = 0usize;
+            while stage < PERSISTENT_STAGES {
+                mbarrier_init(kv_full.add(stage), 1);
+                mbarrier_init(kv_free.add(stage), kv_consumers);
+                stage += 1;
+            }
+            let mut stream = 0usize;
+            while stream < 2 {
+                mbarrier_init(s_full.add(stream), 1);
+                mbarrier_init(s_free.add(stream), TILE as u32);
+                mbarrier_init(p_full.add(stream), TILE as u32);
+                mbarrier_init(o_full.add(stream), 1);
+                mbarrier_init(vote_barrier.add(stream), TILE as u32);
+                stream += 1;
+            }
+        }
+    }
+
+    /// Invalidate the persistent kernel's barrier set between work items
+    /// (and at exit), wiping whatever unbalanced arrivals the item left.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn persistent_barriers_inval(
+        kv_full: *mut Barrier,
+        kv_free: *mut Barrier,
+        s_full: *mut Barrier,
+        s_free: *mut Barrier,
+        p_full: *mut Barrier,
+        o_full: *mut Barrier,
+        vote_barrier: *mut Barrier,
+    ) {
+        unsafe {
+            let mut stage = 0usize;
+            while stage < PERSISTENT_STAGES {
+                mbarrier_inval(kv_full.add(stage));
+                mbarrier_inval(kv_free.add(stage));
+                stage += 1;
+            }
+            let mut stream = 0usize;
+            while stream < 2 {
+                mbarrier_inval(s_full.add(stream));
+                mbarrier_inval(s_free.add(stream));
+                mbarrier_inval(p_full.add(stream));
+                mbarrier_inval(o_full.add(stream));
+                mbarrier_inval(vote_barrier.add(stream));
+                stream += 1;
+            }
+        }
+    }
+
+    /// Persistent two-Q-tile ping-pong forward (issue #35, phase 3).
+    /// Launch with `host::flash_persistent_config`: a 1-D grid of at most
+    /// `ceil(tiles/2) * H * B` CTAs, `FLASH_PERSISTENT_BLOCK` threads,
+    /// `host::FLASH_PERSISTENT_SMEM_BYTES` dynamic shared bytes. Operand
+    /// and output contracts match the other tcgen05 forwards.
+    ///
+    /// Each work item is a (query-tile *pair*, head, batch): warpgroup A
+    /// (warps 0–3) owns query tile `2p`, warpgroup B (warps 4–7) owns
+    /// `2p+1`, and both share one K/V ring, one TMA-load warp (warp 8) and
+    /// one MMA warp (warp 9). TMEM holds a single-buffered S plus an O
+    /// segment per stream (384 of the 512 columns): while one warpgroup
+    /// runs softmax, the MMA warp feeds the other stream — the ping-pong
+    /// a single 128-thread warpgroup could not reach, and the main use of
+    /// the SM's issue slots now that TMEM pins occupancy to one CTA.
+    ///
+    /// CTAs run a static strided work-item loop (`blockIdx.x`, stepping by
+    /// `gridDim.x`) with items ordered by *descending* pair index, so the
+    /// causally long pairs are dealt out before the cheap ones. Launching
+    /// with grid = the full item count degenerates to one item per CTA —
+    /// the non-persistent config kept for hang debugging. Every mbarrier is
+    /// re-initialized per item behind a block sync, so each item's phase
+    /// arithmetic starts from zero and unbalanced arrivals (stream A never
+    /// arrives for the shared stream's extra diagonal tile; an inactive
+    /// stream B never arrives at all) are wiped, not threaded through
+    /// parity math. `kv_free`'s arrival count is likewise chosen per item:
+    /// two consumer streams normally, one when the last odd pair leaves
+    /// stream B inactive.
+    #[kernel]
+    #[launch_bounds(320, 1)]
+    pub unsafe fn flash_forward_persistent(
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        sequence_length: u32,
+        heads: u32,
+        batches: u32,
+        mut output: DisjointSlice<f32>,
+        mut logsumexp: DisjointSlice<f32>,
+        mut correction_counts: DisjointSlice<u32>,
+    ) {
+        unsafe {
+            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
+            static mut KV_FULL: SharedArray<u64, PERSISTENT_STAGES, 8> = SharedArray::UNINIT;
+            static mut KV_FREE: SharedArray<u64, PERSISTENT_STAGES, 8> = SharedArray::UNINIT;
+            // Two-stream barrier pairs, indexed A = 0, B = 1.
+            static mut S_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
+            static mut S_FREE: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
+            static mut P_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
+            static mut O_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
+            static mut VOTE: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
+            static mut VOTES: SharedArray<u32, 16, 4> = SharedArray::UNINIT;
+            static mut RESTART: SharedArray<u32, 4, 4> = SharedArray::UNINIT;
+
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let q_a = smem;
+            let q_b = smem.add(TILE_BYTES);
+            let k_ring = smem.add(2 * TILE_BYTES);
+            let v_ring = smem.add((2 + PERSISTENT_STAGES) * TILE_BYTES);
+            let p_a = smem.add((2 + 2 * PERSISTENT_STAGES) * TILE_BYTES);
+            let p_b = smem.add((4 + 2 * PERSISTENT_STAGES) * TILE_BYTES);
+
+            let tid = thread::threadIdx_x();
+            if thread::blockDim_x() as usize != FLASH_PERSISTENT_BLOCK {
+                return;
+            }
+            let warp_id = warp::warp_id();
+            let lane = warp::lane_id();
+
+            let kv_full = &raw mut KV_FULL as *mut Barrier;
+            let kv_free = &raw mut KV_FREE as *mut Barrier;
+            let s_full = &raw mut S_FULL as *mut Barrier;
+            let s_free = &raw mut S_FREE as *mut Barrier;
+            let p_full = &raw mut P_FULL as *mut Barrier;
+            let o_full = &raw mut O_FULL as *mut Barrier;
+            let vote_barrier = &raw mut VOTE as *mut Barrier;
+            let votes = &raw mut VOTES as *mut u32;
+            let restart = &raw mut RESTART as *mut u32;
+
+            let t = sequence_length;
+            let h = heads;
+            let tiles = t / TILE as u32;
+            let pairs = tiles.div_ceil(2);
+            let plane_count = h * batches;
+            let work_items = pairs * plane_count;
+
+            if warp_id == 0 {
+                tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
+            }
+            thread::sync_threads();
+            let tmem = *(&raw const TMEM_ADDRESS as *const u32);
+            // TMEM columns: S_A 0..128, S_B 128..256, O_A 256..320,
+            // O_B 320..384.
+
+            let mut initialized = false;
+            let mut item = thread::blockIdx_x();
+            while item < work_items {
+                let pair = pairs - 1 - item / plane_count;
+                let plane = item % plane_count;
+                let batch = plane / h;
+                let head = plane % h;
+                let tile_a = pair * 2;
+                let tile_b = tile_a + 1;
+                let b_active = tile_b < tiles;
+                let tiles_a = tile_a + 1;
+                let tiles_b = tile_b + 1;
+                let stream_tiles = if b_active { tiles_b } else { tiles_a };
+
+                if tid == 0 {
+                    if initialized {
+                        persistent_barriers_inval(
+                            kv_full, kv_free, s_full, s_free, p_full, o_full, vote_barrier,
+                        );
+                    }
+                    persistent_barriers_init(
+                        kv_full,
+                        kv_free,
+                        s_full,
+                        s_free,
+                        p_full,
+                        o_full,
+                        vote_barrier,
+                        1 + b_active as u32,
+                    );
+                    fence_proxy_async_shared_cta();
+                }
+                initialized = true;
+                thread::sync_threads();
+
+                if tid < TILE as u32 {
+                    persistent_stream(
+                        tile_a,
+                        batch,
+                        t,
+                        h,
+                        head,
+                        tid,
+                        warp_id,
+                        lane,
+                        tmem,
+                        tmem + 256,
+                        p_a,
+                        votes,
+                        vote_barrier,
+                        restart,
+                        s_full,
+                        s_free,
+                        p_full,
+                        o_full,
+                        kv_free,
+                        &mut output,
+                        &mut logsumexp,
+                        &mut correction_counts,
+                    );
+                } else if tid < 2 * TILE as u32 {
+                    if b_active {
+                        persistent_stream(
+                            tile_b,
+                            batch,
+                            t,
+                            h,
+                            head,
+                            tid - TILE as u32,
+                            warp_id - 4,
+                            lane,
+                            tmem + 128,
+                            tmem + 320,
+                            p_b,
+                            votes.add(8),
+                            vote_barrier.add(1),
+                            restart.add(2),
+                            s_full.add(1),
+                            s_free.add(1),
+                            p_full.add(1),
+                            o_full.add(1),
+                            kv_free,
+                            &mut output,
+                            &mut logsumexp,
+                            &mut correction_counts,
+                        );
+                    }
+                } else if tid == (2 * TILE) as u32 {
+                    // TMA load warp leader: both Q tiles once, then the
+                    // shared K/V ring over the longer stream.
+                    let plane_index = plane as i32;
+                    let mut i = 0u32;
+                    while i < stream_tiles {
+                        let stage = (i as usize) % PERSISTENT_STAGES;
+                        if i as usize >= PERSISTENT_STAGES {
+                            let parity = ((i as usize / PERSISTENT_STAGES - 1) & 1) as u32;
+                            while !mbarrier_try_wait_parity(kv_free.add(stage), parity) {}
+                        }
+                        let key_row = (i * TILE as u32) as i32;
+                        cp_async_bulk_tensor_3d_g2s(
+                            k_ring.add(stage * TILE_BYTES),
+                            k_tma,
+                            0,
+                            key_row,
+                            plane_index,
+                            kv_full.add(stage),
+                        );
+                        cp_async_bulk_tensor_3d_g2s(
+                            v_ring.add(stage * TILE_BYTES),
+                            v_tma,
+                            0,
+                            key_row,
+                            plane_index,
+                            kv_full.add(stage),
+                        );
+                        if i == 0 {
+                            cp_async_bulk_tensor_3d_g2s(
+                                q_a,
+                                q_tma,
+                                0,
+                                (tile_a * TILE as u32) as i32,
+                                plane_index,
+                                kv_full.add(stage),
+                            );
+                            if b_active {
+                                cp_async_bulk_tensor_3d_g2s(
+                                    q_b,
+                                    q_tma,
+                                    0,
+                                    (tile_b * TILE as u32) as i32,
+                                    plane_index,
+                                    kv_full.add(stage),
+                                );
+                            }
+                            let q_tiles = 1 + b_active as u32;
+                            mbarrier_arrive_expect_tx(
+                                kv_full.add(stage),
+                                1,
+                                (2 + q_tiles) * TILE_BYTES as u32,
+                            );
+                        } else {
+                            mbarrier_arrive_expect_tx(kv_full.add(stage), 1, 2 * TILE_BYTES as u32);
+                        }
+                        i += 1;
+                    }
+                } else if tid == (2 * TILE + 32) as u32 {
+                    // MMA warp leader: per shared tile, S-MMAs for both
+                    // streams (each gated by its own single-buffered S
+                    // being free), then the previous tile's O-MMAs — the
+                    // same stagger as the pipelined kernel, per stream.
+                    let s_instruction = Tcgen05InstructionDescriptor::builder()
+                        .shape(Tcgen05MmaShape::M128_N128)
+                        .element_type(Tcgen05ElementType::BF16)
+                        .accumulator_type(Tcgen05AccumulatorType::F32)
+                        .build()
+                        .raw();
+                    let o_instruction = Tcgen05InstructionDescriptor::builder()
+                        .shape(Tcgen05MmaShape::M128_N64)
+                        .element_type(Tcgen05ElementType::BF16)
+                        .accumulator_type(Tcgen05AccumulatorType::F32)
+                        .transpose_b(true)
+                        .build()
+                        .raw();
+                    tcgen05_fence_after_thread_sync();
+                    let mut i = 0u32;
+                    while i < stream_tiles {
+                        let stage = (i as usize) % PERSISTENT_STAGES;
+                        while !mbarrier_try_wait_parity(
+                            kv_full.add(stage),
+                            ((i as usize / PERSISTENT_STAGES) & 1) as u32,
+                        ) {}
+                        let k_smem = k_ring.add(stage * TILE_BYTES);
+                        if i < tiles_a {
+                            if i >= 1 {
+                                while !mbarrier_try_wait_parity(s_free, (i - 1) & 1) {}
+                            }
+                            score_mma(tmem, q_a, k_smem, s_instruction);
+                            tcgen05_commit_shared_cluster(s_full as *mut u64);
+                        }
+                        if b_active {
+                            if i >= 1 {
+                                while !mbarrier_try_wait_parity(s_free.add(1), (i - 1) & 1) {}
+                            }
+                            score_mma(tmem + 128, q_b, k_smem, s_instruction);
+                            tcgen05_commit_shared_cluster(s_full.add(1) as *mut u64);
+                        }
+                        if i > 0 {
+                            output_mma(
+                                i - 1,
+                                PERSISTENT_STAGES,
+                                tmem + 256,
+                                p_a,
+                                v_ring,
+                                o_instruction,
+                                p_full,
+                                o_full,
+                                restart,
+                            );
+                            if b_active {
+                                output_mma(
+                                    i - 1,
+                                    PERSISTENT_STAGES,
+                                    tmem + 320,
+                                    p_b,
+                                    v_ring,
+                                    o_instruction,
+                                    p_full.add(1),
+                                    o_full.add(1),
+                                    restart.add(2),
+                                );
+                            }
+                        }
+                        i += 1;
+                    }
+                    if b_active {
+                        output_mma(
+                            tiles_b - 1,
+                            PERSISTENT_STAGES,
+                            tmem + 320,
+                            p_b,
+                            v_ring,
+                            o_instruction,
+                            p_full.add(1),
+                            o_full.add(1),
+                            restart.add(2),
+                        );
+                    } else {
+                        output_mma(
+                            tiles_a - 1,
+                            PERSISTENT_STAGES,
+                            tmem + 256,
+                            p_a,
+                            v_ring,
+                            o_instruction,
+                            p_full,
+                            o_full,
+                            restart,
+                        );
+                    }
+                }
+
+                tcgen05_fence_before_thread_sync();
+                thread::sync_threads();
+                item += thread::gridDim_x();
+            }
+
+            if warp_id == 0 {
+                tcgen05_dealloc(tmem, 512);
+            }
+            if tid == 0 && initialized {
+                persistent_barriers_inval(
+                    kv_full, kv_free, s_full, s_free, p_full, o_full, vote_barrier,
+                );
             }
         }
     }

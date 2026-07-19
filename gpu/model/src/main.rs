@@ -521,6 +521,7 @@ fn muon_overfit_tiny_batch(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
+    flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     type TinyDense = Dense<4, 4, 4, 128, 2, 64, 12>;
@@ -554,6 +555,7 @@ fn muon_overfit_tiny_batch(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         if initial_loss.is_none() {
@@ -580,6 +582,7 @@ fn muon_overfit_tiny_batch(
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
@@ -602,6 +605,7 @@ fn overfit_tiny_batch(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
+    flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     type TinyDense = Dense<4, 4, 4, 128, 2, 64, 12>;
@@ -637,6 +641,7 @@ fn overfit_tiny_batch(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         if initial_loss.is_none() {
@@ -663,6 +668,7 @@ fn overfit_tiny_batch(
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
@@ -694,6 +700,7 @@ fn aligned_tcgen05_linears(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
+    flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const NA: usize = 128;
@@ -727,6 +734,7 @@ fn aligned_tcgen05_linears(
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
     assert_close(
@@ -803,6 +811,7 @@ fn aligned_tcgen05_linears(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         if initial_loss.is_none() {
@@ -828,6 +837,7 @@ fn aligned_tcgen05_linears(
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
@@ -854,6 +864,7 @@ fn aligned_muon_overfit(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
+    flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const NA: usize = 128;
@@ -895,6 +906,7 @@ fn aligned_muon_overfit(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         if initial_loss.is_none() {
@@ -920,6 +932,7 @@ fn aligned_muon_overfit(
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
@@ -955,6 +968,7 @@ fn moe_model_parity<
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
+    flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const AUX: f32 = 0.02;
@@ -988,6 +1002,7 @@ fn moe_model_parity<
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
     assert_close(
@@ -1086,6 +1101,7 @@ fn aligned_moe_overfit(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
+    flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const ON: usize = 128;
@@ -1126,6 +1142,7 @@ fn aligned_moe_overfit(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         if initial_loss.is_none() {
@@ -1153,6 +1170,7 @@ fn aligned_moe_overfit(
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
     let initial_loss = initial_loss.expect("training loop runs");
@@ -1174,6 +1192,7 @@ fn moe_checkpoint_gate(
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     flash: &model::flash_kernels::LoadedModule,
+    flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const CN: usize = 4;
@@ -1212,6 +1231,7 @@ fn moe_checkpoint_gate(
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
     gpu.backward(
@@ -1264,6 +1284,7 @@ fn moe_checkpoint_gate(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         candidate.backward(
@@ -1337,6 +1358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tensor = model::tensor_kernels::load(&ctx)?;
     let gemm = model::gemm_kernels::load(&ctx)?;
     let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&ctx, "gemm.ptx")?;
+    let flash_bf16 = model::Tcgen05Flash::load_from_ptx(&ctx, "flash.ptx")?;
     let flash = model::flash_kernels::load(&ctx)?;
     let dense = model::dense_kernels::load(&ctx)?;
 
@@ -1356,6 +1378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
+        &flash_bf16,
         &dense,
     )?;
     assert_close(
@@ -1433,6 +1456,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
+        &flash_bf16,
         &dense,
     )?;
     assert_close(
@@ -1654,6 +1678,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
+        &flash_bf16,
         &dense,
     )?;
     moe_model_parity::<256, 256, 128, 128, 3, 2, 128>(
@@ -1664,17 +1689,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
+        &flash_bf16,
         &dense,
     )?;
-    aligned_moe_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
-    moe_checkpoint_gate(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
+    aligned_moe_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
+    moe_checkpoint_gate(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
     // The parity helpers own temporary expert workspaces. Their device frees
     // are stream-ordered; complete those frees before the independent overfit
     // gates begin allocating models and workspaces of their own.
     stream.synchronize()?;
-    overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
-    muon_overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
-    aligned_tcgen05_linears(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
-    aligned_muon_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &dense)?;
+    overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
+    muon_overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
+    aligned_tcgen05_linears(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
+    aligned_muon_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
     Ok(())
 }

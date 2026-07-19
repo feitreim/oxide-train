@@ -23,23 +23,28 @@ mod host;
 mod tcgen05_device;
 
 use host::{
-    FLASH_HD, FLASH_TILE, Tcgen05Flash, create_flash_head_tma_map, flash_forward_config,
-    flash_pipelined_config,
+    FLASH_HD, FLASH_TILE, Tcgen05Flash, correction_count_len, create_flash_head_tma_map,
+    device_sm_count, flash_forward_config, flash_persistent_config, flash_pipelined_config,
 };
 
-/// Which forward kernel a gate or bench exercises; both share the operand
-/// and output contract, so everything downstream of the launch is common.
-#[derive(Clone, Copy)]
+/// Which forward kernel a gate or bench exercises; all three share the
+/// operand and output contract, so everything downstream of the launch is
+/// common.
+#[derive(Clone, Copy, PartialEq)]
 enum Forward {
     Sync,
     Pipelined,
+    Persistent,
 }
+
+const FORWARDS: [Forward; 3] = [Forward::Sync, Forward::Pipelined, Forward::Persistent];
 
 impl Forward {
     fn name(self) -> &'static str {
         match self {
             Forward::Sync => "sync",
             Forward::Pipelined => "pipelined",
+            Forward::Persistent => "persistent",
         }
     }
 
@@ -51,11 +56,13 @@ impl Forward {
         b: usize,
         t: usize,
         h: usize,
+        persistent_ctas: usize,
         q_tma: &host::FlashHeadTmaMap,
         k_tma: &host::FlashHeadTmaMap,
         v_tma: &host::FlashHeadTmaMap,
         y: &mut DeviceBuffer<f32>,
         lse: &mut DeviceBuffer<f32>,
+        corrections: &mut DeviceBuffer<u32>,
     ) -> Result<(), cuda_core::DriverError> {
         unsafe {
             match self {
@@ -69,6 +76,7 @@ impl Forward {
                     h as u32,
                     y,
                     lse,
+                    corrections,
                 ),
                 Forward::Pipelined => flash.forward_pipelined(
                     stream,
@@ -80,6 +88,20 @@ impl Forward {
                     h as u32,
                     y,
                     lse,
+                    corrections,
+                ),
+                Forward::Persistent => flash.forward_persistent(
+                    stream,
+                    flash_persistent_config(b, t, h, persistent_ctas),
+                    q_tma.as_ptr(),
+                    k_tma.as_ptr(),
+                    v_tma.as_ptr(),
+                    t as u32,
+                    h as u32,
+                    b as u32,
+                    y,
+                    lse,
+                    corrections,
                 ),
             }
         }
@@ -288,14 +310,16 @@ fn check_transpose_probe(
     Ok(())
 }
 
-/// Forward parity against a CPU reference computed from the same staged bf16
-/// operands (exact exp2, f64 accumulation), so the tolerance covers only the
-/// device-side differences: fp32 tensor-core accumulation, the exp2
-/// polynomial, and the bf16 rounding of P.
+/// Forward parity for every kernel against one CPU reference computed from
+/// the same staged bf16 operands (exact exp2, f64 accumulation), so the
+/// tolerance covers only the device-side differences: fp32 tensor-core
+/// accumulation, the exp2 polynomial, the bf16 rounding of P, and the
+/// conditional-segment rescale points. Also reports each kernel's measured
+/// mid-stream O-segment correction rate.
 fn check_forward(
     stream: &Arc<CudaStream>,
     flash: &Tcgen05Flash,
-    kernel: Forward,
+    sm_count: usize,
     b: usize,
     t: usize,
     h: usize,
@@ -349,43 +373,88 @@ fn check_forward(
     let q_tma = unsafe { create_flash_head_tma_map(stream, &q_device, t, b * h)? };
     let k_tma = unsafe { create_flash_head_tma_map(stream, &k_device, t, b * h)? };
     let v_tma = unsafe { create_flash_head_tma_map(stream, &v_device, t, b * h)? };
-    let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-    unsafe {
-        kernel.launch(flash, stream, b, t, h, &q_tma, &k_tma, &v_tma, &mut y, &mut lse)?;
-    }
-    println!(
-        "tcgen05 {} forward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]",
-        kernel.name()
-    );
-    let y_host = y.to_host_vec(stream)?;
-    let lse_host = lse.to_host_vec(stream)?;
-    // Diagnostic slice (batch 0, head 0): one y feature and the LSE per
-    // sampled row. LSE encodes the kernel's internal row max + sum, so a
-    // matching LSE with a broken y isolates the P·V path, and vice versa.
-    for row in [0usize, 1, 2, 7, 8, 15, 16, 31, 32, 64, 127] {
-        if row < t {
-            println!(
-                "  row {row:>3}: y0 gpu {:>12.6} ref {:>12.6} | lse gpu {:>12.6} ref {:>12.6}",
-                y_host[row * d],
-                expected_y[row * d],
-                lse_host[row * h],
-                expected_lse[row * h],
-            );
+    for kernel in FORWARDS {
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        let mut corrections =
+            DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
+        unsafe {
+            kernel.launch(
+                flash,
+                stream,
+                b,
+                t,
+                h,
+                sm_count,
+                &q_tma,
+                &k_tma,
+                &v_tma,
+                &mut y,
+                &mut lse,
+                &mut corrections,
+            )?;
         }
+        println!(
+            "tcgen05 {} forward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]",
+            kernel.name()
+        );
+        let y_host = y.to_host_vec(stream)?;
+        let lse_host = lse.to_host_vec(stream)?;
+        // Diagnostic slice (batch 0, head 0): one y feature and the LSE per
+        // sampled row. LSE encodes the kernel's internal row max + sum, so a
+        // matching LSE with a broken y isolates the P·V path, and vice versa.
+        if kernel == Forward::Sync {
+            for row in [0usize, 1, 2, 7, 8, 15, 16, 31, 32, 64, 127] {
+                if row < t {
+                    println!(
+                        "  row {row:>3}: y0 gpu {:>12.6} ref {:>12.6} | lse gpu {:>12.6} ref {:>12.6}",
+                        y_host[row * d],
+                        expected_y[row * d],
+                        lse_host[row * h],
+                        expected_lse[row * h],
+                    );
+                }
+            }
+        }
+        // Measured maxima: y 1.4e-3, lse 1.4e-4 (T=128..512); ~3x headroom.
+        assert_close("y", &y_host, &expected_y, 5.0e-3, 5.0e-3);
+        assert_close("lse", &lse_host, &expected_lse, 1.0e-3, 0.0);
+        print_correction_rate(stream, &corrections, b, t, h)?;
     }
-    // Measured maxima: y 1.4e-3, lse 1.4e-4 (T=128..512); ~3x headroom.
-    assert_close("y", &y_host, &expected_y, 5.0e-3, 5.0e-3);
-    assert_close("lse", &lse_host, &expected_lse, 1.0e-3, 0.0);
     Ok(())
 }
 
-/// Kernel-only TFLOP/s at the post-7e9 profile shape (B=32, T=1024, H=24),
-/// for both forwards in the same container — the sync/pipelined delta is
-/// the direct measure of what the phase-2 overlap bought.
+/// Sum the per-workstream correction counts and report them against the
+/// number of key-tile visits that could have corrected (everything past
+/// each stream's first tile).
+fn print_correction_rate(
+    stream: &Arc<CudaStream>,
+    corrections: &DeviceBuffer<u32>,
+    b: usize,
+    t: usize,
+    h: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let counts = corrections.to_host_vec(stream)?;
+    let total: u64 = counts.iter().map(|&c| c as u64).sum();
+    let tiles = t / FLASH_TILE;
+    let eligible = (b * h * tiles * (tiles - 1) / 2) as u64;
+    let rate = if eligible == 0 {
+        0.0
+    } else {
+        total as f64 / eligible as f64 * 100.0
+    };
+    println!("  corrections: {total} of {eligible} eligible tile visits ({rate:.2}%)");
+    Ok(())
+}
+
+/// Kernel-only TFLOP/s at the post-7e9 profile shape (B=32, T=1024, H=24)
+/// for all three forwards in the same container — the deltas are the direct
+/// measure of what each phase bought — plus the profile-shape correction
+/// rate (the phase-3 conditional-rescale checklist number).
 fn bench(
     stream: &Arc<CudaStream>,
     flash: &Tcgen05Flash,
+    sm_count: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (b, t, h) = (32usize, 1024usize, 24usize);
     let d = h * FLASH_HD;
@@ -402,16 +471,30 @@ fn bench(
     let v_tma = unsafe { create_flash_head_tma_map(stream, &v_device, t, b * h)? };
     let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+    let mut corrections = DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
 
     // Issued MMA work: per key-tile visit one 128x128x64 S GEMM and one
     // 128x64x128 O GEMM; causal tiling visits nt*(nt+1)/2 tiles per (b,h).
     let tiles = t / FLASH_TILE;
     let visits = (b * h * tiles * (tiles + 1) / 2) as f64;
     let flop = visits * 2.0 * (2.0 * 128.0 * 128.0 * 64.0);
-    for kernel in [Forward::Sync, Forward::Pipelined] {
+    for kernel in FORWARDS {
         let milliseconds = time_gpu_iters(stream, 3, 20, || {
             unsafe {
-                kernel.launch(flash, stream, b, t, h, &q_tma, &k_tma, &v_tma, &mut y, &mut lse)?;
+                kernel.launch(
+                    flash,
+                    stream,
+                    b,
+                    t,
+                    h,
+                    sm_count,
+                    &q_tma,
+                    &k_tma,
+                    &v_tma,
+                    &mut y,
+                    &mut lse,
+                    &mut corrections,
+                )?;
             }
             Ok(())
         })?;
@@ -421,6 +504,7 @@ fn bench(
             flop / (milliseconds * 1.0e-3) / 1.0e12
         );
     }
+    print_correction_rate(stream, &corrections, b, t, h)?;
     Ok(())
 }
 
@@ -439,9 +523,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcgen05_device::FLASH_PIPELINE_BLOCK,
         "host.rs and tcgen05.rs disagree on the pipelined block width"
     );
+    assert!(
+        tcgen05_device::FLASH_PERSISTENT_SMEM <= host::FLASH_PERSISTENT_SMEM_BYTES as usize,
+        "PERSISTENT_STAGES overflows the host-side shared-memory ceiling"
+    );
+    assert_eq!(
+        host::FLASH_PERSISTENT_BLOCK_THREADS as usize,
+        tcgen05_device::FLASH_PERSISTENT_BLOCK,
+        "host.rs and tcgen05.rs disagree on the persistent block width"
+    );
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let flash = Tcgen05Flash::load_from_ptx(&ctx, "flash.ptx")?;
+    let sm_count = device_sm_count(&ctx)?;
+    println!("persistent grid: min(work items, {sm_count} SMs)");
 
     println!("software math parity");
     check_math(&stream, &flash)?;
@@ -449,12 +544,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_swizzle_layout(&stream, &flash)?;
     println!("transpose_b operand probe");
     check_transpose_probe(&stream, &flash)?;
-    for kernel in [Forward::Sync, Forward::Pipelined] {
-        check_forward(&stream, &flash, kernel, 2, 128, 3)?;
-        check_forward(&stream, &flash, kernel, 1, 256, 2)?;
-        check_forward(&stream, &flash, kernel, 1, 512, 2)?;
-    }
+    // T=384 exercises the persistent kernel's inactive-stream-B pair;
+    // (4, 256, 38) puts 152 work items over the SM count so CTAs loop.
+    check_forward(&stream, &flash, sm_count, 2, 128, 3)?;
+    check_forward(&stream, &flash, sm_count, 1, 256, 2)?;
+    check_forward(&stream, &flash, sm_count, 1, 384, 2)?;
+    check_forward(&stream, &flash, sm_count, 1, 512, 2)?;
+    check_forward(&stream, &flash, sm_count, 4, 256, 38)?;
     println!("✓ tcgen05 parity passed");
-    bench(&stream, &flash)?;
+    bench(&stream, &flash, sm_count)?;
     Ok(())
 }

@@ -21,7 +21,8 @@ mod flash;
 mod naive;
 
 use flash::host::{
-    Tcgen05Flash, create_flash_head_tma_map, flash_forward_config, flash_pipelined_config,
+    Tcgen05Flash, correction_count_len, create_flash_head_tma_map, device_sm_count,
+    flash_forward_config, flash_persistent_config, flash_pipelined_config,
 };
 
 const HD: usize = 64;
@@ -91,6 +92,7 @@ fn check_tcgen05_shape(
     flash_module: &flash::kernels::LoadedModule,
     naive_module: &naive::kernels::LoadedModule,
     tcgen05: &Tcgen05Flash,
+    sm_count: usize,
     b: usize,
     t: usize,
     h: usize,
@@ -154,15 +156,17 @@ fn check_tcgen05_shape(
     let naive_y_host = naive_y.to_host_vec(stream)?;
     let tiled_y_host = tiled_y.to_host_vec(stream)?;
     let tiled_lse_host = tiled_lse.to_host_vec(stream)?;
-    // Both forwards run the same math over the same staged operands; gating
-    // each against the oracles makes a pipelined failure a pipelining bug
-    // by construction whenever the sync kernel still passes.
-    for pipelined in [false, true] {
+    // All forwards run the same math over the same staged operands; gating
+    // each against the oracles makes a pipelined/persistent failure a
+    // scheduling bug by construction whenever the sync kernel still passes.
+    for name in ["sync", "pipelined", "persistent"] {
         let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
         let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        let mut corrections =
+            DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
         unsafe {
-            if pipelined {
-                tcgen05.forward_pipelined(
+            match name {
+                "pipelined" => tcgen05.forward_pipelined(
                     stream,
                     flash_pipelined_config(b, t, h),
                     q_tma.as_ptr(),
@@ -172,9 +176,22 @@ fn check_tcgen05_shape(
                     h as u32,
                     &mut y,
                     &mut lse,
-                )?;
-            } else {
-                tcgen05.forward(
+                    &mut corrections,
+                )?,
+                "persistent" => tcgen05.forward_persistent(
+                    stream,
+                    flash_persistent_config(b, t, h, sm_count),
+                    q_tma.as_ptr(),
+                    k_tma.as_ptr(),
+                    v_tma.as_ptr(),
+                    t as u32,
+                    h as u32,
+                    b as u32,
+                    &mut y,
+                    &mut lse,
+                    &mut corrections,
+                )?,
+                _ => tcgen05.forward(
                     stream,
                     flash_forward_config(b, t, h),
                     q_tma.as_ptr(),
@@ -184,11 +201,11 @@ fn check_tcgen05_shape(
                     h as u32,
                     &mut y,
                     &mut lse,
-                )?;
+                    &mut corrections,
+                )?,
             }
         }
 
-        let name = if pipelined { "pipelined" } else { "sync" };
         println!("tcgen05 {name} parity against both oracles [{b},{t},{h},{HD}]");
         // Measured maxima vs the fp32 oracles: y 2.4e-3, lse 8.9e-4 (T up
         // to 1024) — dominated by bf16 operand quantization; ~4x headroom.
@@ -561,9 +578,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ per-row and tiled parity passed on both shapes");
 
     let tcgen05 = Tcgen05Flash::load_from_ptx(&ctx, "flash.ptx")?;
-    check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, 1, 128, 2)?;
-    check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, 2, 256, 3)?;
-    check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, 1, 1024, 4)?;
+    let sm_count = device_sm_count(&ctx)?;
+    check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, sm_count, 1, 128, 2)?;
+    check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, sm_count, 2, 256, 3)?;
+    check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, sm_count, 1, 1024, 4)?;
     println!("✓ tcgen05 forward parity passed on tile-aligned shapes");
     Ok(())
 }
