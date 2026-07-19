@@ -441,6 +441,39 @@ Each gated on tests; correctness before speed at every step.
        751.9 → 152.1 ms (~4.9×) since the post-7e7 profile. The measured
        tail is now flash attention (57.5 ms combined, 37.8%) and the
        lm-head GEMM trio (54.2 ms, 35.6%).
+     - ✅ **7e10 FA4-shaped tcgen05 attention forward** (#35, phases 1–3):
+       rebuild the attention forward around Blackwell's tensor cores,
+       FlashAttention-4 style, and route the model's tile-aligned shapes
+       through it. Q/K/V de-interleave to packed-bf16 `[B*H, T, 64]` head
+       panels with `softmax_scale·log₂e` folded into Q, so the softmax is
+       base-2 on a software `exp2` (no SFU, no libdevice — the kernels
+       ship in a separately built pure-PTX flash.ptx, gemm.ptx-style,
+       loaded by a host-only module). `S = Q·Kᵀ` and `O += P·V` are
+       tcgen05 MMAs with fp32 TMEM accumulation; O accumulates in TMEM
+       *segments* under a fixed per-row max reference, drained to
+       registers only when a tile max exceeds the reference by 2⁸ (FA4's
+       conditional correction adapted to the missing `tcgen05.st` as
+       segment-restart; the vote is one `vote.any` per warp plus one
+       128-count mbarrier phase). The production kernel is persistent:
+       two softmax warpgroups ping-pong adjacent query tiles over one
+       shared K/V TMA ring and MMA warp (TMEM 384/512 columns, one
+       CTA/SM, 320 threads), with a static descending-cost work-item loop
+       and per-item mbarrier re-initialization. The phase-1 sync and
+       phase-2 pipelined kernels stay in the artifact as oracles; the
+       fp32 tiled kernels remain the fallback for non-aligned shapes and
+       still run the backward. Kernel bench (B=32, T=1024, H=24, one
+       container): sync 1.481 → pipelined 1.089 → persistent 0.844 ms
+       (137 TFLOP/s); parity vs the staged-bf16 CPU reference and both
+       fp32 oracles is bit-identical across all three schedules, and the
+       measured correction rate is 0% at bench distributions (the first
+       tile's reference survives every stream). Model gates (tile-aligned
+       parity, all overfits) passed with no re-tune. B200 same-container
+       profile vs post-MoE main (239.3M, B=32 T=1024): 160.48 → 148.41 ms
+       full step (-7.5%); forward.attention.flash 13.59 → 0.85 ms (16.0×;
+       1.23 ms including the new bf16 staging row). The measured tail is
+       now the fp32 attention backward (flash_q + flash_kv + dot, 44.5
+       ms, 30.0% — #35 phase 4) and the lm-head GEMM trio (54.2 ms,
+       36.5%).
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on
