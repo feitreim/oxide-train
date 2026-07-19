@@ -79,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tensor = model::tensor_kernels::load(&cuda)?;
     let gemm = model::gemm_kernels::load(&cuda)?;
     let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&cuda, "gemm.ptx")?;
+    let flash_bf16 = model::Tcgen05Flash::load_from_ptx(&cuda, "flash.ptx")?;
     let flash = model::flash_kernels::load(&cuda)?;
     let dense = model::dense_kernels::load(&cuda)?;
 
@@ -119,6 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &gemm,
                 &gemm_bf16,
                 &flash,
+                &flash_bf16,
                 &dense,
             )?;
             let logits = workspace.logits_row(live - 1, &stream)?;

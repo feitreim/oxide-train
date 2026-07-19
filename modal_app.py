@@ -212,6 +212,7 @@ def run_kernel(
     proj = _proj(kernel)
     if kernel == "model":
         _prepare_gemm_ptx(PROJECT_DIR)
+        _prepare_flash_ptx(PROJECT_DIR)
     if kernel == "flash-attn":
         _prepare_flash_ptx(PROJECT_DIR)
     cmd = ["cargo", "oxide", "run", kernel]
@@ -268,6 +269,11 @@ def compare_profile(kernel: str, baseline_ref: str) -> None:
         # Baselines predating the staged tcgen05 PTX simply ignore the file.
         _prepare_gemm_ptx(baseline_root)
         _prepare_gemm_ptx(PROJECT_DIR)
+        # Same for flash.ptx (phase-3 attention); baselines whose flash-attn
+        # crate predates the flash bin target skip the baseline-side prep.
+        if Path(baseline_root, "gpu/flash-attn/src/bin/flash.rs").is_file():
+            _prepare_flash_ptx(baseline_root)
+        _prepare_flash_ptx(PROJECT_DIR)
     prime = ["cargo", "oxide", "run", kernel, "--bin", "profile"]
     _run(prime, cwd=baseline)
     _run(prime, cwd=candidate)

@@ -45,6 +45,9 @@ use tensor_core::{Rank1, Rank2, Rank3, Rank4, Shape, bf16};
 mod dense_device;
 #[path = "../../flash-attn/src/lib.rs"]
 mod flash_device;
+#[path = "../../flash-attn/src/host.rs"]
+#[allow(dead_code)]
+mod flash_host;
 #[path = "../../gemm/src/fp32.rs"]
 mod gemm_device;
 #[path = "../../gemm/src/host.rs"]
@@ -56,10 +59,15 @@ pub mod tensor_device;
 
 pub use dense_device::kernels as dense_kernels;
 pub use flash_device::kernels as flash_kernels;
+pub use flash_host::Tcgen05Flash;
 pub use gemm_device::kernels as gemm_kernels;
 pub use gemm_host::Tcgen05Gemm;
 pub use tensor_device::kernels as tensor_kernels;
 
+use flash_host::{
+    FLASH_HD, FLASH_TILE, FlashHeadTmaMap, correction_count_len, create_flash_head_tma_map,
+    flash_persistent_config,
+};
 use gemm_device::launch_config as fp32_launch_config;
 use gemm_host::{
     Bf16PairsTmaMap, TC_TILE, create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix,
@@ -511,6 +519,50 @@ impl<const N: usize, const D: usize, const FF: usize> Bf16LinearScratch<N, D, FF
 
 fn tcgen05_linear_eligible(m: usize, k: usize, n: usize) -> bool {
     m.is_multiple_of(TC_TILE) && k.is_multiple_of(TC_TILE) && n.is_multiple_of(TC_TILE)
+}
+
+fn tcgen05_attention_eligible(t: usize, head_dim: usize) -> bool {
+    t.is_multiple_of(FLASH_TILE) && head_dim == FLASH_HD
+}
+
+/// Staged packed-bf16 attention operands for the tcgen05 forward (issue
+/// #35): one `[B*H, T, 64]` head-panel buffer per operand, their TMA maps,
+/// and the per-workstream correction-count output. Allocated only when the
+/// shape fits the tcgen05 contract (`T` tile-aligned, `HD == 64`); other
+/// shapes stay on the fp32 tiled forward.
+struct FlashAttentionScratch<const N: usize, const T: usize, const D: usize, const H: usize> {
+    q: DeviceBuffer<u32>,
+    k: DeviceBuffer<u32>,
+    v: DeviceBuffer<u32>,
+    q_tma: FlashHeadTmaMap,
+    k_tma: FlashHeadTmaMap,
+    v_tma: FlashHeadTmaMap,
+    correction_counts: DeviceBuffer<u32>,
+}
+
+impl<const N: usize, const T: usize, const D: usize, const H: usize>
+    FlashAttentionScratch<N, T, D, H>
+{
+    fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+        let q = DeviceBuffer::zeroed(stream, N * D / 2)?;
+        let k = DeviceBuffer::zeroed(stream, N * D / 2)?;
+        let v = DeviceBuffer::zeroed(stream, N * D / 2)?;
+        // SAFETY: the mapped buffers live in this scratch beside their maps
+        // and are never reallocated.
+        let q_tma = unsafe { create_flash_head_tma_map(stream, &q, T, N / T * H)? };
+        let k_tma = unsafe { create_flash_head_tma_map(stream, &k, T, N / T * H)? };
+        let v_tma = unsafe { create_flash_head_tma_map(stream, &v, T, N / T * H)? };
+        let correction_counts = DeviceBuffer::zeroed(stream, correction_count_len(N / T, T, H))?;
+        Ok(Self {
+            q,
+            k,
+            v,
+            q_tma,
+            k_tma,
+            v_tma,
+            correction_counts,
+        })
+    }
 }
 
 pub struct GpuLinear<const IN: usize, const OUT: usize> {
@@ -3139,6 +3191,7 @@ pub struct GpuDenseWorkspace<
     logits_tma: Bf16PairsTmaMap,
     dlogits_t_tma: Bf16PairsTmaMap,
     linear_scratch: Option<Bf16LinearScratch<N, D, FF>>,
+    flash_scratch: Option<FlashAttentionScratch<N, T, D, H>>,
     norm_backward_inv: GpuTensor<f32, Rank1<N>>,
     losses: GpuTensor<f32, Rank1<N>>,
     loss_sum: GpuTensor<f32, Rank1<1>>,
@@ -3217,6 +3270,11 @@ impl<
                 && FF.is_multiple_of(TC_TILE)
             {
                 Some(Bf16LinearScratch::new(stream)?)
+            } else {
+                None
+            },
+            flash_scratch: if tcgen05_attention_eligible(T, D / H) {
+                Some(FlashAttentionScratch::new(stream)?)
             } else {
                 None
             },
@@ -3413,6 +3471,7 @@ impl<
         gemm: &gemm_kernels::LoadedModule,
         gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
+        flash_bf16: &Tcgen05Flash,
         dense: &dense_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
@@ -3426,6 +3485,7 @@ impl<
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
             &mut profiler,
         )
@@ -3443,6 +3503,7 @@ impl<
         gemm: &gemm_kernels::LoadedModule,
         gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
+        flash_bf16: &Tcgen05Flash,
         dense: &dense_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
@@ -3512,8 +3573,10 @@ impl<
             &workspace.v,
             &mut workspace.attended,
             &mut workspace.attention_logsumexp,
+            workspace.flash_scratch.as_mut(),
             stream,
             flash,
+            flash_bf16,
             profiler,
         )?;
         self.o_proj.forward_into(
@@ -4111,6 +4174,7 @@ impl<
         gemm: &gemm_kernels::LoadedModule,
         gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
+        flash_bf16: &Tcgen05Flash,
         dense: &dense_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
@@ -4123,6 +4187,7 @@ impl<
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
             &mut profiler,
         )
@@ -4139,6 +4204,7 @@ impl<
         gemm: &gemm_kernels::LoadedModule,
         gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
+        flash_bf16: &Tcgen05Flash,
         dense: &dense_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
@@ -4207,8 +4273,10 @@ impl<
             &workspace.v,
             &mut workspace.attended,
             &mut workspace.attention_logsumexp,
+            workspace.flash_scratch.as_mut(),
             stream,
             flash,
+            flash_bf16,
             profiler,
         )?;
         self.o_proj.forward_into(
@@ -4688,6 +4756,11 @@ fn rope_into<
     Ok(())
 }
 
+/// Attention forward dispatch: tile-aligned shapes stage packed-bf16 head
+/// panels and run the persistent tcgen05 forward (issue #35 phase 3); other
+/// shapes stay on the fp32 tiled kernel. Both paths write the same fp32
+/// `y`/natural-log LSE contract, so the (still fp32) backward is oblivious.
+#[allow(clippy::too_many_arguments)]
 fn flash_attention_forward_into<
     const N: usize,
     const T: usize,
@@ -4701,23 +4774,76 @@ fn flash_attention_forward_into<
     v: &GpuTensor<f32, Rank2<N, D>>,
     output: &mut GpuTensor<f32, Rank2<N, D>>,
     logsumexp: &mut GpuTensor<f32, Rank2<N, H>>,
+    scratch: Option<&mut FlashAttentionScratch<N, T, D, H>>,
     stream: &CudaStream,
     kernels: &flash_kernels::LoadedModule,
+    flash_bf16: &Tcgen05Flash,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, "forward.attention.flash", || {
-        kernels.flash_attention_forward_tiled(
-            stream,
-            flash_forward_config::<N, T, H, HD>(),
-            q.as_device_buffer(),
-            k.as_device_buffer(),
-            v.as_device_buffer(),
-            T as u32,
-            H as u32,
-            output.as_device_buffer_mut(),
-            logsumexp.as_device_buffer_mut(),
-        )
-    })
+    if let Some(scratch) = scratch {
+        // Fold softmax_scale * log2(e) into Q so the kernel's softmax is
+        // base-2 native; K/V quantize unscaled.
+        let q_scale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
+        profiler.measure(stream, "forward.attention.stage_bf16", || {
+            let config = flash_device::stage_heads_config(N, H, HD);
+            kernels.stage_attention_heads_bf16(
+                stream,
+                config,
+                q.as_device_buffer(),
+                T as u32,
+                H as u32,
+                q_scale,
+                &mut scratch.q,
+            )?;
+            kernels.stage_attention_heads_bf16(
+                stream,
+                config,
+                k.as_device_buffer(),
+                T as u32,
+                H as u32,
+                1.0,
+                &mut scratch.k,
+            )?;
+            kernels.stage_attention_heads_bf16(
+                stream,
+                config,
+                v.as_device_buffer(),
+                T as u32,
+                H as u32,
+                1.0,
+                &mut scratch.v,
+            )
+        })?;
+        profiler.measure(stream, "forward.attention.flash", || unsafe {
+            flash_bf16.forward_persistent(
+                stream,
+                flash_persistent_config(N / T, T, H, flash_bf16.sm_count()),
+                scratch.q_tma.as_ptr(),
+                scratch.k_tma.as_ptr(),
+                scratch.v_tma.as_ptr(),
+                T as u32,
+                H as u32,
+                (N / T) as u32,
+                output.as_device_buffer_mut(),
+                logsumexp.as_device_buffer_mut(),
+                &mut scratch.correction_counts,
+            )
+        })
+    } else {
+        profiler.measure(stream, "forward.attention.flash", || {
+            kernels.flash_attention_forward_tiled(
+                stream,
+                flash_forward_config::<N, T, H, HD>(),
+                q.as_device_buffer(),
+                k.as_device_buffer(),
+                v.as_device_buffer(),
+                T as u32,
+                H as u32,
+                output.as_device_buffer_mut(),
+                logsumexp.as_device_buffer_mut(),
+            )
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

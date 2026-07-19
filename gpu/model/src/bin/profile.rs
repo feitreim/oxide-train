@@ -62,6 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tensor = model::tensor_kernels::load(&ctx)?;
     let gemm = model::gemm_kernels::load(&ctx)?;
     let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&ctx, "gemm.ptx")?;
+    let flash_bf16 = model::Tcgen05Flash::load_from_ptx(&ctx, "flash.ptx")?;
     let flash = model::flash_kernels::load(&ctx)?;
     let dense = model::dense_kernels::load(&ctx)?;
 
@@ -89,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &gemm,
             &gemm_bf16,
             &flash,
+            &flash_bf16,
             &dense,
         )?;
         gpu.backward(
@@ -121,6 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
+        &flash_bf16,
         &dense,
         &mut profiler,
     )?;

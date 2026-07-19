@@ -250,6 +250,7 @@ pub struct Tcgen05Flash {
     swizzle_probe: CudaFunction,
     exp2: CudaFunction,
     log2: CudaFunction,
+    sm_count: usize,
     _module: Arc<CudaModule>,
 }
 
@@ -277,8 +278,15 @@ impl Tcgen05Flash {
             swizzle_probe: module.load_function("swizzle_probe")?,
             exp2: module.load_function("software_exp2")?,
             log2: module.load_function("software_log2")?,
+            sm_count: device_sm_count(ctx)?,
             _module: module,
         })
+    }
+
+    /// SM count captured at load time — the natural `cta_count` for
+    /// `flash_persistent_config`.
+    pub fn sm_count(&self) -> usize {
+        self.sm_count
     }
 
     /// Synchronous tcgen05 causal attention forward over bf16 head-panel
