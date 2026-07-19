@@ -158,6 +158,7 @@ fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dy
 pub struct Tcgen05Flash {
     forward: CudaFunction,
     transpose_probe: CudaFunction,
+    swizzle_probe: CudaFunction,
     exp2: CudaFunction,
     log2: CudaFunction,
     _module: Arc<CudaModule>,
@@ -178,6 +179,7 @@ impl Tcgen05Flash {
         Ok(Self {
             forward,
             transpose_probe,
+            swizzle_probe: module.load_function("swizzle_probe")?,
             exp2: module.load_function("software_exp2")?,
             log2: module.load_function("software_log2")?,
             _module: module,
@@ -259,6 +261,35 @@ impl Tcgen05Flash {
                 (1, 1, 1),
                 (FLASH_TILE as u32, 1, 1),
                 PROBE_DYNAMIC_SMEM_BYTES,
+                stream,
+                &mut args,
+            )
+        }
+    }
+
+    /// Dump one TMA-loaded `[128, 64]` bf16 tile's raw shared-memory words.
+    ///
+    /// # Safety
+    ///
+    /// The map must describe a live staging buffer with at least one
+    /// `[128, 64]` panel; `output` must hold `128 * 32` words.
+    pub unsafe fn swizzle_probe(
+        &self,
+        stream: &CudaStream,
+        src_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<u32>,
+    ) -> Result<(), DriverError> {
+        let mut src_tma = src_tma;
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        cuda_host::push_kernel_scalar(&mut args, &mut src_tma);
+        let (mut output_ptr, mut output_len) = cuda_host::writable_device_buffer_arg(output);
+        cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
+        unsafe {
+            cuda_core::launch_kernel_on_stream(
+                &self.swizzle_probe,
+                (1, 1, 1),
+                (FLASH_TILE as u32, 1, 1),
+                (FLASH_TILE * FLASH_HD * 2) as u32,
                 stream,
                 &mut args,
             )

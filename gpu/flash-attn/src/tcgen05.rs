@@ -163,6 +163,47 @@ pub mod kernels {
         }
     }
 
+    /// Dumps the raw shared-memory word layout of one TMA-loaded `[128, 64]`
+    /// bf16 tile, plus the tile's absolute 128-byte row phase as a trailing
+    /// word. The P-write path mirrors TMA's SWIZZLE_128B placement — which
+    /// XORs *absolute* address bits [9:7] — with manual address XORs; the
+    /// host fills the staging tile with sequential word indices and verifies
+    /// the exact permutation from this dump.
+    #[kernel]
+    pub unsafe fn swizzle_probe(src_tma: *const TmaDescriptor, mut output: DisjointSlice<u32>) {
+        unsafe {
+            static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
+
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tid = thread::threadIdx_x();
+            if tid == 0 {
+                mbarrier_init(&raw mut TMA_BARRIER, 1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            if tid == 0 {
+                cp_async_bulk_tensor_3d_g2s(smem, src_tma, 0, 0, 0, &raw mut TMA_BARRIER);
+                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, TILE_BYTES as u32);
+            }
+            while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
+            thread::sync_threads();
+
+            let words = smem as *const u32;
+            let mut index = tid as usize;
+            while index < TILE_BYTES / 4 {
+                *output.get_unchecked_mut(index) = *words.add(index);
+                index += TILE;
+            }
+            if tid == 0 {
+                *output.get_unchecked_mut(TILE_BYTES / 4) = ((smem as usize >> 7) & 7) as u32;
+            }
+            thread::sync_threads();
+            if tid == 0 {
+                mbarrier_inval(&raw mut TMA_BARRIER);
+            }
+        }
+    }
+
     /// Validation kernel for the transposed-B operand path the `O = P·V` MMA
     /// depends on: one CTA computes `C[128, 64] = A[128, 128] · B[128, 64]`
     /// with `B` stored row-major `[K, N]` — the natural V-tile orientation —
@@ -377,6 +418,14 @@ pub mod kernels {
             let mut running_sum = [0.0f32; 4];
             let mut out_acc = [[0.0f32; 16]; 4];
 
+            // The 128B swizzle XORs *absolute* shared-address bits [9:7], not
+            // tile-relative rows. Dynamic shared memory starts just past the
+            // static barrier words, so the P tile's base row phase is
+            // nonzero; fold it into the manual stmatrix swizzle (the P
+            // subtiles are a whole number of 8-row groups apart, so one
+            // phase serves both).
+            let p_phase = (p_smem as usize >> 7) & 7;
+
             let mut tma_phase = 1u32;
             let mut mma_phase = 0u32;
             let mut key_tile = 0u32;
@@ -532,10 +581,11 @@ pub mod kernels {
                         let chunk = if (8..16).contains(&lane) { chunk_low + 1 } else { chunk_low };
                         let row_low = tmem_row as usize + (lane % 8) as usize;
                         let row_high = row_low + 8;
-                        let address_low =
-                            p_smem.add(subtile + row_low * 128 + (chunk ^ (row_low % 8)) * 16);
-                        let address_high =
-                            p_smem.add(subtile + row_high * 128 + (chunk ^ (row_high % 8)) * 16);
+                        let address_low = p_smem
+                            .add(subtile + row_low * 128 + (chunk ^ ((row_low + p_phase) & 7)) * 16);
+                        let address_high = p_smem.add(
+                            subtile + row_high * 128 + (chunk ^ ((row_high + p_phase) & 7)) * 16,
+                        );
                         stmatrix_m8n8_x2(
                             address_low,
                             cvt_f32x2_bf16x2(p_a0, p_a1),

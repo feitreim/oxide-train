@@ -132,6 +132,60 @@ fn check_math(
     Ok(())
 }
 
+/// Empirically verify the SWIZZLE_128B placement the P-write path assumes:
+/// fill a `[128, 64]` staging tile with sequential word indices, TMA it into
+/// shared memory, dump the words linearly, and check each landing position
+/// against `word(r, c, k) -> r*32 + (c ^ ((r + phase) & 7))*4 + k` — the
+/// 16-byte chunk XORed with the tile's *absolute* 128-byte row phase, which
+/// the kernel reports as a trailing word (the swizzle acts on physical
+/// address bits [9:7], not tile-relative rows). On mismatch, print enough of
+/// the observed permutation to derive the real formula.
+fn check_swizzle_layout(
+    stream: &Arc<CudaStream>,
+    flash: &Tcgen05Flash,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let words_per_row = FLASH_HD * 2 / 4;
+    let total = FLASH_TILE * words_per_row;
+    let pattern: Vec<u32> = (0..total as u32).collect();
+    let source = DeviceBuffer::from_host(stream, &pattern)?;
+    let tma = unsafe { create_flash_head_tma_map(stream, &source, FLASH_TILE, 1)? };
+    let mut output = DeviceBuffer::<u32>::zeroed(stream, total + 1)?;
+    unsafe { flash.swizzle_probe(stream, tma.as_ptr(), &mut output)? };
+    let dump = output.to_host_vec(stream)?;
+    let phase = dump[total] as usize;
+
+    let mut mismatches = 0usize;
+    for word in 0..total {
+        let row = word / words_per_row;
+        let chunk = (word % words_per_row) / 4;
+        let sub = word % 4;
+        let expected_position = row * words_per_row + (chunk ^ ((row + phase) & 7)) * 4 + sub;
+        if dump[expected_position] != word as u32 {
+            if mismatches < 24 {
+                println!(
+                    "  word {word} (row {row} chunk {chunk}+{sub}) expected at {expected_position}, \
+                     smem[{expected_position}] = {}",
+                    dump[expected_position]
+                );
+            }
+            mismatches += 1;
+        }
+    }
+    if mismatches == 0 {
+        println!("  swizzle   TMA 128B placement matches chunk ^ ((row + {phase}) & 7)");
+    } else {
+        println!("  swizzle   {mismatches}/{total} words off (phase {phase}); rows 0..4 layout:");
+        for row in 0..4 {
+            let observed: Vec<u32> = (0..8)
+                .map(|c| dump[row * words_per_row + c * 4] / 4 % 8)
+                .collect();
+            println!("    row {row}: source chunk order in smem = {observed:?}");
+        }
+        return Err("TMA swizzle layout differs from the P-write assumption".into());
+    }
+    Ok(())
+}
+
 /// Transposed-B operand validation: `C[128,64] = A[128,128]·B[128,64]` with
 /// `B` stored `[K, N]` row-major, the V-tile orientation of the `O = P·V`
 /// MMA. A is staged as two head panels (planes hold column halves), so the
@@ -250,8 +304,24 @@ fn check_forward(
         )?;
     }
     println!("tcgen05 forward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]");
-    assert_close("y", &y.to_host_vec(stream)?, &expected_y, 2.0e-2, 2.0e-2);
-    assert_close("lse", &lse.to_host_vec(stream)?, &expected_lse, 5.0e-3, 5.0e-3);
+    let y_host = y.to_host_vec(stream)?;
+    let lse_host = lse.to_host_vec(stream)?;
+    // Diagnostic slice (batch 0, head 0): one y feature and the LSE per
+    // sampled row. LSE encodes the kernel's internal row max + sum, so a
+    // matching LSE with a broken y isolates the P·V path, and vice versa.
+    for row in [0usize, 1, 2, 7, 8, 15, 16, 31, 32, 64, 127] {
+        if row < t {
+            println!(
+                "  row {row:>3}: y0 gpu {:>12.6} ref {:>12.6} | lse gpu {:>12.6} ref {:>12.6}",
+                y_host[row * d],
+                expected_y[row * d],
+                lse_host[row * h],
+                expected_lse[row * h],
+            );
+        }
+    }
+    assert_close("y", &y_host, &expected_y, 2.0e-2, 2.0e-2);
+    assert_close("lse", &lse_host, &expected_lse, 5.0e-3, 5.0e-3);
     Ok(())
 }
 
@@ -318,6 +388,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("software math parity");
     check_math(&stream, &flash)?;
+    println!("TMA swizzle layout probe");
+    check_swizzle_layout(&stream, &flash)?;
     println!("transpose_b operand probe");
     check_transpose_probe(&stream, &flash)?;
     check_forward(&stream, &flash, 2, 128, 3)?;
