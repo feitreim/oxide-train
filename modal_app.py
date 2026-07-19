@@ -19,10 +19,21 @@ from pathlib import Path
 
 import modal
 
-# Keep this tag in sync with the git deps in gpu/*/Cargo.toml: the codegen
+# Keep this rev in sync with the git deps in gpu/*/Cargo.toml: the codegen
 # backend and the device/host/core crates must come from the same revision.
-CUDA_OXIDE_REF = "v0.2.1"
+CUDA_OXIDE_REF = "2409204733c55b81435abf1db4e5fda8309edead"
 RUST_TOOLCHAIN = "nightly-2026-04-03"
+# cuda-oxide's generated-intrinsics catalog (upstream #406) is produced from
+# a pinned LLVM *main* commit and lowers device intrinsics (stmatrix,
+# tcgen05, ...) to `llvm.nvvm.*` calls that the runtime `llc` must know how
+# to emit. Released LLVM 21 lacks those intrinsics entirely, so the pure-PTX
+# path needs the LLVM 22 development snapshot from apt.llvm.org (upstream's
+# own llc resolution prefers `llc-22`; its troubleshooting docs say the same).
+# A too-old llc shows up as PTX containing `.extern .func llvm.nvvm...`,
+# which the driver rejects with DriverError(218) at JIT time. Modal caches
+# the apt layer by its command string, so bump this stamp with
+# CUDA_OXIDE_REF to force the layer to re-pull the current snapshot.
+LLVM_LAYER_STAMP = "cuda-oxide-2409204 catalog-llvm-1cb4e383 llvm-22-snapshot"
 GIT_REPO = "https://github.com/NVlabs/cuda-oxide.git"
 TRAINER_REPO = "https://github.com/feitreim/oxide-train.git"
 
@@ -38,9 +49,9 @@ version = "0.1.0"
 edition = "2024"
 [workspace]
 [dependencies]
-cuda-device = {{ git = "{GIT_REPO}", tag = "{CUDA_OXIDE_REF}" }}
-cuda-host = {{ git = "{GIT_REPO}", tag = "{CUDA_OXIDE_REF}" }}
-cuda-core = {{ git = "{GIT_REPO}", tag = "{CUDA_OXIDE_REF}" }}
+cuda-device = {{ git = "{GIT_REPO}", rev = "{CUDA_OXIDE_REF}" }}
+cuda-host = {{ git = "{GIT_REPO}", rev = "{CUDA_OXIDE_REF}" }}
+cuda-core = {{ git = "{GIT_REPO}", rev = "{CUDA_OXIDE_REF}" }}
 """
 
 WARMUP_MAIN_RS = """
@@ -69,7 +80,7 @@ image = (
             "CUDA_HOME": "/usr/local/cuda",
             "CUDA_PATH": "/usr/local/cuda",
             "CUDA_TOOLKIT_PATH": "/usr/local/cuda",
-            "CUDA_OXIDE_LLC": "/usr/bin/llc-21",
+            "CUDA_OXIDE_LLC": "/usr/bin/llc-22",
             "LIBCLANG_PATH": "/usr/lib/llvm-21/lib",
             "LLVM_CONFIG_PATH": "/usr/bin/llvm-config-21",
             "PATH": (
@@ -83,16 +94,24 @@ image = (
         "ca-certificates", "curl", "g++", "gcc", "git", "gnupg",
         "libc6-dev", "libssl-dev", "make", "pkg-config", "xz-utils",
     )
-    # LLVM 21 toolchain (NVPTX target + clang headers for bindgen).
+    # LLVM toolchains: 21 (stable) provides clang/libclang for bindgen; the
+    # 22 development snapshot provides the llc/opt pair the generated
+    # intrinsics need (see LLVM_LAYER_STAMP above).
     .run_commands(
         "curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key "
         "| gpg --dearmor -o /usr/share/keyrings/apt.llvm.org.gpg",
         'echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] '
         'https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" '
         "> /etc/apt/sources.list.d/llvm-toolchain-noble-21.list",
-        "apt-get update && apt-get install -y --no-install-recommends "
+        'echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] '
+        'https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" '
+        "> /etc/apt/sources.list.d/llvm-toolchain-noble-22.list",
+        f"echo 'LLVM layer stamp: {LLVM_LAYER_STAMP}' "
+        "&& apt-get update && apt-get install -y --no-install-recommends "
         "clang-21 libclang-common-21-dev lld-21 llvm-21 llvm-21-dev "
-        "&& rm -rf /var/lib/apt/lists/*",
+        "llvm-22 "
+        "&& rm -rf /var/lib/apt/lists/* "
+        "&& llc-22 --version | head -3",
     )
     # Pinned nightly Rust with the components the codegen backend needs.
     .run_commands(
@@ -100,10 +119,17 @@ image = (
         "| sh -s -- -y --default-toolchain none --profile minimal",
         f"rustup toolchain install {RUST_TOOLCHAIN} --profile minimal "
         "-c rust-src -c rustc-dev -c llvm-tools",
-        f"cargo +{RUST_TOOLCHAIN} install --git {GIT_REPO} --tag {CUDA_OXIDE_REF} cargo-oxide",
+        f"cargo +{RUST_TOOLCHAIN} install --git {GIT_REPO} --rev {CUDA_OXIDE_REF} cargo-oxide",
     )
     # Build the codegen backend (slow, one time; baked into this image layer)
     # and compile a trivial kernel end-to-end to prove the toolchain works.
+    #
+    # The backend source is pre-seeded into cargo-oxide's cache directory at
+    # CUDA_OXIDE_REF. Without this, cargo-oxide's auto-fetch would build the
+    # backend from a floating `main` clone, silently violating the pin.
+    # (`cargo oxide setup` is skipped on purpose: in standalone mode it now
+    # treats the current package as the backend source and requires a lib
+    # target; any build command constructs the cached backend on demand.)
     #
     # cargo-oxide links libcuda (the *driver*), which isn't present at build
     # time (no GPU). The toolkit ships a driver *stub* that satisfies the
@@ -114,7 +140,11 @@ image = (
         f"cat > /opt/warmup/Cargo.toml <<'EOF'\n{WARMUP_CARGO_TOML}\nEOF",
         f"cat > /opt/warmup/src/main.rs <<'EOF'\n{WARMUP_MAIN_RS}\nEOF",
         "ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1",
-        "cd /opt/warmup && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs cargo oxide setup",
+        "mkdir -p /root/.cargo/cuda-oxide/src"
+        " && git -C /root/.cargo/cuda-oxide/src init -q"
+        f" && git -C /root/.cargo/cuda-oxide/src remote add origin {GIT_REPO}"
+        f" && git -C /root/.cargo/cuda-oxide/src fetch -q --depth 1 origin {CUDA_OXIDE_REF}"
+        " && git -C /root/.cargo/cuda-oxide/src checkout -q FETCH_HEAD",
         "cd /opt/warmup && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs cargo oxide build warmup",
     )
     # Live mounts (re-read each run; edits need no image rebuild). crates/ is

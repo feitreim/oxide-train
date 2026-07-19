@@ -9,9 +9,9 @@ default-run = "tensor-gpu"
 [workspace]
 
 [dependencies]
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2409204733c55b81435abf1db4e5fda8309edead" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2409204733c55b81435abf1db4e5fda8309edead" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2409204733c55b81435abf1db4e5fda8309edead" }
 tensor-core = { path = "../../crates/tensor-core" }
 tensor-cpu = { path = "../../crates/tensor-cpu" }
 bench-util = { path = "../bench-util" }

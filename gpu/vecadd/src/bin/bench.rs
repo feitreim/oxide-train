@@ -24,15 +24,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = DeviceBuffer::<f32>::zeroed(&stream, N)?;
 
     let avg_ms = time_gpu_iters(&stream, WARMUP, ITERS, || {
-        module
-            .vecadd(
+        // SAFETY: the 1-D launch covers exactly N elements and all three
+        // buffers hold N elements.
+        unsafe {
+            module.vecadd(
                 &stream,
                 LaunchConfig::for_num_elems(N as u32),
                 &a,
                 &b,
                 &mut c,
             )
-            .map_err(Into::into)
+        }
+        .map_err(Into::into)
     })?;
 
     let secs = avg_ms / 1.0e3;

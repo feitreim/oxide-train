@@ -9,13 +9,13 @@ default-run = "vecadd"
 [workspace]
 
 # cuda-oxide is not published to crates.io, so we pull the device/host/core
-# crates straight from the repo, pinned to the same tag the Modal image builds
-# its codegen backend from. Keep this tag in sync with CUDA_OXIDE_REF in
-# ../../modal_app.py.
+# crates straight from the repo, pinned to the same revision the Modal image
+# builds its codegen backend from. Keep this rev in sync with CUDA_OXIDE_REF
+# in ../../modal_app.py.
 [dependencies]
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2409204733c55b81435abf1db4e5fda8309edead" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2409204733c55b81435abf1db4e5fda8309edead" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2409204733c55b81435abf1db4e5fda8309edead" }
 bench-util = { path = "../bench-util" }
 
 [profile.release]
