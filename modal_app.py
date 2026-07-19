@@ -164,6 +164,21 @@ def _prepare_gemm_ptx(root: str) -> None:
     shutil.copy(f"{gemm}/gemm.ptx", f"{root}/gpu/model/gemm.ptx")
 
 
+def _prepare_flash_ptx(root: str) -> None:
+    """Prebuild gpu/flash-attn's binaries so the pure-PTX tcgen05 attention
+    artifact (flash.ptx, emitted by the `flash` bin target) exists for the
+    parity harness, and stage a copy for model's phase-3 integration.
+
+    Same artifact split as gemm.ptx: the harness and model device artifacts
+    go through libNVVM (libdevice math), which rejects tcgen05 constructs.
+    """
+    import shutil
+
+    flash = f"{root}/gpu/flash-attn"
+    _run(["cargo", "oxide", "build", "flash-attn"], cwd=flash)
+    shutil.copy(f"{flash}/flash.ptx", f"{root}/gpu/model/flash.ptx")
+
+
 @app.function(
     gpu=DEFAULT_GPU,
     timeout=4 * 3600,
@@ -185,6 +200,8 @@ def run_kernel(
     proj = _proj(kernel)
     if kernel == "model":
         _prepare_gemm_ptx(PROJECT_DIR)
+    if kernel == "flash-attn":
+        _prepare_flash_ptx(PROJECT_DIR)
     cmd = ["cargo", "oxide", "run", kernel]
     if bin:
         cmd += ["--bin", bin]
