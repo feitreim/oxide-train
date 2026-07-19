@@ -76,6 +76,20 @@ pub mod kernels {
         address | (leading << 16) | (stride << 32) | (1u64 << 46) | ((SWIZZLE_128B as u64) << 61)
     }
 
+    /// NaN-free float max/min. `f32::max`/`f32::min` lower to libdevice
+    /// (`__nv_fmaxf`), which would silently force this artifact off the
+    /// pure-PTX path; comparison + select stays native. All scores here are
+    /// finite by construction (`MASKED_SCORE` is finite).
+    #[inline(always)]
+    fn fmax(a: f32, b: f32) -> f32 {
+        if a > b { a } else { b }
+    }
+
+    #[inline(always)]
+    fn fmin(a: f32, b: f32) -> f32 {
+        if a < b { a } else { b }
+    }
+
     /// `2^x` on FMA units: round-to-nearest split via the 1.5·2²³ shift trick,
     /// exponent-bit insertion for the integer part, and a degree-3 minimax
     /// polynomial (max relative error 7.5e-5 on the reduced range) for the
@@ -88,7 +102,7 @@ pub mod kernels {
         const C1: f32 = 0.693_260_99;
         const C2: f32 = 0.242_611_12;
         const C3: f32 = 0.055_171_67;
-        let x = x.max(-125.0).min(125.0);
+        let x = fmin(fmax(x, -125.0), 125.0);
         let shifted = x + SHIFT;
         let integer = (shifted.to_bits() as i32).wrapping_sub(0x4b40_0000);
         let fraction = x - (shifted - SHIFT);
@@ -119,8 +133,8 @@ pub mod kernels {
 
     #[inline(always)]
     fn quad_max(value: f32) -> f32 {
-        let value = value.max(warp::shuffle_xor_f32(value, 1));
-        value.max(warp::shuffle_xor_f32(value, 2))
+        let value = fmax(value, warp::shuffle_xor_f32(value, 1));
+        fmax(value, warp::shuffle_xor_f32(value, 2))
     }
 
     #[inline(always)]
@@ -428,21 +442,33 @@ pub mod kernels {
                             let row_a = (tmem_row as usize + row_in_16) as u32;
                             let row_b = row_a + 8;
                             let col = column + 2 * quad as u32;
-                            tile_max[slot_a] = tile_max[slot_a]
-                                .max(if col <= row_a { low[0] } else { MASKED_SCORE })
-                                .max(if col + 1 <= row_a { low[1] } else { MASKED_SCORE })
-                                .max(if col + 8 <= row_a { high[0] } else { MASKED_SCORE })
-                                .max(if col + 9 <= row_a { high[1] } else { MASKED_SCORE });
-                            tile_max[slot_b] = tile_max[slot_b]
-                                .max(if col <= row_b { low[2] } else { MASKED_SCORE })
-                                .max(if col + 1 <= row_b { low[3] } else { MASKED_SCORE })
-                                .max(if col + 8 <= row_b { high[2] } else { MASKED_SCORE })
-                                .max(if col + 9 <= row_b { high[3] } else { MASKED_SCORE });
+                            let mut max_a = tile_max[slot_a];
+                            max_a = fmax(max_a, if col <= row_a { low[0] } else { MASKED_SCORE });
+                            max_a =
+                                fmax(max_a, if col + 1 <= row_a { low[1] } else { MASKED_SCORE });
+                            max_a =
+                                fmax(max_a, if col + 8 <= row_a { high[0] } else { MASKED_SCORE });
+                            max_a =
+                                fmax(max_a, if col + 9 <= row_a { high[1] } else { MASKED_SCORE });
+                            tile_max[slot_a] = max_a;
+                            let mut max_b = tile_max[slot_b];
+                            max_b = fmax(max_b, if col <= row_b { low[2] } else { MASKED_SCORE });
+                            max_b =
+                                fmax(max_b, if col + 1 <= row_b { low[3] } else { MASKED_SCORE });
+                            max_b =
+                                fmax(max_b, if col + 8 <= row_b { high[2] } else { MASKED_SCORE });
+                            max_b =
+                                fmax(max_b, if col + 9 <= row_b { high[3] } else { MASKED_SCORE });
+                            tile_max[slot_b] = max_b;
                         } else {
-                            tile_max[slot_a] =
-                                tile_max[slot_a].max(low[0]).max(low[1]).max(high[0]).max(high[1]);
-                            tile_max[slot_b] =
-                                tile_max[slot_b].max(low[2]).max(low[3]).max(high[2]).max(high[3]);
+                            tile_max[slot_a] = fmax(
+                                fmax(fmax(tile_max[slot_a], low[0]), fmax(low[1], high[0])),
+                                high[1],
+                            );
+                            tile_max[slot_b] = fmax(
+                                fmax(fmax(tile_max[slot_b], low[2]), fmax(low[3], high[2])),
+                                high[3],
+                            );
                         }
                         column_block += 1;
                     }
@@ -452,7 +478,7 @@ pub mod kernels {
                 let mut slot = 0usize;
                 while slot < 4 {
                     let tile = quad_max(tile_max[slot]);
-                    let next = running_max[slot].max(tile);
+                    let next = fmax(running_max[slot], tile);
                     factor[slot] = exp2_approx(running_max[slot] - next);
                     running_max[slot] = next;
                     slot += 1;

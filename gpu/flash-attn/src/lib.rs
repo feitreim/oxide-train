@@ -26,6 +26,9 @@
 use cuda_core::LaunchConfig;
 use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread};
 
+// Host-only tcgen05 support (flash.ptx loader, TMA maps); no device code, so
+// including it never affects an artifact. Not every including binary uses it.
+#[allow(dead_code)]
 pub mod host;
 
 /// Maximum supported head width. This bounds the statically allocated shared

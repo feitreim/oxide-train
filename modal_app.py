@@ -175,7 +175,19 @@ def _prepare_flash_ptx(root: str) -> None:
     import shutil
 
     flash = f"{root}/gpu/flash-attn"
-    _run(["cargo", "oxide", "build", "flash-attn"], cwd=flash)
+    # `build` compiles every bin target and, unlike `run`, does not
+    # auto-detect the GPU arch. The oracle binaries use libdevice math plus
+    # device atomics, which legacy NVVM IR rejects; pin the Blackwell target
+    # (tcgen05 requires sm_100a anyway) so they take the NVVM path that
+    # `cargo oxide run` would pick on the B200.
+    _run(["cargo", "oxide", "build", "flash-attn", "--arch", "sm_100a"], cwd=flash)
+    if not Path(flash, "flash.ptx").is_file():
+        raise SystemExit(
+            "gpu/flash-attn built but produced no flash.ptx: the tcgen05 "
+            "module picked up a libdevice lowering (even f32::max counts) "
+            "and silently switched to NVVM IR. Check src/tcgen05.rs for "
+            "libdevice math."
+        )
     shutil.copy(f"{flash}/flash.ptx", f"{root}/gpu/model/flash.ptx")
 
 
