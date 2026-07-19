@@ -166,15 +166,17 @@ fn check_tcgen05_shape(
     }
 
     println!("tcgen05 parity against both oracles [{b},{t},{h},{HD}]");
+    // Measured maxima vs the fp32 oracles: y 2.4e-3, lse 8.9e-4 (T up to
+    // 1024) — dominated by bf16 operand quantization; ~4x headroom.
     let y_host = y.to_host_vec(stream)?;
-    assert_close("y/naive", &y_host, &naive_y.to_host_vec(stream)?, 2.0e-2, 2.0e-2);
-    assert_close("y/tiled", &y_host, &tiled_y.to_host_vec(stream)?, 2.0e-2, 2.0e-2);
+    assert_close("y/naive", &y_host, &naive_y.to_host_vec(stream)?, 1.0e-2, 1.0e-2);
+    assert_close("y/tiled", &y_host, &tiled_y.to_host_vec(stream)?, 1.0e-2, 1.0e-2);
     assert_close(
         "lse",
         &lse.to_host_vec(stream)?,
         &tiled_lse.to_host_vec(stream)?,
-        5.0e-2,
         5.0e-3,
+        0.0,
     );
     Ok(())
 }

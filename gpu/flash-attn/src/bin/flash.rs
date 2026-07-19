@@ -320,8 +320,9 @@ fn check_forward(
             );
         }
     }
-    assert_close("y", &y_host, &expected_y, 2.0e-2, 2.0e-2);
-    assert_close("lse", &lse_host, &expected_lse, 5.0e-3, 5.0e-3);
+    // Measured maxima: y 1.4e-3, lse 1.4e-4 (T=128..512); ~3x headroom.
+    assert_close("y", &y_host, &expected_y, 5.0e-3, 5.0e-3);
+    assert_close("lse", &lse_host, &expected_lse, 1.0e-3, 0.0);
     Ok(())
 }
 
