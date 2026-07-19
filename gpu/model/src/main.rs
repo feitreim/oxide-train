@@ -783,10 +783,18 @@ fn aligned_tcgen05_linears(
     )?;
     grad!(down_proj);
     grad!(final_norm);
-    println!("✓ aligned tcgen05 block linears match CPU forward/backward");
+    println!("\u{2713} aligned tcgen05 block linears match CPU forward/backward");
 
+    // 0.02 became knife-edged when the cuda-oxide 2409204 bump changed the
+    // toolchain's rounding family (default FMA contraction, llc-22): the CPU
+    // realization probe (crates/optim/examples/aligned_probe.rs, ±1-ulp
+    // noise at every non-contractual summation) parks 4/16 realizations at
+    // loss 0.05-0.16, matching observed B200 failures; the endgame converges
+    // to ~0.03 and then bounces onto a metastable tie. At 0.005 all 32
+    // sampled realizations (even at ±2 ulp) converge below the bar by step
+    // ~10 and settle at ~4e-5 with zero bounces; 600 steps keeps the margin.
     let config = AdamWConfig {
-        learning_rate: 0.02,
+        learning_rate: 0.005,
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
@@ -1104,8 +1112,14 @@ fn aligned_moe_overfit(
         GpuDense::<ON, ON, OT, VOCAB, VP, D, H, HD, OFF, OE, OK, OC>::from_cpu(stream, &cpu)?;
     let mut workspace =
         GpuDenseWorkspace::<ON, ON, OT, VOCAB, VP, D, H, OFF, OE, OK, OC>::new(stream)?;
+    // 0.02 became knife-edged at the cuda-oxide 2409204 toolchain: the CPU
+    // realization probe (crates/optim/examples/aligned_probe.rs) parks 5/16
+    // ±1-ulp realizations at loss 0.05-0.14, matching observed B200
+    // failures. At 0.005 all 32 sampled realizations (even at ±2 ulp)
+    // converge below the bar by step ~10 and settle at ~1e-5; the 1_200-step
+    // budget still spans the full aux-loss decay horizon.
     let config = AdamWConfig {
-        learning_rate: 0.02,
+        learning_rate: 0.005,
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
