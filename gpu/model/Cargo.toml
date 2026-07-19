@@ -3,6 +3,10 @@ name = "model"
 version = "0.1.0"
 edition = "2024"
 default-run = "model"
+# Every executable includes `src/lib.rs` directly so cuda-oxide collects its
+# kernels from the selected binary target. Do not also compile the same source
+# as an inferred library target, which defines every device symbol twice.
+autolib = false
 
 [workspace]
 

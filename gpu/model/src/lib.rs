@@ -119,6 +119,36 @@ fn norm_weight_config<const N: usize, const D: usize>() -> LaunchConfig {
     }
 }
 
+fn moe_assign_config<const E: usize>() -> LaunchConfig {
+    assert!(dense_device::MOE_ASSIGN_THREADS.is_power_of_two());
+    assert!(E <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (E as u32, 1, 1),
+        block_dim: (dense_device::MOE_ASSIGN_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn router_weight_config<const D: usize, const E: usize>() -> LaunchConfig {
+    assert_eq!(
+        dense_device::ROUTER_WEIGHT_THREADS,
+        dense_device::ROUTER_WEIGHT_ROWS
+            * dense_device::ROUTER_WEIGHT_EXPERTS
+            * dense_device::ROUTER_WEIGHT_SPLITS
+    );
+    assert!(dense_device::ROUTER_WEIGHT_K.is_multiple_of(dense_device::ROUTER_WEIGHT_SPLITS));
+    assert!(D <= u32::MAX as usize && E <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (
+            D.div_ceil(dense_device::ROUTER_WEIGHT_ROWS) as u32,
+            E.div_ceil(dense_device::ROUTER_WEIGHT_EXPERTS) as u32,
+            1,
+        ),
+        block_dim: (dense_device::ROUTER_WEIGHT_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 fn pairs_config(words: usize) -> LaunchConfig {
     assert!(words <= u32::MAX as usize);
     LaunchConfig::for_num_elems(words as u32)
@@ -3545,13 +3575,9 @@ impl<
             )
         })?;
         profiler.measure(stream, "forward.router.assign", || unsafe {
-            dense.moe_bin_assign(
+            dense.moe_bin_assign_parallel(
                 stream,
-                LaunchConfig {
-                    grid_dim: (E as u32, 1, 1),
-                    block_dim: (1, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                moe_assign_config::<E>(),
                 routing.selected_experts.as_device_buffer(),
                 N as u32,
                 E as u32,
@@ -3845,10 +3871,10 @@ impl<
                 routing.router_dx.as_device_buffer_mut(),
             )
         })?;
-        profiler.measure(stream, "backward.router.weight", || {
-            dense.router_backward_weight(
+        profiler.measure(stream, "backward.router.weight", || unsafe {
+            dense.router_backward_weight_tiled(
                 stream,
-                LaunchConfig::for_num_elems((D * E) as u32),
+                router_weight_config::<D, E>(),
                 workspace.ffn_normalized.as_device_buffer(),
                 routing.dlogits.as_device_buffer(),
                 N as u32,

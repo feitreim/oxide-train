@@ -490,8 +490,17 @@ Each gated on tests; correctness before speed at every step.
      (`E`/`K`/`C` + schedule + router/expert state), and a §10.1
      same-container profile against the dense 152.3 ms baseline: 171.8 ms
      at matched active params (+12.7%; the win is params/FLOP, not step
-     time). Profile-ordered follow-up: deterministic bin assignment
-     (7.0 ms), then router weight backward (4.8 ms).
+     time). ✅ The first profile-ordered follow-up replaced the serial
+     per-expert token scan with a deterministic block-parallel prefix
+     assignment, preserving exact token/rank capacity order and tie behavior.
+     B200 same-container result: 171.59 → 164.66 ms full step (-4.0%);
+     `forward.router.assign` 7.009 → 0.083 ms (~85×). ✅ The second follow-up
+     replaced the one-thread-per-output router weight scan with a deterministic
+     tiled fp32 `Xᵀ·dlogits`: 2×8 output tiles, 16 fixed token partitions per
+     output, and a fixed-order shared-memory reduction without atomics. B200
+     same-container result against pre-follow-up main: 171.76 → 160.69 ms full
+     step (-6.45%) for both routing changes; `backward.router.weight` 4.890 →
+     0.916 ms (5.34×).
 9. Scale/stretch: bigger model, activation checkpointing, (much later)
    multi-GPU
 

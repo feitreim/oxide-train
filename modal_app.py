@@ -222,6 +222,20 @@ def compare_profile(kernel: str, baseline_ref: str) -> None:
     baseline = f"{baseline_root}/gpu/{kernel}"
     candidate = _proj(kernel)
     if kernel == "model":
+        # Historical model refs infer `src/lib.rs` as a library target even
+        # though each executable includes it directly for cuda-oxide kernel
+        # discovery. Current Cargo/cuda-oxide then links both copies of every
+        # device symbol. This build-only manifest setting keeps old source refs
+        # profileable without changing their model or kernel implementation.
+        manifest = Path(baseline) / "Cargo.toml"
+        contents = manifest.read_text()
+        if "autolib = false" not in contents:
+            contents = contents.replace(
+                "[package]\n",
+                "[package]\nautolib = false\n",
+                1,
+            )
+            manifest.write_text(contents)
         # Baselines predating the staged tcgen05 PTX simply ignore the file.
         _prepare_gemm_ptx(baseline_root)
         _prepare_gemm_ptx(PROJECT_DIR)
