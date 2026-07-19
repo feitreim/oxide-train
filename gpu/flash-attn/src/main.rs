@@ -61,61 +61,86 @@ fn check_shape(
     let mut expected_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut expected_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut expected_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    naive_module.attention_probabilities(
-        stream,
-        LaunchConfig::for_num_elems((n * h * t) as u32),
-        &q,
-        &k,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut probabilities,
-    )?;
-    naive_module.attention_output(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &probabilities,
-        &v,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_y,
-    )?;
-    naive_module.attention_backward_q(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &q,
-        &k,
-        &v,
-        &probabilities,
-        &dy,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_dq,
-    )?;
-    naive_module.attention_backward_k(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &q,
-        &v,
-        &probabilities,
-        &dy,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_dk,
-    )?;
-    naive_module.attention_backward_v(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &probabilities,
-        &dy,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_dv,
-    )?;
+    // SAFETY: the launch geometry matches `attention_probabilities`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        naive_module.attention_probabilities(
+            stream,
+            LaunchConfig::for_num_elems((n * h * t) as u32),
+            &q,
+            &k,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut probabilities,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `attention_output`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        naive_module.attention_output(
+            stream,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &probabilities,
+            &v,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut expected_y,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `attention_backward_q`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        naive_module.attention_backward_q(
+            stream,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &q,
+            &k,
+            &v,
+            &probabilities,
+            &dy,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut expected_dq,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `attention_backward_k`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        naive_module.attention_backward_k(
+            stream,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &q,
+            &v,
+            &probabilities,
+            &dy,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut expected_dk,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `attention_backward_v`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        naive_module.attention_backward_v(
+            stream,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &probabilities,
+            &dy,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut expected_dv,
+        )
+    }?;
     let expected_y = expected_y.to_host_vec(stream)?;
     let expected_dq = expected_dq.to_host_vec(stream)?;
     let expected_dk = expected_dk.to_host_vec(stream)?;
@@ -128,47 +153,62 @@ fn check_shape(
     let mut actual_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
 
     println!("per-row flash parity against ops [{b},{t},{h},{HD}]");
-    flash_module.flash_attention_forward(
-        stream,
-        per_row_config(n, h),
-        &q,
-        &k,
-        &v,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut actual_y,
-        &mut logsumexp,
-    )?;
-    flash_module.flash_attention_backward_q(
-        stream,
-        per_row_config(n, h),
-        &q,
-        &k,
-        &v,
-        &actual_y,
-        &dy,
-        &logsumexp,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut actual_dq,
-    )?;
-    flash_module.flash_attention_backward_kv(
-        stream,
-        per_row_config(n, h),
-        &q,
-        &k,
-        &v,
-        &actual_y,
-        &dy,
-        &logsumexp,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut actual_dk,
-        &mut actual_dv,
-    )?;
+    // SAFETY: the launch geometry matches `flash_attention_forward`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        flash_module.flash_attention_forward(
+            stream,
+            per_row_config(n, h),
+            &q,
+            &k,
+            &v,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut actual_y,
+            &mut logsumexp,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `flash_attention_backward_q`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        flash_module.flash_attention_backward_q(
+            stream,
+            per_row_config(n, h),
+            &q,
+            &k,
+            &v,
+            &actual_y,
+            &dy,
+            &logsumexp,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut actual_dq,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `flash_attention_backward_kv`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        flash_module.flash_attention_backward_kv(
+            stream,
+            per_row_config(n, h),
+            &q,
+            &k,
+            &v,
+            &actual_y,
+            &dy,
+            &logsumexp,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut actual_dk,
+            &mut actual_dv,
+        )
+    }?;
     assert_close("y", &actual_y.to_host_vec(stream)?, &expected_y, 5e-5, 5e-5);
     assert_close(
         "dq",
@@ -199,52 +239,72 @@ fn check_shape(
     let mut tiled_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut tiled_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut tiled_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    flash_module.flash_attention_forward_tiled(
-        stream,
-        flash::tiled_forward_config(b, t, h, HD),
-        &q,
-        &k,
-        &v,
-        t as u32,
-        h as u32,
-        &mut tiled_y,
-        &mut tiled_logsumexp,
-    )?;
-    flash_module.flash_attention_backward_dot(
-        stream,
-        flash::dot_config(n, h, HD),
-        &dy,
-        &tiled_y,
-        HD as u32,
-        &mut softmax_dot,
-    )?;
-    flash_module.flash_attention_backward_q_tiled(
-        stream,
-        flash::tiled_backward_q_config(b, t, h, HD),
-        &q,
-        &k,
-        &v,
-        &dy,
-        &tiled_logsumexp,
-        &softmax_dot,
-        t as u32,
-        h as u32,
-        &mut tiled_dq,
-    )?;
-    flash_module.flash_attention_backward_kv_tiled(
-        stream,
-        flash::tiled_backward_kv_config(b, t, h, HD),
-        &q,
-        &k,
-        &v,
-        &dy,
-        &tiled_logsumexp,
-        &softmax_dot,
-        t as u32,
-        h as u32,
-        &mut tiled_dk,
-        &mut tiled_dv,
-    )?;
+    // SAFETY: the launch geometry matches `flash_attention_forward_tiled`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        flash_module.flash_attention_forward_tiled(
+            stream,
+            flash::tiled_forward_config(b, t, h, HD),
+            &q,
+            &k,
+            &v,
+            t as u32,
+            h as u32,
+            &mut tiled_y,
+            &mut tiled_logsumexp,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `flash_attention_backward_dot`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        flash_module.flash_attention_backward_dot(
+            stream,
+            flash::dot_config(n, h, HD),
+            &dy,
+            &tiled_y,
+            HD as u32,
+            &mut softmax_dot,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `flash_attention_backward_q_tiled`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        flash_module.flash_attention_backward_q_tiled(
+            stream,
+            flash::tiled_backward_q_config(b, t, h, HD),
+            &q,
+            &k,
+            &v,
+            &dy,
+            &tiled_logsumexp,
+            &softmax_dot,
+            t as u32,
+            h as u32,
+            &mut tiled_dq,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `flash_attention_backward_kv_tiled`'s grid/block
+    // contract for this shape, and every buffer was allocated to the
+    // extents the kernel indexes.
+    unsafe {
+        flash_module.flash_attention_backward_kv_tiled(
+            stream,
+            flash::tiled_backward_kv_config(b, t, h, HD),
+            &q,
+            &k,
+            &v,
+            &dy,
+            &tiled_logsumexp,
+            &softmax_dot,
+            t as u32,
+            h as u32,
+            &mut tiled_dk,
+            &mut tiled_dv,
+        )
+    }?;
     assert_close("y", &tiled_y.to_host_vec(stream)?, &expected_y, 5e-5, 5e-5);
     assert_close(
         "lse",
@@ -294,52 +354,72 @@ fn check_shape(
         let mut tiled_dq = DeviceBuffer::from_host(stream, &sentinel_y)?;
         let mut tiled_dk = DeviceBuffer::from_host(stream, &sentinel_y)?;
         let mut tiled_dv = DeviceBuffer::from_host(stream, &sentinel_y)?;
-        flash_module.flash_attention_forward_tiled(
-            stream,
-            flash::tiled_forward_config(b, t, h, HD),
-            &q,
-            &k,
-            &v,
-            t as u32,
-            h as u32,
-            &mut tiled_y,
-            &mut tiled_logsumexp,
-        )?;
-        flash_module.flash_attention_backward_dot(
-            stream,
-            flash::dot_config(n, h, HD),
-            &dy,
-            &tiled_y,
-            HD as u32,
-            &mut softmax_dot,
-        )?;
-        flash_module.flash_attention_backward_q_tiled(
-            stream,
-            flash::tiled_backward_q_config(b, t, h, HD),
-            &q,
-            &k,
-            &v,
-            &dy,
-            &tiled_logsumexp,
-            &softmax_dot,
-            t as u32,
-            h as u32,
-            &mut tiled_dq,
-        )?;
-        flash_module.flash_attention_backward_kv_tiled(
-            stream,
-            flash::tiled_backward_kv_config(b, t, h, HD),
-            &q,
-            &k,
-            &v,
-            &dy,
-            &tiled_logsumexp,
-            &softmax_dot,
-            t as u32,
-            h as u32,
-            &mut tiled_dk,
-            &mut tiled_dv,
-        )?;
+        // SAFETY: the launch geometry matches `flash_attention_forward_tiled`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_forward_tiled(
+                stream,
+                flash::tiled_forward_config(b, t, h, HD),
+                &q,
+                &k,
+                &v,
+                t as u32,
+                h as u32,
+                &mut tiled_y,
+                &mut tiled_logsumexp,
+            )
+        }?;
+        // SAFETY: the launch geometry matches `flash_attention_backward_dot`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_backward_dot(
+                stream,
+                flash::dot_config(n, h, HD),
+                &dy,
+                &tiled_y,
+                HD as u32,
+                &mut softmax_dot,
+            )
+        }?;
+        // SAFETY: the launch geometry matches `flash_attention_backward_q_tiled`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_backward_q_tiled(
+                stream,
+                flash::tiled_backward_q_config(b, t, h, HD),
+                &q,
+                &k,
+                &v,
+                &dy,
+                &tiled_logsumexp,
+                &softmax_dot,
+                t as u32,
+                h as u32,
+                &mut tiled_dq,
+            )
+        }?;
+        // SAFETY: the launch geometry matches `flash_attention_backward_kv_tiled`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_backward_kv_tiled(
+                stream,
+                flash::tiled_backward_kv_config(b, t, h, HD),
+                &q,
+                &k,
+                &v,
+                &dy,
+                &tiled_logsumexp,
+                &softmax_dot,
+                t as u32,
+                h as u32,
+                &mut tiled_dk,
+                &mut tiled_dv,
+            )
+        }?;
         for (name, buffer, first) in [
             ("y", &tiled_y, &first_y),
             ("lse", &tiled_logsumexp, &first_lse),

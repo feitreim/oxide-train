@@ -17,10 +17,18 @@ bindings.
 
 ## 2. Toolchain & dev environment
 
-- **cuda-oxide** (pinned `v0.2.1`, upstream stock backend) compiles `#[kernel]`
+- **cuda-oxide** (pinned rev `2409204733c55b81435abf1db4e5fda8309edead`,
+  upstream `main` 2026-07-18, upstream stock backend) compiles `#[kernel]`
   Rust to PTX through a real rustc codegen backend. Kernels monomorphize like
   host Rust — const generics included — which is what makes the static-shape
-  design (§3) real.
+  design (§3) real. The pin moved off `v0.2.1` to pick up the
+  generated-intrinsics infrastructure (upstream #406) that makes adding
+  missing device intrinsics (e.g. `tcgen05.st` for FA4-style in-TMEM
+  rescaling) substantially cheaper. Since upstream #318, every generated
+  launcher is `unsafe fn` unless the kernel declares a `#[launch_contract]`;
+  we absorb that with `unsafe { }` + SAFETY comments at each launch site
+  rather than adopting contracts (our launch shapes are already asserted by
+  the `*_config` helpers).
 - **Pinned nightly** `nightly-2026-04-03` everywhere (rust-toolchain.toml =
   Modal image), because the codegen backend and cuda-oxide's proc macros
   require it. Bump both together with CUDA_OXIDE_REF.
@@ -530,3 +538,4 @@ Each gated on tests; correctness before speed at every step.
 | 20 | Block tcgen05 keeps fp32 model tensors | Quantize operands into persistent scratch and use concrete fp32-output store/accumulate epilogues; buffers, optimizer/checkpoint layout, and the naive fp32 fallback stay fp32, though epilogue values are bf16-rounded (the drain reuses the packed-bf16 shared-memory staging, so each GEMM result carries bf16 mantissa precision after full-K fp32 accumulation — doubling SMEM_OUT for true fp32 staging wasn't warranted) |
 | 21 | MoE aux-loss coefficient is runtime config, not const | Const generics are reserved for values the compiler specializes on — `E`/`K`/`C` size buffers, bins, and launch grids; the coefficient is one scalar FMA that shapes nothing, needs a step schedule, and must be sweepable without a Modal rebuild (stable Rust also forbids f32 const generics). It flows host→kernel per step like `learning_rate` and is recorded in the checkpoint header like `AdamWConfig` |
 | 22 | MoE router is fp32 over bf16 experts | Routing is discrete: bf16 rounding near a top-k boundary doesn't perturb the output, it reassigns the token (the 7e7 bf16 two-logit tie showed how violently trajectories react to that). The router GEMM is `[N,D]×[D,E]` — skinny, off the tcgen05 tile contract, and a rounding-error share of step FLOPs — so fp32 costs nothing measurable while keeping gate weights and the aux loss in the precision gradcheck trusts |
+| 23 | cuda-oxide pinned to `main` rev `2409204` (2026-07-18), off `v0.2.1` | The FA4-shaped flash-attention plan needs a register→TMEM `tcgen05.st` the June tag lacks; this rev still lacks it but ships the generated-intrinsics path (upstream #406) that makes adding it — locally or upstream — cheap. Also picks up the rustc-independent PTX backend (#314), typed launch contracts (#318, absorbed as `unsafe` launch sites), and `--no-fmad` codegen fixes (#326). Toolchain nightly unchanged; `Cargo.toml` rev and `CUDA_OXIDE_REF` move together per §2 |

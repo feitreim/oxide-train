@@ -52,164 +52,224 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dv = DeviceBuffer::<f32>::zeroed(&stream, N * D)?;
 
     let naive_forward_ms = time_gpu_iters(&stream, 1, 5, || {
-        naive_module.attention_probabilities(
-            &stream,
-            LaunchConfig::for_num_elems((N * H * T) as u32),
-            &q,
-            &k,
-            T as u32,
-            H as u32,
-            HD as u32,
-            &mut probabilities,
-        )?;
-        naive_module.attention_output(
-            &stream,
-            LaunchConfig::for_num_elems((N * D) as u32),
-            &probabilities,
-            &v,
-            T as u32,
-            H as u32,
-            HD as u32,
-            &mut y,
-        )?;
+        // SAFETY: the launch geometry matches `attention_probabilities`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            naive_module.attention_probabilities(
+                &stream,
+                LaunchConfig::for_num_elems((N * H * T) as u32),
+                &q,
+                &k,
+                T as u32,
+                H as u32,
+                HD as u32,
+                &mut probabilities,
+            )
+        }?;
+        // SAFETY: the launch geometry matches `attention_output`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            naive_module.attention_output(
+                &stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                &probabilities,
+                &v,
+                T as u32,
+                H as u32,
+                HD as u32,
+                &mut y,
+            )
+        }?;
         Ok(())
     })?;
     let per_row_forward_ms = time_gpu_iters(&stream, 2, 10, || {
-        flash_module.flash_attention_forward(
-            &stream,
-            per_row_config(),
-            &q,
-            &k,
-            &v,
-            T as u32,
-            H as u32,
-            HD as u32,
-            &mut y,
-            &mut logsumexp,
-        )?;
+        // SAFETY: the launch geometry matches `flash_attention_forward`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_forward(
+                &stream,
+                per_row_config(),
+                &q,
+                &k,
+                &v,
+                T as u32,
+                H as u32,
+                HD as u32,
+                &mut y,
+                &mut logsumexp,
+            )
+        }?;
         Ok(())
     })?;
     let tiled_forward_ms = time_gpu_iters(&stream, 5, 20, || {
-        flash_module.flash_attention_forward_tiled(
-            &stream,
-            flash::tiled_forward_config(B, T, H, HD),
-            &q,
-            &k,
-            &v,
-            T as u32,
-            H as u32,
-            &mut y,
-            &mut logsumexp,
-        )?;
+        // SAFETY: the launch geometry matches `flash_attention_forward_tiled`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_forward_tiled(
+                &stream,
+                flash::tiled_forward_config(B, T, H, HD),
+                &q,
+                &k,
+                &v,
+                T as u32,
+                H as u32,
+                &mut y,
+                &mut logsumexp,
+            )
+        }?;
         Ok(())
     })?;
 
     let naive_backward_ms = time_gpu_iters(&stream, 1, 5, || {
-        naive_module.attention_backward_q(
-            &stream,
-            LaunchConfig::for_num_elems((N * D) as u32),
-            &q,
-            &k,
-            &v,
-            &probabilities,
-            &dy,
-            T as u32,
-            H as u32,
-            HD as u32,
-            &mut dq,
-        )?;
-        naive_module.attention_backward_k(
-            &stream,
-            LaunchConfig::for_num_elems((N * D) as u32),
-            &q,
-            &v,
-            &probabilities,
-            &dy,
-            T as u32,
-            H as u32,
-            HD as u32,
-            &mut dk,
-        )?;
-        naive_module.attention_backward_v(
-            &stream,
-            LaunchConfig::for_num_elems((N * D) as u32),
-            &probabilities,
-            &dy,
-            T as u32,
-            H as u32,
-            HD as u32,
-            &mut dv,
-        )?;
+        // SAFETY: the launch geometry matches `attention_backward_q`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            naive_module.attention_backward_q(
+                &stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                &q,
+                &k,
+                &v,
+                &probabilities,
+                &dy,
+                T as u32,
+                H as u32,
+                HD as u32,
+                &mut dq,
+            )
+        }?;
+        // SAFETY: the launch geometry matches `attention_backward_k`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            naive_module.attention_backward_k(
+                &stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                &q,
+                &v,
+                &probabilities,
+                &dy,
+                T as u32,
+                H as u32,
+                HD as u32,
+                &mut dk,
+            )
+        }?;
+        // SAFETY: the launch geometry matches `attention_backward_v`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            naive_module.attention_backward_v(
+                &stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                &probabilities,
+                &dy,
+                T as u32,
+                H as u32,
+                HD as u32,
+                &mut dv,
+            )
+        }?;
         Ok(())
     })?;
     let per_row_backward_ms = time_gpu_iters(&stream, 2, 10, || {
-        flash_module.flash_attention_backward_q(
-            &stream,
-            per_row_config(),
-            &q,
-            &k,
-            &v,
-            &y,
-            &dy,
-            &logsumexp,
-            T as u32,
-            H as u32,
-            HD as u32,
-            &mut dq,
-        )?;
-        flash_module.flash_attention_backward_kv(
-            &stream,
-            per_row_config(),
-            &q,
-            &k,
-            &v,
-            &y,
-            &dy,
-            &logsumexp,
-            T as u32,
-            H as u32,
-            HD as u32,
-            &mut dk,
-            &mut dv,
-        )?;
+        // SAFETY: the launch geometry matches `flash_attention_backward_q`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_backward_q(
+                &stream,
+                per_row_config(),
+                &q,
+                &k,
+                &v,
+                &y,
+                &dy,
+                &logsumexp,
+                T as u32,
+                H as u32,
+                HD as u32,
+                &mut dq,
+            )
+        }?;
+        // SAFETY: the launch geometry matches `flash_attention_backward_kv`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_backward_kv(
+                &stream,
+                per_row_config(),
+                &q,
+                &k,
+                &v,
+                &y,
+                &dy,
+                &logsumexp,
+                T as u32,
+                H as u32,
+                HD as u32,
+                &mut dk,
+                &mut dv,
+            )
+        }?;
         Ok(())
     })?;
     let tiled_backward_ms = time_gpu_iters(&stream, 5, 20, || {
-        flash_module.flash_attention_backward_dot(
-            &stream,
-            flash::dot_config(N, H, HD),
-            &dy,
-            &y,
-            HD as u32,
-            &mut softmax_dot,
-        )?;
-        flash_module.flash_attention_backward_q_tiled(
-            &stream,
-            flash::tiled_backward_q_config(B, T, H, HD),
-            &q,
-            &k,
-            &v,
-            &dy,
-            &logsumexp,
-            &softmax_dot,
-            T as u32,
-            H as u32,
-            &mut dq,
-        )?;
-        flash_module.flash_attention_backward_kv_tiled(
-            &stream,
-            flash::tiled_backward_kv_config(B, T, H, HD),
-            &q,
-            &k,
-            &v,
-            &dy,
-            &logsumexp,
-            &softmax_dot,
-            T as u32,
-            H as u32,
-            &mut dk,
-            &mut dv,
-        )?;
+        // SAFETY: the launch geometry matches `flash_attention_backward_dot`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_backward_dot(
+                &stream,
+                flash::dot_config(N, H, HD),
+                &dy,
+                &y,
+                HD as u32,
+                &mut softmax_dot,
+            )
+        }?;
+        // SAFETY: the launch geometry matches `flash_attention_backward_q_tiled`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_backward_q_tiled(
+                &stream,
+                flash::tiled_backward_q_config(B, T, H, HD),
+                &q,
+                &k,
+                &v,
+                &dy,
+                &logsumexp,
+                &softmax_dot,
+                T as u32,
+                H as u32,
+                &mut dq,
+            )
+        }?;
+        // SAFETY: the launch geometry matches `flash_attention_backward_kv_tiled`'s grid/block
+        // contract for this shape, and every buffer was allocated to the
+        // extents the kernel indexes.
+        unsafe {
+            flash_module.flash_attention_backward_kv_tiled(
+                &stream,
+                flash::tiled_backward_kv_config(B, T, H, HD),
+                &q,
+                &k,
+                &v,
+                &dy,
+                &logsumexp,
+                &softmax_dot,
+                T as u32,
+                H as u32,
+                &mut dk,
+                &mut dv,
+            )
+        }?;
         Ok(())
     })?;
 

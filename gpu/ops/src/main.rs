@@ -142,19 +142,24 @@ fn check_moe_routing(
     let expert_output_dev = DeviceBuffer::from_host(stream, &expert_outputs)?;
     let mut output_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
 
-    module.router_logits(
-        stream,
-        LaunchConfig {
-            grid_dim: (N as u32, 1, 1),
-            block_dim: (E as u32, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        &x_dev,
-        &weight_dev,
-        D as u32,
-        E as u32,
-        &mut logits_dev,
-    )?;
+    // SAFETY: the launch geometry matches `router_logits`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.router_logits(
+            stream,
+            LaunchConfig {
+                grid_dim: (N as u32, 1, 1),
+                block_dim: (E as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &x_dev,
+            &weight_dev,
+            D as u32,
+            E as u32,
+            &mut logits_dev,
+        )
+    }?;
     unsafe {
         module.router_softmax_topk(
             stream,
@@ -208,18 +213,23 @@ fn check_moe_routing(
             &mut expert_input_dev,
         )?;
     }
-    module.moe_gather_combine(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &expert_output_dev,
-        &selected_dev,
-        &gates_dev,
-        &slots_dev,
-        D as u32,
-        K as u32,
-        C as u32,
-        &mut output_dev,
-    )?;
+    // SAFETY: the launch geometry matches `moe_gather_combine`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.moe_gather_combine(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &expert_output_dev,
+            &selected_dev,
+            &gates_dev,
+            &slots_dev,
+            D as u32,
+            K as u32,
+            C as u32,
+            &mut output_dev,
+        )
+    }?;
 
     assert_close(
         "MoE router logits",
@@ -261,18 +271,23 @@ fn check_moe_routing(
         "MoE scatter must preserve accepted rows and zero-fill unused slots"
     );
     let mut roundtrip_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
-    module.moe_gather_combine(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &expert_input_dev,
-        &selected_dev,
-        &gates_dev,
-        &slots_dev,
-        D as u32,
-        K as u32,
-        C as u32,
-        &mut roundtrip_dev,
-    )?;
+    // SAFETY: the launch geometry matches `moe_gather_combine`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.moe_gather_combine(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &expert_input_dev,
+            &selected_dev,
+            &gates_dev,
+            &slots_dev,
+            D as u32,
+            K as u32,
+            C as u32,
+            &mut roundtrip_dev,
+        )
+    }?;
     let mut expected_roundtrip = vec![0.0f32; N * D];
     for token in 0..N {
         for rank in 0..K {
@@ -368,17 +383,22 @@ fn check_moe_routing(
         .collect();
     let expert_input_gradient_dev = DeviceBuffer::from_host(stream, &expert_input_gradient)?;
     let mut expert_dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
-    module.moe_gather_dx(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &expert_input_gradient_dev,
-        &selected_dev,
-        &slots_dev,
-        D as u32,
-        K as u32,
-        C as u32,
-        &mut expert_dx_dev,
-    )?;
+    // SAFETY: the launch geometry matches `moe_gather_dx`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.moe_gather_dx(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &expert_input_gradient_dev,
+            &selected_dev,
+            &slots_dev,
+            D as u32,
+            K as u32,
+            C as u32,
+            &mut expert_dx_dev,
+        )
+    }?;
     let mut expected_expert_dx = vec![0.0f32; N * D];
     for token in 0..N {
         for rank in 0..K {
@@ -420,23 +440,33 @@ fn check_moe_routing(
             &mut dlogits_dev,
         )?;
     }
-    module.router_backward_input(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &dlogits_dev,
-        &weight_dev,
-        E as u32,
-        &mut router_dx_dev,
-    )?;
-    module.router_backward_weight(
-        stream,
-        LaunchConfig::for_num_elems((D * E) as u32),
-        &x_dev,
-        &dlogits_dev,
-        N as u32,
-        E as u32,
-        &mut serial_router_dweight_dev,
-    )?;
+    // SAFETY: the launch geometry matches `router_backward_input`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.router_backward_input(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &dlogits_dev,
+            &weight_dev,
+            E as u32,
+            &mut router_dx_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `router_backward_weight`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.router_backward_weight(
+            stream,
+            LaunchConfig::for_num_elems((D * E) as u32),
+            &x_dev,
+            &dlogits_dev,
+            N as u32,
+            E as u32,
+            &mut serial_router_dweight_dev,
+        )
+    }?;
     unsafe {
         module.router_backward_weight_tiled(
             stream,
@@ -565,24 +595,34 @@ fn check_rope(
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
 
-    module.rope_forward(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &x_dev,
-        T as u32,
-        H as u32,
-        HD as u32,
-        &mut y_dev,
-    )?;
-    module.rope_backward(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &dy_dev,
-        T as u32,
-        H as u32,
-        HD as u32,
-        &mut dx_dev,
-    )?;
+    // SAFETY: the launch geometry matches `rope_forward`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.rope_forward(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &x_dev,
+            T as u32,
+            H as u32,
+            HD as u32,
+            &mut y_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `rope_backward`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.rope_backward(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &dy_dev,
+            T as u32,
+            H as u32,
+            HD as u32,
+            &mut dx_dev,
+        )
+    }?;
     assert_close(
         "rope y",
         &y_dev.to_host_vec(stream)?,
@@ -626,61 +666,86 @@ fn check_attention(
     let mut dq_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut dk_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut dv_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
-    module.attention_probabilities(
-        stream,
-        LaunchConfig::for_num_elems((N * H * T) as u32),
-        &q_dev,
-        &k_dev,
-        T as u32,
-        H as u32,
-        HD as u32,
-        &mut p_dev,
-    )?;
-    module.attention_output(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &p_dev,
-        &v_dev,
-        T as u32,
-        H as u32,
-        HD as u32,
-        &mut y_dev,
-    )?;
-    module.attention_backward_q(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &q_dev,
-        &k_dev,
-        &v_dev,
-        &p_dev,
-        &dy_dev,
-        T as u32,
-        H as u32,
-        HD as u32,
-        &mut dq_dev,
-    )?;
-    module.attention_backward_k(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &q_dev,
-        &v_dev,
-        &p_dev,
-        &dy_dev,
-        T as u32,
-        H as u32,
-        HD as u32,
-        &mut dk_dev,
-    )?;
-    module.attention_backward_v(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &p_dev,
-        &dy_dev,
-        T as u32,
-        H as u32,
-        HD as u32,
-        &mut dv_dev,
-    )?;
+    // SAFETY: the launch geometry matches `attention_probabilities`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.attention_probabilities(
+            stream,
+            LaunchConfig::for_num_elems((N * H * T) as u32),
+            &q_dev,
+            &k_dev,
+            T as u32,
+            H as u32,
+            HD as u32,
+            &mut p_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `attention_output`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.attention_output(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &p_dev,
+            &v_dev,
+            T as u32,
+            H as u32,
+            HD as u32,
+            &mut y_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `attention_backward_q`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.attention_backward_q(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &q_dev,
+            &k_dev,
+            &v_dev,
+            &p_dev,
+            &dy_dev,
+            T as u32,
+            H as u32,
+            HD as u32,
+            &mut dq_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `attention_backward_k`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.attention_backward_k(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &q_dev,
+            &v_dev,
+            &p_dev,
+            &dy_dev,
+            T as u32,
+            H as u32,
+            HD as u32,
+            &mut dk_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `attention_backward_v`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.attention_backward_v(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &p_dev,
+            &dy_dev,
+            T as u32,
+            H as u32,
+            HD as u32,
+            &mut dv_dev,
+        )
+    }?;
 
     assert_close(
         "attention y",
@@ -743,35 +808,50 @@ fn check_rms_norm(
     let mut dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut dw_dev = DeviceBuffer::<f32>::zeroed(stream, D)?;
 
-    module.rms_norm_forward(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &x_dev,
-        &weight_dev,
-        1e-5,
-        D as u32,
-        &mut y_dev,
-    )?;
-    module.rms_norm_backward_x(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &x_dev,
-        &weight_dev,
-        &dy_dev,
-        1e-5,
-        D as u32,
-        &mut dx_dev,
-    )?;
-    module.rms_norm_backward_weight(
-        stream,
-        LaunchConfig::for_num_elems(D as u32),
-        &x_dev,
-        &dy_dev,
-        1e-5,
-        N as u32,
-        D as u32,
-        &mut dw_dev,
-    )?;
+    // SAFETY: the launch geometry matches `rms_norm_forward`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.rms_norm_forward(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &x_dev,
+            &weight_dev,
+            1e-5,
+            D as u32,
+            &mut y_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `rms_norm_backward_x`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.rms_norm_backward_x(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &x_dev,
+            &weight_dev,
+            &dy_dev,
+            1e-5,
+            D as u32,
+            &mut dx_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `rms_norm_backward_weight`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.rms_norm_backward_weight(
+            stream,
+            LaunchConfig::for_num_elems(D as u32),
+            &x_dev,
+            &dy_dev,
+            1e-5,
+            N as u32,
+            D as u32,
+            &mut dw_dev,
+        )
+    }?;
 
     assert_close(
         "rmsnorm y",
@@ -801,46 +881,61 @@ fn check_rms_norm(
     let mut y_fast_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut dx_fast_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut dw_fast_dev = DeviceBuffer::<f32>::zeroed(stream, D)?;
-    module.rms_norm_row_inv(
-        stream,
-        LaunchConfig {
-            grid_dim: (N as u32, 1, 1),
-            block_dim: (NORM_THREADS as u32, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        &x_dev,
-        1e-5,
-        D as u32,
-        &mut inv_dev,
-    )?;
-    module.rms_norm_forward_fast(
-        stream,
-        LaunchConfig {
-            grid_dim: (N as u32, 1, 1),
-            block_dim: (NORM_THREADS as u32, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        &x_dev,
-        &weight_dev,
-        1e-5,
-        D as u32,
-        &mut y_fast_dev,
-    )?;
-    module.rms_norm_backward_x_fast(
-        stream,
-        LaunchConfig {
-            grid_dim: (N as u32, 1, 1),
-            block_dim: (NORM_THREADS as u32, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        &x_dev,
-        &weight_dev,
-        &dy_dev,
-        1e-5,
-        D as u32,
-        &mut dx_fast_dev,
-        &mut inv_fast_dev,
-    )?;
+    // SAFETY: the launch geometry matches `rms_norm_row_inv`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.rms_norm_row_inv(
+            stream,
+            LaunchConfig {
+                grid_dim: (N as u32, 1, 1),
+                block_dim: (NORM_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &x_dev,
+            1e-5,
+            D as u32,
+            &mut inv_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `rms_norm_forward_fast`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.rms_norm_forward_fast(
+            stream,
+            LaunchConfig {
+                grid_dim: (N as u32, 1, 1),
+                block_dim: (NORM_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &x_dev,
+            &weight_dev,
+            1e-5,
+            D as u32,
+            &mut y_fast_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `rms_norm_backward_x_fast`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.rms_norm_backward_x_fast(
+            stream,
+            LaunchConfig {
+                grid_dim: (N as u32, 1, 1),
+                block_dim: (NORM_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &x_dev,
+            &weight_dev,
+            &dy_dev,
+            1e-5,
+            D as u32,
+            &mut dx_fast_dev,
+            &mut inv_fast_dev,
+        )
+    }?;
     unsafe {
         module.rms_norm_backward_weight_fast(
             stream,
@@ -936,48 +1031,68 @@ fn check_classifier_bf16_case<const N: usize, const C: usize, const CP: usize>(
     let rounded_dev = DeviceBuffer::from_host(stream, &rounded)?;
     let mut oracle_losses = DeviceBuffer::<f32>::zeroed(stream, N)?;
     let mut oracle_dlogits = DeviceBuffer::from_host(stream, &rounded)?;
-    module.fused_classifier_forward(
-        stream,
-        classifier_config,
-        &rounded_dev,
-        &targets_dev,
-        N as u32,
-        C as u32,
-        &mut oracle_losses,
-    )?;
-    module.fused_classifier_backward_in_place(
-        stream,
-        classifier_config,
-        &targets_dev,
-        1.0,
-        N as u32,
-        C as u32,
-        &mut oracle_dlogits,
-    )?;
+    // SAFETY: the launch geometry matches `fused_classifier_forward`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.fused_classifier_forward(
+            stream,
+            classifier_config,
+            &rounded_dev,
+            &targets_dev,
+            N as u32,
+            C as u32,
+            &mut oracle_losses,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `fused_classifier_backward_in_place`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.fused_classifier_backward_in_place(
+            stream,
+            classifier_config,
+            &targets_dev,
+            1.0,
+            N as u32,
+            C as u32,
+            &mut oracle_dlogits,
+        )
+    }?;
 
     let packed_dev = DeviceBuffer::from_host(stream, &packed)?;
     let mut losses = DeviceBuffer::<f32>::zeroed(stream, N)?;
     let mut dlogits = DeviceBuffer::from_host(stream, &packed)?;
-    module.fused_classifier_forward_bf16(
-        stream,
-        classifier_config,
-        &packed_dev,
-        &targets_dev,
-        N as u32,
-        C as u32,
-        CP as u32,
-        &mut losses,
-    )?;
-    module.fused_classifier_backward_in_place_bf16(
-        stream,
-        classifier_config,
-        &targets_dev,
-        1.0,
-        N as u32,
-        C as u32,
-        CP as u32,
-        &mut dlogits,
-    )?;
+    // SAFETY: the launch geometry matches `fused_classifier_forward_bf16`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.fused_classifier_forward_bf16(
+            stream,
+            classifier_config,
+            &packed_dev,
+            &targets_dev,
+            N as u32,
+            C as u32,
+            CP as u32,
+            &mut losses,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `fused_classifier_backward_in_place_bf16`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.fused_classifier_backward_in_place_bf16(
+            stream,
+            classifier_config,
+            &targets_dev,
+            1.0,
+            N as u32,
+            C as u32,
+            CP as u32,
+            &mut dlogits,
+        )
+    }?;
 
     assert_close(
         "bf16 classifier losses vs f32 fused",
@@ -1027,28 +1142,43 @@ fn check_swiglu(
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
     let mut dgate_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
     let mut dup_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
-    module.swiglu_forward(
-        stream,
-        LaunchConfig::for_num_elems(LEN as u32),
-        &gate_dev,
-        &up_dev,
-        &mut y_dev,
-    )?;
-    module.swiglu_backward_gate(
-        stream,
-        LaunchConfig::for_num_elems(LEN as u32),
-        &gate_dev,
-        &up_dev,
-        &dy_dev,
-        &mut dgate_dev,
-    )?;
-    module.swiglu_backward_up(
-        stream,
-        LaunchConfig::for_num_elems(LEN as u32),
-        &gate_dev,
-        &dy_dev,
-        &mut dup_dev,
-    )?;
+    // SAFETY: the launch geometry matches `swiglu_forward`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.swiglu_forward(
+            stream,
+            LaunchConfig::for_num_elems(LEN as u32),
+            &gate_dev,
+            &up_dev,
+            &mut y_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `swiglu_backward_gate`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.swiglu_backward_gate(
+            stream,
+            LaunchConfig::for_num_elems(LEN as u32),
+            &gate_dev,
+            &up_dev,
+            &dy_dev,
+            &mut dgate_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `swiglu_backward_up`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.swiglu_backward_up(
+            stream,
+            LaunchConfig::for_num_elems(LEN as u32),
+            &gate_dev,
+            &dy_dev,
+            &mut dup_dev,
+        )
+    }?;
 
     assert_close(
         "swiglu y",
@@ -1095,23 +1225,33 @@ fn check_embedding(
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut dw_dev = DeviceBuffer::<f32>::zeroed(stream, V * D)?;
     let mut dw_scatter_dev = DeviceBuffer::<f32>::zeroed(stream, V * D)?;
-    module.embedding_forward(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &weight_dev,
-        &tokens_dev,
-        D as u32,
-        &mut y_dev,
-    )?;
-    module.embedding_backward(
-        stream,
-        LaunchConfig::for_num_elems((V * D) as u32),
-        &tokens_dev,
-        &dy_dev,
-        N as u32,
-        D as u32,
-        &mut dw_dev,
-    )?;
+    // SAFETY: the launch geometry matches `embedding_forward`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.embedding_forward(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &weight_dev,
+            &tokens_dev,
+            D as u32,
+            &mut y_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `embedding_backward`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.embedding_backward(
+            stream,
+            LaunchConfig::for_num_elems((V * D) as u32),
+            &tokens_dev,
+            &dy_dev,
+            N as u32,
+            D as u32,
+            &mut dw_dev,
+        )
+    }?;
     unsafe {
         module.embedding_backward_scatter(
             stream,
@@ -1169,15 +1309,20 @@ fn check_group_split_join(
     let mut second = DeviceBuffer::<f32>::zeroed(stream, ROWS * WIDTH)?;
     let mut third = DeviceBuffer::<f32>::zeroed(stream, ROWS * WIDTH)?;
     let elems = LaunchConfig::for_num_elems((ROWS * WIDTH) as u32);
-    module.split_group3(
-        stream,
-        elems,
-        &packed3_dev,
-        WIDTH as u32,
-        &mut first,
-        &mut second,
-        &mut third,
-    )?;
+    // SAFETY: the launch geometry matches `split_group3`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.split_group3(
+            stream,
+            elems,
+            &packed3_dev,
+            WIDTH as u32,
+            &mut first,
+            &mut second,
+            &mut third,
+        )
+    }?;
     for (name, buffer, group) in [
         ("split_group3 first", &first, 0),
         ("split_group3 second", &second, 1),
@@ -1214,14 +1359,19 @@ fn check_group_split_join(
     );
 
     let packed2_dev = DeviceBuffer::from_host(stream, packed2.as_slice())?;
-    module.split_group2(
-        stream,
-        elems,
-        &packed2_dev,
-        WIDTH as u32,
-        &mut first,
-        &mut second,
-    )?;
+    // SAFETY: the launch geometry matches `split_group2`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.split_group2(
+            stream,
+            elems,
+            &packed2_dev,
+            WIDTH as u32,
+            &mut first,
+            &mut second,
+        )
+    }?;
     for (name, buffer, group) in [
         ("split_group2 first", &first, 0),
         ("split_group2 second", &second, 1),
@@ -1279,55 +1429,80 @@ fn check_cross_entropy_case<const N: usize, const C: usize>(
     let mut dlogits_dev = DeviceBuffer::<f32>::zeroed(stream, N * C)?;
     let mut fused_losses_dev = DeviceBuffer::<f32>::zeroed(stream, N)?;
     let mut fused_dlogits_dev = DeviceBuffer::from_host(stream, logits.as_slice())?;
-    module.softmax_forward(
-        stream,
-        LaunchConfig::for_num_elems((N * C) as u32),
-        &logits_dev,
-        C as u32,
-        &mut probabilities_dev,
-    )?;
-    module.cross_entropy_loss(
-        stream,
-        LaunchConfig::for_num_elems(N as u32),
-        &logits_dev,
-        &targets_dev,
-        N as u32,
-        C as u32,
-        &mut losses_dev,
-    )?;
-    module.softmax_cross_entropy_backward(
-        stream,
-        LaunchConfig::for_num_elems((N * C) as u32),
-        &probabilities_dev,
-        &targets_dev,
-        1.0,
-        N as u32,
-        C as u32,
-        &mut dlogits_dev,
-    )?;
+    // SAFETY: the launch geometry matches `softmax_forward`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.softmax_forward(
+            stream,
+            LaunchConfig::for_num_elems((N * C) as u32),
+            &logits_dev,
+            C as u32,
+            &mut probabilities_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `cross_entropy_loss`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.cross_entropy_loss(
+            stream,
+            LaunchConfig::for_num_elems(N as u32),
+            &logits_dev,
+            &targets_dev,
+            N as u32,
+            C as u32,
+            &mut losses_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `softmax_cross_entropy_backward`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.softmax_cross_entropy_backward(
+            stream,
+            LaunchConfig::for_num_elems((N * C) as u32),
+            &probabilities_dev,
+            &targets_dev,
+            1.0,
+            N as u32,
+            C as u32,
+            &mut dlogits_dev,
+        )
+    }?;
     let classifier_config = LaunchConfig {
         grid_dim: (N as u32, 1, 1),
         block_dim: (CLASSIFIER_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     };
-    module.fused_classifier_forward(
-        stream,
-        classifier_config,
-        &logits_dev,
-        &targets_dev,
-        N as u32,
-        C as u32,
-        &mut fused_losses_dev,
-    )?;
-    module.fused_classifier_backward_in_place(
-        stream,
-        classifier_config,
-        &targets_dev,
-        1.0,
-        N as u32,
-        C as u32,
-        &mut fused_dlogits_dev,
-    )?;
+    // SAFETY: the launch geometry matches `fused_classifier_forward`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.fused_classifier_forward(
+            stream,
+            classifier_config,
+            &logits_dev,
+            &targets_dev,
+            N as u32,
+            C as u32,
+            &mut fused_losses_dev,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `fused_classifier_backward_in_place`'s grid/block
+    // contract for these test shapes, and every buffer was allocated to
+    // the extents the kernel indexes.
+    unsafe {
+        module.fused_classifier_backward_in_place(
+            stream,
+            classifier_config,
+            &targets_dev,
+            1.0,
+            N as u32,
+            C as u32,
+            &mut fused_dlogits_dev,
+        )
+    }?;
 
     let losses = losses_dev.to_host_vec(stream)?;
     let fused_losses = fused_losses_dev.to_host_vec(stream)?;

@@ -24,15 +24,18 @@ fn main() {
             .expect("load vecadd.ptx"),
     )
     .expect("wrap loaded module");
-    module
-        .vecadd(
+    // SAFETY: the 1-D launch covers exactly N elements and all three buffers
+    // hold N elements.
+    unsafe {
+        module.vecadd(
             &stream,
             LaunchConfig::for_num_elems(N as u32),
             &a,
             &b,
             &mut c,
         )
-        .expect("kernel launch");
+    }
+    .expect("kernel launch");
 
     let c_host = c.to_host_vec(&stream).unwrap();
 

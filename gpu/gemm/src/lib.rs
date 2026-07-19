@@ -1,6 +1,7 @@
 /*
  * The tcgen05 path is adapted from cuda-oxide's Apache-2.0-licensed
- * `examples/gemm_sol` at the repository's pinned v0.2.1 tag.
+ * `examples/gemm_sol` as it stood at the v0.2.1 tag (the pin this repo
+ * used at the time of the port; see SPEC §2 for the current pin).
  */
 
 //! GEMM performance ladder for the B200 training target.

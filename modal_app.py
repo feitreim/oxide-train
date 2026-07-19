@@ -19,9 +19,9 @@ from pathlib import Path
 
 import modal
 
-# Keep this tag in sync with the git deps in gpu/*/Cargo.toml: the codegen
+# Keep this rev in sync with the git deps in gpu/*/Cargo.toml: the codegen
 # backend and the device/host/core crates must come from the same revision.
-CUDA_OXIDE_REF = "v0.2.1"
+CUDA_OXIDE_REF = "2409204733c55b81435abf1db4e5fda8309edead"
 RUST_TOOLCHAIN = "nightly-2026-04-03"
 GIT_REPO = "https://github.com/NVlabs/cuda-oxide.git"
 TRAINER_REPO = "https://github.com/feitreim/oxide-train.git"
@@ -38,9 +38,9 @@ version = "0.1.0"
 edition = "2024"
 [workspace]
 [dependencies]
-cuda-device = {{ git = "{GIT_REPO}", tag = "{CUDA_OXIDE_REF}" }}
-cuda-host = {{ git = "{GIT_REPO}", tag = "{CUDA_OXIDE_REF}" }}
-cuda-core = {{ git = "{GIT_REPO}", tag = "{CUDA_OXIDE_REF}" }}
+cuda-device = {{ git = "{GIT_REPO}", rev = "{CUDA_OXIDE_REF}" }}
+cuda-host = {{ git = "{GIT_REPO}", rev = "{CUDA_OXIDE_REF}" }}
+cuda-core = {{ git = "{GIT_REPO}", rev = "{CUDA_OXIDE_REF}" }}
 """
 
 WARMUP_MAIN_RS = """
@@ -100,7 +100,7 @@ image = (
         "| sh -s -- -y --default-toolchain none --profile minimal",
         f"rustup toolchain install {RUST_TOOLCHAIN} --profile minimal "
         "-c rust-src -c rustc-dev -c llvm-tools",
-        f"cargo +{RUST_TOOLCHAIN} install --git {GIT_REPO} --tag {CUDA_OXIDE_REF} cargo-oxide",
+        f"cargo +{RUST_TOOLCHAIN} install --git {GIT_REPO} --rev {CUDA_OXIDE_REF} cargo-oxide",
     )
     # Build the codegen backend (slow, one time; baked into this image layer)
     # and compile a trivial kernel end-to-end to prove the toolchain works.

@@ -186,13 +186,18 @@ fn add_into<S: Shape, P: KernelProfiler>(
     name: &'static str,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
-        kernels.add(
-            stream,
-            elementwise_config::<S>(),
-            lhs.as_device_buffer(),
-            rhs.as_device_buffer(),
-            output.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `add`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.add(
+                stream,
+                elementwise_config::<S>(),
+                lhs.as_device_buffer(),
+                rhs.as_device_buffer(),
+                output.as_device_buffer_mut(),
+            )
+        }
     })
 }
 
@@ -204,12 +209,17 @@ fn fill_zero<S: Shape, P: KernelProfiler>(
     name: &'static str,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
-        kernels.fill(
-            stream,
-            elementwise_config::<S>(),
-            0.0,
-            output.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `fill`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.fill(
+                stream,
+                elementwise_config::<S>(),
+                0.0,
+                output.as_device_buffer_mut(),
+            )
+        }
     })
 }
 
@@ -222,13 +232,18 @@ fn sum_into<S: Shape, P: KernelProfiler>(
     name: &'static str,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
-        kernels.sum(
-            stream,
-            reduction_config(),
-            input.as_device_buffer(),
-            S::NUM_ELEMENTS as u32,
-            output.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `sum`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.sum(
+                stream,
+                reduction_config(),
+                input.as_device_buffer(),
+                S::NUM_ELEMENTS as u32,
+                output.as_device_buffer_mut(),
+            )
+        }
     })
 }
 
@@ -242,13 +257,18 @@ fn scale_into<S: Shape, P: KernelProfiler>(
     name: &'static str,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
-        kernels.scale(
-            stream,
-            elementwise_config::<S>(),
-            input.as_device_buffer(),
-            factor,
-            output.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `scale`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.scale(
+                stream,
+                elementwise_config::<S>(),
+                input.as_device_buffer(),
+                factor,
+                output.as_device_buffer_mut(),
+            )
+        }
     })
 }
 
@@ -413,12 +433,17 @@ impl Bf16LinearWeights {
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        kernels.convert_f32_to_bf16_pairs(
-            stream,
-            pairs_config(rows * columns / 2),
-            master,
-            &mut self.normal,
-        )?;
+        // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.convert_f32_to_bf16_pairs(
+                stream,
+                pairs_config(rows * columns / 2),
+                master,
+                &mut self.normal,
+            )
+        }?;
         unsafe {
             kernels.transpose_bf16_pairs(
                 stream,
@@ -553,12 +578,17 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
             && tcgen05_linear_eligible(N, IN, OUT)
         {
             profiler.measure(stream, name, || {
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * IN / 2),
-                    x.as_device_buffer(),
-                    &mut scratch.rows,
-                )?;
+                // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+                // for these compile-time shapes, and every buffer is sized to the
+                // extents the kernel indexes.
+                unsafe {
+                    tensor.convert_f32_to_bf16_pairs(
+                        stream,
+                        pairs_config(N * IN / 2),
+                        x.as_device_buffer(),
+                        &mut scratch.rows,
+                    )
+                }?;
                 unsafe {
                     tcgen05.f32_store(
                         stream,
@@ -594,12 +624,17 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
             && tcgen05_linear_eligible(N, IN, OUT)
         {
             profiler.measure(stream, names[0], || {
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * IN / 2),
-                    x.as_device_buffer(),
-                    &mut scratch.rows,
-                )?;
+                // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+                // for these compile-time shapes, and every buffer is sized to the
+                // extents the kernel indexes.
+                unsafe {
+                    tensor.convert_f32_to_bf16_pairs(
+                        stream,
+                        pairs_config(N * IN / 2),
+                        x.as_device_buffer(),
+                        &mut scratch.rows,
+                    )
+                }?;
                 unsafe {
                     tensor.transpose_bf16_pairs(
                         stream,
@@ -610,12 +645,17 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                         &mut scratch.lhs_t,
                     )?;
                 }
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * OUT / 2),
-                    dy.as_device_buffer(),
-                    &mut scratch.rows,
-                )?;
+                // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+                // for these compile-time shapes, and every buffer is sized to the
+                // extents the kernel indexes.
+                unsafe {
+                    tensor.convert_f32_to_bf16_pairs(
+                        stream,
+                        pairs_config(N * OUT / 2),
+                        dy.as_device_buffer(),
+                        &mut scratch.rows,
+                    )
+                }?;
                 unsafe {
                     tensor.transpose_bf16_pairs(
                         stream,
@@ -717,12 +757,17 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
             && tcgen05_linear_eligible(N, IN, width)
         {
             profiler.measure(stream, name, || {
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * IN / 2),
-                    x.as_device_buffer(),
-                    &mut scratch.rows,
-                )?;
+                // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+                // for these compile-time shapes, and every buffer is sized to the
+                // extents the kernel indexes.
+                unsafe {
+                    tensor.convert_f32_to_bf16_pairs(
+                        stream,
+                        pairs_config(N * IN / 2),
+                        x.as_device_buffer(),
+                        &mut scratch.rows,
+                    )
+                }?;
                 unsafe {
                     tcgen05.f32_store(
                         stream,
@@ -770,12 +815,17 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
             && tcgen05_linear_eligible(N, IN, width)
         {
             profiler.measure(stream, names[0], || {
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * IN / 2),
-                    x.as_device_buffer(),
-                    &mut scratch.rows,
-                )?;
+                // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+                // for these compile-time shapes, and every buffer is sized to the
+                // extents the kernel indexes.
+                unsafe {
+                    tensor.convert_f32_to_bf16_pairs(
+                        stream,
+                        pairs_config(N * IN / 2),
+                        x.as_device_buffer(),
+                        &mut scratch.rows,
+                    )
+                }?;
                 unsafe {
                     tensor.transpose_bf16_pairs(
                         stream,
@@ -786,12 +836,17 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                         &mut scratch.lhs_t,
                     )?;
                 }
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * width / 2),
-                    dy.as_device_buffer(),
-                    &mut scratch.rows,
-                )?;
+                // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+                // for these compile-time shapes, and every buffer is sized to the
+                // extents the kernel indexes.
+                unsafe {
+                    tensor.convert_f32_to_bf16_pairs(
+                        stream,
+                        pairs_config(N * width / 2),
+                        dy.as_device_buffer(),
+                        &mut scratch.rows,
+                    )
+                }?;
                 unsafe {
                     tensor.transpose_bf16_pairs(
                         stream,
@@ -959,12 +1014,17 @@ impl StackedBf16Weights {
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        kernels.convert_f32_to_bf16_pairs(
-            stream,
-            pairs_config(master.len() / 2),
-            master,
-            &mut self.normal,
-        )?;
+        // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.convert_f32_to_bf16_pairs(
+                stream,
+                pairs_config(master.len() / 2),
+                master,
+                &mut self.normal,
+            )
+        }?;
         unsafe {
             kernels.transpose_bf16_pairs(
                 stream,
@@ -1129,12 +1189,17 @@ fn expert_linear_forward<
         && tcgen05_linear_eligible(C, input_width, output_width)
     {
         profiler.measure(stream, name, || {
-            tensor.convert_f32_to_bf16_pairs(
-                stream,
-                pairs_config(E * C * input_width / 2),
-                input,
-                &mut bf16_scratch.rows,
-            )?;
+            // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                tensor.convert_f32_to_bf16_pairs(
+                    stream,
+                    pairs_config(E * C * input_width / 2),
+                    input,
+                    &mut bf16_scratch.rows,
+                )
+            }?;
             let input_maps = bf16_scratch.row_maps.get::<D, FF>(input_width);
             for expert in 0..E {
                 unsafe {
@@ -1230,12 +1295,17 @@ fn expert_linear_backward<
         && tcgen05_linear_eligible(C, input_width, output_width)
     {
         profiler.measure(stream, names[0], || {
-            tensor.convert_f32_to_bf16_pairs(
-                stream,
-                pairs_config(E * C * input_width / 2),
-                input,
-                &mut bf16_scratch.rows,
-            )?;
+            // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                tensor.convert_f32_to_bf16_pairs(
+                    stream,
+                    pairs_config(E * C * input_width / 2),
+                    input,
+                    &mut bf16_scratch.rows,
+                )
+            }?;
             unsafe {
                 tensor.transpose_bf16_pairs(
                     stream,
@@ -1246,12 +1316,17 @@ fn expert_linear_backward<
                     &mut bf16_scratch.lhs_t,
                 )?;
             }
-            tensor.convert_f32_to_bf16_pairs(
-                stream,
-                pairs_config(E * C * output_width / 2),
-                output_gradient,
-                &mut bf16_scratch.rows,
-            )?;
+            // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                tensor.convert_f32_to_bf16_pairs(
+                    stream,
+                    pairs_config(E * C * output_width / 2),
+                    output_gradient,
+                    &mut bf16_scratch.rows,
+                )
+            }?;
             unsafe {
                 tensor.transpose_bf16_pairs(
                     stream,
@@ -1495,23 +1570,33 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             "forward.experts.gate_up_gemm",
         )?;
         profiler.measure(stream, "forward.experts.gate_up_split", || {
-            dense.split_group2(
-                stream,
-                LaunchConfig::for_num_elems((E * C * FF) as u32),
-                workspace.gate_up.as_device_buffer(),
-                FF as u32,
-                workspace.gate.as_device_buffer_mut(),
-                workspace.up.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `split_group2`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.split_group2(
+                    stream,
+                    LaunchConfig::for_num_elems((E * C * FF) as u32),
+                    workspace.gate_up.as_device_buffer(),
+                    FF as u32,
+                    workspace.gate.as_device_buffer_mut(),
+                    workspace.up.as_device_buffer_mut(),
+                )
+            }
         })?;
         profiler.measure(stream, "forward.experts.swiglu", || {
-            dense.swiglu_forward(
-                stream,
-                LaunchConfig::for_num_elems((E * C * FF) as u32),
-                workspace.gate.as_device_buffer(),
-                workspace.up.as_device_buffer(),
-                workspace.activated.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `swiglu_forward`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.swiglu_forward(
+                    stream,
+                    LaunchConfig::for_num_elems((E * C * FF) as u32),
+                    workspace.gate.as_device_buffer(),
+                    workspace.up.as_device_buffer(),
+                    workspace.activated.as_device_buffer_mut(),
+                )
+            }
         })?;
         expert_linear_forward(
             workspace.activated.as_device_buffer(),
@@ -1585,23 +1670,33 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         )?;
         let elementwise = LaunchConfig::for_num_elems((E * C * FF) as u32);
         profiler.measure(stream, "backward.experts.swiglu_gate", || {
-            dense.swiglu_backward_gate(
-                stream,
-                elementwise,
-                workspace.gate.as_device_buffer(),
-                workspace.up.as_device_buffer(),
-                workspace.d_activated.as_device_buffer(),
-                workspace.d_gate.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `swiglu_backward_gate`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.swiglu_backward_gate(
+                    stream,
+                    elementwise,
+                    workspace.gate.as_device_buffer(),
+                    workspace.up.as_device_buffer(),
+                    workspace.d_activated.as_device_buffer(),
+                    workspace.d_gate.as_device_buffer_mut(),
+                )
+            }
         })?;
         profiler.measure(stream, "backward.experts.swiglu_up", || {
-            dense.swiglu_backward_up(
-                stream,
-                elementwise,
-                workspace.gate.as_device_buffer(),
-                workspace.d_activated.as_device_buffer(),
-                workspace.d_up.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `swiglu_backward_up`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.swiglu_backward_up(
+                    stream,
+                    elementwise,
+                    workspace.gate.as_device_buffer(),
+                    workspace.d_activated.as_device_buffer(),
+                    workspace.d_up.as_device_buffer_mut(),
+                )
+            }
         })?;
         profiler.measure(stream, "backward.experts.gate_up_join", || unsafe {
             dense.join_group2(
@@ -1853,15 +1948,20 @@ impl<const D: usize> GpuRmsNorm<D> {
         name: &'static str,
     ) -> Result<(), DriverError> {
         profiler.measure(stream, name, || {
-            kernels.rms_norm_forward_fast(
-                stream,
-                norm_config::<N>(),
-                x.as_device_buffer(),
-                self.w.as_device_buffer(),
-                self.eps,
-                D as u32,
-                y.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `rms_norm_forward_fast`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                kernels.rms_norm_forward_fast(
+                    stream,
+                    norm_config::<N>(),
+                    x.as_device_buffer(),
+                    self.w.as_device_buffer(),
+                    self.eps,
+                    D as u32,
+                    y.as_device_buffer_mut(),
+                )
+            }
         })
     }
 
@@ -1877,17 +1977,22 @@ impl<const D: usize> GpuRmsNorm<D> {
         names: [&'static str; 2],
     ) -> Result<(), DriverError> {
         profiler.measure(stream, names[0], || {
-            kernels.rms_norm_backward_x_fast(
-                stream,
-                norm_config::<N>(),
-                x.as_device_buffer(),
-                self.w.as_device_buffer(),
-                dy.as_device_buffer(),
-                self.eps,
-                D as u32,
-                dx.as_device_buffer_mut(),
-                inv.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `rms_norm_backward_x_fast`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                kernels.rms_norm_backward_x_fast(
+                    stream,
+                    norm_config::<N>(),
+                    x.as_device_buffer(),
+                    self.w.as_device_buffer(),
+                    dy.as_device_buffer(),
+                    self.eps,
+                    D as u32,
+                    dx.as_device_buffer_mut(),
+                    inv.as_device_buffer_mut(),
+                )
+            }
         })?;
         profiler.measure(stream, names[1], || unsafe {
             kernels.rms_norm_backward_weight_fast(
@@ -1930,14 +2035,19 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
         name: &'static str,
     ) -> Result<(), DriverError> {
         profiler.measure(stream, name, || {
-            kernels.embedding_forward(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                self.w.as_device_buffer(),
-                tokens.as_device_buffer(),
-                D as u32,
-                y.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `embedding_forward`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                kernels.embedding_forward(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    self.w.as_device_buffer(),
+                    tokens.as_device_buffer(),
+                    D as u32,
+                    y.as_device_buffer_mut(),
+                )
+            }
         })
     }
 
@@ -2065,7 +2175,10 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         name: &'static str,
     ) -> Result<(), DriverError> {
         profiler.measure(stream, name, || {
-            kernels.fill_u32(stream, pairs_config(D * VP / 2), 0, &mut self.dw)
+            // SAFETY: the launch geometry matches `fill_u32`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe { kernels.fill_u32(stream, pairs_config(D * VP / 2), 0, &mut self.dw) }
         })
     }
 
@@ -2147,22 +2260,27 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        kernels.adamw_master_bf16(
-            stream,
-            pairs_config(D * VP / 2),
-            &self.dw,
-            config.learning_rate,
-            config.beta1,
-            config.beta2,
-            config.epsilon,
-            config.weight_decay,
-            first_correction,
-            second_correction,
-            self.master.as_device_buffer_mut(),
-            moments.first.as_device_buffer_mut(),
-            moments.second.as_device_buffer_mut(),
-            &mut self.w,
-        )
+        // SAFETY: the launch geometry matches `adamw_master_bf16`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.adamw_master_bf16(
+                stream,
+                pairs_config(D * VP / 2),
+                &self.dw,
+                config.learning_rate,
+                config.beta1,
+                config.beta2,
+                config.epsilon,
+                config.weight_decay,
+                first_correction,
+                second_correction,
+                self.master.as_device_buffer_mut(),
+                moments.first.as_device_buffer_mut(),
+                moments.second.as_device_buffer_mut(),
+                &mut self.w,
+            )
+        }
     }
 
     /// Refresh `w_t` from `w` after an optimizer step.
@@ -2650,16 +2768,21 @@ impl GpuMuonScratch {
         gemm: &gemm_kernels::LoadedModule,
     ) -> Result<Vec<f32>, DriverError> {
         let elements = rows * cols;
-        tensor.gather_group(
-            stream,
-            pairs_config(elements),
-            input,
-            1,
-            0,
-            cols as u32,
-            elements as u32,
-            &mut self.x,
-        )?;
+        // SAFETY: the launch geometry matches `gather_group`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            tensor.gather_group(
+                stream,
+                pairs_config(elements),
+                input,
+                1,
+                0,
+                cols as u32,
+                elements as u32,
+                &mut self.x,
+            )
+        }?;
         newton_schulz_orthogonalize(self, rows, cols, steps, stream, tensor, gemm)?;
         let mut values = self.x.to_host_vec(stream)?;
         values.truncate(elements);
@@ -2690,22 +2813,32 @@ fn newton_schulz_orthogonalize(
     let gram_side = rows.min(cols);
     let gram_elements = gram_side * gram_side;
 
-    tensor.sum_squares(
-        stream,
-        reduction_config(),
-        &scratch.x,
-        elements as u32,
-        &mut scratch.sum_squares,
-    )?;
-    tensor.scale_by_inv_norm(
-        stream,
-        pairs_config(elements),
-        &scratch.x,
-        &scratch.sum_squares,
-        NEWTON_SCHULZ_EPSILON,
-        elements as u32,
-        &mut scratch.x_next,
-    )?;
+    // SAFETY: the launch geometry matches `sum_squares`'s grid/block contract
+    // for these compile-time shapes, and every buffer is sized to the
+    // extents the kernel indexes.
+    unsafe {
+        tensor.sum_squares(
+            stream,
+            reduction_config(),
+            &scratch.x,
+            elements as u32,
+            &mut scratch.sum_squares,
+        )
+    }?;
+    // SAFETY: the launch geometry matches `scale_by_inv_norm`'s grid/block contract
+    // for these compile-time shapes, and every buffer is sized to the
+    // extents the kernel indexes.
+    unsafe {
+        tensor.scale_by_inv_norm(
+            stream,
+            pairs_config(elements),
+            &scratch.x,
+            &scratch.sum_squares,
+            NEWTON_SCHULZ_EPSILON,
+            elements as u32,
+            &mut scratch.x_next,
+        )
+    }?;
     std::mem::swap(&mut scratch.x, &mut scratch.x_next);
 
     for _ in 0..steps {
@@ -2725,7 +2858,10 @@ fn newton_schulz_orthogonalize(
             }
         } else {
             // A = X^T X; the fp32 family has no TN store, so zero + accumulate.
-            tensor.fill(stream, pairs_config(gram_elements), 0.0, &mut scratch.gram)?;
+            // SAFETY: the launch geometry matches `fill`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe { tensor.fill(stream, pairs_config(gram_elements), 0.0, &mut scratch.gram) }?;
             unsafe {
                 gemm.register_gemm_tn_accumulate(
                     stream,
@@ -2752,16 +2888,21 @@ fn newton_schulz_orthogonalize(
             )?;
         }
         // B = b A + c A^2
-        tensor.scaled_sum(
-            stream,
-            pairs_config(gram_elements),
-            NEWTON_SCHULZ_B,
-            &scratch.gram,
-            NEWTON_SCHULZ_C,
-            &scratch.gram_squared,
-            gram_elements as u32,
-            &mut scratch.polynomial,
-        )?;
+        // SAFETY: the launch geometry matches `scaled_sum`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            tensor.scaled_sum(
+                stream,
+                pairs_config(gram_elements),
+                NEWTON_SCHULZ_B,
+                &scratch.gram,
+                NEWTON_SCHULZ_C,
+                &scratch.gram_squared,
+                gram_elements as u32,
+                &mut scratch.polynomial,
+            )
+        }?;
         if rows <= cols {
             // X = a X + B X
             unsafe {
@@ -2791,16 +2932,21 @@ fn newton_schulz_orthogonalize(
                 )?;
             }
         }
-        tensor.scaled_sum(
-            stream,
-            pairs_config(elements),
-            NEWTON_SCHULZ_A,
-            &scratch.x,
-            1.0,
-            &scratch.product,
-            elements as u32,
-            &mut scratch.x_next,
-        )?;
+        // SAFETY: the launch geometry matches `scaled_sum`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            tensor.scaled_sum(
+                stream,
+                pairs_config(elements),
+                NEWTON_SCHULZ_A,
+                &scratch.x,
+                1.0,
+                &scratch.product,
+                elements as u32,
+                &mut scratch.x_next,
+            )
+        }?;
         std::mem::swap(&mut scratch.x, &mut scratch.x_next);
     }
     Ok(())
@@ -2829,43 +2975,58 @@ fn muon_step_raw(
 ) -> Result<(), DriverError> {
     let total = rows * groups * cols;
     let per_group = rows * cols;
-    tensor.ema_momentum(
-        stream,
-        pairs_config(total),
-        gradient,
-        config.momentum,
-        momentum,
-    )?;
+    // SAFETY: the launch geometry matches `ema_momentum`'s grid/block contract
+    // for these compile-time shapes, and every buffer is sized to the
+    // extents the kernel indexes.
+    unsafe {
+        tensor.ema_momentum(
+            stream,
+            pairs_config(total),
+            gradient,
+            config.momentum,
+            momentum,
+        )
+    }?;
     let (gradient_weight, momentum_weight) = if config.nesterov {
         (1.0 - config.momentum, config.momentum)
     } else {
         (0.0, 1.0)
     };
-    tensor.scaled_sum(
-        stream,
-        pairs_config(total),
-        gradient_weight,
-        gradient,
-        momentum_weight,
-        momentum,
-        total as u32,
-        &mut scratch.update,
-    )?;
+    // SAFETY: the launch geometry matches `scaled_sum`'s grid/block contract
+    // for these compile-time shapes, and every buffer is sized to the
+    // extents the kernel indexes.
+    unsafe {
+        tensor.scaled_sum(
+            stream,
+            pairs_config(total),
+            gradient_weight,
+            gradient,
+            momentum_weight,
+            momentum,
+            total as u32,
+            &mut scratch.update,
+        )
+    }?;
 
     let aspect_ratio_scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
     let decay = 1.0 - config.learning_rate * config.weight_decay;
     let update_scale = config.learning_rate * aspect_ratio_scale;
     for group in 0..groups {
-        tensor.gather_group(
-            stream,
-            pairs_config(per_group),
-            &scratch.update,
-            groups as u32,
-            group as u32,
-            cols as u32,
-            per_group as u32,
-            &mut scratch.x,
-        )?;
+        // SAFETY: the launch geometry matches `gather_group`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            tensor.gather_group(
+                stream,
+                pairs_config(per_group),
+                &scratch.update,
+                groups as u32,
+                group as u32,
+                cols as u32,
+                per_group as u32,
+                &mut scratch.x,
+            )
+        }?;
         newton_schulz_orthogonalize(
             scratch,
             rows,
@@ -3476,15 +3637,20 @@ impl<
             "forward.qkv_proj.gemm",
         )?;
         profiler.measure(stream, "forward.qkv_proj.split", || {
-            dense.split_group3(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                workspace.qkv.as_device_buffer(),
-                D as u32,
-                workspace.q.as_device_buffer_mut(),
-                workspace.k.as_device_buffer_mut(),
-                workspace.v.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `split_group3`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.split_group3(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    workspace.qkv.as_device_buffer(),
+                    D as u32,
+                    workspace.q.as_device_buffer_mut(),
+                    workspace.k.as_device_buffer_mut(),
+                    workspace.v.as_device_buffer_mut(),
+                )
+            }
         })?;
         rope_into::<N, T, D, H, HD, P>(
             &workspace.q,
@@ -3548,19 +3714,24 @@ impl<
         let routing = workspace.routing.as_mut().expect("MoE routing workspace");
         let experts = workspace.experts.as_mut().expect("MoE expert workspace");
         profiler.measure(stream, "forward.router.logits", || {
-            dense.router_logits(
-                stream,
-                LaunchConfig {
-                    grid_dim: (N as u32, 1, 1),
-                    block_dim: (E as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                workspace.ffn_normalized.as_device_buffer(),
-                self.router.as_device_buffer(),
-                D as u32,
-                E as u32,
-                routing.logits.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `router_logits`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.router_logits(
+                    stream,
+                    LaunchConfig {
+                        grid_dim: (N as u32, 1, 1),
+                        block_dim: (E as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    workspace.ffn_normalized.as_device_buffer(),
+                    self.router.as_device_buffer(),
+                    D as u32,
+                    E as u32,
+                    routing.logits.as_device_buffer_mut(),
+                )
+            }
         })?;
         profiler.measure(stream, "forward.router.topk", || unsafe {
             dense.router_softmax_topk(
@@ -3610,18 +3781,23 @@ impl<
         self.experts
             .forward_profiled(experts, stream, tensor, gemm, gemm_bf16, dense, profiler)?;
         profiler.measure(stream, "forward.router.gather", || {
-            dense.moe_gather_combine(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                experts.bin_output.as_device_buffer(),
-                routing.selected_experts.as_device_buffer(),
-                routing.gate_weights.as_device_buffer(),
-                routing.slots.as_device_buffer(),
-                D as u32,
-                K as u32,
-                C as u32,
-                workspace.projection_output.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `moe_gather_combine`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.moe_gather_combine(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    experts.bin_output.as_device_buffer(),
+                    routing.selected_experts.as_device_buffer(),
+                    routing.gate_weights.as_device_buffer(),
+                    routing.slots.as_device_buffer(),
+                    D as u32,
+                    K as u32,
+                    C as u32,
+                    workspace.projection_output.as_device_buffer_mut(),
+                )
+            }
         })?;
         add_into(
             &workspace.ffn_input,
@@ -3641,12 +3817,17 @@ impl<
             "forward.final_norm",
         )?;
         profiler.measure(stream, "forward.lm_head.quantize", || {
-            tensor.convert_f32_to_bf16_pairs(
-                stream,
-                pairs_config(N * D / 2),
-                workspace.final_normalized.as_device_buffer(),
-                &mut workspace.head_input,
-            )
+            // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                tensor.convert_f32_to_bf16_pairs(
+                    stream,
+                    pairs_config(N * D / 2),
+                    workspace.final_normalized.as_device_buffer(),
+                    &mut workspace.head_input,
+                )
+            }
         })?;
         self.lm_head.forward_into::<NP, P>(
             &workspace.head_input_tma,
@@ -3787,12 +3968,17 @@ impl<
             "backward.lm_head.input_gemm",
         )?;
         profiler.measure(stream, "backward.lm_head.dequantize", || {
-            tensor.convert_bf16_pairs_to_f32(
-                stream,
-                elementwise_config::<Rank2<N, D>>(),
-                &workspace.d_head_input,
-                workspace.d_model_0.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `convert_bf16_pairs_to_f32`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                tensor.convert_bf16_pairs_to_f32(
+                    stream,
+                    elementwise_config::<Rank2<N, D>>(),
+                    &workspace.d_head_input,
+                    workspace.d_model_0.as_device_buffer_mut(),
+                )
+            }
         })?;
         self.final_norm.backward_into(
             &workspace.final_input,
@@ -3833,17 +4019,22 @@ impl<
         self.experts
             .backward_profiled(experts, stream, tensor, gemm, gemm_bf16, dense, profiler)?;
         profiler.measure(stream, "backward.router.gather_dx", || {
-            dense.moe_gather_dx(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                experts.d_bin_input.as_device_buffer(),
-                routing.selected_experts.as_device_buffer(),
-                routing.slots.as_device_buffer(),
-                D as u32,
-                K as u32,
-                C as u32,
-                workspace.d_model_3.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `moe_gather_dx`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.moe_gather_dx(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    experts.d_bin_input.as_device_buffer(),
+                    routing.selected_experts.as_device_buffer(),
+                    routing.slots.as_device_buffer(),
+                    D as u32,
+                    K as u32,
+                    C as u32,
+                    workspace.d_model_3.as_device_buffer_mut(),
+                )
+            }
         })?;
         profiler.measure(stream, "backward.router.softmax", || unsafe {
             dense.router_backward(
@@ -3862,14 +4053,19 @@ impl<
             )
         })?;
         profiler.measure(stream, "backward.router.input", || {
-            dense.router_backward_input(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                routing.dlogits.as_device_buffer(),
-                self.router.as_device_buffer(),
-                E as u32,
-                routing.router_dx.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `router_backward_input`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.router_backward_input(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    routing.dlogits.as_device_buffer(),
+                    self.router.as_device_buffer(),
+                    E as u32,
+                    routing.router_dx.as_device_buffer_mut(),
+                )
+            }
         })?;
         profiler.measure(stream, "backward.router.weight", || unsafe {
             dense.router_backward_weight_tiled(
@@ -4171,15 +4367,20 @@ impl<
             "forward.qkv_proj.gemm",
         )?;
         profiler.measure(stream, "forward.qkv_proj.split", || {
-            dense.split_group3(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                workspace.qkv.as_device_buffer(),
-                D as u32,
-                workspace.q.as_device_buffer_mut(),
-                workspace.k.as_device_buffer_mut(),
-                workspace.v.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `split_group3`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.split_group3(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    workspace.qkv.as_device_buffer(),
+                    D as u32,
+                    workspace.q.as_device_buffer_mut(),
+                    workspace.k.as_device_buffer_mut(),
+                    workspace.v.as_device_buffer_mut(),
+                )
+            }
         })?;
         rope_into::<N, T, D, H, HD, P>(
             &workspace.q,
@@ -4252,14 +4453,19 @@ impl<
             "forward.gate_up_proj.gemm",
         )?;
         profiler.measure(stream, "forward.gate_up_proj.split", || {
-            dense.split_group2(
-                stream,
-                LaunchConfig::for_num_elems((N * FF) as u32),
-                workspace.gate_up.as_device_buffer(),
-                FF as u32,
-                workspace.gate.as_device_buffer_mut(),
-                workspace.up.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `split_group2`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                dense.split_group2(
+                    stream,
+                    LaunchConfig::for_num_elems((N * FF) as u32),
+                    workspace.gate_up.as_device_buffer(),
+                    FF as u32,
+                    workspace.gate.as_device_buffer_mut(),
+                    workspace.up.as_device_buffer_mut(),
+                )
+            }
         })?;
         swiglu_into(
             &workspace.gate,
@@ -4302,12 +4508,17 @@ impl<
         // Rows N..NP of head_input were zeroed at allocation and the convert
         // stops at the fp32 input's length, so they stay zero.
         profiler.measure(stream, "forward.lm_head.quantize", || {
-            tensor.convert_f32_to_bf16_pairs(
-                stream,
-                pairs_config(N * D / 2),
-                workspace.final_normalized.as_device_buffer(),
-                &mut workspace.head_input,
-            )
+            // SAFETY: the launch geometry matches `convert_f32_to_bf16_pairs`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                tensor.convert_f32_to_bf16_pairs(
+                    stream,
+                    pairs_config(N * D / 2),
+                    workspace.final_normalized.as_device_buffer(),
+                    &mut workspace.head_input,
+                )
+            }
         })?;
         self.lm_head.forward_into::<NP, P>(
             &workspace.head_input_tma,
@@ -4413,12 +4624,17 @@ impl<
             "backward.lm_head.input_gemm",
         )?;
         profiler.measure(stream, "backward.lm_head.dequantize", || {
-            tensor.convert_bf16_pairs_to_f32(
-                stream,
-                elementwise_config::<Rank2<N, D>>(),
-                &workspace.d_head_input,
-                workspace.d_model_0.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `convert_bf16_pairs_to_f32`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                tensor.convert_bf16_pairs_to_f32(
+                    stream,
+                    elementwise_config::<Rank2<N, D>>(),
+                    &workspace.d_head_input,
+                    workspace.d_model_0.as_device_buffer_mut(),
+                )
+            }
         })?;
         self.final_norm.backward_into(
             &workspace.final_input,
@@ -4662,27 +4878,37 @@ fn rope_into<
 ) -> Result<(), DriverError> {
     if backward {
         profiler.measure(stream, name, || {
-            kernels.rope_backward(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                x.as_device_buffer(),
-                T as u32,
-                H as u32,
-                HD as u32,
-                y.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `rope_backward`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                kernels.rope_backward(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    x.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    HD as u32,
+                    y.as_device_buffer_mut(),
+                )
+            }
         })?;
     } else {
         profiler.measure(stream, name, || {
-            kernels.rope_forward(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                x.as_device_buffer(),
-                T as u32,
-                H as u32,
-                HD as u32,
-                y.as_device_buffer_mut(),
-            )
+            // SAFETY: the launch geometry matches `rope_forward`'s grid/block contract
+            // for these compile-time shapes, and every buffer is sized to the
+            // extents the kernel indexes.
+            unsafe {
+                kernels.rope_forward(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    x.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    HD as u32,
+                    y.as_device_buffer_mut(),
+                )
+            }
         })?;
     }
     Ok(())
@@ -4706,17 +4932,22 @@ fn flash_attention_forward_into<
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, "forward.attention.flash", || {
-        kernels.flash_attention_forward_tiled(
-            stream,
-            flash_forward_config::<N, T, H, HD>(),
-            q.as_device_buffer(),
-            k.as_device_buffer(),
-            v.as_device_buffer(),
-            T as u32,
-            H as u32,
-            output.as_device_buffer_mut(),
-            logsumexp.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `flash_attention_forward_tiled`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.flash_attention_forward_tiled(
+                stream,
+                flash_forward_config::<N, T, H, HD>(),
+                q.as_device_buffer(),
+                k.as_device_buffer(),
+                v.as_device_buffer(),
+                T as u32,
+                H as u32,
+                output.as_device_buffer_mut(),
+                logsumexp.as_device_buffer_mut(),
+            )
+        }
     })
 }
 
@@ -4744,45 +4975,60 @@ fn flash_attention_backward_into<
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, "backward.attention.flash_dot", || {
-        kernels.flash_attention_backward_dot(
-            stream,
-            flash_dot_config::<N, H, HD>(),
-            dy.as_device_buffer(),
-            output.as_device_buffer(),
-            HD as u32,
-            softmax_dot.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `flash_attention_backward_dot`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.flash_attention_backward_dot(
+                stream,
+                flash_dot_config::<N, H, HD>(),
+                dy.as_device_buffer(),
+                output.as_device_buffer(),
+                HD as u32,
+                softmax_dot.as_device_buffer_mut(),
+            )
+        }
     })?;
     profiler.measure(stream, "backward.attention.flash_q", || {
-        kernels.flash_attention_backward_q_tiled(
-            stream,
-            flash_backward_q_config::<N, T, H, HD>(),
-            q.as_device_buffer(),
-            k.as_device_buffer(),
-            v.as_device_buffer(),
-            dy.as_device_buffer(),
-            logsumexp.as_device_buffer(),
-            softmax_dot.as_device_buffer(),
-            T as u32,
-            H as u32,
-            dq.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `flash_attention_backward_q_tiled`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.flash_attention_backward_q_tiled(
+                stream,
+                flash_backward_q_config::<N, T, H, HD>(),
+                q.as_device_buffer(),
+                k.as_device_buffer(),
+                v.as_device_buffer(),
+                dy.as_device_buffer(),
+                logsumexp.as_device_buffer(),
+                softmax_dot.as_device_buffer(),
+                T as u32,
+                H as u32,
+                dq.as_device_buffer_mut(),
+            )
+        }
     })?;
     profiler.measure(stream, "backward.attention.flash_kv", || {
-        kernels.flash_attention_backward_kv_tiled(
-            stream,
-            flash_backward_kv_config::<N, T, H, HD>(),
-            q.as_device_buffer(),
-            k.as_device_buffer(),
-            v.as_device_buffer(),
-            dy.as_device_buffer(),
-            logsumexp.as_device_buffer(),
-            softmax_dot.as_device_buffer(),
-            T as u32,
-            H as u32,
-            dk.as_device_buffer_mut(),
-            dv.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `flash_attention_backward_kv_tiled`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.flash_attention_backward_kv_tiled(
+                stream,
+                flash_backward_kv_config::<N, T, H, HD>(),
+                q.as_device_buffer(),
+                k.as_device_buffer(),
+                v.as_device_buffer(),
+                dy.as_device_buffer(),
+                logsumexp.as_device_buffer(),
+                softmax_dot.as_device_buffer(),
+                T as u32,
+                H as u32,
+                dk.as_device_buffer_mut(),
+                dv.as_device_buffer_mut(),
+            )
+        }
     })?;
     Ok(())
 }
@@ -4797,13 +5043,18 @@ fn swiglu_into<const N: usize, const FF: usize, P: KernelProfiler>(
     name: &'static str,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, name, || {
-        kernels.swiglu_forward(
-            stream,
-            LaunchConfig::for_num_elems((N * FF) as u32),
-            gate.as_device_buffer(),
-            up.as_device_buffer(),
-            output.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `swiglu_forward`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.swiglu_forward(
+                stream,
+                LaunchConfig::for_num_elems((N * FF) as u32),
+                gate.as_device_buffer(),
+                up.as_device_buffer(),
+                output.as_device_buffer_mut(),
+            )
+        }
     })?;
     Ok(())
 }
@@ -4820,23 +5071,33 @@ fn swiglu_backward_into<const N: usize, const FF: usize, P: KernelProfiler>(
 ) -> Result<(), DriverError> {
     let config = LaunchConfig::for_num_elems((N * FF) as u32);
     profiler.measure(stream, "backward.swiglu.gate", || {
-        kernels.swiglu_backward_gate(
-            stream,
-            config,
-            gate.as_device_buffer(),
-            up.as_device_buffer(),
-            dy.as_device_buffer(),
-            dgate.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `swiglu_backward_gate`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.swiglu_backward_gate(
+                stream,
+                config,
+                gate.as_device_buffer(),
+                up.as_device_buffer(),
+                dy.as_device_buffer(),
+                dgate.as_device_buffer_mut(),
+            )
+        }
     })?;
     profiler.measure(stream, "backward.swiglu.up", || {
-        kernels.swiglu_backward_up(
-            stream,
-            config,
-            gate.as_device_buffer(),
-            dy.as_device_buffer(),
-            dup.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `swiglu_backward_up`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.swiglu_backward_up(
+                stream,
+                config,
+                gate.as_device_buffer(),
+                dy.as_device_buffer(),
+                dup.as_device_buffer_mut(),
+            )
+        }
     })?;
     Ok(())
 }
@@ -4854,16 +5115,21 @@ fn cross_entropy_into<const N: usize, const VOCAB: usize, const VP: usize, P: Ke
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, "forward.loss.fused_classifier", || {
-        dense.fused_classifier_forward_bf16(
-            stream,
-            classifier_config::<N>(),
-            logits,
-            targets.as_device_buffer(),
-            N as u32,
-            VOCAB as u32,
-            VP as u32,
-            losses.as_device_buffer_mut(),
-        )
+        // SAFETY: the launch geometry matches `fused_classifier_forward_bf16`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            dense.fused_classifier_forward_bf16(
+                stream,
+                classifier_config::<N>(),
+                logits,
+                targets.as_device_buffer(),
+                N as u32,
+                VOCAB as u32,
+                VP as u32,
+                losses.as_device_buffer_mut(),
+            )
+        }
     })?;
     sum_into(
         losses,
@@ -4897,15 +5163,20 @@ fn cross_entropy_backward_into<
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, "backward.loss.fused_classifier", || {
-        kernels.fused_classifier_backward_in_place_bf16(
-            stream,
-            classifier_config::<N>(),
-            targets.as_device_buffer(),
-            1.0,
-            N as u32,
-            VOCAB as u32,
-            VP as u32,
-            dlogits,
-        )
+        // SAFETY: the launch geometry matches `fused_classifier_backward_in_place_bf16`'s grid/block contract
+        // for these compile-time shapes, and every buffer is sized to the
+        // extents the kernel indexes.
+        unsafe {
+            kernels.fused_classifier_backward_in_place_bf16(
+                stream,
+                classifier_config::<N>(),
+                targets.as_device_buffer(),
+                1.0,
+                N as u32,
+                VOCAB as u32,
+                VP as u32,
+                dlogits,
+            )
+        }
     })
 }
