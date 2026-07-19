@@ -26,6 +26,11 @@
 use cuda_core::LaunchConfig;
 use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread};
 
+// Host-only tcgen05 support (flash.ptx loader, TMA maps); no device code, so
+// including it never affects an artifact. Not every including binary uses it.
+#[allow(dead_code)]
+pub mod host;
+
 /// Maximum supported head width. This bounds the statically allocated shared
 /// reduction buffer; actual launches use exactly `head_dim` threads.
 pub const MAX_HEAD_DIM: usize = 256;
@@ -88,6 +93,45 @@ const STATIC_SHARED_LIMIT: usize = 48 * 1024;
 #[cuda_module]
 pub mod kernels {
     use super::*;
+
+    #[inline(always)]
+    fn f32_to_bf16_rne(value: f32) -> u16 {
+        let bits = value.to_bits();
+        let round = 0x7fffu32 + ((bits >> 16) & 1);
+        (bits.wrapping_add(round) >> 16) as u16
+    }
+
+    /// De-interleave fp32 `[B*T, H*64]` activations into the packed-bf16
+    /// head panels `[B*H, T, 64]` the tcgen05 forward streams with TMA,
+    /// folding `scale` into the quantization (`1.0` for K/V;
+    /// `softmax_scale * log2(e)` for Q, which makes downstream softmax math
+    /// base-2 native). One thread per packed output pair; launch with
+    /// [`stage_heads_config`].
+    #[kernel]
+    pub fn stage_attention_heads_bf16(
+        input: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        scale: f32,
+        mut output: DisjointSlice<u32>,
+    ) {
+        const PAIRS_PER_ROW: usize = TILE_HD / 2;
+        let index = thread::index_1d();
+        let word = index.get();
+        let t = sequence_length as usize;
+        let h = heads as usize;
+        let pair = word % PAIRS_PER_ROW;
+        let token = (word / PAIRS_PER_ROW) % t;
+        let plane = word / (PAIRS_PER_ROW * t);
+        let batch = plane / h;
+        let head = plane % h;
+        let base = ((batch * t + token) * h + head) * TILE_HD + pair * 2;
+        if let Some(slot) = output.get_mut(index) {
+            let low = f32_to_bf16_rne(input[base] * scale) as u32;
+            let high = f32_to_bf16_rne(input[base + 1] * scale) as u32;
+            *slot = low | (high << 16);
+        }
+    }
 
     /// Flash-style causal attention forward using an online softmax.
     #[kernel]
@@ -1267,6 +1311,15 @@ pub fn tiled_backward_q_config(
         BWQ_THREADS,
         2 * BWQ_BQ * TILE_HD + 2 * BWQ_BK * TILE_HD + BWQ_BQ * BWQ_BK + 2 * BWQ_BQ,
     )
+}
+
+/// Launch shape for [`kernels::stage_attention_heads_bf16`]: one thread per
+/// packed bf16 output pair.
+pub fn stage_heads_config(rows: usize, heads: usize, head_dim: usize) -> LaunchConfig {
+    assert_eq!(head_dim, TILE_HD, "staging specializes on TILE_HD");
+    let words = rows * heads * head_dim / 2;
+    assert!(words <= u32::MAX as usize);
+    LaunchConfig::for_num_elems(words as u32)
 }
 
 /// Launch shape for [`kernels::flash_attention_backward_kv_tiled`].
