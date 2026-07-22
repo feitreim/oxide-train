@@ -24,7 +24,8 @@ mod tcgen05_device;
 
 use host::{
     FLASH_HD, FLASH_TILE, Tcgen05Flash, correction_count_len, create_flash_head_tma_map,
-    device_sm_count, flash_forward_config, flash_persistent_config, flash_pipelined_config,
+    device_sm_count, flash_backward_kv_config, flash_backward_q_config, flash_forward_config,
+    flash_persistent_config, flash_pipelined_config,
 };
 
 /// Which forward kernel a gate or bench exercises; all three share the
@@ -424,6 +425,170 @@ fn check_forward(
     Ok(())
 }
 
+/// Backward parity for the two tcgen05 gradient kernels against a CPU
+/// reference computed from the same staged bf16 operands (exact exp2, f64
+/// accumulation), mirroring the exact operations each kernel issues so the
+/// tolerance covers only device-side arithmetic: fp32 tensor-core
+/// accumulation, the exp2 polynomial, and the bf16 rounding of the P/dS
+/// operands. The saved LSE (natural log) and softmax dot are computed on the
+/// CPU and fed to the kernels exactly as the model's `backward_dot` would.
+fn check_backward(
+    stream: &Arc<CudaStream>,
+    flash: &Tcgen05Flash,
+    b: usize,
+    t: usize,
+    h: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let d = h * FLASH_HD;
+    let n = b * t;
+    let q = uniform_vec(n * d, 61);
+    let k = uniform_vec(n * d, 62);
+    let v = uniform_vec(n * d, 63);
+    let dy = uniform_vec(n * d, 64);
+    let q_scale = LOG2_E / (FLASH_HD as f32).sqrt();
+    let q_staged = stage_heads(&q, b, t, h, q_scale);
+    let k_staged = stage_heads(&k, b, t, h, 1.0);
+    let v_staged = stage_heads(&v, b, t, h, 1.0);
+    let dy_staged = stage_heads(&dy, b, t, h, 1.0);
+
+    let scale = 1.0 / (FLASH_HD as f64).sqrt();
+    let mut lse = vec![0.0f32; n * h];
+    let mut dot = vec![0.0f32; n * h];
+    let mut expected_dq = vec![0.0f32; n * d];
+    let mut expected_dk = vec![0.0f32; n * d];
+    let mut expected_dv = vec![0.0f32; n * d];
+    for plane in 0..b * h {
+        let (batch, head) = (plane / h, plane % h);
+        // Per query row: base-2 scores, row max, denominator, and dot.
+        let mut probabilities = vec![vec![0.0f64; t]; t];
+        let mut dp = vec![vec![0.0f64; t]; t];
+        let mut row_dot = vec![0.0f64; t];
+        for query in 0..t {
+            let mut row_max = f64::NEG_INFINITY;
+            for key in 0..=query {
+                let mut score = 0.0f64;
+                for feature in 0..FLASH_HD {
+                    score += staged_value(&q_staged, t, plane, query, feature) as f64
+                        * staged_value(&k_staged, t, plane, key, feature) as f64;
+                }
+                probabilities[query][key] = score;
+                row_max = row_max.max(score);
+            }
+            let mut denominator = 0.0f64;
+            for key in 0..=query {
+                let value = (probabilities[query][key] - row_max).exp2();
+                probabilities[query][key] = value;
+                denominator += value;
+            }
+            for key in 0..=query {
+                probabilities[query][key] /= denominator;
+            }
+            let mut acc_dot = 0.0f64;
+            for feature in 0..FLASH_HD {
+                let mut y = 0.0f64;
+                for key in 0..=query {
+                    y += probabilities[query][key]
+                        * staged_value(&v_staged, t, plane, key, feature) as f64;
+                }
+                acc_dot += staged_value(&dy_staged, t, plane, query, feature) as f64 * y;
+            }
+            row_dot[query] = acc_dot;
+            for key in 0..=query {
+                let mut value = 0.0f64;
+                for feature in 0..FLASH_HD {
+                    value += staged_value(&dy_staged, t, plane, query, feature) as f64
+                        * staged_value(&v_staged, t, plane, key, feature) as f64;
+                }
+                dp[query][key] = value;
+            }
+            let row = batch * t + query;
+            lse[row * h + head] = (LN_2 * (row_max + denominator.log2())) as f32;
+            dot[row * h + head] = acc_dot as f32;
+        }
+        // dQ = Σ_k dS·K (scale folded), dK = Σ_q dSᵀ·Q_staged (ln2 folded so
+        // ln2·scale·log2e = scale), dV = Σ_q Pᵀ·dY.
+        for query in 0..t {
+            let out = (batch * t + query) * d + head * FLASH_HD;
+            for feature in 0..FLASH_HD {
+                let mut value = 0.0f64;
+                for key in 0..=query {
+                    let dscore =
+                        probabilities[query][key] * (dp[query][key] - row_dot[query]) * scale;
+                    value += dscore * staged_value(&k_staged, t, plane, key, feature) as f64;
+                }
+                expected_dq[out + feature] = value as f32;
+            }
+        }
+        for key in 0..t {
+            let out = (batch * t + key) * d + head * FLASH_HD;
+            for feature in 0..FLASH_HD {
+                let mut dk_value = 0.0f64;
+                let mut dv_value = 0.0f64;
+                for query in key..t {
+                    let probability = probabilities[query][key];
+                    let dscore = probability * (dp[query][key] - row_dot[query]) * LN_2;
+                    dk_value += dscore * staged_value(&q_staged, t, plane, query, feature) as f64;
+                    dv_value +=
+                        probability * staged_value(&dy_staged, t, plane, query, feature) as f64;
+                }
+                expected_dk[out + feature] = dk_value as f32;
+                expected_dv[out + feature] = dv_value as f32;
+            }
+        }
+    }
+
+    let q_device = DeviceBuffer::from_host(stream, &q_staged)?;
+    let k_device = DeviceBuffer::from_host(stream, &k_staged)?;
+    let v_device = DeviceBuffer::from_host(stream, &v_staged)?;
+    let dy_device = DeviceBuffer::from_host(stream, &dy_staged)?;
+    let q_tma = unsafe { create_flash_head_tma_map(stream, &q_device, t, b * h)? };
+    let k_tma = unsafe { create_flash_head_tma_map(stream, &k_device, t, b * h)? };
+    let v_tma = unsafe { create_flash_head_tma_map(stream, &v_device, t, b * h)? };
+    let dy_tma = unsafe { create_flash_head_tma_map(stream, &dy_device, t, b * h)? };
+    let lse_device = DeviceBuffer::from_host(stream, &lse)?;
+    let dot_device = DeviceBuffer::from_host(stream, &dot)?;
+
+    let mut dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    unsafe {
+        flash.backward_q(
+            stream,
+            flash_backward_q_config(b, t, h),
+            q_tma.as_ptr(),
+            k_tma.as_ptr(),
+            v_tma.as_ptr(),
+            dy_tma.as_ptr(),
+            &lse_device,
+            &dot_device,
+            t as u32,
+            h as u32,
+            &mut dq,
+        )?;
+        flash.backward_kv(
+            stream,
+            flash_backward_kv_config(b, t, h),
+            q_tma.as_ptr(),
+            k_tma.as_ptr(),
+            v_tma.as_ptr(),
+            dy_tma.as_ptr(),
+            &lse_device,
+            &dot_device,
+            t as u32,
+            h as u32,
+            &mut dk,
+            &mut dv,
+        )?;
+    }
+    println!(
+        "tcgen05 backward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]"
+    );
+    assert_close("dq", &dq.to_host_vec(stream)?, &expected_dq, 5.0e-3, 5.0e-3);
+    assert_close("dk", &dk.to_host_vec(stream)?, &expected_dk, 5.0e-3, 5.0e-3);
+    assert_close("dv", &dv.to_host_vec(stream)?, &expected_dv, 5.0e-3, 5.0e-3);
+    Ok(())
+}
+
 /// Sum the per-workstream correction counts and report them against the
 /// number of key-tile visits that could have corrected (everything past
 /// each stream's first tile).
@@ -505,6 +670,56 @@ fn bench(
         );
     }
     print_correction_rate(stream, &corrections, b, t, h)?;
+
+    // Backward kernels at the same shape. Per key-tile visit each kernel
+    // issues its two 128x128x64 score GEMMs plus a 128x64x128 gradient GEMM
+    // (kernel A: dQ; kernel B: dV and dK — three gradient GEMMs there), so the
+    // combined backward MMA work is 5 GEMMs per visit against the forward's 2.
+    let dy_staged = stage_heads(&uniform_vec(n * d, 84), b, t, h, 1.0);
+    let dy_device = DeviceBuffer::from_host(stream, &dy_staged)?;
+    let dy_tma = unsafe { create_flash_head_tma_map(stream, &dy_device, t, b * h)? };
+    let lse_in = DeviceBuffer::from_host(stream, &vec![0.0f32; n * h])?;
+    let dot_in = DeviceBuffer::from_host(stream, &vec![0.0f32; n * h])?;
+    let mut dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let backward_flop = visits * 5.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    let milliseconds = time_gpu_iters(stream, 3, 20, || {
+        unsafe {
+            flash.backward_q(
+                stream,
+                flash_backward_q_config(b, t, h),
+                q_tma.as_ptr(),
+                k_tma.as_ptr(),
+                v_tma.as_ptr(),
+                dy_tma.as_ptr(),
+                &lse_in,
+                &dot_in,
+                t as u32,
+                h as u32,
+                &mut dq,
+            )?;
+            flash.backward_kv(
+                stream,
+                flash_backward_kv_config(b, t, h),
+                q_tma.as_ptr(),
+                k_tma.as_ptr(),
+                v_tma.as_ptr(),
+                dy_tma.as_ptr(),
+                &lse_in,
+                &dot_in,
+                t as u32,
+                h as u32,
+                &mut dk,
+                &mut dv,
+            )?;
+        }
+        Ok(())
+    })?;
+    println!(
+        "tcgen05 sync backward [{b},{t},{h},{FLASH_HD}]: {milliseconds:.3} ms, {:.1} TFLOP/s",
+        backward_flop / (milliseconds * 1.0e-3) / 1.0e12
+    );
     Ok(())
 }
 
@@ -532,6 +747,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcgen05_device::FLASH_PERSISTENT_BLOCK,
         "host.rs and tcgen05.rs disagree on the persistent block width"
     );
+    assert_eq!(
+        host::FLASH_BACKWARD_Q_SMEM_BYTES as usize,
+        tcgen05_device::FLASH_BACKWARD_Q_SMEM,
+        "host.rs and tcgen05.rs disagree on the kernel-A shared plan"
+    );
+    assert_eq!(
+        host::FLASH_BACKWARD_KV_SMEM_BYTES as usize,
+        tcgen05_device::FLASH_BACKWARD_KV_SMEM,
+        "host.rs and tcgen05.rs disagree on the kernel-B shared plan"
+    );
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let flash = Tcgen05Flash::load_from_ptx(&ctx, "flash.ptx")?;
@@ -551,6 +776,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_forward(&stream, &flash, sm_count, 1, 384, 2)?;
     check_forward(&stream, &flash, sm_count, 1, 512, 2)?;
     check_forward(&stream, &flash, sm_count, 4, 256, 38)?;
+    check_backward(&stream, &flash, 2, 128, 3)?;
+    check_backward(&stream, &flash, 1, 256, 2)?;
+    check_backward(&stream, &flash, 1, 1024, 4)?;
     println!("✓ tcgen05 parity passed");
     bench(&stream, &flash, sm_count)?;
     Ok(())

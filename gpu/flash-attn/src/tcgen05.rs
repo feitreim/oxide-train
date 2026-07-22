@@ -1,4 +1,5 @@
-//! FA4-shaped tcgen05 attention forward (issue #35, phases 1–3).
+//! FA4-shaped tcgen05 attention forward (issue #35, phases 1–3) and backward
+//! (phase 4).
 //!
 //! This module compiles ONLY into `src/bin/flash.rs`, whose device artifact
 //! takes the pure-PTX path and ships as `flash.ptx`. It must never be reached
@@ -49,6 +50,20 @@
 //!   ping-pong adjacent query tiles over one shared K/V ring and one MMA
 //!   warp, and CTAs run a static persistent work-item loop. See the kernel
 //!   doc for the scheduling and barrier story.
+//!
+//! Phase 4 adds two synchronous backward kernels sharing the same idioms —
+//! the swizzle-aware bf16 fragment writes, the transposed-B gradient MMA
+//! shape, and the fp32 TMEM accumulators. `flash_backward_q_tcgen05`
+//! (query-parallel) recomputes `S`/`dP` per key tile and accumulates
+//! `dQ += dS·K`; `flash_backward_kv_tcgen05` (key-parallel) recomputes the
+//! transposed `Sᵀ`/`dPᵀ` per query tile and accumulates `dV += Pᵀ·dY` and
+//! `dK += dSᵀ·Q`. Probabilities are recomputed base-2 from the saved LSE
+//! (`P = exp2(s − lse·log2e)`, no running-max machinery); gradient writes are
+//! disjoint by tile so there are no atomics. The three-kernel split
+//! (`backward_dot` stays fp32 in `lib.rs`, then dQ, then dK/dV) keeps the
+//! gradient outputs disjoint. Both take the packed-bf16 Q/K/V/dY staging
+//! panels plus the read-only `logsumexp` (natural log) and `dot` (`Σ dy·y`)
+//! device slices, and write fp32 `dq`/`dk`/`dv`.
 
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{
@@ -89,6 +104,15 @@ pub const FLASH_PIPELINE_SMEM: usize = (3 + 2 * PIPELINE_STAGES) * TILE_BYTES;
 /// warpgroup plus the TMA-load warp and the MMA-issue warp.
 pub const FLASH_PIPELINE_BLOCK: usize = TILE + 64;
 
+/// Dynamic shared plan of the synchronous query-parallel backward (kernel A):
+/// the resident Q and dY tiles, the streamed K and V tiles, and the two
+/// stacked dS subtiles.
+pub const FLASH_BACKWARD_Q_SMEM: usize = 6 * TILE_BYTES;
+/// Dynamic shared plan of the synchronous key-parallel backward (kernel B):
+/// the resident K and V tiles, the streamed Q and dY tiles, and the two
+/// stacked subtile pairs (Pᵀ and dSᵀ).
+pub const FLASH_BACKWARD_KV_SMEM: usize = 8 * TILE_BYTES;
+
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
 /// most `2^CORRECTION_THRESHOLD`, comfortably inside bf16 range and the fp32
@@ -116,6 +140,12 @@ pub mod kernels {
     use super::*;
 
     const LN2: f32 = 0.693_147_18;
+    /// Softmax scale for `HD == 64` (`1/sqrt(64)`), written as a literal
+    /// because `1.0/(HD as f32).sqrt()` would lower to libdevice `sqrtf`.
+    const SCALE: f32 = 0.125;
+    /// `log2(e)`, converting the saved natural-log LSE into the base-2 domain
+    /// the recomputed probabilities live in.
+    const LOG2E: f32 = 1.442_695_04;
 
     /// Same encoding as gemm's operand descriptors: SWIZZLE_128B tiles with a
     /// 16-byte leading offset and 1024-byte stride.
@@ -518,6 +548,290 @@ pub mod kernels {
                 let b_descriptor = smem_descriptor(k_smem as u64 + chunk * 32);
                 tcgen05_mma_f16(s_tmem, a_descriptor, b_descriptor, s_instruction, chunk > 0);
                 chunk += 1;
+            }
+        }
+    }
+
+    /// Store one thread's eight-value bf16 fragment into a stacked
+    /// SWIZZLE_128B `[128, 128]` subtile pair, exactly like `softmax_tile`'s
+    /// pass-2 P-write: the two `stmatrix` targets carry the 16-byte-chunk XOR
+    /// the TMA swizzle would produce, folding in the tile base's absolute
+    /// 128-byte row phase, so the accumulating MMA reads the operand like a
+    /// TMA-loaded tile. Shared by both backward kernels (dS for kernel A, Pᵀ
+    /// and dSᵀ for kernel B).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn write_bf16_fragment(
+        smem: *mut u8,
+        phase: usize,
+        tmem_row: u32,
+        column_block: u32,
+        lane: u32,
+        a0: f32,
+        a1: f32,
+        a8: f32,
+        a9: f32,
+        b0: f32,
+        b1: f32,
+        b8: f32,
+        b9: f32,
+    ) {
+        unsafe {
+            let subtile = (column_block / 4) as usize * TILE_BYTES;
+            let chunk_low = ((column_block % 4) * 2) as usize;
+            let chunk = if (8..16).contains(&lane) { chunk_low + 1 } else { chunk_low };
+            let row_low = tmem_row as usize + (lane % 8) as usize;
+            let row_high = row_low + 8;
+            let address_low =
+                smem.add(subtile + row_low * 128 + (chunk ^ ((row_low + phase) & 7)) * 16);
+            let address_high =
+                smem.add(subtile + row_high * 128 + (chunk ^ ((row_high + phase) & 7)) * 16);
+            stmatrix_m8n8_x2(address_low, cvt_f32x2_bf16x2(a0, a1), cvt_f32x2_bf16x2(a8, a9));
+            stmatrix_m8n8_x2(address_high, cvt_f32x2_bf16x2(b0, b1), cvt_f32x2_bf16x2(b8, b9));
+        }
+    }
+
+    /// True `dS = P·(dP − D)·scale` for one score element, base-2 domain.
+    /// `s` is the staged pre-scaled score (`scale·log2e·(q·k)`) so the
+    /// probability is `exp2(s − lse2)`; `keep` is false only on masked
+    /// diagonal positions, where the gradient is a literal zero rather than
+    /// `exp2` of `MASKED_SCORE`. `factor` folds the operand scaling the MMA
+    /// leaves for the caller (`scale` for dQ against unscaled K; `ln2` for dK
+    /// against the pre-scaled Q, since `ln2·scale·log2e = scale`).
+    #[inline(always)]
+    fn backward_dscore(s: f32, dp: f32, lse2: f32, dot: f32, factor: f32, keep: bool) -> f32 {
+        if keep {
+            exp2_approx(s - lse2) * (dp - dot) * factor
+        } else {
+            0.0
+        }
+    }
+
+    /// One key tile of the query-parallel backward register pass (kernel A):
+    /// drain `S` and `dP` from TMEM through the 16x256b fragment map,
+    /// recompute `P = exp2(s − lse2[row])`, form `dS = P·(dP − dot[row])·scale`
+    /// (diagonal positions past the causal edge are zero), and store the bf16
+    /// dS into the two stacked SWIZZLE_128B subtiles. `lse2`/`dot` are the
+    /// query tile's per-row statistics staged in shared memory; rows are query
+    /// rows, so both index by the fragment's row coordinate.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn backward_q_tile(
+        s_tmem: u32,
+        dp_tmem: u32,
+        diagonal: bool,
+        warp_id: u32,
+        lane: u32,
+        lse2: *const f32,
+        dot: *const f32,
+        ds_smem: *mut u8,
+        ds_phase: usize,
+    ) {
+        unsafe {
+            let quad = (lane % 4) as usize;
+            let row_in_16 = (lane / 4) as usize;
+            let mut row_block = 0u32;
+            while row_block < 2 {
+                let tmem_row = warp_id * 32 + row_block * 16;
+                let mut column_block = 0u32;
+                while column_block < 8 {
+                    let column = column_block * 16;
+                    let s_low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
+                    tcgen05_load_wait();
+                    let s_high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
+                    tcgen05_load_wait();
+                    let dp_low = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column);
+                    tcgen05_load_wait();
+                    let dp_high = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column + 8);
+                    tcgen05_load_wait();
+                    let row_a = tmem_row + row_in_16 as u32;
+                    let row_b = row_a + 8;
+                    let col = column + 2 * quad as u32;
+                    let lse_a = *lse2.add(row_a as usize);
+                    let dot_a = *dot.add(row_a as usize);
+                    let lse_b = *lse2.add(row_b as usize);
+                    let dot_b = *dot.add(row_b as usize);
+
+                    let ds_a0 =
+                        backward_dscore(s_low[0], dp_low[0], lse_a, dot_a, SCALE, !diagonal || col <= row_a);
+                    let ds_a1 = backward_dscore(
+                        s_low[1], dp_low[1], lse_a, dot_a, SCALE, !diagonal || col + 1 <= row_a,
+                    );
+                    let ds_a8 = backward_dscore(
+                        s_high[0], dp_high[0], lse_a, dot_a, SCALE, !diagonal || col + 8 <= row_a,
+                    );
+                    let ds_a9 = backward_dscore(
+                        s_high[1], dp_high[1], lse_a, dot_a, SCALE, !diagonal || col + 9 <= row_a,
+                    );
+                    let ds_b0 =
+                        backward_dscore(s_low[2], dp_low[2], lse_b, dot_b, SCALE, !diagonal || col <= row_b);
+                    let ds_b1 = backward_dscore(
+                        s_low[3], dp_low[3], lse_b, dot_b, SCALE, !diagonal || col + 1 <= row_b,
+                    );
+                    let ds_b8 = backward_dscore(
+                        s_high[2], dp_high[2], lse_b, dot_b, SCALE, !diagonal || col + 8 <= row_b,
+                    );
+                    let ds_b9 = backward_dscore(
+                        s_high[3], dp_high[3], lse_b, dot_b, SCALE, !diagonal || col + 9 <= row_b,
+                    );
+                    write_bf16_fragment(
+                        ds_smem, ds_phase, tmem_row, column_block, lane, ds_a0, ds_a1, ds_a8,
+                        ds_a9, ds_b0, ds_b1, ds_b8, ds_b9,
+                    );
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+        }
+    }
+
+    /// One query tile of the key-parallel backward register pass (kernel B):
+    /// drain the transposed `Sᵀ` and `dPᵀ` from TMEM, recompute the
+    /// transposed probabilities `Pᵀ = exp2(sᵀ − lse2[col])` and
+    /// `dSᵀ = Pᵀ·(dPᵀ − dot[col])·ln2`, and store both into their own stacked
+    /// subtile pairs. Rows are key rows and columns are query rows, so the
+    /// statistics index by the fragment's *column* coordinate and the causal
+    /// mask zeroes positions where the key row leads the query column.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn backward_kv_tile(
+        st_tmem: u32,
+        dpt_tmem: u32,
+        diagonal: bool,
+        warp_id: u32,
+        lane: u32,
+        lse2: *const f32,
+        dot: *const f32,
+        p_smem: *mut u8,
+        p_phase: usize,
+        ds_smem: *mut u8,
+        ds_phase: usize,
+    ) {
+        unsafe {
+            let quad = (lane % 4) as usize;
+            let row_in_16 = (lane / 4) as usize;
+            let mut row_block = 0u32;
+            while row_block < 2 {
+                let tmem_row = warp_id * 32 + row_block * 16;
+                let mut column_block = 0u32;
+                while column_block < 8 {
+                    let column = column_block * 16;
+                    let s_low = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column);
+                    tcgen05_load_wait();
+                    let s_high = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column + 8);
+                    tcgen05_load_wait();
+                    let dp_low = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column);
+                    tcgen05_load_wait();
+                    let dp_high = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column + 8);
+                    tcgen05_load_wait();
+                    let row_a = tmem_row + row_in_16 as u32;
+                    let row_b = row_a + 8;
+                    let col = column + 2 * quad as u32;
+                    let lse_c0 = *lse2.add(col as usize);
+                    let dot_c0 = *dot.add(col as usize);
+                    let lse_c1 = *lse2.add(col as usize + 1);
+                    let dot_c1 = *dot.add(col as usize + 1);
+                    let lse_c8 = *lse2.add(col as usize + 8);
+                    let dot_c8 = *dot.add(col as usize + 8);
+                    let lse_c9 = *lse2.add(col as usize + 9);
+                    let dot_c9 = *dot.add(col as usize + 9);
+
+                    let p_a0 = if !diagonal || row_a <= col { exp2_approx(s_low[0] - lse_c0) } else { 0.0 };
+                    let p_a1 =
+                        if !diagonal || row_a <= col + 1 { exp2_approx(s_low[1] - lse_c1) } else { 0.0 };
+                    let p_a8 =
+                        if !diagonal || row_a <= col + 8 { exp2_approx(s_high[0] - lse_c8) } else { 0.0 };
+                    let p_a9 =
+                        if !diagonal || row_a <= col + 9 { exp2_approx(s_high[1] - lse_c9) } else { 0.0 };
+                    let p_b0 = if !diagonal || row_b <= col { exp2_approx(s_low[2] - lse_c0) } else { 0.0 };
+                    let p_b1 =
+                        if !diagonal || row_b <= col + 1 { exp2_approx(s_low[3] - lse_c1) } else { 0.0 };
+                    let p_b8 =
+                        if !diagonal || row_b <= col + 8 { exp2_approx(s_high[2] - lse_c8) } else { 0.0 };
+                    let p_b9 =
+                        if !diagonal || row_b <= col + 9 { exp2_approx(s_high[3] - lse_c9) } else { 0.0 };
+
+                    let ds_a0 = p_a0 * (dp_low[0] - dot_c0) * LN2;
+                    let ds_a1 = p_a1 * (dp_low[1] - dot_c1) * LN2;
+                    let ds_a8 = p_a8 * (dp_high[0] - dot_c8) * LN2;
+                    let ds_a9 = p_a9 * (dp_high[1] - dot_c9) * LN2;
+                    let ds_b0 = p_b0 * (dp_low[2] - dot_c0) * LN2;
+                    let ds_b1 = p_b1 * (dp_low[3] - dot_c1) * LN2;
+                    let ds_b8 = p_b8 * (dp_high[2] - dot_c8) * LN2;
+                    let ds_b9 = p_b9 * (dp_high[3] - dot_c9) * LN2;
+
+                    write_bf16_fragment(
+                        p_smem, p_phase, tmem_row, column_block, lane, p_a0, p_a1, p_a8, p_a9,
+                        p_b0, p_b1, p_b8, p_b9,
+                    );
+                    write_bf16_fragment(
+                        ds_smem, ds_phase, tmem_row, column_block, lane, ds_a0, ds_a1, ds_a8,
+                        ds_a9, ds_b0, ds_b1, ds_b8, ds_b9,
+                    );
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+        }
+    }
+
+    /// Issue one `dQ/dK/dV += A·B` gradient tile from the leader thread: the
+    /// forward O-MMA shape (M128_N64, transpose_b, eight chained K=16 chunks)
+    /// with `A` walking two stacked bf16 subtiles and `B` walking a key/query
+    /// operand by 2048-byte rows. `fresh` starts a new TMEM accumulator (the
+    /// block's first visited tile); otherwise it accumulates with `enable_d`.
+    #[inline(always)]
+    unsafe fn grad_mma(acc_tmem: u32, a_smem: *mut u8, b_smem: *mut u8, instruction: u32, fresh: bool) {
+        unsafe {
+            let mut chunk = 0u64;
+            while chunk < 8 {
+                let a_descriptor =
+                    smem_descriptor(a_smem as u64 + (chunk / 4) * TILE_BYTES as u64 + (chunk % 4) * 32);
+                let b_descriptor = smem_descriptor(b_smem as u64 + chunk * 2048);
+                tcgen05_mma_f16(acc_tmem, a_descriptor, b_descriptor, instruction, chunk > 0 || !fresh);
+                chunk += 1;
+            }
+        }
+    }
+
+    /// Drain a 64-column gradient accumulator and store fp32 straight to
+    /// global memory through the fragment map, at the block's `tile` rows.
+    /// Like `store_outputs` minus the `1/sum` scale and the LSE write — the
+    /// gradients are already complete sums.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn store_grad_tile(
+        batch: u32,
+        t: u32,
+        h: u32,
+        head: u32,
+        tile: u32,
+        warp_id: u32,
+        lane: u32,
+        grad_acc: &[[f32; 16]; 4],
+        output: &mut DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let quad = (lane % 4) as usize;
+            let row_in_16 = (lane / 4) as usize;
+            let d_model = (h as usize) * HD;
+            let mut slot = 0usize;
+            while slot < 4 {
+                let local_row =
+                    warp_id as usize * 32 + (slot / 2) * 16 + (slot % 2) * 8 + row_in_16;
+                let global_row = (batch * t) as usize + tile as usize * TILE + local_row;
+                let out_base = global_row * d_model + head as usize * HD;
+                let mut column_block = 0usize;
+                while column_block < 4 {
+                    let column = column_block * 16 + 2 * quad;
+                    let base = column_block * 4;
+                    *output.get_unchecked_mut(out_base + column) = grad_acc[slot][base];
+                    *output.get_unchecked_mut(out_base + column + 1) = grad_acc[slot][base + 1];
+                    *output.get_unchecked_mut(out_base + column + 8) = grad_acc[slot][base + 2];
+                    *output.get_unchecked_mut(out_base + column + 9) = grad_acc[slot][base + 3];
+                    column_block += 1;
+                }
+                slot += 1;
             }
         }
     }
@@ -931,6 +1245,410 @@ pub mod kernels {
                 mbarrier_inval(&raw mut TMA_BARRIER);
                 mbarrier_inval(&raw mut MMA_BARRIER);
                 mbarrier_inval(&raw mut VOTE_BARRIER);
+            }
+        }
+    }
+
+    /// Synchronous tcgen05 query-parallel backward (issue #35, phase 4,
+    /// kernel A). Launch with `host::flash_backward_q_config`: grid
+    /// `(T/128, H, B)`, 128 threads, `FLASH_BACKWARD_Q_SMEM` dynamic shared
+    /// bytes (opted in by the loader).
+    ///
+    /// One CTA owns a 128-query tile of one `(batch, head)` and streams the
+    /// causal key tiles `0..=query_tile`. Q and dY stay resident; per key
+    /// tile it recomputes `S = Q·Kᵀ` and `dP = dY·Vᵀ` into fp32 TMEM, forms
+    /// the true `dS = P·(dP − D)·scale` in registers (§ `backward_q_tile`),
+    /// stores bf16 dS through the swizzle-aware path, and accumulates
+    /// `dQ += dS·K` in a TMEM segment via the transposed-B O-MMA shape (K
+    /// staged unscaled, so `scale` is folded into the bf16 dS). The saved LSE
+    /// is the normalizer — no running-max machinery — and `dot` is the
+    /// pre-staged `Σ dy·y` per query row. `dq` is written directly from the
+    /// register accumulator; blocks own disjoint query tiles, so no atomics.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    pub unsafe fn flash_backward_q_tcgen05(
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &[f32],
+        dot: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        mut dq: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
+            static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
+            static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
+            static mut LSE2: SharedArray<f32, 128> = SharedArray::UNINIT;
+            static mut DOTS: SharedArray<f32, 128> = SharedArray::UNINIT;
+
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let q_smem = smem;
+            let dy_smem = smem.add(TILE_BYTES);
+            let k_smem = smem.add(2 * TILE_BYTES);
+            let v_smem = smem.add(3 * TILE_BYTES);
+            let ds_smem = smem.add(4 * TILE_BYTES);
+
+            let tid = thread::threadIdx_x();
+            if thread::blockDim_x() as usize != TILE {
+                return;
+            }
+            let warp_id = warp::warp_id();
+            let lane = warp::lane_id();
+            let is_leader = tid == 0;
+
+            let query_tile = thread::blockIdx_x();
+            let head = thread::blockIdx_y();
+            let batch = thread::blockIdx_z();
+            let t = sequence_length;
+            let h = heads;
+            let plane = (batch * h + head) as i32;
+
+            if is_leader {
+                mbarrier_init(&raw mut TMA_BARRIER, 1);
+                mbarrier_init(&raw mut MMA_BARRIER, 1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            if warp_id == 0 {
+                tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
+            }
+            thread::sync_threads();
+            let tmem = *(&raw const TMEM_ADDRESS as *const u32);
+            let s_tmem = tmem;
+            let dp_tmem = tmem + 128;
+            let dq_tmem = tmem + 256;
+
+            let s_instruction = Tcgen05InstructionDescriptor::builder()
+                .shape(Tcgen05MmaShape::M128_N128)
+                .element_type(Tcgen05ElementType::BF16)
+                .accumulator_type(Tcgen05AccumulatorType::F32)
+                .build()
+                .raw();
+            let grad_instruction = Tcgen05InstructionDescriptor::builder()
+                .shape(Tcgen05MmaShape::M128_N64)
+                .element_type(Tcgen05ElementType::BF16)
+                .accumulator_type(Tcgen05AccumulatorType::F32)
+                .transpose_b(true)
+                .build()
+                .raw();
+
+            // Q and dY stay operand-A resident for the whole key stream.
+            if is_leader {
+                cp_async_bulk_tensor_3d_g2s(
+                    q_smem,
+                    q_tma,
+                    0,
+                    (query_tile * TILE as u32) as i32,
+                    plane,
+                    &raw mut TMA_BARRIER,
+                );
+                cp_async_bulk_tensor_3d_g2s(
+                    dy_smem,
+                    dy_tma,
+                    0,
+                    (query_tile * TILE as u32) as i32,
+                    plane,
+                    &raw mut TMA_BARRIER,
+                );
+                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
+            }
+            while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
+
+            // The 128 query rows' LSE (converted to base-2) and softmax dot,
+            // staged once so the register pass reads them from shared memory.
+            let query_row = (batch * t) as usize + query_tile as usize * TILE + tid as usize;
+            let stat_index = query_row * h as usize + head as usize;
+            (*(&raw mut LSE2 as *mut f32).add(tid as usize)) = logsumexp[stat_index] * LOG2E;
+            (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
+            thread::sync_threads();
+
+            let ds_phase = (ds_smem as usize >> 7) & 7;
+            let mut dq_acc = [[0.0f32; 16]; 4];
+
+            let mut tma_phase = 1u32;
+            let mut mma_phase = 0u32;
+            let mut key_tile = 0u32;
+            while key_tile <= query_tile {
+                if is_leader {
+                    let key_row = (key_tile * TILE as u32) as i32;
+                    cp_async_bulk_tensor_3d_g2s(
+                        k_smem,
+                        k_tma,
+                        0,
+                        key_row,
+                        plane,
+                        &raw mut TMA_BARRIER,
+                    );
+                    cp_async_bulk_tensor_3d_g2s(
+                        v_smem,
+                        v_tma,
+                        0,
+                        key_row,
+                        plane,
+                        &raw mut TMA_BARRIER,
+                    );
+                    mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
+                }
+                while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, tma_phase & 1) {}
+                tma_phase += 1;
+                thread::sync_threads();
+
+                // S = Q·Kᵀ and dP = dY·Vᵀ, both fresh into their own TMEM.
+                if is_leader {
+                    tcgen05_fence_after_thread_sync();
+                    score_mma(s_tmem, q_smem, k_smem, s_instruction);
+                    score_mma(dp_tmem, dy_smem, v_smem, s_instruction);
+                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                }
+                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
+                mma_phase += 1;
+                thread::sync_threads();
+
+                backward_q_tile(
+                    s_tmem,
+                    dp_tmem,
+                    key_tile == query_tile,
+                    warp_id,
+                    lane,
+                    &raw const LSE2 as *const f32,
+                    &raw const DOTS as *const f32,
+                    ds_smem,
+                    ds_phase,
+                );
+
+                fence_proxy_async_shared_cta();
+                tcgen05_fence_before_thread_sync();
+                thread::sync_threads();
+
+                // dQ += dS·K, continuing the accumulator (fresh on key 0).
+                if is_leader {
+                    tcgen05_fence_after_thread_sync();
+                    grad_mma(dq_tmem, ds_smem, k_smem, grad_instruction, key_tile == 0);
+                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                }
+                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
+                mma_phase += 1;
+
+                tcgen05_fence_before_thread_sync();
+                thread::sync_threads();
+                key_tile += 1;
+            }
+
+            merge_output_tile(dq_tmem, warp_id, &mut dq_acc);
+            store_grad_tile(batch, t, h, head, query_tile, warp_id, lane, &dq_acc, &mut dq);
+
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
+            if warp_id == 0 {
+                tcgen05_dealloc(tmem, 512);
+            }
+            if is_leader {
+                mbarrier_inval(&raw mut TMA_BARRIER);
+                mbarrier_inval(&raw mut MMA_BARRIER);
+            }
+        }
+    }
+
+    /// Synchronous tcgen05 key-parallel backward (issue #35, phase 4,
+    /// kernel B). Launch with `host::flash_backward_kv_config`: grid
+    /// `(T/128, H, B)`, 128 threads, `FLASH_BACKWARD_KV_SMEM` dynamic shared
+    /// bytes (opted in by the loader).
+    ///
+    /// One CTA owns a 128-key tile of one `(batch, head)` and streams the
+    /// causal query tiles `key_tile..T/128`. K and V stay resident; per query
+    /// tile it recomputes the transposed `Sᵀ = K·Qᵀ` and `dPᵀ = V·dYᵀ` into
+    /// fp32 TMEM, forms the transposed probabilities and `dSᵀ·ln2` in
+    /// registers (§ `backward_kv_tile`), and accumulates `dV += Pᵀ·dY` and
+    /// `dK += dSᵀ·Q` in two TMEM segments. The staged Q carries `scale·log2e`,
+    /// so folding `ln2` into dSᵀ lands `scale` on dK (`ln2·scale·log2e =
+    /// scale`) and dV needs no factor. `dk`/`dv` are written directly from the
+    /// register accumulators; blocks own disjoint key tiles, so no atomics.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    pub unsafe fn flash_backward_kv_tcgen05(
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &[f32],
+        dot: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        mut dk: DisjointSlice<f32>,
+        mut dv: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
+            static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
+            static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
+            static mut LSE2: SharedArray<f32, 128> = SharedArray::UNINIT;
+            static mut DOTS: SharedArray<f32, 128> = SharedArray::UNINIT;
+
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let k_smem = smem;
+            let v_smem = smem.add(TILE_BYTES);
+            let q_smem = smem.add(2 * TILE_BYTES);
+            let dy_smem = smem.add(3 * TILE_BYTES);
+            let p_smem = smem.add(4 * TILE_BYTES);
+            let ds_smem = smem.add(6 * TILE_BYTES);
+
+            let tid = thread::threadIdx_x();
+            if thread::blockDim_x() as usize != TILE {
+                return;
+            }
+            let warp_id = warp::warp_id();
+            let lane = warp::lane_id();
+            let is_leader = tid == 0;
+
+            let key_tile = thread::blockIdx_x();
+            let head = thread::blockIdx_y();
+            let batch = thread::blockIdx_z();
+            let t = sequence_length;
+            let h = heads;
+            let plane = (batch * h + head) as i32;
+            let tiles = t / TILE as u32;
+
+            if is_leader {
+                mbarrier_init(&raw mut TMA_BARRIER, 1);
+                mbarrier_init(&raw mut MMA_BARRIER, 1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            if warp_id == 0 {
+                tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
+            }
+            thread::sync_threads();
+            let tmem = *(&raw const TMEM_ADDRESS as *const u32);
+            let st_tmem = tmem;
+            let dpt_tmem = tmem + 128;
+            let dv_tmem = tmem + 256;
+            let dk_tmem = tmem + 320;
+
+            let s_instruction = Tcgen05InstructionDescriptor::builder()
+                .shape(Tcgen05MmaShape::M128_N128)
+                .element_type(Tcgen05ElementType::BF16)
+                .accumulator_type(Tcgen05AccumulatorType::F32)
+                .build()
+                .raw();
+            let grad_instruction = Tcgen05InstructionDescriptor::builder()
+                .shape(Tcgen05MmaShape::M128_N64)
+                .element_type(Tcgen05ElementType::BF16)
+                .accumulator_type(Tcgen05AccumulatorType::F32)
+                .transpose_b(true)
+                .build()
+                .raw();
+
+            // K and V stay operand-A resident for the whole query stream.
+            if is_leader {
+                let key_row = (key_tile * TILE as u32) as i32;
+                cp_async_bulk_tensor_3d_g2s(k_smem, k_tma, 0, key_row, plane, &raw mut TMA_BARRIER);
+                cp_async_bulk_tensor_3d_g2s(v_smem, v_tma, 0, key_row, plane, &raw mut TMA_BARRIER);
+                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
+            }
+            while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
+
+            let p_phase = (p_smem as usize >> 7) & 7;
+            let ds_phase = (ds_smem as usize >> 7) & 7;
+            let mut dv_acc = [[0.0f32; 16]; 4];
+            let mut dk_acc = [[0.0f32; 16]; 4];
+
+            let mut tma_phase = 1u32;
+            let mut mma_phase = 0u32;
+            let mut query_tile = key_tile;
+            while query_tile < tiles {
+                if is_leader {
+                    let query_row = (query_tile * TILE as u32) as i32;
+                    cp_async_bulk_tensor_3d_g2s(
+                        q_smem,
+                        q_tma,
+                        0,
+                        query_row,
+                        plane,
+                        &raw mut TMA_BARRIER,
+                    );
+                    cp_async_bulk_tensor_3d_g2s(
+                        dy_smem,
+                        dy_tma,
+                        0,
+                        query_row,
+                        plane,
+                        &raw mut TMA_BARRIER,
+                    );
+                    mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
+                }
+                while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, tma_phase & 1) {}
+                tma_phase += 1;
+                thread::sync_threads();
+
+                // Stage this query tile's 128 rows' base-2 LSE and dot.
+                let global_row =
+                    (batch * t) as usize + query_tile as usize * TILE + tid as usize;
+                let stat_index = global_row * h as usize + head as usize;
+                (*(&raw mut LSE2 as *mut f32).add(tid as usize)) = logsumexp[stat_index] * LOG2E;
+                (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
+                thread::sync_threads();
+
+                // Sᵀ = K·Qᵀ and dPᵀ = V·dYᵀ, both fresh into their own TMEM.
+                if is_leader {
+                    tcgen05_fence_after_thread_sync();
+                    score_mma(st_tmem, k_smem, q_smem, s_instruction);
+                    score_mma(dpt_tmem, v_smem, dy_smem, s_instruction);
+                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                }
+                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
+                mma_phase += 1;
+                thread::sync_threads();
+
+                backward_kv_tile(
+                    st_tmem,
+                    dpt_tmem,
+                    query_tile == key_tile,
+                    warp_id,
+                    lane,
+                    &raw const LSE2 as *const f32,
+                    &raw const DOTS as *const f32,
+                    p_smem,
+                    p_phase,
+                    ds_smem,
+                    ds_phase,
+                );
+
+                fence_proxy_async_shared_cta();
+                tcgen05_fence_before_thread_sync();
+                thread::sync_threads();
+
+                // dV += Pᵀ·dY and dK += dSᵀ·Q, fresh on the first query tile.
+                if is_leader {
+                    tcgen05_fence_after_thread_sync();
+                    let fresh = query_tile == key_tile;
+                    grad_mma(dv_tmem, p_smem, dy_smem, grad_instruction, fresh);
+                    grad_mma(dk_tmem, ds_smem, q_smem, grad_instruction, fresh);
+                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                }
+                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
+                mma_phase += 1;
+
+                tcgen05_fence_before_thread_sync();
+                thread::sync_threads();
+                query_tile += 1;
+            }
+
+            merge_output_tile(dv_tmem, warp_id, &mut dv_acc);
+            merge_output_tile(dk_tmem, warp_id, &mut dk_acc);
+            store_grad_tile(batch, t, h, head, key_tile, warp_id, lane, &dv_acc, &mut dv);
+            store_grad_tile(batch, t, h, head, key_tile, warp_id, lane, &dk_acc, &mut dk);
+
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
+            if warp_id == 0 {
+                tcgen05_dealloc(tmem, 512);
+            }
+            if is_leader {
+                mbarrier_inval(&raw mut TMA_BARRIER);
+                mbarrier_inval(&raw mut MMA_BARRIER);
             }
         }
     }
