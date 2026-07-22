@@ -534,9 +534,11 @@ struct FlashAttentionScratch<const N: usize, const T: usize, const D: usize, con
     q: DeviceBuffer<u32>,
     k: DeviceBuffer<u32>,
     v: DeviceBuffer<u32>,
+    dy: DeviceBuffer<u32>,
     q_tma: FlashHeadTmaMap,
     k_tma: FlashHeadTmaMap,
     v_tma: FlashHeadTmaMap,
+    dy_tma: FlashHeadTmaMap,
     correction_counts: DeviceBuffer<u32>,
 }
 
@@ -547,19 +549,26 @@ impl<const N: usize, const T: usize, const D: usize, const H: usize>
         let q = DeviceBuffer::zeroed(stream, N * D / 2)?;
         let k = DeviceBuffer::zeroed(stream, N * D / 2)?;
         let v = DeviceBuffer::zeroed(stream, N * D / 2)?;
+        // The backward gradient kernels stream dY the same way the forward
+        // streams K/V; scratch is shared across layers, so both passes
+        // re-stage into these buffers.
+        let dy = DeviceBuffer::zeroed(stream, N * D / 2)?;
         // SAFETY: the mapped buffers live in this scratch beside their maps
         // and are never reallocated.
         let q_tma = unsafe { create_flash_head_tma_map(stream, &q, T, N / T * H)? };
         let k_tma = unsafe { create_flash_head_tma_map(stream, &k, T, N / T * H)? };
         let v_tma = unsafe { create_flash_head_tma_map(stream, &v, T, N / T * H)? };
+        let dy_tma = unsafe { create_flash_head_tma_map(stream, &dy, T, N / T * H)? };
         let correction_counts = DeviceBuffer::zeroed(stream, correction_count_len(N / T, T, H))?;
         Ok(Self {
             q,
             k,
             v,
+            dy,
             q_tma,
             k_tma,
             v_tma,
+            dy_tma,
             correction_counts,
         })
     }
@@ -3776,6 +3785,7 @@ impl<
         gemm: &gemm_kernels::LoadedModule,
         gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
+        flash_bf16: &Tcgen05Flash,
         dense: &dense_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
@@ -3787,6 +3797,7 @@ impl<
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
             &mut profiler,
         )
@@ -3802,6 +3813,7 @@ impl<
         gemm: &gemm_kernels::LoadedModule,
         gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
+        flash_bf16: &Tcgen05Flash,
         dense: &dense_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
@@ -3996,8 +4008,10 @@ impl<
             &mut workspace.d_model_1,
             &mut workspace.d_model_3,
             &mut workspace.d_model_4,
+            workspace.flash_scratch.as_mut(),
             stream,
             flash,
+            flash_bf16,
             profiler,
         )?;
         rope_into::<N, T, D, H, HD, P>(
@@ -4406,6 +4420,7 @@ impl<
         gemm: &gemm_kernels::LoadedModule,
         gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
+        flash_bf16: &Tcgen05Flash,
         dense: &dense_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         let mut profiler = NoopProfiler;
@@ -4416,6 +4431,7 @@ impl<
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
             &mut profiler,
         )
@@ -4430,6 +4446,7 @@ impl<
         gemm: &gemm_kernels::LoadedModule,
         gemm_bf16: &Tcgen05Gemm,
         flash: &flash_kernels::LoadedModule,
+        flash_bf16: &Tcgen05Flash,
         dense: &dense_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
@@ -4592,8 +4609,10 @@ impl<
             &mut workspace.d_model_1,
             &mut workspace.d_model_3,
             &mut workspace.d_model_4,
+            workspace.flash_scratch.as_mut(),
             stream,
             flash,
+            flash_bf16,
             profiler,
         )?;
         rope_into::<N, T, D, H, HD, P>(
@@ -4846,6 +4865,13 @@ fn flash_attention_forward_into<
     }
 }
 
+/// Attention backward dispatch (issue #35 phase 4): tile-aligned shapes
+/// re-stage the packed-bf16 head panels (scratch is shared across layers, so
+/// the forward-time staging is stale by backward time) and run the tcgen05
+/// query-parallel dQ and key-parallel dK/dV kernels; other shapes stay on the
+/// fp32 tiled kernels. Both paths first run the fp32 `backward_dot` over the
+/// forward `y` — the tcgen05 kernels consume the same `Σ dy·y` and the saved
+/// natural-log LSE as read-only device slices.
 #[allow(clippy::too_many_arguments)]
 fn flash_attention_backward_into<
     const N: usize,
@@ -4865,8 +4891,10 @@ fn flash_attention_backward_into<
     dq: &mut GpuTensor<f32, Rank2<N, D>>,
     dk: &mut GpuTensor<f32, Rank2<N, D>>,
     dv: &mut GpuTensor<f32, Rank2<N, D>>,
+    scratch: Option<&mut FlashAttentionScratch<N, T, D, H>>,
     stream: &CudaStream,
     kernels: &flash_kernels::LoadedModule,
+    flash_bf16: &Tcgen05Flash,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     profiler.measure(stream, "backward.attention.flash_dot", || {
@@ -4879,38 +4907,116 @@ fn flash_attention_backward_into<
             softmax_dot.as_device_buffer_mut(),
         )
     })?;
-    profiler.measure(stream, "backward.attention.flash_q", || {
-        kernels.flash_attention_backward_q_tiled(
-            stream,
-            flash_backward_q_config::<N, T, H, HD>(),
-            q.as_device_buffer(),
-            k.as_device_buffer(),
-            v.as_device_buffer(),
-            dy.as_device_buffer(),
-            logsumexp.as_device_buffer(),
-            softmax_dot.as_device_buffer(),
-            T as u32,
-            H as u32,
-            dq.as_device_buffer_mut(),
-        )
-    })?;
-    profiler.measure(stream, "backward.attention.flash_kv", || {
-        kernels.flash_attention_backward_kv_tiled(
-            stream,
-            flash_backward_kv_config::<N, T, H, HD>(),
-            q.as_device_buffer(),
-            k.as_device_buffer(),
-            v.as_device_buffer(),
-            dy.as_device_buffer(),
-            logsumexp.as_device_buffer(),
-            softmax_dot.as_device_buffer(),
-            T as u32,
-            H as u32,
-            dk.as_device_buffer_mut(),
-            dv.as_device_buffer_mut(),
-        )
-    })?;
-    Ok(())
+    if let Some(scratch) = scratch {
+        // Fold softmax_scale * log2(e) into Q so scores are base-2 native;
+        // K/V/dY quantize unscaled. Re-staged because the shared scratch may
+        // hold another layer's forward panels by now.
+        let q_scale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
+        profiler.measure(stream, "backward.attention.stage_bf16", || {
+            let config = flash_device::stage_heads_config(N, H, HD);
+            kernels.stage_attention_heads_bf16(
+                stream,
+                config,
+                q.as_device_buffer(),
+                T as u32,
+                H as u32,
+                q_scale,
+                &mut scratch.q,
+            )?;
+            kernels.stage_attention_heads_bf16(
+                stream,
+                config,
+                k.as_device_buffer(),
+                T as u32,
+                H as u32,
+                1.0,
+                &mut scratch.k,
+            )?;
+            kernels.stage_attention_heads_bf16(
+                stream,
+                config,
+                v.as_device_buffer(),
+                T as u32,
+                H as u32,
+                1.0,
+                &mut scratch.v,
+            )?;
+            kernels.stage_attention_heads_bf16(
+                stream,
+                config,
+                dy.as_device_buffer(),
+                T as u32,
+                H as u32,
+                1.0,
+                &mut scratch.dy,
+            )
+        })?;
+        profiler.measure(stream, "backward.attention.flash_q", || unsafe {
+            flash_bf16.backward_q(
+                stream,
+                flash_host::flash_backward_q_config(N / T, T, H),
+                scratch.q_tma.as_ptr(),
+                scratch.k_tma.as_ptr(),
+                scratch.v_tma.as_ptr(),
+                scratch.dy_tma.as_ptr(),
+                logsumexp.as_device_buffer(),
+                softmax_dot.as_device_buffer(),
+                T as u32,
+                H as u32,
+                dq.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
+            flash_bf16.backward_kv(
+                stream,
+                flash_host::flash_backward_kv_config(N / T, T, H),
+                scratch.q_tma.as_ptr(),
+                scratch.k_tma.as_ptr(),
+                scratch.v_tma.as_ptr(),
+                scratch.dy_tma.as_ptr(),
+                logsumexp.as_device_buffer(),
+                softmax_dot.as_device_buffer(),
+                T as u32,
+                H as u32,
+                dk.as_device_buffer_mut(),
+                dv.as_device_buffer_mut(),
+            )
+        })?;
+        Ok(())
+    } else {
+        profiler.measure(stream, "backward.attention.flash_q", || {
+            kernels.flash_attention_backward_q_tiled(
+                stream,
+                flash_backward_q_config::<N, T, H, HD>(),
+                q.as_device_buffer(),
+                k.as_device_buffer(),
+                v.as_device_buffer(),
+                dy.as_device_buffer(),
+                logsumexp.as_device_buffer(),
+                softmax_dot.as_device_buffer(),
+                T as u32,
+                H as u32,
+                dq.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, "backward.attention.flash_kv", || {
+            kernels.flash_attention_backward_kv_tiled(
+                stream,
+                flash_backward_kv_config::<N, T, H, HD>(),
+                q.as_device_buffer(),
+                k.as_device_buffer(),
+                v.as_device_buffer(),
+                dy.as_device_buffer(),
+                logsumexp.as_device_buffer(),
+                softmax_dot.as_device_buffer(),
+                T as u32,
+                H as u32,
+                dk.as_device_buffer_mut(),
+                dv.as_device_buffer_mut(),
+            )
+        })?;
+        Ok(())
+    }
 }
 
 fn swiglu_into<const N: usize, const FF: usize, P: KernelProfiler>(
