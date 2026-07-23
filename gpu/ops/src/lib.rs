@@ -54,6 +54,11 @@ pub const ROUTER_WEIGHT_THREADS: usize =
 /// Sentinel written by deterministic MoE binning for a capacity-dropped pair.
 pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
 
+/// Threads in one block-per-pair MoE backward scatter. Lanes stride the `D`
+/// gradient row for a coalesced copy and a tree-reduced gate dot. Must remain a
+/// power of two.
+pub const MOE_SCATTER_DY_THREADS: usize = 256;
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -1696,7 +1701,11 @@ pub mod kernels {
     }
 
     /// Scatter `gate * dy` to expert-output order and compute one gate gradient
-    /// dot product per accepted pair.
+    /// dot product per accepted pair, one block per `(token, slot)`.
+    ///
+    /// Lanes stride the `D` row so the bin copy is fully coalesced, and the
+    /// gate dot `Σ_d expert_output·dy` reduces in shared memory. The prior
+    /// thread-per-pair variant walked the whole row serially on a single lane.
     #[kernel]
     pub unsafe fn moe_scatter_dy(
         expert_output: &[f32],
@@ -1710,7 +1719,13 @@ pub mod kernels {
         mut expert_output_gradient: DisjointSlice<f32>,
         mut gate_gradients: DisjointSlice<f32>,
     ) {
-        let pair = thread::index_1d().get();
+        static mut DOT: SharedArray<f32, MOE_SCATTER_DY_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != MOE_SCATTER_DY_THREADS {
+            return;
+        }
+        let pair = thread::blockIdx_x() as usize;
         let d = dim as usize;
         let k = top_k as usize;
         let c = capacity as usize;
@@ -1723,29 +1738,61 @@ pub mod kernels {
         {
             return;
         }
+
         let slot = slots[pair];
-        let mut gate_gradient = 0.0f32;
-        if slot != MOE_DROPPED_SLOT {
-            let token = pair / k;
-            let expert = selected_experts[pair] as usize;
-            let bin_base = (expert * c + slot as usize) * d;
-            let token_base = token * d;
-            if bin_base + d > expert_output.len()
-                || bin_base + d > expert_output_gradient.len()
-                || token_base + d > dy.len()
-            {
-                return;
-            }
-            for column in 0..d {
-                gate_gradient += expert_output[bin_base + column] * dy[token_base + column];
+        if slot == MOE_DROPPED_SLOT {
+            if tid == 0 {
+                // SAFETY: this block exclusively owns `pair`.
                 unsafe {
-                    *expert_output_gradient.get_unchecked_mut(bin_base + column) =
-                        gate_weights[pair] * dy[token_base + column];
+                    *gate_gradients.get_unchecked_mut(pair) = 0.0;
                 }
             }
+            return;
+        }
+
+        let token = pair / k;
+        let expert = selected_experts[pair] as usize;
+        let bin_base = (expert * c + slot as usize) * d;
+        let token_base = token * d;
+        if bin_base + d > expert_output.len()
+            || bin_base + d > expert_output_gradient.len()
+            || token_base + d > dy.len()
+        {
+            return;
+        }
+
+        let gate = gate_weights[pair];
+        let mut dot = 0.0f32;
+        let mut column = tid;
+        while column < d {
+            let grad = dy[token_base + column];
+            dot += expert_output[bin_base + column] * grad;
+            // SAFETY: each lane owns distinct columns of this block's bin row.
+            unsafe {
+                *expert_output_gradient.get_unchecked_mut(bin_base + column) = gate * grad;
+            }
+            column += MOE_SCATTER_DY_THREADS;
         }
         unsafe {
-            *gate_gradients.get_unchecked_mut(pair) = gate_gradient;
+            DOT[tid] = dot;
+        }
+        thread::sync_threads();
+
+        let mut stride = MOE_SCATTER_DY_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    DOT[tid] += DOT[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            // SAFETY: this block exclusively owns `pair`.
+            unsafe {
+                *gate_gradients.get_unchecked_mut(pair) = DOT[0];
+            }
         }
     }
 

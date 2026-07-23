@@ -128,6 +128,16 @@ fn norm_weight_config<const N: usize, const D: usize>() -> LaunchConfig {
     }
 }
 
+fn moe_scatter_dy_config(pairs: usize) -> LaunchConfig {
+    assert!(dense_device::MOE_SCATTER_DY_THREADS.is_power_of_two());
+    assert!(pairs <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (pairs as u32, 1, 1),
+        block_dim: (dense_device::MOE_SCATTER_DY_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 fn moe_assign_config<const E: usize>() -> LaunchConfig {
     assert!(dense_device::MOE_ASSIGN_THREADS.is_power_of_two());
     assert!(E <= u32::MAX as usize);
@@ -4075,7 +4085,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         profiler.measure(stream, "backward.router.scatter_dy", || unsafe {
             dense.moe_scatter_dy(
                 stream,
-                LaunchConfig::for_num_elems((N * K) as u32),
+                moe_scatter_dy_config(N * K),
                 acts.experts.bin_output.as_device_buffer(),
                 scratch.d_model_1.as_device_buffer(),
                 acts.routing.selected_experts.as_device_buffer(),

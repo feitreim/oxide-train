@@ -14,7 +14,7 @@ use tensor_cpu::CpuTensor;
 #[path = "lib.rs"]
 mod device;
 use device::{
-    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, NORM_THREADS,
+    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS, NORM_THREADS,
     NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_WEIGHT_EXPERTS, ROUTER_WEIGHT_ROWS, ROUTER_WEIGHT_THREADS,
     kernels,
 };
@@ -315,7 +315,11 @@ fn check_moe_routing(
     unsafe {
         module.moe_scatter_dy(
             stream,
-            LaunchConfig::for_num_elems((N * K) as u32),
+            LaunchConfig {
+                grid_dim: ((N * K) as u32, 1, 1),
+                block_dim: (MOE_SCATTER_DY_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
             &expert_output_dev,
             &dy_dev,
             &selected_dev,
