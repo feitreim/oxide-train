@@ -188,6 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &gemm,
             &gemm_bf16,
             &flash,
+            &flash_bf16,
             &dense,
         )?;
         optimizer.update(&mut gpu, &stream, &tensor)?;

@@ -109,6 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &gemm,
             &gemm_bf16,
             &flash,
+            &flash_bf16,
             &dense,
         )?;
         stream.synchronize()?;
@@ -146,6 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
+        &flash_bf16,
         &dense,
         &mut profiler,
     )?;

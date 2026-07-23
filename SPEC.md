@@ -474,6 +474,38 @@ Each gated on tests; correctness before speed at every step.
        now the fp32 attention backward (flash_q + flash_kv + dot, 44.5
        ms, 30.0% — #35 phase 4) and the lm-head GEMM trio (54.2 ms,
        36.5%).
+     - ✅ **7e11 tcgen05 attention backward** (#35, phase 4): two
+       synchronous tcgen05 gradient kernels in the same flash.ptx
+       artifact, sharing the forward's swizzle-aware bf16 fragment writes,
+       transposed-B O-MMA shape, and fp32 TMEM accumulation. Probabilities
+       are recomputed base-2 straight from the saved LSE (`P = exp2(s −
+       lse·log₂e)`, no running-max machinery) over the same packed-bf16
+       Q/K/V/dY head panels, with `logsumexp` (natural log) and the fp32
+       `Σ dy·y` dot fed as read-only device slices. `backward_q`
+       (query-parallel) recomputes `S = Q·Kᵀ` and `dP = dY·Vᵀ` per key
+       tile, forms the true `dS = P·(dP − D)·scale`, and accumulates
+       `dQ += dS·K`; `backward_kv` (key-parallel) recomputes the
+       transposed `Sᵀ`/`dPᵀ` per query tile and accumulates `dV += Pᵀ·dY`
+       and `dK += dSᵀ·Q`. The operand scaling folds into the bf16
+       conversions — `scale` into dS (K is staged unscaled), `ln2` into
+       dSᵀ (the pre-scaled Q lands `scale` on dK since `ln2·scale·log₂e =
+       scale`), dV needs none. Gradient writes are disjoint by query/key
+       tile, so no atomics; the three-kernel split keeps `backward_dot`
+       fp32 in lib.rs. Parity: staged-bf16 CPU reference (dq ≤6.9e-4,
+       dk ≤6.4e-4, dv ≤3.8e-3) and the ops materialized-probability oracle
+       at bf16 tolerances (dq ≤2.0e-3, dk ≤2.1e-3, dv ≤5.5e-3, T up to
+       1024). Kernel bench (B=32 T=1024 H=24): combined dQ + dK/dV backward
+       3.94 ms, 73.5 TFLOP/s. Model gate (aligned tcgen05 MoE parity,
+       T=128) matches CPU and all overfits converge, no re-tune.
+       B200 same-container profile vs main: 149.65 → 110.07 ms full step
+       (-26.4%); backward.attention.flash_q 21.49 → 1.84 ms (11.7×),
+       flash_kv 22.56 → 2.11 ms (10.7×), combined backward attention (dot
+       + q + kv + the new bf16 staging row) 44.46 → 4.87 ms (9.1×). Shipped
+       sync-only: with the backward attention now 4.4% of the step it is no
+       longer a tail, so the pipelined/warp-specialized backward is a
+       recorded follow-up (as is the fused single-pass backward and 2-CTA,
+       deferred per the issue). compute-sanitizer is unavailable to gate it
+       — every tool reports "Device not supported" on B200 (sm_100).
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on
