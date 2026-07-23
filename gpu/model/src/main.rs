@@ -33,10 +33,11 @@ const NP: usize = 256;
 const T: usize = 4;
 const VOCAB: usize = 17;
 const VP: usize = 256;
-// `HD` must match the tiled flash kernels' compile-time head width (7e7).
-const D: usize = 256;
+// `HD` must match the tiled flash kernels' compile-time head width (7e7); at
+// HD=128 four heads (D=512) keep the tiny overfit gates converging.
+const D: usize = 512;
 const H: usize = 4;
-const HD: usize = 64;
+const HD: usize = 128;
 const FF: usize = 19;
 
 /// Loss and gradients that crossed the bf16 head: inputs quantized to bf16,
@@ -523,11 +524,11 @@ fn muon_overfit_tiny_batch(
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    type TinyDense = Dense<4, 4, 4, 256, 4, 64, 12>;
+    type TinyDense = Dense<4, 4, 4, 512, 4, 128, 12>;
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
     let cpu = TinyDense::new(100);
-    let mut gpu = GpuDenseDense::<4, 256, 4, 4, 256, 256, 4, 64, 12>::from_cpu(stream, &cpu)?;
+    let mut gpu = GpuDenseDense::<4, 256, 4, 4, 256, 512, 4, 128, 12>::from_cpu(stream, &cpu)?;
     // AdamW stays at the 0.02 the plain-AdamW gate settled on (0.03 is
     // knife-edge on this batch); Muon's default 0.02 handles the hidden
     // matrices.
@@ -540,7 +541,7 @@ fn muon_overfit_tiny_batch(
             ..AdamWConfig::default()
         },
     )?;
-    let mut workspace = GpuDenseWorkspace::<4, 256, 4, 4, 256, 256, 4, 12>::new(stream)?;
+    let mut workspace = GpuDenseWorkspace::<4, 256, 4, 4, 256, 512, 4, 12>::new(stream)?;
     let mut initial_loss = None;
 
     for _ in 0..600 {
@@ -608,11 +609,11 @@ fn overfit_tiny_batch(
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    type TinyDense = Dense<4, 4, 4, 256, 4, 64, 12>;
+    type TinyDense = Dense<4, 4, 4, 512, 4, 128, 12>;
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
     let cpu = TinyDense::new(100);
-    let mut gpu = GpuDenseDense::<4, 256, 4, 4, 256, 256, 4, 64, 12>::from_cpu(stream, &cpu)?;
+    let mut gpu = GpuDenseDense::<4, 256, 4, 4, 256, 512, 4, 128, 12>::from_cpu(stream, &cpu)?;
     // 0.03 is knife-edge on this batch: the bf16 two-logit tie's escape is
     // violently sensitive there, and a CPU sweep injecting +/-1-ulp-scale
     // noise (modelling kernel summation-order differences, 7e7) left ~1 in 8
@@ -625,7 +626,7 @@ fn overfit_tiny_batch(
         ..AdamWConfig::default()
     };
     let mut optimizer = GpuDenseDenseAdamW::new(stream, config)?;
-    let mut workspace = GpuDenseWorkspace::<4, 256, 4, 4, 256, 256, 4, 12>::new(stream)?;
+    let mut workspace = GpuDenseWorkspace::<4, 256, 4, 4, 256, 512, 4, 12>::new(stream)?;
     let mut initial_loss = None;
 
     // At this learning rate the CPU probe converges by ~step 60 across all
@@ -708,7 +709,7 @@ fn aligned_tcgen05_linears(
     const TA: usize = 4;
     const VA: usize = 17;
     const VPA: usize = 256;
-    const DA: usize = 256;
+    const DA: usize = 512;
     const HA: usize = 4;
     const FFA: usize = 256;
 
@@ -874,7 +875,7 @@ fn aligned_muon_overfit(
     const TA: usize = 4;
     const VA: usize = 17;
     const VPA: usize = 256;
-    const DA: usize = 256;
+    const DA: usize = 512;
     const HA: usize = 4;
     const FFA: usize = 256;
 

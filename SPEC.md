@@ -550,6 +550,71 @@ Each gated on tests; correctness before speed at every step.
        o_proj weight 0.86 → 0.47 / input 0.60 → 0.22. gemm 256³ parity (all
        four store/accumulate modes) and all 15 model gates pass; the branch
        is merged onto current main (post-#40).
+     - ✅ **7e13 flash attention HD=128 conversion** (#42): the trained
+       model's head width moved to 128 (§13.9), so every flash kernel that
+       specialized on `HD == 64` now specializes on `HD == 128` — a single
+       compile-time constant, no dual-head-width dispatch, the 64-wide fast
+       paths deleted. Only the head-dim-generic per-row oracle kernels stay.
+       **Tiling (issue §3 Option 1):** `TILE = 64` rows so `TILE_BYTES`
+       returns to 16 KiB and all five SMEM plans fit the 227 KiB budget with
+       the #35 pipeline/barrier structure intact. Each 128-wide operand is
+       stored as **two stacked 64-wide (128-byte-row) `SWIZZLE_128B`
+       subtiles**, so the swizzle phase still equals the row index inside each
+       subtile — the coincidence HD=64 gave for free — and the manual
+       `stmatrix` P/dS writes need no re-derivation (`swizzle_probe` confirms
+       `chunk ^ ((row + phase) & 7)` empirically). HD-deep MMAs (`S = Q·Kᵀ`)
+       walk 8 K=16 chunks across the two subtiles; HD-wide MMAs (`O = P·V`,
+       the gradient MMAs) split into two N=64 accumulations, one per V/K
+       subtile; the softmax scale is the `1/√128` literal (a `.sqrt()` would
+       pull in libdevice and reject the pure-PTX path). **MMA shape:** the
+       `M64` tcgen05 shape mis-pairs operand A/B K-indices for accumulator
+       rows ≥16 across multi-chunk K accumulation (isolated with row-, column-
+       and K-encoded TMEM probes; a single chunk or a uniform operand hides
+       it). The fix keeps the proven `M128` shape over the 64-row tiles: the
+       tensor core computes 128 M-rows, the unused rows 64..128 stream a
+       `TILE_BYTES` phantom tail past each operand's base (one extra
+       `TILE_BYTES` per SMEM plan keeps it in bounds; the garbage lands in
+       accumulator rows never drained), and the drain reads rows 0..63 with
+       the original `lane = row` fragment map. **Gates (B200):** flash-attn
+       in-crate parity — sync + pipelined forward and both backward kernels vs
+       the staged-bf16 CPU reference, over `T ∈ {128,256,384,512,1024}` and
+       `B·H` up to 152 workstreams — pass (max abs: y 1.5e-3, lse 7.3e-5, dQ
+       7.7e-4, dK 7.3e-4, dV 2.9e-3), and `T = 1024` exercises multiple key
+       tiles and the correction path; pipelined 181 TFLOP/s at
+       [32,1024,24,128]. gpu/model parity gates (dense fwd/bwd + AdamW, Muon,
+       Newton–Schulz, expert and MoE substitution) match CPU at HD=128.
+       Single-block profile at the §13.9 shape (B=12 T=2048 D=3072 H=24
+       HD=128, tcgen05 pipelined): `forward.attention.flash` 2.98 ms,
+       `backward.attention.flash_q` 5.52 ms, `flash_kv` 6.57 ms — ≈15 ms/block
+       against the per-row oracle's ≈1.8 s/block (§1), a ~120× attention-kernel
+       win; full step 81 ms/block. **Deferred:** the persistent (phase-3)
+       two-Q-tile forward has a stream-B regression under this conversion, so
+       the model runs on the pipelined (phase-2) forward meanwhile; the M64
+       operand-pairing quirk is the reason the wasteful-but-correct M128 path
+       is used.
+     - ✅ **7e14 persistent forward stream-B fix** (#47): the deferred
+       phase-3 regression was a TMEM **lane-access / warp-placement** bug, not
+       an operand or column-overlap one. A `tcgen05.ld` warp reaches only TMEM
+       lanes `(warp % 4) * 32 .. +32`, and a 64-row tile's `M128` accumulator
+       keeps its real rows in lanes 0..63 (rows 64..127 are the undrained
+       phantom tail). When the HD=128 conversion dropped `TILE` 128→64 each
+       stream shrank from a 4-warp warpgroup to 2 warps, and the dispatch left
+       stream B on warps 2–3 (warpgroup-0 positions 2–3 → hardware lanes
+       64..127): its softmax drained the phantom rows, the inflated max
+       underflowed every `P = exp2(s − m_ref)` to ~0, and `y` (and the LSE)
+       came out garbage — stream A (warps 0–1 → lanes 0..63) was fine. The
+       fix relabels the dispatch so stream B runs on warps 4–5 (warpgroup-1
+       positions 0–1 → lanes 0..63) with the TMA/MMA warps on 2–3; block
+       stays 192, every per-stream offset unchanged. Persistent is now green
+       on both parity harnesses (flash-attn in-crate y 1.5e-3 / lse 7.3e-5;
+       cross-oracle y 2.4e-3 / lse 1.2e-3) and **faster than pipelined**
+       (kernel bench [32,1024,24,128]: 1.937 ms / 226 TFLOP/s vs pipelined
+       2.425 ms / 181), so the model forward is switched back to
+       `forward_persistent`. `BASELINE_REF=main` A/B at §13.9 (B=12 T=2048,
+       single block): `forward.attention.flash` 3.07 → 2.45 ms (−20%), full
+       step 81.70 → 80.51 ms; backward unchanged. **Still deferred:** the M64
+       operand-K mispairing (issue #47 item 2) — a genuine, distinct operand
+       addressing quirk — so the M128-over-64-row path stays.
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on

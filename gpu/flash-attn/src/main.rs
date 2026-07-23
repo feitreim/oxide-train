@@ -26,7 +26,7 @@ use flash::host::{
     flash_persistent_config, flash_pipelined_config,
 };
 
-const HD: usize = 64;
+const HD: usize = 128;
 const LOG2_E: f32 = std::f32::consts::LOG2_E;
 
 fn f32_to_bf16_rne(value: f32) -> u16 {
