@@ -745,13 +745,9 @@ Each gated on tests; correctness before speed at every step.
      full step 750.85 → 733.77 ms (−2.3%). The lm-head `transpose_dlogits`/
      `transpose_input` are already-bf16 movement with no quantize to fold, so
      the fallback leaves them for the descriptor route.
-   - ⏳ **tcgen05 flash at HD=128** (#42): both flash generations specialize on
-     `HD == 64` (`TILE_HD` fp32 tiles; the tcgen05 swizzle/SMEM plans bake
-     `TILE_BYTES = 128·64·2`). `HD != 64` currently dispatches to the
-     per-row oracle kernels — correct but serial over keys, so the big
-     config trains at oracle-attention speed until the tcgen05 kernels
-     learn 128 (two 64-wide panels or a 64-row tile re-tiling; the naive
-     SMEM scaling of the persistent kernel would need 384 KiB > 227 KiB).
+   - ✅ **tcgen05 flash at HD=128** (#42): landed via #46/#48/#51 — see the
+     7e13/7e14/7e15 milestone entries (64-row tiles, stacked 64-wide
+     swizzle subtiles, M128 pairing in the backwards).
    - ✅ **`moe_scatter_dy` block-per-pair** (#45): the backward MoE scatter gave
      each `(token, slot)` pair a single thread that serially walked the whole
      `D=3072` gradient row — an uncoalesced copy fused with a serial gate dot,
@@ -789,6 +785,18 @@ Each gated on tests; correctness before speed at every step.
      43.78 → 18.52 ms, full step 748.0 → 719.9 ms (−3.8%). Input-backward
      and weight-grad remain L2-weight-bandwidth bound (a full skinny-GEMM
      weight-reuse pass without the block overhead is the next lever).
+   - ✅ **Combined stack** (#43+#44+#45, merged as #49/#50/#52): single
+     B200 §10.1 profile at the canonical config after all three merges:
+     **full step 618.1 ms** (from the 748–751 ms pre-stack baselines,
+     −17.5%). Summing the three individual A/B deltas predicts ≈677 ms;
+     the extra ~59 ms is cross-container variance (different B200s,
+     different clocks), so 618 is a fresh single-container measurement,
+     not an A/B. Attention (`flash` fwd + `flash_q`/`flash_kv` + staging +
+     `flash_dot`) is 130.8 ms (21.2%), expert GEMMs + staging 216.5 ms
+     (35.0%), and no single non-GEMM kernel exceeds 2.1%. Remaining
+     levers tracked in #47 (M128-pairing model-shape A/B), #53
+     (descriptor-transpose TN weight grads), #54 (router weight-reuse),
+     #55 (float4 scatter + `zero_dy_bins` fold).
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 
