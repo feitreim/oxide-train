@@ -66,7 +66,7 @@ pub use tensor_device::kernels as tensor_kernels;
 
 use flash_host::{
     FLASH_HD, FLASH_TILE, FlashHeadTmaMap, correction_count_len, create_flash_head_tma_map,
-    flash_persistent_config,
+    flash_pipelined_config,
 };
 use gemm_device::launch_config as fp32_launch_config;
 use gemm_host::{
@@ -4837,15 +4837,16 @@ fn flash_attention_forward_into<
             )
         })?;
         profiler.measure(stream, "forward.attention.flash", || unsafe {
-            flash_bf16.forward_persistent(
+            // Pipelined (phase-2) forward: the persistent (phase-3) kernel has a
+            // stream-B regression under the HD=128 M128-over-64-row conversion.
+            flash_bf16.forward_pipelined(
                 stream,
-                flash_persistent_config(N / T, T, H, flash_bf16.sm_count()),
+                flash_pipelined_config(N / T, T, H),
                 scratch.q_tma.as_ptr(),
                 scratch.k_tma.as_ptr(),
                 scratch.v_tma.as_ptr(),
                 T as u32,
                 H as u32,
-                (N / T) as u32,
                 output.as_device_buffer_mut(),
                 logsumexp.as_device_buffer_mut(),
                 &mut scratch.correction_counts,

@@ -18,7 +18,7 @@ mod naive;
 const B: usize = 2;
 const T: usize = 1024;
 const H: usize = 24;
-const HD: usize = 64;
+const HD: usize = 128;
 const N: usize = B * T;
 const D: usize = H * HD;
 

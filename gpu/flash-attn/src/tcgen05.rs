@@ -14,13 +14,14 @@
 //!   `[T, HD]` panel per head, produced by tensor-gpu's
 //!   `stage_attention_heads_bf16` (Q arrives pre-scaled by
 //!   `softmax_scale * log2(e)`, so scores are base-2 native);
-//! - `T` is a multiple of the 128-row tile; `HD == 64`; non-aligned shapes
+//! - `T` is a multiple of the 64-row tile; `HD == 128`; non-aligned shapes
 //!   stay on the fp32 tiled kernels in `lib.rs`;
 //! - outputs keep the existing contract: fp32 `y[B*T, H*HD]` and fp32
 //!   `logsumexp[B*T, H]` in natural-log units.
 //!
-//! One CTA workstream owns a 128-query tile of one `(batch, head)` and
-//! streams 128-key tiles: TMA loads Q/K/V into swizzled shared tiles,
+//! One CTA workstream owns a 64-query tile of one `(batch, head)` and
+//! streams 64-key tiles: TMA loads Q/K/V into swizzled shared tiles (each
+//! 128-wide head panel is two stacked 64-wide SWIZZLE_128B subtiles),
 //! `S = Q·Kᵀ` accumulates in fp32 TMEM, a register softmax (mask → row max →
 //! software exp2 → running sum) packs bf16 probabilities back to shared
 //! memory with swizzled `stmatrix` stores, and `O += P·V` accumulates in a
@@ -82,14 +83,33 @@ use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
 
 // Tile contract; `host.rs` mirrors these as FLASH_TILE / FLASH_HD (kept
 // non-pub here so SWEEP's one-definition rule never sees two copies).
-const TILE: usize = 128;
-const HD: usize = 64;
+//
+// The head width is 128, but every SWIZZLE_128B shared tile is stored as one
+// or two 64-wide (128-byte-row) subtiles so the swizzle phase still equals the
+// row index inside each subtile — the coincidence HD=64 gave for free. A
+// 128-wide operand (Q/K/V) is two stacked `[TILE, 64]` subtiles a
+// `SUBTILE_BYTES` apart; the 64-wide P/dS operands are a single subtile. HD-deep
+// MMAs (`S = Q·Kᵀ`) walk 8 K=16 chunks across the two subtiles; HD-wide MMAs
+// (`O = P·V`, the gradient MMAs) split into two N=64 accumulations, one per V/K
+// subtile.
+const TILE: usize = 64;
+const HD: usize = 128;
 
-/// Bytes of one swizzled bf16 `[128, 64]` shared tile.
+/// Bytes of one full-width bf16 `[TILE, HD]` operand (two stacked subtiles).
 const TILE_BYTES: usize = TILE * HD * 2;
-/// Dynamic shared plan of the synchronous kernel: Q, K, V tiles plus the two
-/// stacked P subtiles.
-pub const FLASH_DYNAMIC_SMEM: usize = 5 * TILE_BYTES;
+/// Bytes of one 64-wide `[TILE, 64]` SWIZZLE_128B subtile — half a `TILE_BYTES`
+/// panel, and the footprint of a `[TILE, TILE]` P/dS probability operand.
+const SUBTILE_BYTES: usize = TILE_BYTES / 2;
+/// Phantom-read pad. Every MMA uses the `M128` shape over 64-row tiles (the
+/// `M64` shape mis-pairs operand K-indices for rows ≥16), so the tensor core
+/// reads 128 operand rows and the unused rows 64..128 stream a `TILE_BYTES`
+/// tail past each operand's base. One extra `TILE_BYTES` at the end of every
+/// dynamic-shared plan keeps those reads in bounds; the garbage they pull lands
+/// in accumulator rows 64..128, which are never drained.
+const PHANTOM_PAD: usize = TILE_BYTES;
+/// Dynamic shared plan of the synchronous kernel: Q, K, V panels plus the
+/// single P subtile.
+pub const FLASH_DYNAMIC_SMEM: usize = 3 * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
 
 /// K/V ring depth of the pipelined kernel (SWEEP knob). Two is the floor:
 /// the staggered issue order (`S-MMA(i)` before `O-MMA(i-1)`) needs one
@@ -98,20 +118,20 @@ pub const FLASH_DYNAMIC_SMEM: usize = 5 * TILE_BYTES;
 pub const PIPELINE_STAGES: usize = 3;
 const _: () = assert!(2 <= PIPELINE_STAGES && PIPELINE_STAGES <= 4);
 /// Dynamic shared plan of the pipelined kernel: Q, the K and V rings, and
-/// the two stacked P subtiles.
-pub const FLASH_PIPELINE_SMEM: usize = (3 + 2 * PIPELINE_STAGES) * TILE_BYTES;
+/// the single P subtile.
+pub const FLASH_PIPELINE_SMEM: usize = (1 + 2 * PIPELINE_STAGES) * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
 /// Threads of the pipelined kernel: the softmax/correction/epilogue
 /// warpgroup plus the TMA-load warp and the MMA-issue warp.
 pub const FLASH_PIPELINE_BLOCK: usize = TILE + 64;
 
 /// Dynamic shared plan of the synchronous query-parallel backward (kernel A):
-/// the resident Q and dY tiles, the streamed K and V tiles, and the two
-/// stacked dS subtiles.
-pub const FLASH_BACKWARD_Q_SMEM: usize = 6 * TILE_BYTES;
+/// the resident Q and dY panels, the streamed K and V panels, and the single
+/// dS subtile.
+pub const FLASH_BACKWARD_Q_SMEM: usize = 4 * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
 /// Dynamic shared plan of the synchronous key-parallel backward (kernel B):
-/// the resident K and V tiles, the streamed Q and dY tiles, and the two
-/// stacked subtile pairs (Pᵀ and dSᵀ).
-pub const FLASH_BACKWARD_KV_SMEM: usize = 8 * TILE_BYTES;
+/// the resident K and V panels, the streamed Q and dY panels, and the Pᵀ and
+/// dSᵀ subtiles.
+pub const FLASH_BACKWARD_KV_SMEM: usize = 4 * TILE_BYTES + 2 * SUBTILE_BYTES + PHANTOM_PAD;
 
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
@@ -123,9 +143,10 @@ pub const CORRECTION_THRESHOLD: f32 = 8.0;
 /// the doubled Q/P footprint of two workstreams stays inside the ~227 KiB
 /// shared-memory budget.
 pub const PERSISTENT_STAGES: usize = if PIPELINE_STAGES < 3 { PIPELINE_STAGES } else { 3 };
-/// Dynamic shared plan of the persistent kernel: two Q tiles, the K and V
-/// rings, and one two-subtile P buffer per workstream.
-pub const FLASH_PERSISTENT_SMEM: usize = (2 + 2 * PERSISTENT_STAGES + 4) * TILE_BYTES;
+/// Dynamic shared plan of the persistent kernel: two Q panels, the K and V
+/// rings, and one P subtile per workstream.
+pub const FLASH_PERSISTENT_SMEM: usize =
+    (2 + 2 * PERSISTENT_STAGES) * TILE_BYTES + 2 * SUBTILE_BYTES + PHANTOM_PAD;
 /// Threads of the persistent kernel: two softmax warpgroups plus the
 /// TMA-load warp and the MMA-issue warp.
 pub const FLASH_PERSISTENT_BLOCK: usize = 2 * TILE + 64;
@@ -140,9 +161,9 @@ pub mod kernels {
     use super::*;
 
     const LN2: f32 = 0.693_147_18;
-    /// Softmax scale for `HD == 64` (`1/sqrt(64)`), written as a literal
+    /// Softmax scale for `HD == 128` (`1/sqrt(128)`), written as a literal
     /// because `1.0/(HD as f32).sqrt()` would lower to libdevice `sqrtf`.
-    const SCALE: f32 = 0.125;
+    const SCALE: f32 = 0.088_388_35;
     /// `log2(e)`, converting the saved natural-log LSE into the base-2 domain
     /// the recomputed probabilities live in.
     const LOG2E: f32 = 1.442_695_04;
@@ -158,6 +179,25 @@ pub mod kernels {
         let leading = ((LEADING_BYTES >> 4) & 0x3fff) as u64;
         let stride = ((STRIDE_BYTES >> 4) & 0x3fff) as u64;
         address | (leading << 16) | (stride << 32) | (1u64 << 46) | ((SWIZZLE_128B as u64) << 61)
+    }
+
+    /// TMA one `[TILE, HD]` head-panel row range into two stacked 64-wide
+    /// SWIZZLE_128B subtiles: the descriptor's box is 64 columns, so the
+    /// second load lifts the leading (HD) coordinate by 64 to fetch columns
+    /// 64..128 into `dst + SUBTILE_BYTES`. Callers still charge one
+    /// `TILE_BYTES` (= 2·SUBTILE_BYTES) of expected transaction bytes.
+    #[inline(always)]
+    unsafe fn load_panel(
+        dst: *mut u8,
+        tma: *const TmaDescriptor,
+        row: i32,
+        plane: i32,
+        barrier: *mut Barrier,
+    ) {
+        unsafe {
+            cp_async_bulk_tensor_3d_g2s(dst, tma, 0, row, plane, barrier);
+            cp_async_bulk_tensor_3d_g2s(dst.add(SUBTILE_BYTES), tma, 64, row, plane, barrier);
+        }
     }
 
     /// NaN-free float max/min. `f32::max`/`f32::min` lower to libdevice
@@ -273,7 +313,7 @@ pub mod kernels {
         vote_barrier: *const Barrier,
         m_ref: &mut [f32; 4],
         running_sum: &mut [f32; 4],
-        out_acc: &mut [[f32; 16]; 4],
+        out_acc: &mut [[f32; 32]; 4],
     ) -> bool {
         unsafe {
             let quad = (lane % 4) as usize;
@@ -285,7 +325,7 @@ pub mod kernels {
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
                 let mut column_block = 0u32;
-                while column_block < 8 {
+                while column_block < 4 {
                     let column = column_block * 16;
                     let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
@@ -348,12 +388,10 @@ pub mod kernels {
             }
             mbarrier_arrive(vote_barrier);
             while !mbarrier_try_wait_parity(vote_barrier, parity) {}
+            // Only two warps make up the softmax warpgroup at TILE=64, so the
+            // warpgroup-wide OR spans two vote words.
             let base = (parity * 4) as usize;
-            let correction = (*votes.add(base)
-                | *votes.add(base + 1)
-                | *votes.add(base + 2)
-                | *votes.add(base + 3))
-                != 0;
+            let correction = (*votes.add(base) | *votes.add(base + 1)) != 0;
 
             if correction {
                 if tile > 0 {
@@ -366,7 +404,7 @@ pub mod kernels {
                     m_ref[slot] = next;
                     running_sum[slot] *= factor;
                     let mut value = 0usize;
-                    while value < 16 {
+                    while value < 32 {
                         out_acc[slot][value] *= factor;
                         value += 1;
                     }
@@ -382,7 +420,7 @@ pub mod kernels {
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
                 let mut column_block = 0u32;
-                while column_block < 8 {
+                while column_block < 4 {
                     let column = column_block * 16;
                     let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
@@ -413,16 +451,16 @@ pub mod kernels {
                     tile_sum[slot_a] += p_a0 + p_a1 + p_a8 + p_a9;
                     tile_sum[slot_b] += p_b0 + p_b1 + p_b8 + p_b9;
 
-                    let subtile = (column_block / 4) as usize * TILE_BYTES;
-                    let chunk_low = ((column_block % 4) * 2) as usize;
+                    // P is a single 64-wide subtile (128-byte rows), so the
+                    // eight 16-byte chunks index the whole row directly.
+                    let chunk_low = (column_block * 2) as usize;
                     let chunk = if (8..16).contains(&lane) { chunk_low + 1 } else { chunk_low };
                     let row_low = tmem_row as usize + (lane % 8) as usize;
                     let row_high = row_low + 8;
-                    let address_low = p_smem
-                        .add(subtile + row_low * 128 + (chunk ^ ((row_low + p_phase) & 7)) * 16);
-                    let address_high = p_smem.add(
-                        subtile + row_high * 128 + (chunk ^ ((row_high + p_phase) & 7)) * 16,
-                    );
+                    let address_low =
+                        p_smem.add(row_low * 128 + (chunk ^ ((row_low + p_phase) & 7)) * 16);
+                    let address_high =
+                        p_smem.add(row_high * 128 + (chunk ^ ((row_high + p_phase) & 7)) * 16);
                     stmatrix_m8n8_x2(
                         address_low,
                         cvt_f32x2_bf16x2(p_a0, p_a1),
@@ -451,13 +489,13 @@ pub mod kernels {
     /// then rescales the merged accumulator to the new reference) and by
     /// the epilogue for the final segment. `warp_id` is warpgroup-local.
     #[inline(always)]
-    unsafe fn merge_output_tile(o_tmem: u32, warp_id: u32, out_acc: &mut [[f32; 16]; 4]) {
+    unsafe fn merge_output_tile(o_tmem: u32, warp_id: u32, out_acc: &mut [[f32; 32]; 4]) {
         unsafe {
             let mut row_block = 0u32;
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
                 let mut column_block = 0u32;
-                while column_block < 4 {
+                while column_block < 8 {
                     let column = column_block * 16;
                     let low = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
@@ -499,7 +537,7 @@ pub mod kernels {
         lane: u32,
         max_ref: &[f32; 4],
         running_sum: &[f32; 4],
-        out_acc: &[[f32; 16]; 4],
+        out_acc: &[[f32; 32]; 4],
         output: &mut DisjointSlice<f32>,
         logsumexp: &mut DisjointSlice<f32>,
     ) {
@@ -516,7 +554,7 @@ pub mod kernels {
                 let inverse = 1.0 / running_sum[slot];
                 let out_base = global_row * d_model + head as usize * HD;
                 let mut column_block = 0usize;
-                while column_block < 4 {
+                while column_block < 8 {
                     let column = column_block * 16 + 2 * quad;
                     let base = column_block * 4;
                     *output.get_unchecked_mut(out_base + column) = out_acc[slot][base] * inverse;
@@ -537,15 +575,19 @@ pub mod kernels {
         }
     }
 
-    /// Issue one `S = Q·Kᵀ` tile (M128_N128, four chained K=16 MMAs) from
-    /// the current leader thread; the caller owns the commit.
+    /// Issue one `S = Q·Kᵀ` tile (M128_N64 over the 64-row tile, eight chained
+    /// K=16 MMAs walking the two stacked HD subtiles of both operands) from the
+    /// current leader thread; the caller owns the commit. The `M128` shape's
+    /// phantom rows 64..128 read the operand's `TILE_BYTES` tail and land in
+    /// accumulator rows the drain never touches.
     #[inline(always)]
     unsafe fn score_mma(s_tmem: u32, q_smem: *mut u8, k_smem: *mut u8, s_instruction: u32) {
         unsafe {
             let mut chunk = 0u64;
-            while chunk < 4 {
-                let a_descriptor = smem_descriptor(q_smem as u64 + chunk * 32);
-                let b_descriptor = smem_descriptor(k_smem as u64 + chunk * 32);
+            while chunk < 8 {
+                let offset = (chunk / 4) * SUBTILE_BYTES as u64 + (chunk % 4) * 32;
+                let a_descriptor = smem_descriptor(q_smem as u64 + offset);
+                let b_descriptor = smem_descriptor(k_smem as u64 + offset);
                 tcgen05_mma_f16(s_tmem, a_descriptor, b_descriptor, s_instruction, chunk > 0);
                 chunk += 1;
             }
@@ -577,15 +619,16 @@ pub mod kernels {
         b9: f32,
     ) {
         unsafe {
-            let subtile = (column_block / 4) as usize * TILE_BYTES;
-            let chunk_low = ((column_block % 4) * 2) as usize;
+            // The dS / Pᵀ / dSᵀ operands are a single 64-wide subtile
+            // (128-byte rows), so the eight 16-byte chunks index the row.
+            let chunk_low = (column_block * 2) as usize;
             let chunk = if (8..16).contains(&lane) { chunk_low + 1 } else { chunk_low };
             let row_low = tmem_row as usize + (lane % 8) as usize;
             let row_high = row_low + 8;
             let address_low =
-                smem.add(subtile + row_low * 128 + (chunk ^ ((row_low + phase) & 7)) * 16);
+                smem.add(row_low * 128 + (chunk ^ ((row_low + phase) & 7)) * 16);
             let address_high =
-                smem.add(subtile + row_high * 128 + (chunk ^ ((row_high + phase) & 7)) * 16);
+                smem.add(row_high * 128 + (chunk ^ ((row_high + phase) & 7)) * 16);
             stmatrix_m8n8_x2(address_low, cvt_f32x2_bf16x2(a0, a1), cvt_f32x2_bf16x2(a8, a9));
             stmatrix_m8n8_x2(address_high, cvt_f32x2_bf16x2(b0, b1), cvt_f32x2_bf16x2(b8, b9));
         }
@@ -634,7 +677,7 @@ pub mod kernels {
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
                 let mut column_block = 0u32;
-                while column_block < 8 {
+                while column_block < 4 {
                     let column = column_block * 16;
                     let s_low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
@@ -714,7 +757,7 @@ pub mod kernels {
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
                 let mut column_block = 0u32;
-                while column_block < 8 {
+                while column_block < 4 {
                     let column = column_block * 16;
                     let s_low = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
@@ -775,26 +818,39 @@ pub mod kernels {
         }
     }
 
-    /// Issue one `dQ/dK/dV += A·B` gradient tile from the leader thread: the
-    /// forward O-MMA shape (M128_N64, transpose_b, eight chained K=16 chunks)
-    /// with `A` walking two stacked bf16 subtiles and `B` walking a key/query
-    /// operand by 2048-byte rows. `fresh` starts a new TMEM accumulator (the
-    /// block's first visited tile); otherwise it accumulates with `enable_d`.
+    /// Issue one `dQ/dK/dV += A·Bᵀ` gradient tile (also the forward `O = P·V`)
+    /// from the leader thread. `A` (the 64-wide probability/`dS` subtile) walks
+    /// four K=16 chunks; `B` (a 128-wide key/query/value operand) is two stacked
+    /// HD subtiles, so the 128-column output is two chained `M128_N64`
+    /// transpose_b accumulations (over the 64-row tile; phantom rows 64..128 as
+    /// in `score_mma`), one per subtile, into `acc_tmem` and `acc_tmem + 64`.
+    /// `fresh` starts a new TMEM accumulator (the block's first visited tile);
+    /// otherwise it accumulates with `enable_d`.
     #[inline(always)]
     unsafe fn grad_mma(acc_tmem: u32, a_smem: *mut u8, b_smem: *mut u8, instruction: u32, fresh: bool) {
         unsafe {
-            let mut chunk = 0u64;
-            while chunk < 8 {
-                let a_descriptor =
-                    smem_descriptor(a_smem as u64 + (chunk / 4) * TILE_BYTES as u64 + (chunk % 4) * 32);
-                let b_descriptor = smem_descriptor(b_smem as u64 + chunk * 2048);
-                tcgen05_mma_f16(acc_tmem, a_descriptor, b_descriptor, instruction, chunk > 0 || !fresh);
-                chunk += 1;
+            let mut hd = 0u64;
+            while hd < 2 {
+                let mut chunk = 0u64;
+                while chunk < 4 {
+                    let a_descriptor = smem_descriptor(a_smem as u64 + chunk * 32);
+                    let b_descriptor =
+                        smem_descriptor(b_smem as u64 + hd * SUBTILE_BYTES as u64 + chunk * 2048);
+                    tcgen05_mma_f16(
+                        acc_tmem + (hd as u32) * 64,
+                        a_descriptor,
+                        b_descriptor,
+                        instruction,
+                        chunk > 0 || !fresh,
+                    );
+                    chunk += 1;
+                }
+                hd += 1;
             }
         }
     }
 
-    /// Drain a 64-column gradient accumulator and store fp32 straight to
+    /// Drain a 128-column gradient accumulator and store fp32 straight to
     /// global memory through the fragment map, at the block's `tile` rows.
     /// Like `store_outputs` minus the `1/sum` scale and the LSE write — the
     /// gradients are already complete sums.
@@ -808,7 +864,7 @@ pub mod kernels {
         tile: u32,
         warp_id: u32,
         lane: u32,
-        grad_acc: &[[f32; 16]; 4],
+        grad_acc: &[[f32; 32]; 4],
         output: &mut DisjointSlice<f32>,
     ) {
         unsafe {
@@ -822,7 +878,7 @@ pub mod kernels {
                 let global_row = (batch * t) as usize + tile as usize * TILE + local_row;
                 let out_base = global_row * d_model + head as usize * HD;
                 let mut column_block = 0usize;
-                while column_block < 4 {
+                while column_block < 8 {
                     let column = column_block * 16 + 2 * quad;
                     let base = column_block * 4;
                     *output.get_unchecked_mut(out_base + column) = grad_acc[slot][base];
@@ -856,10 +912,10 @@ pub mod kernels {
         }
     }
 
-    /// Dumps the raw shared-memory word layout of one TMA-loaded `[128, 64]`
-    /// bf16 tile, plus the tile's absolute 128-byte row phase as a trailing
-    /// word. The P-write path mirrors TMA's SWIZZLE_128B placement — which
-    /// XORs *absolute* address bits [9:7] — with manual address XORs; the
+    /// Dumps the raw shared-memory word layout of one TMA-loaded `[TILE, 64]`
+    /// bf16 subtile, plus the subtile's absolute 128-byte row phase as a
+    /// trailing word. The P-write path mirrors TMA's SWIZZLE_128B placement —
+    /// which XORs *absolute* address bits [9:7] — with manual address XORs; the
     /// host fills the staging tile with sequential word indices and verifies
     /// the exact permutation from this dump.
     #[kernel]
@@ -876,19 +932,19 @@ pub mod kernels {
             thread::sync_threads();
             if tid == 0 {
                 cp_async_bulk_tensor_3d_g2s(smem, src_tma, 0, 0, 0, &raw mut TMA_BARRIER);
-                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, TILE_BYTES as u32);
+                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, SUBTILE_BYTES as u32);
             }
             while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
             thread::sync_threads();
 
             let words = smem as *const u32;
             let mut index = tid as usize;
-            while index < TILE_BYTES / 4 {
+            while index < SUBTILE_BYTES / 4 {
                 *output.get_unchecked_mut(index) = *words.add(index);
                 index += TILE;
             }
             if tid == 0 {
-                *output.get_unchecked_mut(TILE_BYTES / 4) = ((smem as usize >> 7) & 7) as u32;
+                *output.get_unchecked_mut(SUBTILE_BYTES / 4) = ((smem as usize >> 7) & 7) as u32;
             }
             thread::sync_threads();
             if tid == 0 {
@@ -897,16 +953,14 @@ pub mod kernels {
         }
     }
 
-    /// Validation kernel for the transposed-B operand path the `O = P·V` MMA
-    /// depends on: one CTA computes `C[128, 64] = A[128, 128] · B[128, 64]`
-    /// with `B` stored row-major `[K, N]` — the natural V-tile orientation —
-    /// consumed through `transpose_b` instruction-descriptor bit plus
-    /// 16-row (2048-byte) descriptor advances per K chunk.
-    ///
-    /// The epilogue stores each thread's fragment straight to global memory
-    /// through the decoded (row, column) ownership map, so a failure here
-    /// distinguishes descriptor problems (values transposed/permuted in
-    /// blocks) from fragment-map problems (fine-grained scrambling).
+    /// Validation kernel for the `S = Q·Kᵀ` operand path: one CTA computes
+    /// `C[64, 64] = A[64, 64] · B[64, 64]` over the full 128-wide HD (two
+    /// stacked subtiles, K=128) through the real `score_mma` walk and the
+    /// `M128`-over-64-row accumulator, then drains rows 0..63 through the
+    /// decoded (row, column) fragment map. A failure here isolates the
+    /// operand descriptor / fragment map from the softmax and epilogue — it is
+    /// what caught the `M64`-shape A/B K-mispairing that this conversion
+    /// works around with the `M128` shape.
     #[kernel]
     pub unsafe fn transpose_b_probe(
         a_tma: *const TmaDescriptor,
@@ -920,7 +974,7 @@ pub mod kernels {
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let a_smem = smem;
-            let b_smem = smem.add(2 * TILE_BYTES);
+            let b_smem = smem.add(TILE_BYTES);
 
             let tid = thread::threadIdx_x();
             let warp_id = warp::warp_id();
@@ -940,17 +994,9 @@ pub mod kernels {
             let tmem = *(&raw const TMEM_ADDRESS as *const u32);
 
             if is_leader {
-                cp_async_bulk_tensor_3d_g2s(a_smem, a_tma, 0, 0, 0, &raw mut TMA_BARRIER);
-                cp_async_bulk_tensor_3d_g2s(
-                    a_smem.add(TILE_BYTES),
-                    a_tma,
-                    0,
-                    0,
-                    1,
-                    &raw mut TMA_BARRIER,
-                );
-                cp_async_bulk_tensor_3d_g2s(b_smem, b_tma, 0, 0, 0, &raw mut TMA_BARRIER);
-                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, (3 * TILE_BYTES) as u32);
+                load_panel(a_smem, a_tma, 0, 0, &raw mut TMA_BARRIER);
+                load_panel(b_smem, b_tma, 0, 0, &raw mut TMA_BARRIER);
+                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, (2 * TILE_BYTES) as u32);
             }
             while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
             thread::sync_threads();
@@ -959,20 +1005,10 @@ pub mod kernels {
                 .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
-                .transpose_b(true)
                 .build()
                 .raw();
             if is_leader {
-                let mut chunk = 0u32;
-                while chunk < 8 {
-                    let a_descriptor = smem_descriptor(
-                        a_smem as u64 + (chunk / 4) as u64 * TILE_BYTES as u64
-                            + (chunk % 4) as u64 * 32,
-                    );
-                    let b_descriptor = smem_descriptor(b_smem as u64 + chunk as u64 * 2048);
-                    tcgen05_mma_f16(tmem, a_descriptor, b_descriptor, instruction, chunk > 0);
-                    chunk += 1;
-                }
+                score_mma(tmem, a_smem, b_smem, instruction);
                 tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
             }
             while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, 0) {}
@@ -994,14 +1030,14 @@ pub mod kernels {
                     let row_a = tmem_row as usize + row_in_16;
                     let row_b = row_a + 8;
                     let col = column + 2 * quad;
-                    *output.get_unchecked_mut(row_a * HD + col) = low[0];
-                    *output.get_unchecked_mut(row_a * HD + col + 1) = low[1];
-                    *output.get_unchecked_mut(row_b * HD + col) = low[2];
-                    *output.get_unchecked_mut(row_b * HD + col + 1) = low[3];
-                    *output.get_unchecked_mut(row_a * HD + col + 8) = high[0];
-                    *output.get_unchecked_mut(row_a * HD + col + 9) = high[1];
-                    *output.get_unchecked_mut(row_b * HD + col + 8) = high[2];
-                    *output.get_unchecked_mut(row_b * HD + col + 9) = high[3];
+                    *output.get_unchecked_mut(row_a * TILE + col) = low[0];
+                    *output.get_unchecked_mut(row_a * TILE + col + 1) = low[1];
+                    *output.get_unchecked_mut(row_b * TILE + col) = low[2];
+                    *output.get_unchecked_mut(row_b * TILE + col + 1) = low[3];
+                    *output.get_unchecked_mut(row_a * TILE + col + 8) = high[0];
+                    *output.get_unchecked_mut(row_a * TILE + col + 9) = high[1];
+                    *output.get_unchecked_mut(row_b * TILE + col + 8) = high[2];
+                    *output.get_unchecked_mut(row_b * TILE + col + 9) = high[3];
                     column_block += 1;
                 }
                 row_block += 1;
@@ -1079,7 +1115,7 @@ pub mod kernels {
             let o_tmem = tmem + 256;
 
             let s_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N128)
+                .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
                 .build()
@@ -1094,10 +1130,9 @@ pub mod kernels {
 
             // Q stays operand-A resident for the whole key stream.
             if is_leader {
-                cp_async_bulk_tensor_3d_g2s(
+                load_panel(
                     q_smem,
                     q_tma,
-                    0,
                     (query_tile * TILE as u32) as i32,
                     plane,
                     &raw mut TMA_BARRIER,
@@ -1109,7 +1144,7 @@ pub mod kernels {
 
             let mut m_ref = [MASKED_SCORE; 4];
             let mut running_sum = [0.0f32; 4];
-            let mut out_acc = [[0.0f32; 16]; 4];
+            let mut out_acc = [[0.0f32; 32]; 4];
             let mut corrections = 0u32;
 
             // The 128B swizzle XORs *absolute* shared-address bits [9:7], not
@@ -1126,22 +1161,8 @@ pub mod kernels {
             while key_tile <= query_tile {
                 if is_leader {
                     let key_row = (key_tile * TILE as u32) as i32;
-                    cp_async_bulk_tensor_3d_g2s(
-                        k_smem,
-                        k_tma,
-                        0,
-                        key_row,
-                        plane,
-                        &raw mut TMA_BARRIER,
-                    );
-                    cp_async_bulk_tensor_3d_g2s(
-                        v_smem,
-                        v_tma,
-                        0,
-                        key_row,
-                        plane,
-                        &raw mut TMA_BARRIER,
-                    );
+                    load_panel(k_smem, k_tma, key_row, plane, &raw mut TMA_BARRIER);
+                    load_panel(v_smem, v_tma, key_row, plane, &raw mut TMA_BARRIER);
                     mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
                 }
                 while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, tma_phase & 1) {}
@@ -1188,21 +1209,7 @@ pub mod kernels {
                 // across the block, so the leader's copy is the vote).
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    let mut chunk = 0u64;
-                    while chunk < 8 {
-                        let a_descriptor = smem_descriptor(
-                            p_smem as u64 + (chunk / 4) * TILE_BYTES as u64 + (chunk % 4) * 32,
-                        );
-                        let b_descriptor = smem_descriptor(v_smem as u64 + chunk * 2048);
-                        tcgen05_mma_f16(
-                            o_tmem,
-                            a_descriptor,
-                            b_descriptor,
-                            o_instruction,
-                            chunk > 0 || !correction,
-                        );
-                        chunk += 1;
-                    }
+                    grad_mma(o_tmem, p_smem, v_smem, o_instruction, correction);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
@@ -1322,7 +1329,7 @@ pub mod kernels {
             let dq_tmem = tmem + 256;
 
             let s_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N128)
+                .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
                 .build()
@@ -1337,27 +1344,14 @@ pub mod kernels {
 
             // Q and dY stay operand-A resident for the whole key stream.
             if is_leader {
-                cp_async_bulk_tensor_3d_g2s(
-                    q_smem,
-                    q_tma,
-                    0,
-                    (query_tile * TILE as u32) as i32,
-                    plane,
-                    &raw mut TMA_BARRIER,
-                );
-                cp_async_bulk_tensor_3d_g2s(
-                    dy_smem,
-                    dy_tma,
-                    0,
-                    (query_tile * TILE as u32) as i32,
-                    plane,
-                    &raw mut TMA_BARRIER,
-                );
+                let query_row = (query_tile * TILE as u32) as i32;
+                load_panel(q_smem, q_tma, query_row, plane, &raw mut TMA_BARRIER);
+                load_panel(dy_smem, dy_tma, query_row, plane, &raw mut TMA_BARRIER);
                 mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
             }
             while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
 
-            // The 128 query rows' LSE (converted to base-2) and softmax dot,
+            // The TILE query rows' LSE (converted to base-2) and softmax dot,
             // staged once so the register pass reads them from shared memory.
             let query_row = (batch * t) as usize + query_tile as usize * TILE + tid as usize;
             let stat_index = query_row * h as usize + head as usize;
@@ -1366,7 +1360,7 @@ pub mod kernels {
             thread::sync_threads();
 
             let ds_phase = (ds_smem as usize >> 7) & 7;
-            let mut dq_acc = [[0.0f32; 16]; 4];
+            let mut dq_acc = [[0.0f32; 32]; 4];
 
             let mut tma_phase = 1u32;
             let mut mma_phase = 0u32;
@@ -1374,22 +1368,8 @@ pub mod kernels {
             while key_tile <= query_tile {
                 if is_leader {
                     let key_row = (key_tile * TILE as u32) as i32;
-                    cp_async_bulk_tensor_3d_g2s(
-                        k_smem,
-                        k_tma,
-                        0,
-                        key_row,
-                        plane,
-                        &raw mut TMA_BARRIER,
-                    );
-                    cp_async_bulk_tensor_3d_g2s(
-                        v_smem,
-                        v_tma,
-                        0,
-                        key_row,
-                        plane,
-                        &raw mut TMA_BARRIER,
-                    );
+                    load_panel(k_smem, k_tma, key_row, plane, &raw mut TMA_BARRIER);
+                    load_panel(v_smem, v_tma, key_row, plane, &raw mut TMA_BARRIER);
                     mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
                 }
                 while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, tma_phase & 1) {}
@@ -1493,7 +1473,7 @@ pub mod kernels {
             let q_smem = smem.add(2 * TILE_BYTES);
             let dy_smem = smem.add(3 * TILE_BYTES);
             let p_smem = smem.add(4 * TILE_BYTES);
-            let ds_smem = smem.add(6 * TILE_BYTES);
+            let ds_smem = smem.add(4 * TILE_BYTES + SUBTILE_BYTES);
 
             let tid = thread::threadIdx_x();
             if thread::blockDim_x() as usize != TILE {
@@ -1522,13 +1502,15 @@ pub mod kernels {
             }
             thread::sync_threads();
             let tmem = *(&raw const TMEM_ADDRESS as *const u32);
+            // S/dP segments are 64 columns; the dV/dK gradient segments are
+            // 128 columns, so they follow at tmem+128 and tmem+256.
             let st_tmem = tmem;
-            let dpt_tmem = tmem + 128;
-            let dv_tmem = tmem + 256;
-            let dk_tmem = tmem + 320;
+            let dpt_tmem = tmem + 64;
+            let dv_tmem = tmem + 128;
+            let dk_tmem = tmem + 256;
 
             let s_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N128)
+                .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
                 .build()
@@ -1544,16 +1526,16 @@ pub mod kernels {
             // K and V stay operand-A resident for the whole query stream.
             if is_leader {
                 let key_row = (key_tile * TILE as u32) as i32;
-                cp_async_bulk_tensor_3d_g2s(k_smem, k_tma, 0, key_row, plane, &raw mut TMA_BARRIER);
-                cp_async_bulk_tensor_3d_g2s(v_smem, v_tma, 0, key_row, plane, &raw mut TMA_BARRIER);
+                load_panel(k_smem, k_tma, key_row, plane, &raw mut TMA_BARRIER);
+                load_panel(v_smem, v_tma, key_row, plane, &raw mut TMA_BARRIER);
                 mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
             }
             while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
 
             let p_phase = (p_smem as usize >> 7) & 7;
             let ds_phase = (ds_smem as usize >> 7) & 7;
-            let mut dv_acc = [[0.0f32; 16]; 4];
-            let mut dk_acc = [[0.0f32; 16]; 4];
+            let mut dv_acc = [[0.0f32; 32]; 4];
+            let mut dk_acc = [[0.0f32; 32]; 4];
 
             let mut tma_phase = 1u32;
             let mut mma_phase = 0u32;
@@ -1561,29 +1543,15 @@ pub mod kernels {
             while query_tile < tiles {
                 if is_leader {
                     let query_row = (query_tile * TILE as u32) as i32;
-                    cp_async_bulk_tensor_3d_g2s(
-                        q_smem,
-                        q_tma,
-                        0,
-                        query_row,
-                        plane,
-                        &raw mut TMA_BARRIER,
-                    );
-                    cp_async_bulk_tensor_3d_g2s(
-                        dy_smem,
-                        dy_tma,
-                        0,
-                        query_row,
-                        plane,
-                        &raw mut TMA_BARRIER,
-                    );
+                    load_panel(q_smem, q_tma, query_row, plane, &raw mut TMA_BARRIER);
+                    load_panel(dy_smem, dy_tma, query_row, plane, &raw mut TMA_BARRIER);
                     mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
                 }
                 while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, tma_phase & 1) {}
                 tma_phase += 1;
                 thread::sync_threads();
 
-                // Stage this query tile's 128 rows' base-2 LSE and dot.
+                // Stage this query tile's TILE rows' base-2 LSE and dot.
                 let global_row =
                     (batch * t) as usize + query_tile as usize * TILE + tid as usize;
                 let stat_index = global_row * h as usize + head as usize;
@@ -1676,21 +1644,7 @@ pub mod kernels {
             while !mbarrier_try_wait_parity(p_full, tile & 1) {}
             let fresh = *restart.add((tile & 1) as usize) != 0;
             let v_smem = v_ring.add((tile as usize % stages) * TILE_BYTES);
-            let mut chunk = 0u64;
-            while chunk < 8 {
-                let a_descriptor = smem_descriptor(
-                    p_smem as u64 + (chunk / 4) * TILE_BYTES as u64 + (chunk % 4) * 32,
-                );
-                let b_descriptor = smem_descriptor(v_smem as u64 + chunk * 2048);
-                tcgen05_mma_f16(
-                    o_tmem,
-                    a_descriptor,
-                    b_descriptor,
-                    o_instruction,
-                    chunk > 0 || !fresh,
-                );
-                chunk += 1;
-            }
+            grad_mma(o_tmem, p_smem, v_smem, o_instruction, fresh);
             tcgen05_commit_shared_cluster(o_full as *mut u64);
         }
     }
@@ -1727,7 +1681,7 @@ pub mod kernels {
         kv_free: *mut Barrier,
         m_ref: &mut [f32; 4],
         running_sum: &mut [f32; 4],
-        out_acc: &mut [[f32; 16]; 4],
+        out_acc: &mut [[f32; 32]; 4],
         corrections: &mut u32,
     ) {
         unsafe {
@@ -1738,7 +1692,8 @@ pub mod kernels {
             };
             while !mbarrier_try_wait_parity(s_full.add(buffer), s_parity) {}
             let correction = softmax_tile(
-                s_tmem + (buffer as u32) * 128,
+                // The double-buffered S is 64 columns wide per buffer.
+                s_tmem + (buffer as u32) * 64,
                 o_tmem,
                 i,
                 diagonal,
@@ -1877,7 +1832,8 @@ pub mod kernels {
             }
             thread::sync_threads();
             let tmem = *(&raw const TMEM_ADDRESS as *const u32);
-            let o_tmem = tmem + 256;
+            // Two 64-wide S buffers occupy columns 0..128; O follows at 128.
+            let o_tmem = tmem + 128;
 
             if tid < TILE as u32 {
                 // Softmax / correction / epilogue warpgroup. The key loop
@@ -1888,7 +1844,7 @@ pub mod kernels {
                 let restart = &raw mut RESTART as *mut u32;
                 let mut m_ref = [MASKED_SCORE; 4];
                 let mut running_sum = [0.0f32; 4];
-                let mut out_acc = [[0.0f32; 16]; 4];
+                let mut out_acc = [[0.0f32; 32]; 4];
                 let mut corrections = 0u32;
                 let mut i = 0u32;
                 while i + 1 < key_tiles {
@@ -1975,27 +1931,12 @@ pub mod kernels {
                         while !mbarrier_try_wait_parity(kv_free.add(stage), parity) {}
                     }
                     let key_row = (i * TILE as u32) as i32;
-                    cp_async_bulk_tensor_3d_g2s(
-                        k_ring.add(stage * TILE_BYTES),
-                        k_tma,
-                        0,
-                        key_row,
-                        plane,
-                        kv_full.add(stage),
-                    );
-                    cp_async_bulk_tensor_3d_g2s(
-                        v_ring.add(stage * TILE_BYTES),
-                        v_tma,
-                        0,
-                        key_row,
-                        plane,
-                        kv_full.add(stage),
-                    );
+                    load_panel(k_ring.add(stage * TILE_BYTES), k_tma, key_row, plane, kv_full.add(stage));
+                    load_panel(v_ring.add(stage * TILE_BYTES), v_tma, key_row, plane, kv_full.add(stage));
                     if i == 0 {
-                        cp_async_bulk_tensor_3d_g2s(
+                        load_panel(
                             q_smem,
                             q_tma,
-                            0,
                             (query_tile * TILE as u32) as i32,
                             plane,
                             kv_full.add(stage),
@@ -2009,7 +1950,7 @@ pub mod kernels {
             } else if tid == (TILE + 32) as u32 {
                 // MMA warp leader.
                 let s_instruction = Tcgen05InstructionDescriptor::builder()
-                    .shape(Tcgen05MmaShape::M128_N128)
+                    .shape(Tcgen05MmaShape::M128_N64)
                     .element_type(Tcgen05ElementType::BF16)
                     .accumulator_type(Tcgen05AccumulatorType::F32)
                     .build()
@@ -2034,7 +1975,7 @@ pub mod kernels {
                         while !mbarrier_try_wait_parity(s_free.add(buffer), (i / 2 - 1) & 1) {}
                     }
                     score_mma(
-                        tmem + (buffer as u32) * 128,
+                        tmem + (buffer as u32) * 64,
                         q_smem,
                         k_ring.add(stage * TILE_BYTES),
                         s_instruction,
@@ -2128,7 +2069,7 @@ pub mod kernels {
             let key_tiles = query_tile + 1;
             let mut m_ref = [MASKED_SCORE; 4];
             let mut running_sum = [0.0f32; 4];
-            let mut out_acc = [[0.0f32; 16]; 4];
+            let mut out_acc = [[0.0f32; 32]; 4];
             let mut corrections = 0u32;
             let mut i = 0u32;
             while i + 1 < key_tiles {
@@ -2332,7 +2273,7 @@ pub mod kernels {
             let k_ring = smem.add(2 * TILE_BYTES);
             let v_ring = smem.add((2 + PERSISTENT_STAGES) * TILE_BYTES);
             let p_a = smem.add((2 + 2 * PERSISTENT_STAGES) * TILE_BYTES);
-            let p_b = smem.add((4 + 2 * PERSISTENT_STAGES) * TILE_BYTES);
+            let p_b = p_a.add(SUBTILE_BYTES);
 
             let tid = thread::threadIdx_x();
             if thread::blockDim_x() as usize != FLASH_PERSISTENT_BLOCK {
@@ -2363,8 +2304,8 @@ pub mod kernels {
             }
             thread::sync_threads();
             let tmem = *(&raw const TMEM_ADDRESS as *const u32);
-            // TMEM columns: S_A 0..128, S_B 128..256, O_A 256..320,
-            // O_B 320..384.
+            // TMEM columns: S_A 0..64, S_B 64..128, O_A 128..256,
+            // O_B 256..384.
 
             let mut initialized = false;
             let mut item = thread::blockIdx_x();
@@ -2412,7 +2353,7 @@ pub mod kernels {
                         warp_id,
                         lane,
                         tmem,
-                        tmem + 256,
+                        tmem + 128,
                         p_a,
                         votes,
                         vote_barrier,
@@ -2435,10 +2376,10 @@ pub mod kernels {
                             h,
                             head,
                             tid - TILE as u32,
-                            warp_id - 4,
+                            warp_id - (TILE / 32) as u32,
                             lane,
-                            tmem + 128,
-                            tmem + 320,
+                            tmem + 64,
+                            tmem + 256,
                             p_b,
                             votes.add(8),
                             vote_barrier.add(1),
@@ -2465,36 +2406,20 @@ pub mod kernels {
                             while !mbarrier_try_wait_parity(kv_free.add(stage), parity) {}
                         }
                         let key_row = (i * TILE as u32) as i32;
-                        cp_async_bulk_tensor_3d_g2s(
-                            k_ring.add(stage * TILE_BYTES),
-                            k_tma,
-                            0,
-                            key_row,
-                            plane_index,
-                            kv_full.add(stage),
-                        );
-                        cp_async_bulk_tensor_3d_g2s(
-                            v_ring.add(stage * TILE_BYTES),
-                            v_tma,
-                            0,
-                            key_row,
-                            plane_index,
-                            kv_full.add(stage),
-                        );
+                        load_panel(k_ring.add(stage * TILE_BYTES), k_tma, key_row, plane_index, kv_full.add(stage));
+                        load_panel(v_ring.add(stage * TILE_BYTES), v_tma, key_row, plane_index, kv_full.add(stage));
                         if i == 0 {
-                            cp_async_bulk_tensor_3d_g2s(
+                            load_panel(
                                 q_a,
                                 q_tma,
-                                0,
                                 (tile_a * TILE as u32) as i32,
                                 plane_index,
                                 kv_full.add(stage),
                             );
                             if b_active {
-                                cp_async_bulk_tensor_3d_g2s(
+                                load_panel(
                                     q_b,
                                     q_tma,
-                                    0,
                                     (tile_b * TILE as u32) as i32,
                                     plane_index,
                                     kv_full.add(stage),
@@ -2517,7 +2442,7 @@ pub mod kernels {
                     // being free), then the previous tile's O-MMAs — the
                     // same stagger as the pipelined kernel, per stream.
                     let s_instruction = Tcgen05InstructionDescriptor::builder()
-                        .shape(Tcgen05MmaShape::M128_N128)
+                        .shape(Tcgen05MmaShape::M128_N64)
                         .element_type(Tcgen05ElementType::BF16)
                         .accumulator_type(Tcgen05AccumulatorType::F32)
                         .build()
@@ -2549,14 +2474,14 @@ pub mod kernels {
                             if i >= 1 {
                                 while !mbarrier_try_wait_parity(s_free.add(1), (i - 1) & 1) {}
                             }
-                            score_mma(tmem + 128, q_b, k_smem, s_instruction);
+                            score_mma(tmem + 64, q_b, k_smem, s_instruction);
                             tcgen05_commit_shared_cluster(s_full.add(1) as *mut u64);
                         }
                         if i > 0 {
                             output_mma(
                                 i - 1,
                                 PERSISTENT_STAGES,
-                                tmem + 256,
+                                tmem + 128,
                                 p_a,
                                 v_ring,
                                 o_instruction,
@@ -2568,7 +2493,7 @@ pub mod kernels {
                                 output_mma(
                                     i - 1,
                                     PERSISTENT_STAGES,
-                                    tmem + 320,
+                                    tmem + 256,
                                     p_b,
                                     v_ring,
                                     o_instruction,
@@ -2584,7 +2509,7 @@ pub mod kernels {
                         output_mma(
                             tiles_b - 1,
                             PERSISTENT_STAGES,
-                            tmem + 320,
+                            tmem + 256,
                             p_b,
                             v_ring,
                             o_instruction,
@@ -2596,7 +2521,7 @@ pub mod kernels {
                         output_mma(
                             tiles_a - 1,
                             PERSISTENT_STAGES,
-                            tmem + 256,
+                            tmem + 128,
                             p_a,
                             v_ring,
                             o_instruction,
