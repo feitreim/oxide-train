@@ -723,6 +723,28 @@ Each gated on tests; correctness before speed at every step.
    (`C=4096` keeps `N·K == E·C`). Gates: CPU deep overfit, two-block
    CPU/GPU parity on both expert paths, checkpoint v4 bit-identical resume
    with `L`-mismatch rejection.
+   - ✅ **Weight-gradient staging fusion** (#43): the weight-grad GEMM staged
+     both operands with a separate `convert_f32_to_bf16_pairs` then a full
+     `transpose_bf16_pairs` pass on every call, so the profiled span charged two
+     whole-panel bf16 round-trips against the MMA (`gate_up_weight_gemm` ran at
+     ~18% of bf16 peak vs the forward expert GEMM's ~42%). The full fix — the
+     v0.2.1 tcgen05 descriptor's `transpose_a`/`transpose_b` bits, consuming the
+     native row-major operands with nothing transposed — would need the 256×256
+     pair-UMMA kernel re-plumbed for MN-major operands (different TMA box
+     geometry, swizzle atom, and smem descriptor LBO/SBO), with no reference in
+     cuda-oxide and only `swizzle_probe` to verify, so it was deferred as too
+     much blind-iteration risk against the Modal-only build loop. Landed the
+     documented fallback instead: two single-pass fp32-read kernels,
+     `convert_f32_transpose_bf16_pairs` (input operand → transposed `lhs_t`) and
+     `convert_f32_to_bf16_pairs_and_transpose` (output gradient → both the
+     row-major `rows` the input GEMM needs and the transposed `rhs_t`), each
+     removing a whole-panel bf16 write+read. B200 same-container A/B vs main at
+     the §13.9 shape (B=12): `gate_up_weight_gemm` 59.78 → 53.62 ms (−10.3%),
+     `down_weight_gemm` 33.22 → 28.61 ms (−13.9%), `qkv_proj.weight_gemm`
+     21.81 → 18.46 ms (−15.4%), `o_proj.weight_gemm` 9.03 → 7.03 ms (−22.2%);
+     full step 750.85 → 733.77 ms (−2.3%). The lm-head `transpose_dlogits`/
+     `transpose_input` are already-bf16 movement with no quantize to fold, so
+     the fallback leaves them for the descriptor route.
    - ⏳ **tcgen05 flash at HD=128** (#42): both flash generations specialize on
      `HD == 64` (`TILE_HD` fp32 tiles; the tcgen05 swizzle/SMEM plans bake
      `TILE_BYTES = 128·64·2`). `HD != 64` currently dispatches to the
