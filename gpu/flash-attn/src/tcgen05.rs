@@ -2220,14 +2220,19 @@ pub mod kernels {
     /// `host::FLASH_PERSISTENT_SMEM_BYTES` dynamic shared bytes. Operand
     /// and output contracts match the other tcgen05 forwards.
     ///
-    /// Each work item is a (query-tile *pair*, head, batch): warpgroup A
-    /// (warps 0–3) owns query tile `2p`, warpgroup B (warps 4–7) owns
-    /// `2p+1`, and both share one K/V ring, one TMA-load warp (warp 8) and
-    /// one MMA warp (warp 9). TMEM holds a single-buffered S plus an O
-    /// segment per stream (384 of the 512 columns): while one warpgroup
-    /// runs softmax, the MMA warp feeds the other stream — the ping-pong
-    /// a single 128-thread warpgroup could not reach, and the main use of
-    /// the SM's issue slots now that TMEM pins occupancy to one CTA.
+    /// Each work item is a (query-tile *pair*, head, batch): stream A
+    /// (warps 0–1) owns query tile `2p`, stream B (warps 4–5) owns `2p+1`,
+    /// and both share one K/V ring, one TMA-load warp (warp 2) and one MMA
+    /// warp (warp 3). A stream is only two warps because a 64-row tile fills
+    /// TMEM lanes 0..63; stream B sits at warpgroup-1 positions 0–1 (warps
+    /// 4–5) — NOT the adjacent warps 2–3 — because a `tcgen05.ld` warp
+    /// reaches only lanes `(warp % 4) * 32 .. +32`, so only positions 0–1 of
+    /// a warpgroup can drain the accumulator's real rows 0..63. TMEM holds a
+    /// single-buffered S plus an O segment per stream (384 of the 512
+    /// columns): while one stream runs softmax, the MMA warp feeds the
+    /// other — the ping-pong a single warpgroup could not reach, and the
+    /// main use of the SM's issue slots now that TMEM pins occupancy to one
+    /// CTA.
     ///
     /// CTAs run a static strided work-item loop (`blockIdx.x`, stepping by
     /// `gridDim.x`) with items ordered by *descending* pair index, so the
@@ -2367,7 +2372,14 @@ pub mod kernels {
                         &mut logsumexp,
                         &mut correction_counts,
                     );
-                } else if tid < 2 * TILE as u32 {
+                } else if tid >= 2 * TILE as u32 {
+                    // Stream B runs on warps 4-5 (warpgroup-1 positions 0-1),
+                    // NOT warps 2-3: a `tcgen05.ld` warp can only reach TMEM
+                    // lanes `(warp % 4) * 32 .. +32`, and a 64-row tile's M128
+                    // accumulator keeps its real rows in lanes 0..63. Warps
+                    // 2-3 (positions 2-3) would read lanes 64..127 — the
+                    // undrained phantom rows — so stream B must sit at a
+                    // warpgroup boundary (positions 0-1) to reach lanes 0..63.
                     if b_active {
                         persistent_stream(
                             tile_b,
@@ -2375,8 +2387,8 @@ pub mod kernels {
                             t,
                             h,
                             head,
-                            tid - TILE as u32,
-                            warp_id - (TILE / 32) as u32,
+                            tid - 2 * TILE as u32,
+                            warp_id - (2 * TILE / 32) as u32,
                             lane,
                             tmem + 64,
                             tmem + 256,
@@ -2394,9 +2406,9 @@ pub mod kernels {
                             &mut correction_counts,
                         );
                     }
-                } else if tid == (2 * TILE) as u32 {
-                    // TMA load warp leader: both Q tiles once, then the
-                    // shared K/V ring over the longer stream.
+                } else if tid == TILE as u32 {
+                    // TMA load warp leader (warp 2): both Q tiles once, then
+                    // the shared K/V ring over the longer stream.
                     let plane_index = plane as i32;
                     let mut i = 0u32;
                     while i < stream_tiles {
@@ -2436,8 +2448,8 @@ pub mod kernels {
                         }
                         i += 1;
                     }
-                } else if tid == (2 * TILE + 32) as u32 {
-                    // MMA warp leader: per shared tile, S-MMAs for both
+                } else if tid == (TILE + 32) as u32 {
+                    // MMA warp leader (warp 3): per shared tile, S-MMAs for both
                     // streams (each gated by its own single-buffered S
                     // being free), then the previous tile's O-MMAs — the
                     // same stagger as the pipelined kernel, per stream.
