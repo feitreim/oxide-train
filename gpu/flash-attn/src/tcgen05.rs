@@ -575,9 +575,11 @@ pub mod kernels {
         }
     }
 
-    /// Issue one `S = Q·Kᵀ` tile (M64_N64, eight chained K=16 MMAs walking the
-    /// two stacked HD subtiles of both operands) from the current leader
-    /// thread; the caller owns the commit.
+    /// Issue one `S = Q·Kᵀ` tile (M128_N64 over the 64-row tile, eight chained
+    /// K=16 MMAs walking the two stacked HD subtiles of both operands) from the
+    /// current leader thread; the caller owns the commit. The `M128` shape's
+    /// phantom rows 64..128 read the operand's `TILE_BYTES` tail and land in
+    /// accumulator rows the drain never touches.
     #[inline(always)]
     unsafe fn score_mma(s_tmem: u32, q_smem: *mut u8, k_smem: *mut u8, s_instruction: u32) {
         unsafe {
@@ -819,10 +821,11 @@ pub mod kernels {
     /// Issue one `dQ/dK/dV += A·Bᵀ` gradient tile (also the forward `O = P·V`)
     /// from the leader thread. `A` (the 64-wide probability/`dS` subtile) walks
     /// four K=16 chunks; `B` (a 128-wide key/query/value operand) is two stacked
-    /// HD subtiles, so the 128-column output is two chained `M64_N64`
-    /// transpose_b accumulations, one per subtile, into `acc_tmem` and
-    /// `acc_tmem + 64`. `fresh` starts a new TMEM accumulator (the block's first
-    /// visited tile); otherwise it accumulates with `enable_d`.
+    /// HD subtiles, so the 128-column output is two chained `M128_N64`
+    /// transpose_b accumulations (over the 64-row tile; phantom rows 64..128 as
+    /// in `score_mma`), one per subtile, into `acc_tmem` and `acc_tmem + 64`.
+    /// `fresh` starts a new TMEM accumulator (the block's first visited tile);
+    /// otherwise it accumulates with `enable_d`.
     #[inline(always)]
     unsafe fn grad_mma(acc_tmem: u32, a_smem: *mut u8, b_smem: *mut u8, instruction: u32, fresh: bool) {
         unsafe {
