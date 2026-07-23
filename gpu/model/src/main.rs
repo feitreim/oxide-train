@@ -709,7 +709,7 @@ fn aligned_tcgen05_linears(
     const TA: usize = 4;
     const VA: usize = 17;
     const VPA: usize = 256;
-    const DA: usize = 256;
+    const DA: usize = 512;
     const HA: usize = 4;
     const FFA: usize = 256;
 
@@ -875,7 +875,7 @@ fn aligned_muon_overfit(
     const TA: usize = 4;
     const VA: usize = 17;
     const VPA: usize = 256;
-    const DA: usize = 256;
+    const DA: usize = 512;
     const HA: usize = 4;
     const FFA: usize = 256;
 
