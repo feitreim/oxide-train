@@ -697,6 +697,30 @@ Each gated on tests; correctness before speed at every step.
      config trains at oracle-attention speed until the tcgen05 kernels
      learn 128 (two 64-wide panels or a 64-row tile re-tiling; the naive
      SMEM scaling of the persistent kernel would need 384 KiB > 227 KiB).
+   - ✅ **Router fp32 kernels re-tiled for D=3072** (#44): the three fp32
+     router matmuls sat ~30× off HBM-bound at `D=3072` on launch geometry,
+     not precision. `forward.router.logits` (eight threads per token, each
+     striding the full `D` row) is now a register-tiled skinny fp32 GEMM: a
+     `[BM=32, BN=8]` output tile loads the router weight once per `BK` step
+     and reuses it across the token tile, so the weight streams from L2
+     instead of being re-read per token; `BN=8` matches the routed expert
+     width, so the skinny dimension carries no tile padding.
+     `backward.router.input` (a per-`(token,d)` serial dot re-reading the
+     gate row from HBM; `dx` is write-bound) is now one block per token row
+     with the 32-byte gate row staged once in shared and broadcast, lanes
+     striding `D` with coalesced `dx` writes (routing the skinny GEMM here
+     instead regressed it by breaking the wide coalesced write).
+     `backward.router.weight` keeps its deterministic fixed-order,
+     atomic-free reduction but is re-sized from the D=1536-era 2×8-tile/16-
+     partition geometry to 8 coalesced `D`-rows × 8 token partitions per
+     block. Router stays fp32 end-to-end; routing decisions unchanged (ops
+     and MoE model parity green). B200 same-container A/B vs main:
+     `forward.router.logits` 18.66 → 3.96 ms (4.71×),
+     `backward.router.weight` 17.48 → 7.96 ms (2.20×),
+     `backward.router.input` 7.63 → 6.59 ms (1.16×); the three combined
+     43.78 → 18.52 ms, full step 748.0 → 719.9 ms (−3.8%). Input-backward
+     and weight-grad remain L2-weight-bandwidth bound (a full skinny-GEMM
+     weight-reuse pass without the block overhead is the next lever).
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 
