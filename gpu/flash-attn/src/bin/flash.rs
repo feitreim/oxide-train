@@ -38,10 +38,7 @@ enum Forward {
     Persistent,
 }
 
-// Persistent temporarily excluded: its two-stream ping-pong has a stream-B
-// regression under the HD=128 (M128-over-64-row) conversion; sync and pipelined
-// are the verified paths and the model runs on pipelined.
-const FORWARDS: [Forward; 2] = [Forward::Sync, Forward::Pipelined];
+const FORWARDS: [Forward; 3] = [Forward::Sync, Forward::Pipelined, Forward::Persistent];
 
 impl Forward {
     fn name(self) -> &'static str {
