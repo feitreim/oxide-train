@@ -22,7 +22,8 @@ mod naive;
 
 use flash::host::{
     Tcgen05Flash, correction_count_len, create_flash_head_tma_map, device_sm_count,
-    flash_forward_config, flash_persistent_config, flash_pipelined_config,
+    flash_backward_kv_config, flash_backward_q_config, flash_forward_config,
+    flash_persistent_config, flash_pipelined_config,
 };
 
 const HD: usize = 64;
@@ -214,6 +215,166 @@ fn check_tcgen05_shape(
         assert_close("y/tiled", &y_host, &tiled_y_host, 1.0e-2, 1.0e-2);
         assert_close("lse", &lse.to_host_vec(stream)?, &tiled_lse_host, 5.0e-3, 0.0);
     }
+    Ok(())
+}
+
+/// tcgen05 backward (issue #35 phase 4) vs both fp32 oracles at a
+/// tile-aligned shape, wired exactly like the model: the tcgen05 forward
+/// produces `y`/LSE from the staged bf16 operands, the fp32 `backward_dot`
+/// reduces `Σ dy·y` from that `y`, and the two gradient kernels consume the
+/// staged operands plus those statistics. Gradients are compared against the
+/// materialized-probability oracle at bf16-appropriate tolerances (operand
+/// quantization dominates, per the forward's 7e9/7e10 precedent).
+#[allow(clippy::too_many_arguments)]
+fn check_tcgen05_backward_shape(
+    stream: &CudaStream,
+    flash_module: &flash::kernels::LoadedModule,
+    naive_module: &naive::kernels::LoadedModule,
+    tcgen05: &Tcgen05Flash,
+    b: usize,
+    t: usize,
+    h: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = b * t;
+    let d = h * HD;
+    let q = uniform_vec(n * d, 271);
+    let k = uniform_vec(n * d, 272);
+    let v = uniform_vec(n * d, 273);
+    let dy = uniform_vec(n * d, 274);
+    let q_device = DeviceBuffer::from_host(stream, &q)?;
+    let k_device = DeviceBuffer::from_host(stream, &k)?;
+    let v_device = DeviceBuffer::from_host(stream, &v)?;
+    let dy_device = DeviceBuffer::from_host(stream, &dy)?;
+
+    let q_scale = LOG2_E / (HD as f32).sqrt();
+    let q_staged = stage_on_device(stream, flash_module, &q_device, &q, b, t, h, q_scale, "q")?;
+    let k_staged = stage_on_device(stream, flash_module, &k_device, &k, b, t, h, 1.0, "k")?;
+    let v_staged = stage_on_device(stream, flash_module, &v_device, &v, b, t, h, 1.0, "v")?;
+    let dy_staged = stage_on_device(stream, flash_module, &dy_device, &dy, b, t, h, 1.0, "dy")?;
+
+    // Tier-1 oracle: materialized-probability backward from ops.
+    let mut probabilities = DeviceBuffer::<f32>::zeroed(stream, n * h * t)?;
+    naive_module.attention_probabilities(
+        stream,
+        LaunchConfig::for_num_elems((n * h * t) as u32),
+        &q_device,
+        &k_device,
+        t as u32,
+        h as u32,
+        HD as u32,
+        &mut probabilities,
+    )?;
+    let mut expected_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut expected_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut expected_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    naive_module.attention_backward_q(
+        stream,
+        LaunchConfig::for_num_elems((n * d) as u32),
+        &q_device,
+        &k_device,
+        &v_device,
+        &probabilities,
+        &dy_device,
+        t as u32,
+        h as u32,
+        HD as u32,
+        &mut expected_dq,
+    )?;
+    naive_module.attention_backward_k(
+        stream,
+        LaunchConfig::for_num_elems((n * d) as u32),
+        &q_device,
+        &v_device,
+        &probabilities,
+        &dy_device,
+        t as u32,
+        h as u32,
+        HD as u32,
+        &mut expected_dk,
+    )?;
+    naive_module.attention_backward_v(
+        stream,
+        LaunchConfig::for_num_elems((n * d) as u32),
+        &probabilities,
+        &dy_device,
+        t as u32,
+        h as u32,
+        HD as u32,
+        &mut expected_dv,
+    )?;
+    let expected_dq = expected_dq.to_host_vec(stream)?;
+    let expected_dk = expected_dk.to_host_vec(stream)?;
+    let expected_dv = expected_dv.to_host_vec(stream)?;
+
+    // Model data flow: tcgen05 forward y/LSE, then fp32 backward_dot over y.
+    let q_tma = unsafe { create_flash_head_tma_map(stream, &q_staged, t, b * h)? };
+    let k_tma = unsafe { create_flash_head_tma_map(stream, &k_staged, t, b * h)? };
+    let v_tma = unsafe { create_flash_head_tma_map(stream, &v_staged, t, b * h)? };
+    let dy_tma = unsafe { create_flash_head_tma_map(stream, &dy_staged, t, b * h)? };
+    let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+    let mut corrections = DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
+    unsafe {
+        tcgen05.forward(
+            stream,
+            flash_forward_config(b, t, h),
+            q_tma.as_ptr(),
+            k_tma.as_ptr(),
+            v_tma.as_ptr(),
+            t as u32,
+            h as u32,
+            &mut y,
+            &mut lse,
+            &mut corrections,
+        )?;
+    }
+    let mut dot = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+    flash_module.flash_attention_backward_dot(
+        stream,
+        flash::dot_config(n, h, HD),
+        &dy_device,
+        &y,
+        HD as u32,
+        &mut dot,
+    )?;
+
+    let mut dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    unsafe {
+        tcgen05.backward_q(
+            stream,
+            flash_backward_q_config(b, t, h),
+            q_tma.as_ptr(),
+            k_tma.as_ptr(),
+            v_tma.as_ptr(),
+            dy_tma.as_ptr(),
+            &lse,
+            &dot,
+            t as u32,
+            h as u32,
+            &mut dq,
+        )?;
+        tcgen05.backward_kv(
+            stream,
+            flash_backward_kv_config(b, t, h),
+            q_tma.as_ptr(),
+            k_tma.as_ptr(),
+            v_tma.as_ptr(),
+            dy_tma.as_ptr(),
+            &lse,
+            &dot,
+            t as u32,
+            h as u32,
+            &mut dk,
+            &mut dv,
+        )?;
+    }
+
+    println!("tcgen05 backward parity against ops oracle [{b},{t},{h},{HD}]");
+    assert_close("dq", &dq.to_host_vec(stream)?, &expected_dq, 1.0e-2, 1.0e-2);
+    assert_close("dk", &dk.to_host_vec(stream)?, &expected_dk, 1.0e-2, 1.0e-2);
+    assert_close("dv", &dv.to_host_vec(stream)?, &expected_dv, 1.0e-2, 1.0e-2);
     Ok(())
 }
 
@@ -583,5 +744,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, sm_count, 2, 256, 3)?;
     check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, sm_count, 1, 1024, 4)?;
     println!("✓ tcgen05 forward parity passed on tile-aligned shapes");
+    check_tcgen05_backward_shape(&stream, &flash_module, &naive_module, &tcgen05, 1, 128, 2)?;
+    check_tcgen05_backward_shape(&stream, &flash_module, &naive_module, &tcgen05, 2, 256, 3)?;
+    check_tcgen05_backward_shape(&stream, &flash_module, &naive_module, &tcgen05, 1, 1024, 4)?;
+    println!("✓ tcgen05 backward parity passed on tile-aligned shapes");
     Ok(())
 }

@@ -28,6 +28,14 @@ pub const FLASH_HD: usize = 64;
 pub const FLASH_DYNAMIC_SMEM_BYTES: u32 = (5 * FLASH_TILE * FLASH_HD * 2) as u32;
 /// Dynamic shared bytes of the transpose_b probe: A (two subtiles) plus B.
 pub const PROBE_DYNAMIC_SMEM_BYTES: u32 = (3 * FLASH_TILE * FLASH_HD * 2) as u32;
+/// Dynamic shared bytes of the query-parallel backward (kernel A): resident
+/// Q/dY, streamed K/V, and the two stacked dS subtiles. Mirrors
+/// `FLASH_BACKWARD_Q_SMEM` in `tcgen05.rs`.
+pub const FLASH_BACKWARD_Q_SMEM_BYTES: u32 = (6 * FLASH_TILE * FLASH_HD * 2) as u32;
+/// Dynamic shared bytes of the key-parallel backward (kernel B): resident
+/// K/V, streamed Q/dY, and the Pᵀ and dSᵀ subtile pairs. Mirrors
+/// `FLASH_BACKWARD_KV_SMEM` in `tcgen05.rs`.
+pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = (8 * FLASH_TILE * FLASH_HD * 2) as u32;
 /// Dynamic shared allocation for the pipelined forward: Q + K/V rings sized
 /// for the deepest supported `PIPELINE_STAGES` (4) + the two P subtiles.
 /// The kernel's actual plan (`FLASH_PIPELINE_SMEM`, a function of the swept
@@ -63,6 +71,47 @@ pub fn flash_forward_config(batches: usize, sequence_length: usize, heads: usize
         block_dim: (FLASH_TILE as u32, 1, 1),
         shared_mem_bytes: FLASH_DYNAMIC_SMEM_BYTES,
     }
+}
+
+/// Launch for both synchronous tcgen05 backward kernels: grid
+/// `(T/128, H, B)`, 128 threads. `dynamic_smem` is the caller's kernel-A or
+/// kernel-B shared-memory plan.
+fn flash_backward_config(
+    batches: usize,
+    sequence_length: usize,
+    heads: usize,
+    dynamic_smem: u32,
+) -> LaunchConfig {
+    assert!(sequence_length.is_multiple_of(FLASH_TILE));
+    assert!(batches <= u16::MAX as usize && heads <= u16::MAX as usize);
+    assert!(sequence_length / FLASH_TILE <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (
+            (sequence_length / FLASH_TILE) as u32,
+            heads as u32,
+            batches as u32,
+        ),
+        block_dim: (FLASH_TILE as u32, 1, 1),
+        shared_mem_bytes: dynamic_smem,
+    }
+}
+
+/// Launch for the query-parallel backward (kernel A).
+pub fn flash_backward_q_config(
+    batches: usize,
+    sequence_length: usize,
+    heads: usize,
+) -> LaunchConfig {
+    flash_backward_config(batches, sequence_length, heads, FLASH_BACKWARD_Q_SMEM_BYTES)
+}
+
+/// Launch for the key-parallel backward (kernel B).
+pub fn flash_backward_kv_config(
+    batches: usize,
+    sequence_length: usize,
+    heads: usize,
+) -> LaunchConfig {
+    flash_backward_config(batches, sequence_length, heads, FLASH_BACKWARD_KV_SMEM_BYTES)
 }
 
 /// Launch for the warp-specialized pipelined forward: same grid, the wider
@@ -246,6 +295,8 @@ pub struct Tcgen05Flash {
     forward: CudaFunction,
     forward_pipelined: CudaFunction,
     forward_persistent: CudaFunction,
+    backward_q: CudaFunction,
+    backward_kv: CudaFunction,
     transpose_probe: CudaFunction,
     swizzle_probe: CudaFunction,
     exp2: CudaFunction,
@@ -265,15 +316,21 @@ impl Tcgen05Flash {
         let forward = module.load_function("flash_forward_tcgen05")?;
         let forward_pipelined = module.load_function("flash_forward_pipelined")?;
         let forward_persistent = module.load_function("flash_forward_persistent")?;
+        let backward_q = module.load_function("flash_backward_q_tcgen05")?;
+        let backward_kv = module.load_function("flash_backward_kv_tcgen05")?;
         let transpose_probe = module.load_function("transpose_b_probe")?;
         opt_in_dynamic_smem(&forward, FLASH_DYNAMIC_SMEM_BYTES)?;
         opt_in_dynamic_smem(&forward_pipelined, FLASH_PIPELINE_SMEM_BYTES)?;
         opt_in_dynamic_smem(&forward_persistent, FLASH_PERSISTENT_SMEM_BYTES)?;
+        opt_in_dynamic_smem(&backward_q, FLASH_BACKWARD_Q_SMEM_BYTES)?;
+        opt_in_dynamic_smem(&backward_kv, FLASH_BACKWARD_KV_SMEM_BYTES)?;
         opt_in_dynamic_smem(&transpose_probe, PROBE_DYNAMIC_SMEM_BYTES)?;
         Ok(Self {
             forward,
             forward_pipelined,
             forward_persistent,
+            backward_q,
+            backward_kv,
             transpose_probe,
             swizzle_probe: module.load_function("swizzle_probe")?,
             exp2: module.load_function("software_exp2")?,
@@ -405,6 +462,119 @@ impl Tcgen05Flash {
                 output,
                 logsumexp,
                 correction_counts,
+            )
+        }
+    }
+
+    /// Synchronous tcgen05 query-parallel backward (kernel A): writes fp32
+    /// `dq[B*T, H*64]` from the bf16 head-panel staging buffers plus the saved
+    /// `logsumexp[B*T, H]` (natural log) and `dot[B*T, H]`. Launch with
+    /// `flash_backward_q_config`.
+    ///
+    /// # Safety
+    ///
+    /// The maps must describe live `[B*H, T, 64]` staging buffers matching the
+    /// launch config (`dy` staged unscaled like K/V), `logsumexp`/`dot` must
+    /// hold `B*T*H` elements, and `dq` must hold `B*T*H*64` elements.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn backward_q(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &DeviceBuffer<f32>,
+        dot: &DeviceBuffer<f32>,
+        sequence_length: u32,
+        heads: u32,
+        dq: &mut DeviceBuffer<f32>,
+    ) -> Result<(), DriverError> {
+        let mut q_tma = q_tma;
+        let mut k_tma = k_tma;
+        let mut v_tma = v_tma;
+        let mut dy_tma = dy_tma;
+        let mut sequence_length = sequence_length;
+        let mut heads = heads;
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        cuda_host::push_kernel_scalar(&mut args, &mut q_tma);
+        cuda_host::push_kernel_scalar(&mut args, &mut k_tma);
+        cuda_host::push_kernel_scalar(&mut args, &mut v_tma);
+        cuda_host::push_kernel_scalar(&mut args, &mut dy_tma);
+        let (mut lse_ptr, mut lse_len) = cuda_host::read_only_device_buffer_arg(logsumexp);
+        cuda_host::push_kernel_device_slice(&mut args, &mut lse_ptr, &mut lse_len);
+        let (mut dot_ptr, mut dot_len) = cuda_host::read_only_device_buffer_arg(dot);
+        cuda_host::push_kernel_device_slice(&mut args, &mut dot_ptr, &mut dot_len);
+        cuda_host::push_kernel_scalar(&mut args, &mut sequence_length);
+        cuda_host::push_kernel_scalar(&mut args, &mut heads);
+        let (mut dq_ptr, mut dq_len) = cuda_host::writable_device_buffer_arg(dq);
+        cuda_host::push_kernel_device_slice(&mut args, &mut dq_ptr, &mut dq_len);
+        unsafe {
+            cuda_core::launch_kernel_on_stream(
+                &self.backward_q,
+                config.grid_dim,
+                config.block_dim,
+                config.shared_mem_bytes,
+                stream,
+                &mut args,
+            )
+        }
+    }
+
+    /// Synchronous tcgen05 key-parallel backward (kernel B): writes fp32
+    /// `dk`/`dv` `[B*T, H*64]` from the same staged operands and statistics.
+    /// Launch with `flash_backward_kv_config`.
+    ///
+    /// # Safety
+    ///
+    /// Same operand/statistic contract as `backward_q`; `dk` and `dv` must
+    /// each hold `B*T*H*64` elements.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn backward_kv(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &DeviceBuffer<f32>,
+        dot: &DeviceBuffer<f32>,
+        sequence_length: u32,
+        heads: u32,
+        dk: &mut DeviceBuffer<f32>,
+        dv: &mut DeviceBuffer<f32>,
+    ) -> Result<(), DriverError> {
+        let mut q_tma = q_tma;
+        let mut k_tma = k_tma;
+        let mut v_tma = v_tma;
+        let mut dy_tma = dy_tma;
+        let mut sequence_length = sequence_length;
+        let mut heads = heads;
+        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
+        cuda_host::push_kernel_scalar(&mut args, &mut q_tma);
+        cuda_host::push_kernel_scalar(&mut args, &mut k_tma);
+        cuda_host::push_kernel_scalar(&mut args, &mut v_tma);
+        cuda_host::push_kernel_scalar(&mut args, &mut dy_tma);
+        let (mut lse_ptr, mut lse_len) = cuda_host::read_only_device_buffer_arg(logsumexp);
+        cuda_host::push_kernel_device_slice(&mut args, &mut lse_ptr, &mut lse_len);
+        let (mut dot_ptr, mut dot_len) = cuda_host::read_only_device_buffer_arg(dot);
+        cuda_host::push_kernel_device_slice(&mut args, &mut dot_ptr, &mut dot_len);
+        cuda_host::push_kernel_scalar(&mut args, &mut sequence_length);
+        cuda_host::push_kernel_scalar(&mut args, &mut heads);
+        let (mut dk_ptr, mut dk_len) = cuda_host::writable_device_buffer_arg(dk);
+        cuda_host::push_kernel_device_slice(&mut args, &mut dk_ptr, &mut dk_len);
+        let (mut dv_ptr, mut dv_len) = cuda_host::writable_device_buffer_arg(dv);
+        cuda_host::push_kernel_device_slice(&mut args, &mut dv_ptr, &mut dv_len);
+        unsafe {
+            cuda_core::launch_kernel_on_stream(
+                &self.backward_kv,
+                config.grid_dim,
+                config.block_dim,
+                config.shared_mem_bytes,
+                stream,
+                &mut args,
             )
         }
     }

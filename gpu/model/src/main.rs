@@ -568,6 +568,7 @@ fn muon_overfit_tiny_batch(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         optimizer.update(&mut gpu, stream, tensor, gemm)?;
@@ -654,6 +655,7 @@ fn overfit_tiny_batch(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         optimizer.update(&mut gpu, stream, tensor)?;
@@ -754,6 +756,7 @@ fn aligned_tcgen05_linears(
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
 
@@ -824,6 +827,7 @@ fn aligned_tcgen05_linears(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         optimizer.update(&mut gpu, stream, tensor)?;
@@ -919,6 +923,7 @@ fn aligned_muon_overfit(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         optimizer.update(&mut gpu, stream, tensor, gemm)?;
@@ -1022,6 +1027,7 @@ fn moe_model_parity<
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
 
@@ -1156,6 +1162,7 @@ fn aligned_moe_overfit(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         optimizer.update(&mut gpu, stream, tensor)?;
@@ -1242,6 +1249,7 @@ fn moe_checkpoint_gate(
         gemm,
         gemm_bf16,
         flash,
+        flash_bf16,
         dense,
     )?;
     optimizer.update(&mut gpu, stream, tensor)?;
@@ -1295,6 +1303,7 @@ fn moe_checkpoint_gate(
             gemm,
             gemm_bf16,
             flash,
+            flash_bf16,
             dense,
         )?;
         candidate_optimizer.update(candidate, stream, tensor)?;
@@ -1398,6 +1407,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
+        &flash_bf16,
         &dense,
     )?;
 
@@ -1474,6 +1484,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &flash,
+        &flash_bf16,
         &dense,
     )?;
     grads!(" (pass 2)");
