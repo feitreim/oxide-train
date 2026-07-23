@@ -100,9 +100,16 @@ const TILE_BYTES: usize = TILE * HD * 2;
 /// Bytes of one 64-wide `[TILE, 64]` SWIZZLE_128B subtile — half a `TILE_BYTES`
 /// panel, and the footprint of a `[TILE, TILE]` P/dS probability operand.
 const SUBTILE_BYTES: usize = TILE_BYTES / 2;
+/// Phantom-read pad. Every MMA uses the `M128` shape over 64-row tiles (the
+/// `M64` shape mis-pairs operand K-indices for rows ≥16), so the tensor core
+/// reads 128 operand rows and the unused rows 64..128 stream a `TILE_BYTES`
+/// tail past each operand's base. One extra `TILE_BYTES` at the end of every
+/// dynamic-shared plan keeps those reads in bounds; the garbage they pull lands
+/// in accumulator rows 64..128, which are never drained.
+const PHANTOM_PAD: usize = TILE_BYTES;
 /// Dynamic shared plan of the synchronous kernel: Q, K, V panels plus the
 /// single P subtile.
-pub const FLASH_DYNAMIC_SMEM: usize = 3 * TILE_BYTES + SUBTILE_BYTES;
+pub const FLASH_DYNAMIC_SMEM: usize = 3 * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
 
 /// K/V ring depth of the pipelined kernel (SWEEP knob). Two is the floor:
 /// the staggered issue order (`S-MMA(i)` before `O-MMA(i-1)`) needs one
@@ -112,7 +119,7 @@ pub const PIPELINE_STAGES: usize = 3;
 const _: () = assert!(2 <= PIPELINE_STAGES && PIPELINE_STAGES <= 4);
 /// Dynamic shared plan of the pipelined kernel: Q, the K and V rings, and
 /// the single P subtile.
-pub const FLASH_PIPELINE_SMEM: usize = (1 + 2 * PIPELINE_STAGES) * TILE_BYTES + SUBTILE_BYTES;
+pub const FLASH_PIPELINE_SMEM: usize = (1 + 2 * PIPELINE_STAGES) * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
 /// Threads of the pipelined kernel: the softmax/correction/epilogue
 /// warpgroup plus the TMA-load warp and the MMA-issue warp.
 pub const FLASH_PIPELINE_BLOCK: usize = TILE + 64;
@@ -120,11 +127,11 @@ pub const FLASH_PIPELINE_BLOCK: usize = TILE + 64;
 /// Dynamic shared plan of the synchronous query-parallel backward (kernel A):
 /// the resident Q and dY panels, the streamed K and V panels, and the single
 /// dS subtile.
-pub const FLASH_BACKWARD_Q_SMEM: usize = 4 * TILE_BYTES + SUBTILE_BYTES;
+pub const FLASH_BACKWARD_Q_SMEM: usize = 4 * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
 /// Dynamic shared plan of the synchronous key-parallel backward (kernel B):
 /// the resident K and V panels, the streamed Q and dY panels, and the Pᵀ and
 /// dSᵀ subtiles.
-pub const FLASH_BACKWARD_KV_SMEM: usize = 4 * TILE_BYTES + 2 * SUBTILE_BYTES;
+pub const FLASH_BACKWARD_KV_SMEM: usize = 4 * TILE_BYTES + 2 * SUBTILE_BYTES + PHANTOM_PAD;
 
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
@@ -139,7 +146,7 @@ pub const PERSISTENT_STAGES: usize = if PIPELINE_STAGES < 3 { PIPELINE_STAGES } 
 /// Dynamic shared plan of the persistent kernel: two Q panels, the K and V
 /// rings, and one P subtile per workstream.
 pub const FLASH_PERSISTENT_SMEM: usize =
-    (2 + 2 * PERSISTENT_STAGES) * TILE_BYTES + 2 * SUBTILE_BYTES;
+    (2 + 2 * PERSISTENT_STAGES) * TILE_BYTES + 2 * SUBTILE_BYTES + PHANTOM_PAD;
 /// Threads of the persistent kernel: two softmax warpgroups plus the
 /// TMA-load warp and the MMA-issue warp.
 pub const FLASH_PERSISTENT_BLOCK: usize = 2 * TILE + 64;
@@ -320,9 +327,9 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column);
+                    let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column + 8);
+                    let high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
                     tcgen05_load_wait();
                     let slot_a = (row_block * 2) as usize;
                     let slot_b = slot_a + 1;
@@ -415,9 +422,9 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column);
+                    let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column + 8);
+                    let high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
                     tcgen05_load_wait();
                     let slot_a = (row_block * 2) as usize;
                     let slot_b = slot_a + 1;
@@ -490,9 +497,9 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 8 {
                     let column = column_block * 16;
-                    let low = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 17) + column);
+                    let low = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 17) + column + 8);
+                    let high = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 16) + column + 8);
                     tcgen05_load_wait();
                     let slot_a = (row_block * 2) as usize;
                     let slot_b = slot_a + 1;
@@ -670,13 +677,13 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let s_low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column);
+                    let s_low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
-                    let s_high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column + 8);
+                    let s_high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
                     tcgen05_load_wait();
-                    let dp_low = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 17) + column);
+                    let dp_low = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
-                    let dp_high = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 17) + column + 8);
+                    let dp_high = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column + 8);
                     tcgen05_load_wait();
                     let row_a = tmem_row + row_in_16 as u32;
                     let row_b = row_a + 8;
@@ -750,13 +757,13 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let s_low = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 17) + column);
+                    let s_low = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
-                    let s_high = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 17) + column + 8);
+                    let s_high = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column + 8);
                     tcgen05_load_wait();
-                    let dp_low = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 17) + column);
+                    let dp_low = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column);
                     tcgen05_load_wait();
-                    let dp_high = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 17) + column + 8);
+                    let dp_high = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column + 8);
                     tcgen05_load_wait();
                     let row_a = tmem_row + row_in_16 as u32;
                     let row_b = row_a + 8;
@@ -964,9 +971,11 @@ pub mod kernels {
             static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
             static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
 
+            // DIAGNOSTIC: exercise the real `score_mma` path (2 HD subtiles,
+            // K=128, non-transpose) and drain to logical rows with <<17.
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let a_smem = smem;
-            let b_smem = smem.add(SUBTILE_BYTES);
+            let b_smem = smem.add(TILE_BYTES);
 
             let tid = thread::threadIdx_x();
             let warp_id = warp::warp_id();
@@ -986,28 +995,21 @@ pub mod kernels {
             let tmem = *(&raw const TMEM_ADDRESS as *const u32);
 
             if is_leader {
-                cp_async_bulk_tensor_3d_g2s(a_smem, a_tma, 0, 0, 0, &raw mut TMA_BARRIER);
-                cp_async_bulk_tensor_3d_g2s(b_smem, b_tma, 0, 0, 0, &raw mut TMA_BARRIER);
-                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, (2 * SUBTILE_BYTES) as u32);
+                load_panel(a_smem, a_tma, 0, 0, &raw mut TMA_BARRIER);
+                load_panel(b_smem, b_tma, 0, 0, &raw mut TMA_BARRIER);
+                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, (2 * TILE_BYTES) as u32);
             }
             while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
             thread::sync_threads();
 
             let instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M64_N64)
+                .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
-                .transpose_b(true)
                 .build()
                 .raw();
             if is_leader {
-                let mut chunk = 0u32;
-                while chunk < 4 {
-                    let a_descriptor = smem_descriptor(a_smem as u64 + chunk as u64 * 32);
-                    let b_descriptor = smem_descriptor(b_smem as u64 + chunk as u64 * 2048);
-                    tcgen05_mma_f16(tmem, a_descriptor, b_descriptor, instruction, chunk > 0);
-                    chunk += 1;
-                }
+                score_mma(tmem, a_smem, b_smem, instruction);
                 tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
             }
             while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, 0) {}
@@ -1021,10 +1023,10 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = (column_block * 16) as usize;
-                    let low = tcgen05_ld_16x256b_pure(tmem + (tmem_row << 17) + column as u32);
+                    let low = tcgen05_ld_16x256b_pure(tmem + (tmem_row << 16) + column as u32);
                     tcgen05_load_wait();
                     let high =
-                        tcgen05_ld_16x256b_pure(tmem + (tmem_row << 17) + column as u32 + 8);
+                        tcgen05_ld_16x256b_pure(tmem + (tmem_row << 16) + column as u32 + 8);
                     tcgen05_load_wait();
                     let row_a = tmem_row as usize + row_in_16;
                     let row_b = row_a + 8;
@@ -1114,13 +1116,13 @@ pub mod kernels {
             let o_tmem = tmem + 256;
 
             let s_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M64_N64)
+                .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
                 .build()
                 .raw();
             let o_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M64_N64)
+                .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
                 .transpose_b(true)
@@ -1328,13 +1330,13 @@ pub mod kernels {
             let dq_tmem = tmem + 256;
 
             let s_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M64_N64)
+                .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
                 .build()
                 .raw();
             let grad_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M64_N64)
+                .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
                 .transpose_b(true)
@@ -1472,7 +1474,7 @@ pub mod kernels {
             let q_smem = smem.add(2 * TILE_BYTES);
             let dy_smem = smem.add(3 * TILE_BYTES);
             let p_smem = smem.add(4 * TILE_BYTES);
-            let ds_smem = smem.add(6 * TILE_BYTES);
+            let ds_smem = smem.add(4 * TILE_BYTES + SUBTILE_BYTES);
 
             let tid = thread::threadIdx_x();
             if thread::blockDim_x() as usize != TILE {
@@ -1509,13 +1511,13 @@ pub mod kernels {
             let dk_tmem = tmem + 256;
 
             let s_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M64_N64)
+                .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
                 .build()
                 .raw();
             let grad_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M64_N64)
+                .shape(Tcgen05MmaShape::M128_N64)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
                 .transpose_b(true)
@@ -1949,13 +1951,13 @@ pub mod kernels {
             } else if tid == (TILE + 32) as u32 {
                 // MMA warp leader.
                 let s_instruction = Tcgen05InstructionDescriptor::builder()
-                    .shape(Tcgen05MmaShape::M64_N64)
+                    .shape(Tcgen05MmaShape::M128_N64)
                     .element_type(Tcgen05ElementType::BF16)
                     .accumulator_type(Tcgen05AccumulatorType::F32)
                     .build()
                     .raw();
                 let o_instruction = Tcgen05InstructionDescriptor::builder()
-                    .shape(Tcgen05MmaShape::M64_N64)
+                    .shape(Tcgen05MmaShape::M128_N64)
                     .element_type(Tcgen05ElementType::BF16)
                     .accumulator_type(Tcgen05AccumulatorType::F32)
                     .transpose_b(true)
@@ -2441,13 +2443,13 @@ pub mod kernels {
                     // being free), then the previous tile's O-MMAs — the
                     // same stagger as the pipelined kernel, per stream.
                     let s_instruction = Tcgen05InstructionDescriptor::builder()
-                        .shape(Tcgen05MmaShape::M64_N64)
+                        .shape(Tcgen05MmaShape::M128_N64)
                         .element_type(Tcgen05ElementType::BF16)
                         .accumulator_type(Tcgen05AccumulatorType::F32)
                         .build()
                         .raw();
                     let o_instruction = Tcgen05InstructionDescriptor::builder()
-                        .shape(Tcgen05MmaShape::M64_N64)
+                        .shape(Tcgen05MmaShape::M128_N64)
                         .element_type(Tcgen05ElementType::BF16)
                         .accumulator_type(Tcgen05AccumulatorType::F32)
                         .transpose_b(true)
