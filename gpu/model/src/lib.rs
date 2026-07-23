@@ -138,6 +138,31 @@ fn moe_assign_config<const E: usize>() -> LaunchConfig {
     }
 }
 
+/// Launch for a router GEMM producing an `[m, n]` output: one lane per element
+/// of a `[ROUTER_GEMM_BM, ROUTER_GEMM_BN]` output tile.
+fn router_gemm_config(m: usize, n: usize) -> LaunchConfig {
+    assert!(m <= u32::MAX as usize && n <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (
+            (n as u32).div_ceil(dense_device::ROUTER_GEMM_BN as u32),
+            (m as u32).div_ceil(dense_device::ROUTER_GEMM_BM as u32),
+            1,
+        ),
+        block_dim: (dense_device::ROUTER_GEMM_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Launch for the router input-backward kernel: one block per token row.
+fn router_input_config<const N: usize>() -> LaunchConfig {
+    assert!(N <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (N as u32, 1, 1),
+        block_dim: (dense_device::ROUTER_INPUT_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 fn router_weight_config<const D: usize, const E: usize>() -> LaunchConfig {
     assert_eq!(
         dense_device::ROUTER_WEIGHT_THREADS,
@@ -3939,14 +3964,10 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             "forward.ffn_norm",
         )?;
 
-        profiler.measure(stream, "forward.router.logits", || {
+        profiler.measure(stream, "forward.router.logits", || unsafe {
             dense.router_logits(
                 stream,
-                LaunchConfig {
-                    grid_dim: (N as u32, 1, 1),
-                    block_dim: (E as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                router_gemm_config(N, E),
                 acts.ffn_normalized.as_device_buffer(),
                 self.router.as_device_buffer(),
                 D as u32,
@@ -4127,10 +4148,10 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                 scratch.dlogits.as_device_buffer_mut(),
             )
         })?;
-        profiler.measure(stream, "backward.router.input", || {
+        profiler.measure(stream, "backward.router.input", || unsafe {
             dense.router_backward_input(
                 stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
+                router_input_config::<N>(),
                 scratch.dlogits.as_device_buffer(),
                 self.router.as_device_buffer(),
                 E as u32,
