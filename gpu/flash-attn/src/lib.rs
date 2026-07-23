@@ -37,13 +37,14 @@ pub const MAX_HEAD_DIM: usize = 256;
 
 /// Head width the tiled kernels specialize on; shared tiles are sized by it
 /// at compile time. Launches assert the model's `HD` matches.
-pub const TILE_HD: usize = 64;
+pub const TILE_HD: usize = 128;
 
 /// Tiled-forward query rows per block. Rewritten by the repository's `SWEEP`
-/// harness.
-pub const FWD_BQ: usize = 64;
+/// harness. Halved from the HD=64 era so the doubled head width keeps the
+/// static shared tiles under the 48 KiB limit.
+pub const FWD_BQ: usize = 32;
 /// Tiled-forward key rows per staged tile. Rewritten by `SWEEP`.
-pub const FWD_BK: usize = 32;
+pub const FWD_BK: usize = 16;
 /// Tiled-forward query rows per thread in the score fragment.
 pub const FWD_TM: usize = 4;
 /// Tiled-forward key columns per thread in the score fragment.
@@ -55,9 +56,9 @@ const FWD_THREADS: usize = FWD_ROW_THREADS * FWD_COL_THREADS;
 const FWD_TD: usize = TILE_HD / FWD_COL_THREADS;
 
 /// Tiled dQ query rows per block. Rewritten by `SWEEP`.
-pub const BWQ_BQ: usize = 32;
+pub const BWQ_BQ: usize = 16;
 /// Tiled dQ key rows per staged tile. Rewritten by `SWEEP`.
-pub const BWQ_BK: usize = 32;
+pub const BWQ_BK: usize = 16;
 /// Tiled dQ query rows per thread in the score fragment.
 pub const BWQ_TM: usize = 4;
 /// Tiled dQ key columns per thread in the score fragment.
@@ -69,9 +70,9 @@ const BWQ_THREADS: usize = BWQ_ROW_THREADS * BWQ_COL_THREADS;
 const BWQ_TD: usize = TILE_HD / BWQ_COL_THREADS;
 
 /// Tiled dK/dV key rows per block. Rewritten by `SWEEP`.
-pub const KV_BK: usize = 32;
+pub const KV_BK: usize = 16;
 /// Tiled dK/dV query rows per staged tile. Rewritten by `SWEEP`.
-pub const KV_BQ: usize = 32;
+pub const KV_BQ: usize = 16;
 /// Tiled dK/dV query rows per thread in the score fragment.
 pub const KV_TM: usize = 4;
 /// Tiled dK/dV key columns per thread in the score fragment.

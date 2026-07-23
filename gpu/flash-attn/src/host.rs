@@ -19,39 +19,47 @@ use cuda_device::tma::TmaDescriptor;
 
 /// Query/key tile edge: `T` must be a multiple of this to use the tcgen05
 /// forward; other shapes stay on the fp32 tiled kernels.
-pub const FLASH_TILE: usize = 128;
+pub const FLASH_TILE: usize = 64;
 /// The only head width the tcgen05 forward supports.
-pub const FLASH_HD: usize = 64;
-/// Dynamic shared bytes of the synchronous forward kernel: Q, K, V tiles
-/// plus the two stacked P subtiles. Mirrors `FLASH_DYNAMIC_SMEM` in
-/// `tcgen05.rs`.
-pub const FLASH_DYNAMIC_SMEM_BYTES: u32 = (5 * FLASH_TILE * FLASH_HD * 2) as u32;
-/// Dynamic shared bytes of the transpose_b probe: A (two subtiles) plus B.
-pub const PROBE_DYNAMIC_SMEM_BYTES: u32 = (3 * FLASH_TILE * FLASH_HD * 2) as u32;
+pub const FLASH_HD: usize = 128;
+/// SWIZZLE_128B subtile width: a 128-wide operand is two stacked `[TILE, 64]`
+/// subtiles, which is also the TMA descriptor's box column count.
+pub const FLASH_SUBTILE_HD: usize = 64;
+/// Bytes of one full-width `[TILE, HD]` bf16 panel (two stacked subtiles).
+const TILE_BYTES: usize = FLASH_TILE * FLASH_HD * 2;
+/// Bytes of one 64-wide `[TILE, 64]` subtile — half a panel, and the width of
+/// a `[TILE, TILE]` P/dS probability operand.
+const SUBTILE_BYTES: usize = TILE_BYTES / 2;
+/// Dynamic shared bytes of the synchronous forward kernel: Q, K, V panels
+/// plus the single P subtile. Mirrors `FLASH_DYNAMIC_SMEM` in `tcgen05.rs`.
+pub const FLASH_DYNAMIC_SMEM_BYTES: u32 = (3 * TILE_BYTES + SUBTILE_BYTES) as u32;
+/// Dynamic shared bytes of the transpose_b probe: A subtile plus B subtile.
+pub const PROBE_DYNAMIC_SMEM_BYTES: u32 = (2 * SUBTILE_BYTES) as u32;
 /// Dynamic shared bytes of the query-parallel backward (kernel A): resident
-/// Q/dY, streamed K/V, and the two stacked dS subtiles. Mirrors
+/// Q/dY, streamed K/V panels, and the single dS subtile. Mirrors
 /// `FLASH_BACKWARD_Q_SMEM` in `tcgen05.rs`.
-pub const FLASH_BACKWARD_Q_SMEM_BYTES: u32 = (6 * FLASH_TILE * FLASH_HD * 2) as u32;
+pub const FLASH_BACKWARD_Q_SMEM_BYTES: u32 = (4 * TILE_BYTES + SUBTILE_BYTES) as u32;
 /// Dynamic shared bytes of the key-parallel backward (kernel B): resident
-/// K/V, streamed Q/dY, and the Pᵀ and dSᵀ subtile pairs. Mirrors
+/// K/V, streamed Q/dY panels, and the Pᵀ and dSᵀ subtiles. Mirrors
 /// `FLASH_BACKWARD_KV_SMEM` in `tcgen05.rs`.
-pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = (8 * FLASH_TILE * FLASH_HD * 2) as u32;
+pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = (4 * TILE_BYTES + 2 * SUBTILE_BYTES) as u32;
 /// Dynamic shared allocation for the pipelined forward: Q + K/V rings sized
-/// for the deepest supported `PIPELINE_STAGES` (4) + the two P subtiles.
+/// for the deepest supported `PIPELINE_STAGES` (4) + the P subtile.
 /// The kernel's actual plan (`FLASH_PIPELINE_SMEM`, a function of the swept
 /// `PIPELINE_STAGES` in `tcgen05.rs`) must stay at or under this; the flash
 /// bin asserts it. Allocating the ceiling keeps stage sweeps a one-const
 /// edit, and costs nothing: TMEM (512 columns per CTA against a 512-column
 /// SM budget) already pins occupancy to one CTA per SM.
-pub const FLASH_PIPELINE_SMEM_BYTES: u32 = ((3 + 2 * 4) * FLASH_TILE * FLASH_HD * 2) as u32;
-/// Threads of the pipelined forward: the 128-thread softmax warpgroup plus
+pub const FLASH_PIPELINE_SMEM_BYTES: u32 = ((1 + 2 * 4) * TILE_BYTES + SUBTILE_BYTES) as u32;
+/// Threads of the pipelined forward: the TILE-thread softmax warpgroup plus
 /// the TMA-load warp and the MMA-issue warp. Mirrors `FLASH_PIPELINE_BLOCK`.
 pub const FLASH_PIPELINE_BLOCK_THREADS: u32 = (FLASH_TILE + 64) as u32;
 /// Dynamic shared allocation for the persistent ping-pong forward: two Q
-/// tiles, K/V rings sized for its 3-stage ceiling (`PERSISTENT_STAGES` caps
-/// there), and one two-subtile P buffer per workstream. The flash bin
-/// asserts the kernel's `FLASH_PERSISTENT_SMEM` fits.
-pub const FLASH_PERSISTENT_SMEM_BYTES: u32 = ((2 + 2 * 3 + 4) * FLASH_TILE * FLASH_HD * 2) as u32;
+/// panels, K/V rings sized for its 3-stage ceiling (`PERSISTENT_STAGES` caps
+/// there), and one P subtile per workstream. The flash bin asserts the
+/// kernel's `FLASH_PERSISTENT_SMEM` fits.
+pub const FLASH_PERSISTENT_SMEM_BYTES: u32 =
+    ((2 + 2 * 3) * TILE_BYTES + 2 * SUBTILE_BYTES) as u32;
 /// Threads of the persistent forward: two softmax warpgroups plus the
 /// TMA-load warp and the MMA-issue warp. Mirrors `FLASH_PERSISTENT_BLOCK`.
 pub const FLASH_PERSISTENT_BLOCK_THREADS: u32 = (2 * FLASH_TILE + 64) as u32;
@@ -180,9 +188,10 @@ pub fn flash_persistent_config(
     }
 }
 
-/// Encode a `SWIZZLE_128B` tensor map loading swizzled `[128, 64]` bf16 tiles
-/// from one `[T, 64]` head panel of a packed `[planes, T, 64]` staging buffer
-/// (`planes = B*H`); the kernel selects the panel via the third coordinate.
+/// Encode a `SWIZZLE_128B` tensor map loading swizzled `[TILE, 64]` bf16
+/// subtiles from one `[T, 128]` head panel of a packed `[planes, T, 128]`
+/// staging buffer (`planes = B*H`); the kernel selects the panel via the third
+/// coordinate and the HD subtile (columns 0..64 or 64..128) via the first.
 fn encode_bf16_head_tma_map(
     stream: &CudaStream,
     base: u64,
@@ -205,7 +214,7 @@ fn encode_bf16_head_tma_map(
         (FLASH_HD * 2) as u64,
         (sequence_length * FLASH_HD * 2) as u64,
     ];
-    let box_dimensions = [FLASH_HD as u32, FLASH_TILE as u32, 1u32];
+    let box_dimensions = [FLASH_SUBTILE_HD as u32, FLASH_TILE as u32, 1u32];
     let element_strides = [1u32, 1u32, 1u32];
     let status = unsafe {
         cuTensorMapEncodeTiled(
