@@ -7,42 +7,57 @@
 
 use bench_util::StepProfiler;
 use cuda_core::CudaContext;
-use nn::MoeDense;
 use optim::{AdamWConfig, AuxLossSchedule};
 
 #[path = "../lib.rs"]
 mod model;
-use model::{GpuDense, GpuDenseAdamW, GpuDenseWorkspace};
+use model::{GpuDense, GpuDenseAdamW, GpuMoeWorkspace};
 
-const B: usize = 32;
-const T: usize = 1_024;
+const B: usize = 12;
+const T: usize = 2_048;
 const N: usize = B * T;
-const NP: usize = 32_768;
+const NP: usize = 24_576;
 const VOCAB: usize = 50_257;
 const VP: usize = 50_432;
-const D: usize = 1_536;
+const D: usize = 3_072;
 const H: usize = 24;
-const HD: usize = 64;
-const FF: usize = 2_048;
+const HD: usize = 128;
+const FF: usize = 4_096;
 const E: usize = 8;
 const K: usize = 2;
-const C: usize = 8_192;
+const C: usize = 6_144;
+const L: usize = 12;
 const WARMUP_STEPS: usize = 2;
 
 const fn parameter_count() -> usize {
-    // Untied embedding/lm-head, four attention projections, router, all expert
-    // projections, and the three RMSNorm weights.
+    // Untied embedding/lm-head, per block: four attention projections, router,
+    // all expert projections, and two RMSNorm weights; plus the final norm.
     // Padded lm-head vocabulary columns are frozen zeros, not parameters.
-    2 * VOCAB * D + 4 * D * D + D * E + E * 3 * D * FF + 3 * D
+    2 * VOCAB * D + L * (4 * D * D + D * E + E * 3 * D * FF + 2 * D) + D
+}
+
+fn print_vram(label: &str) {
+    let mut free = 0usize;
+    let mut total = 0usize;
+    let rc = unsafe { cuda_bindings::cuMemGetInfo_v2(&mut free, &mut total) };
+    if rc == 0 {
+        println!(
+            "vram {label}: used={:.1}GiB free={:.1}GiB total={:.1}GiB",
+            (total - free) as f64 / (1 << 30) as f64,
+            free as f64 / (1 << 30) as f64,
+            total as f64 / (1 << 30) as f64,
+        );
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(N, B * T);
     assert_eq!(D, H * HD);
     println!(
-        "config: params={} ({:.1}M) B={} T={} vocab={} (padded {}) D={} H={} HD={} E={} K={} FF_expert={} C={} active_FF={}",
+        "config: params={} ({:.1}M) L={} B={} T={} vocab={} (padded {}) D={} H={} HD={} E={} K={} FF_expert={} C={} active_FF={}",
         parameter_count(),
         parameter_count() as f64 / 1_000_000.0,
+        L,
         B,
         T,
         VOCAB,
@@ -67,14 +82,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dense = model::dense_kernels::load(&ctx)?;
 
     let aux_schedule = AuxLossSchedule::default();
-    eprintln!("profile setup: initializing CPU parameters");
-    let cpu = MoeDense::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(42, aux_schedule.coefficient(0));
-    eprintln!("profile setup: uploading parameters");
-    let mut gpu = GpuDense::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>::from_cpu(&stream, &cpu)?;
-    drop(cpu);
+    eprintln!("profile setup: initializing parameters block by block");
+    let mut gpu = GpuDense::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>::initialized(
+        &stream,
+        42,
+        aux_schedule.coefficient(0),
+    )?;
     eprintln!("profile setup: allocating optimizer and workspace");
-    let mut optimizer = GpuDenseAdamW::new(&stream, AdamWConfig::default(), aux_schedule)?;
-    let mut workspace = GpuDenseWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
+    let mut optimizer = GpuDenseAdamW::new(&stream, AdamWConfig::default(), aux_schedule, L)?;
+    let mut workspace =
+        GpuMoeWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C, L>::new(&stream)?;
+    print_vram("after model/optimizer/workspace allocation");
     let tokens: Vec<usize> = (0..N).map(|i| (i * 7919 + 17) % VOCAB).collect();
     let targets: Vec<usize> = (0..N).map(|i| tokens[(i + 1) % N]).collect();
     let tokens: &[usize; N] = tokens.as_slice().try_into().expect("length N");

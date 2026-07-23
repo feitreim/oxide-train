@@ -11,7 +11,6 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use cuda_core::CudaStream;
-use nn::MoeDense;
 use optim::{AdamWConfig, AuxLossSchedule};
 use tensor_core::{Rank2, Shape};
 
@@ -19,7 +18,7 @@ use super::tensor_device::GpuTensor;
 use super::{GpuBf16Head, GpuDense, GpuDenseAdamW};
 
 const MAGIC: &[u8; 8] = b"RTCKPT01";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const CONFIG_FLOATS: usize = 7;
 
 pub struct LoadedCheckpoint<
@@ -35,8 +34,9 @@ pub struct LoadedCheckpoint<
     const E: usize,
     const K: usize,
     const C: usize,
+    const L: usize,
 > {
-    pub model: GpuDense<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>,
+    pub model: GpuDense<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>,
     pub optimizer: GpuDenseAdamW<VOCAB, VP, D, FF, E>,
     pub next_batch: u64,
 }
@@ -189,14 +189,17 @@ pub fn save<
     const E: usize,
     const K: usize,
     const C: usize,
+    const L: usize,
 >(
     path: impl AsRef<Path>,
-    model: &GpuDense<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>,
+    model: &GpuDense<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>,
     optimizer: &GpuDenseAdamW<VOCAB, VP, D, FF, E>,
     next_batch: u64,
     stream: &CudaStream,
 ) -> Result<(), Box<dyn Error>> {
     const { assert!(cfg!(target_endian = "little")) };
+    assert_eq!(model.blocks.len(), L);
+    assert_eq!(optimizer.blocks.len(), L);
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -207,7 +210,7 @@ pub fn save<
 
     writer.write_all(MAGIC)?;
     write_u32(&mut writer, VERSION)?;
-    for dimension in [N, T, VOCAB, D, H, HD, FF, E, K, C] {
+    for dimension in [N, T, VOCAB, D, H, HD, FF, E, K, C, L] {
         write_u64(&mut writer, dimension as u64)?;
     }
     write_u64(&mut writer, optimizer.step())?;
@@ -215,27 +218,23 @@ pub fn save<
     write_config(&mut writer, optimizer.config(), optimizer.aux_schedule())?;
 
     macro_rules! write_parameter {
-        ($field:ident) => {
-            write_tensor(&mut writer, &model.$field.w, stream)?;
-            write_tensor(&mut writer, &optimizer.$field.first, stream)?;
-            write_tensor(&mut writer, &optimizer.$field.second, stream)?;
+        ($parameter:expr, $moments:expr) => {
+            write_tensor(&mut writer, $parameter, stream)?;
+            write_tensor(&mut writer, &$moments.first, stream)?;
+            write_tensor(&mut writer, &$moments.second, stream)?;
         };
     }
-    write_parameter!(embedding);
-    write_parameter!(attention_norm);
-    write_parameter!(qkv_proj);
-    write_parameter!(o_proj);
-    write_parameter!(ffn_norm);
-    write_tensor(&mut writer, &model.router, stream)?;
-    write_tensor(&mut writer, &optimizer.router.first, stream)?;
-    write_tensor(&mut writer, &optimizer.router.second, stream)?;
-    write_tensor(&mut writer, &model.experts.gate_up, stream)?;
-    write_tensor(&mut writer, &optimizer.expert_gate_up.first, stream)?;
-    write_tensor(&mut writer, &optimizer.expert_gate_up.second, stream)?;
-    write_tensor(&mut writer, &model.experts.down, stream)?;
-    write_tensor(&mut writer, &optimizer.expert_down.first, stream)?;
-    write_tensor(&mut writer, &optimizer.expert_down.second, stream)?;
-    write_parameter!(final_norm);
+    write_parameter!(&model.embedding.w, optimizer.embedding);
+    for (block, moments) in model.blocks.iter().zip(optimizer.blocks.iter()) {
+        write_parameter!(&block.attention_norm.w, moments.attention_norm);
+        write_parameter!(&block.qkv_proj.w, moments.qkv_proj);
+        write_parameter!(&block.o_proj.w, moments.o_proj);
+        write_parameter!(&block.ffn_norm.w, moments.ffn_norm);
+        write_parameter!(&block.router, moments.router);
+        write_parameter!(&block.experts.gate_up, moments.expert_gate_up);
+        write_parameter!(&block.experts.down, moments.expert_down);
+    }
+    write_parameter!(&model.final_norm.w, optimizer.final_norm);
     write_head_tensor::<D, VP>(&mut writer, &model.lm_head.master, VOCAB, stream)?;
     write_head_tensor::<D, VP>(&mut writer, &optimizer.lm_head.first, VOCAB, stream)?;
     write_head_tensor::<D, VP>(&mut writer, &optimizer.lm_head.second, VOCAB, stream)?;
@@ -260,11 +259,12 @@ pub fn load<
     const E: usize,
     const K: usize,
     const C: usize,
+    const L: usize,
 >(
     path: impl AsRef<Path>,
     stream: &CudaStream,
     tensor: &super::tensor_kernels::LoadedModule,
-) -> Result<LoadedCheckpoint<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>, Box<dyn Error>> {
+) -> Result<LoadedCheckpoint<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>, Box<dyn Error>> {
     const { assert!(cfg!(target_endian = "little")) };
     let mut reader = BufReader::new(File::open(path)?);
     let mut magic = [0; MAGIC.len()];
@@ -276,8 +276,8 @@ pub fn load<
     if version != VERSION {
         return Err(invalid(format!("unsupported checkpoint version {version}")).into());
     }
-    let expected = [N, T, VOCAB, D, H, HD, FF, E, K, C];
-    for (name, expected) in ["N", "T", "VOCAB", "D", "H", "HD", "FF", "E", "K", "C"]
+    let expected = [N, T, VOCAB, D, H, HD, FF, E, K, C, L];
+    for (name, expected) in ["N", "T", "VOCAB", "D", "H", "HD", "FF", "E", "K", "C", "L"]
         .into_iter()
         .zip(expected)
     {
@@ -293,32 +293,32 @@ pub fn load<
     let next_batch = read_u64(&mut reader)?;
     let (config, aux_schedule) = read_config(&mut reader)?;
 
-    let cpu = MoeDense::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(0, aux_schedule.base_coefficient);
-    let mut model = GpuDense::from_cpu(stream, &cpu)?;
-    let mut optimizer = GpuDenseAdamW::new(stream, config, aux_schedule)?;
+    let mut model =
+        GpuDense::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>::initialized(
+            stream,
+            0,
+            aux_schedule.base_coefficient,
+        )?;
+    let mut optimizer = GpuDenseAdamW::new(stream, config, aux_schedule, L)?;
 
     macro_rules! read_parameter {
-        ($field:ident) => {
-            model.$field.w = read_tensor(&mut reader, stream)?;
-            optimizer.$field.first = read_tensor(&mut reader, stream)?;
-            optimizer.$field.second = read_tensor(&mut reader, stream)?;
+        ($parameter:expr, $moments:expr) => {
+            *$parameter = read_tensor(&mut reader, stream)?;
+            $moments.first = read_tensor(&mut reader, stream)?;
+            $moments.second = read_tensor(&mut reader, stream)?;
         };
     }
-    read_parameter!(embedding);
-    read_parameter!(attention_norm);
-    read_parameter!(qkv_proj);
-    read_parameter!(o_proj);
-    read_parameter!(ffn_norm);
-    model.router = read_tensor(&mut reader, stream)?;
-    optimizer.router.first = read_tensor(&mut reader, stream)?;
-    optimizer.router.second = read_tensor(&mut reader, stream)?;
-    model.experts.gate_up = read_tensor(&mut reader, stream)?;
-    optimizer.expert_gate_up.first = read_tensor(&mut reader, stream)?;
-    optimizer.expert_gate_up.second = read_tensor(&mut reader, stream)?;
-    model.experts.down = read_tensor(&mut reader, stream)?;
-    optimizer.expert_down.first = read_tensor(&mut reader, stream)?;
-    optimizer.expert_down.second = read_tensor(&mut reader, stream)?;
-    read_parameter!(final_norm);
+    read_parameter!(&mut model.embedding.w, optimizer.embedding);
+    for (block, moments) in model.blocks.iter_mut().zip(optimizer.blocks.iter_mut()) {
+        read_parameter!(&mut block.attention_norm.w, moments.attention_norm);
+        read_parameter!(&mut block.qkv_proj.w, moments.qkv_proj);
+        read_parameter!(&mut block.o_proj.w, moments.o_proj);
+        read_parameter!(&mut block.ffn_norm.w, moments.ffn_norm);
+        read_parameter!(&mut block.router, moments.router);
+        read_parameter!(&mut block.experts.gate_up, moments.expert_gate_up);
+        read_parameter!(&mut block.experts.down, moments.expert_down);
+    }
+    read_parameter!(&mut model.final_norm.w, optimizer.final_norm);
     model.sync_compute(stream, tensor)?;
     model.lm_head =
         GpuBf16Head::from_master_values(stream, &read_head_values::<D, VP>(&mut reader, VOCAB)?)?;

@@ -12,6 +12,7 @@ autolib = false
 
 [dependencies]
 bench-util = { path = "../bench-util" }
+cuda-bindings = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }

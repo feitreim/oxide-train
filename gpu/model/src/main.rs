@@ -25,7 +25,7 @@ use tensor_cpu::CpuTensor;
 mod model;
 use model::{
     GpuDense, GpuDenseAdamW, GpuDenseDense, GpuDenseDenseAdamW, GpuDenseMuon, GpuDenseWorkspace,
-    GpuExpertAdamW, GpuExpertFfn, GpuExpertWorkspace, GpuMuonScratch,
+    GpuExpertAdamW, GpuExpertFfn, GpuExpertWorkspace, GpuMoeWorkspace, GpuMuonScratch,
 };
 
 const N: usize = 8;
@@ -254,7 +254,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
 
     workspace.upload_bins(&bins, stream)?;
     gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
-    let sparse_output = workspace.bin_output.to_host(stream)?;
+    let sparse_output = workspace.acts.bin_output.to_host(stream)?;
     let (atol, rtol) = if aligned {
         (BF16_ATOL, BF16_RTOL)
     } else {
@@ -296,7 +296,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
     }
     workspace.upload_bins(&full_bins, stream)?;
     gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
-    let full_output = workspace.bin_output.to_host(stream)?;
+    let full_output = workspace.acts.bin_output.to_host(stream)?;
     for expert in 0..E {
         for slot in 0..live_slots {
             for feature in 0..D {
@@ -335,7 +335,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
     gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
     assert_close_slices(
         &format!("{label} input gradient"),
-        &workspace.d_bin_input.to_host(stream)?,
+        &workspace.scratch.d_bin_input.to_host(stream)?,
         &expected_input_gradient,
         atol,
         rtol,
@@ -964,6 +964,7 @@ fn moe_model_parity<
     const ME: usize,
     const MK: usize,
     const MC: usize,
+    const ML: usize,
 >(
     label: &str,
     expect_tcgen05: bool,
@@ -976,22 +977,18 @@ fn moe_model_parity<
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const AUX: f32 = 0.02;
-    let mut cpu = MoeDense::<MN, MT, VOCAB, D, H, HD, MFF, ME, MK, MC>::new(71, AUX);
+    let mut cpu = MoeDense::<MN, MT, VOCAB, D, H, HD, MFF, ME, MK, MC, ML>::new(71, AUX);
     // Deterministic ties force experts 0/1 over capacity while all remaining
     // experts stay underfull, covering both dispatch edge cases.
-    cpu.ffn.router.w.as_mut_slice().fill(0.0);
+    for block in &mut cpu.blocks {
+        block.ffn.router.w.as_mut_slice().fill(0.0);
+    }
     let mut gpu =
-        GpuDense::<MN, MNP, MT, VOCAB, VP, D, H, HD, MFF, ME, MK, MC>::from_cpu(stream, &cpu)?;
+        GpuDense::<MN, MNP, MT, VOCAB, VP, D, H, HD, MFF, ME, MK, MC, ML>::from_cpu(stream, &cpu)?;
     let mut workspace =
-        GpuDenseWorkspace::<MN, MNP, MT, VOCAB, VP, D, H, MFF, ME, MK, MC>::new(stream)?;
+        GpuMoeWorkspace::<MN, MNP, MT, VOCAB, VP, D, H, MFF, ME, MK, MC, ML>::new(stream)?;
     assert_eq!(workspace.tcgen05_linears_active(), expect_tcgen05);
-    assert_eq!(
-        workspace
-            .expert_workspace()
-            .expect("MoE expert workspace")
-            .tcgen05_active(),
-        expect_tcgen05
-    );
+    assert_eq!(workspace.tcgen05_experts_active(), expect_tcgen05);
     let tokens: [usize; MN] = std::array::from_fn(|i| (i * 7 + 3) % VOCAB);
     let targets: [usize; MN] = std::array::from_fn(|i| (tokens[i] + 1) % VOCAB);
 
@@ -1043,50 +1040,79 @@ fn moe_model_parity<
         };
     }
     common_grad!(embedding);
-    common_grad!(attention_norm);
-    assert_grouped_close(
-        "MoE qkv_proj.dw",
-        &gpu.qkv_proj.dw,
-        [&cpu.q_proj.dw, &cpu.k_proj.dw, &cpu.v_proj.dw],
-        stream,
-        BF16_ATOL,
-        BF16_RTOL,
-    )?;
-    common_grad!(o_proj);
-    common_grad!(ffn_norm);
-    assert_close(
-        "MoE router.dw",
-        &gpu.d_router,
-        &cpu.ffn.router.dw,
-        stream,
-        BF16_ATOL,
-        BF16_RTOL,
-    )?;
-    let mut expected_gate_up = Vec::with_capacity(ME * D * 2 * MFF);
-    let mut expected_down = Vec::with_capacity(ME * MFF * D);
-    for expert in &cpu.ffn.experts {
-        for input in 0..D {
-            expected_gate_up
-                .extend_from_slice(&expert.gate_proj.dw.as_slice()[input * MFF..(input + 1) * MFF]);
-            expected_gate_up
-                .extend_from_slice(&expert.up_proj.dw.as_slice()[input * MFF..(input + 1) * MFF]);
+    for (index, (gpu_block, cpu_block)) in gpu.blocks.iter().zip(cpu.blocks.iter()).enumerate() {
+        assert_close(
+            &format!("MoE block{index} attention_norm.dw"),
+            &gpu_block.attention_norm.dw,
+            &cpu_block.attention_norm.dw,
+            stream,
+            BF16_ATOL,
+            BF16_RTOL,
+        )?;
+        assert_grouped_close(
+            &format!("MoE block{index} qkv_proj.dw"),
+            &gpu_block.qkv_proj.dw,
+            [
+                &cpu_block.q_proj.dw,
+                &cpu_block.k_proj.dw,
+                &cpu_block.v_proj.dw,
+            ],
+            stream,
+            BF16_ATOL,
+            BF16_RTOL,
+        )?;
+        assert_close(
+            &format!("MoE block{index} o_proj.dw"),
+            &gpu_block.o_proj.dw,
+            &cpu_block.o_proj.dw,
+            stream,
+            BF16_ATOL,
+            BF16_RTOL,
+        )?;
+        assert_close(
+            &format!("MoE block{index} ffn_norm.dw"),
+            &gpu_block.ffn_norm.dw,
+            &cpu_block.ffn_norm.dw,
+            stream,
+            BF16_ATOL,
+            BF16_RTOL,
+        )?;
+        assert_close(
+            &format!("MoE block{index} router.dw"),
+            &gpu_block.d_router,
+            &cpu_block.ffn.router.dw,
+            stream,
+            BF16_ATOL,
+            BF16_RTOL,
+        )?;
+        let mut expected_gate_up = Vec::with_capacity(ME * D * 2 * MFF);
+        let mut expected_down = Vec::with_capacity(ME * MFF * D);
+        for expert in &cpu_block.ffn.experts {
+            for input in 0..D {
+                expected_gate_up.extend_from_slice(
+                    &expert.gate_proj.dw.as_slice()[input * MFF..(input + 1) * MFF],
+                );
+                expected_gate_up.extend_from_slice(
+                    &expert.up_proj.dw.as_slice()[input * MFF..(input + 1) * MFF],
+                );
+            }
+            expected_down.extend_from_slice(expert.down_proj.dw.as_slice());
         }
-        expected_down.extend_from_slice(expert.down_proj.dw.as_slice());
+        assert_close_slices(
+            &format!("MoE block{index} expert gate/up gradients"),
+            &gpu_block.experts.d_gate_up.to_host(stream)?,
+            &expected_gate_up,
+            BF16_ATOL,
+            BF16_RTOL,
+        );
+        assert_close_slices(
+            &format!("MoE block{index} expert down gradients"),
+            &gpu_block.experts.d_down.to_host(stream)?,
+            &expected_down,
+            BF16_ATOL,
+            BF16_RTOL,
+        );
     }
-    assert_close_slices(
-        "MoE expert gate/up gradients",
-        &gpu.experts.d_gate_up.to_host(stream)?,
-        &expected_gate_up,
-        BF16_ATOL,
-        BF16_RTOL,
-    );
-    assert_close_slices(
-        "MoE expert down gradients",
-        &gpu.experts.d_down.to_host(stream)?,
-        &expected_down,
-        BF16_ATOL,
-        BF16_RTOL,
-    );
     common_grad!(final_norm);
     assert_close_slices(
         "MoE lm_head.dw",
@@ -1124,13 +1150,13 @@ fn aligned_moe_overfit(
     let mut gpu =
         GpuDense::<ON, ON, OT, VOCAB, VP, D, H, HD, OFF, OE, OK, OC>::from_cpu(stream, &cpu)?;
     let mut workspace =
-        GpuDenseWorkspace::<ON, ON, OT, VOCAB, VP, D, H, OFF, OE, OK, OC>::new(stream)?;
+        GpuMoeWorkspace::<ON, ON, OT, VOCAB, VP, D, H, OFF, OE, OK, OC>::new(stream)?;
     let config = AdamWConfig {
         learning_rate: 0.02,
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
-    let mut optimizer = GpuDenseAdamW::new(stream, config, schedule)?;
+    let mut optimizer = GpuDenseAdamW::new(stream, config, schedule, 1)?;
     let tokens: [usize; ON] = std::array::from_fn(|i| (i * 7 + 3) % VOCAB);
     let targets: [usize; ON] = std::array::from_fn(|i| (tokens[i] + 1) % VOCAB);
     let mut initial_loss = None;
@@ -1216,13 +1242,14 @@ fn moe_checkpoint_gate(
         weight_decay: 0.1,
         ..AdamWConfig::default()
     };
+    const CL: usize = 2;
     let cpu =
-        MoeDense::<CN, CT, VOCAB, D, H, HD, CFF, CE, CK, CC>::new(123, schedule.base_coefficient);
+        MoeDense::<CN, CT, VOCAB, D, H, HD, CFF, CE, CK, CC, CL>::new(123, schedule.base_coefficient);
     let mut gpu =
-        GpuDense::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC>::from_cpu(stream, &cpu)?;
-    let mut optimizer = GpuDenseAdamW::new(stream, config, schedule)?;
+        GpuDense::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC, CL>::from_cpu(stream, &cpu)?;
+    let mut optimizer = GpuDenseAdamW::new(stream, config, schedule, CL)?;
     let mut workspace =
-        GpuDenseWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC>::new(stream)?;
+        GpuMoeWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC, CL>::new(stream)?;
     let tokens = [1, 5, 5, 2];
     let targets = [5, 5, 2, 7];
     let coefficient = optimizer.aux_coefficient();
@@ -1259,7 +1286,7 @@ fn moe_checkpoint_gate(
     let resumed_path = base.with_extension("continued-b");
     let tampered_path = base.with_extension("tampered");
     model::checkpoint::save(&checkpoint_path, &gpu, &optimizer, 7, stream)?;
-    let loaded = model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC>(
+    let loaded = model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC, CL>(
         &checkpoint_path,
         stream,
         tensor,
@@ -1269,7 +1296,7 @@ fn moe_checkpoint_gate(
     let mut resumed_gpu = loaded.model;
     let mut resumed_optimizer = loaded.optimizer;
     let mut resumed_workspace =
-        GpuDenseWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC>::new(stream)?;
+        GpuMoeWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC, CL>::new(stream)?;
 
     for (candidate, candidate_optimizer, candidate_workspace) in [
         (&mut gpu, &mut optimizer, &mut workspace),
@@ -1316,7 +1343,7 @@ fn moe_checkpoint_gate(
     );
 
     assert!(
-        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, 4, CK, CC>(
+        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, 4, CK, CC, CL>(
             &checkpoint_path,
             stream,
             tensor
@@ -1324,7 +1351,7 @@ fn moe_checkpoint_gate(
         .is_err()
     );
     assert!(
-        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, 1, CC>(
+        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, 1, CC, CL>(
             &checkpoint_path,
             stream,
             tensor
@@ -1332,7 +1359,15 @@ fn moe_checkpoint_gate(
         .is_err()
     );
     assert!(
-        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, 4>(
+        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, 4, CL>(
+            &checkpoint_path,
+            stream,
+            tensor
+        )
+        .is_err()
+    );
+    assert!(
+        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC, 1>(
             &checkpoint_path,
             stream,
             tensor
@@ -1341,11 +1376,11 @@ fn moe_checkpoint_gate(
     );
 
     let mut tampered = std::fs::read(&checkpoint_path)?;
-    const AUX_BASE_OFFSET: usize = 8 + 4 + 10 * 8 + 2 * 8 + 5 * 4;
+    const AUX_BASE_OFFSET: usize = 8 + 4 + 11 * 8 + 2 * 8 + 5 * 4;
     tampered[AUX_BASE_OFFSET..AUX_BASE_OFFSET + 4].copy_from_slice(&f32::NAN.to_le_bytes());
     std::fs::write(&tampered_path, tampered)?;
     assert!(
-        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC>(
+        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC, CL>(
             &tampered_path,
             stream,
             tensor
@@ -1356,7 +1391,7 @@ fn moe_checkpoint_gate(
     for path in [checkpoint_path, continued_path, resumed_path, tampered_path] {
         let _ = std::fs::remove_file(path);
     }
-    println!("✓ checkpoint v3 resumes bit-identically and rejects E/K/C or schedule mismatches");
+    println!("✓ checkpoint v4 resumes bit-identically and rejects E/K/C/L or schedule mismatches");
     Ok(())
 }
 
@@ -1680,7 +1715,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm_bf16,
         &dense,
     )?;
-    moe_model_parity::<8, 256, 4, 19, 3, 2, 3>(
+    moe_model_parity::<8, 256, 4, 19, 3, 2, 3, 2>(
         "fp32-oracle",
         false,
         &stream,
@@ -1691,7 +1726,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash_bf16,
         &dense,
     )?;
-    moe_model_parity::<256, 256, 256, 256, 3, 2, 256>(
+    moe_model_parity::<256, 256, 256, 256, 3, 2, 256, 2>(
         "aligned tcgen05",
         true,
         &stream,

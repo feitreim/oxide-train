@@ -1,32 +1,32 @@
 //! Minimal Wikipedia training loop.
 //!
-//! Runs the canonical 182.7M-parameter single-block profile configuration
-//! (matching bin/profile.rs) on real `TOK1` shards end to end.
+//! Runs the canonical 12-block MoE configuration (matching bin/profile.rs)
+//! on real `TOK1` shards end to end.
 
 use std::env;
 
 use cuda_core::CudaContext;
 use data::{Batches, TokenFile};
-use nn::MoeDense;
 use optim::{AdamWConfig, AuxLossSchedule};
 
 #[path = "../lib.rs"]
 mod model;
-use model::{GpuDense, GpuDenseAdamW, GpuDenseWorkspace};
+use model::{GpuDense, GpuDenseAdamW, GpuMoeWorkspace};
 
-const B: usize = 32;
-const T: usize = 1_024;
-const N: usize = 32_768;
-const NP: usize = 32_768;
+const B: usize = 12;
+const T: usize = 2_048;
+const N: usize = 24_576;
+const NP: usize = 24_576;
 const VOCAB: usize = 50_257;
 const VP: usize = 50_432;
-const D: usize = 1_536;
+const D: usize = 3_072;
 const H: usize = 24;
-const HD: usize = 64;
-const FF: usize = 2_048;
+const HD: usize = 128;
+const FF: usize = 4_096;
 const E: usize = 8;
 const K: usize = 2;
-const C: usize = 8_192;
+const C: usize = 6_144;
+const L: usize = 12;
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
     env::var(name)
@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     aux_schedule.validate();
     let (mut gpu, mut optimizer, mut next_batch) = if resume {
-        let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>(
+        let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>(
             checkpoint_path.as_deref().expect("validated above"),
             &stream,
             &tensor,
@@ -119,16 +119,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             checkpoint.next_batch,
         )
     } else {
-        let cpu =
-            MoeDense::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(42, aux_schedule.coefficient(0));
         (
-            GpuDense::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>::from_cpu(&stream, &cpu)?,
-            GpuDenseAdamW::new(&stream, config, aux_schedule)?,
+            GpuDense::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>::initialized(
+                &stream,
+                42,
+                aux_schedule.coefficient(0),
+            )?,
+            GpuDenseAdamW::new(&stream, config, aux_schedule, L)?,
             0,
         )
     };
     let starting_step = optimizer.step() as usize;
-    let mut workspace = GpuDenseWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
+    let mut workspace = GpuMoeWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C, L>::new(&stream)?;
     if max_steps < starting_step {
         return Err(
             format!("TRAIN_STEPS={max_steps} is behind checkpoint step {starting_step}").into(),

@@ -266,7 +266,8 @@ impl<
     const E: usize,
     const K: usize,
     const C: usize,
-> VisitCpuParameters for MoeDense<N, T, VOCAB, D, H, HD, FF, E, K, C>
+    const L: usize,
+> VisitCpuParameters for MoeDense<N, T, VOCAB, D, H, HD, FF, E, K, C, L>
 {
     fn visit_cpu_parameters<V: CpuParameterVisitor>(&mut self, visitor: &mut V) {
         macro_rules! visit {
@@ -281,42 +282,44 @@ impl<
             &self.embedding.dw,
             Embedding
         );
-        visit!(
-            "attention_norm",
-            &mut self.attention_norm.w,
-            &self.attention_norm.dw,
-            Norm
-        );
-        visit!("q_proj", &mut self.q_proj.w, &self.q_proj.dw, Matrix);
-        visit!("k_proj", &mut self.k_proj.w, &self.k_proj.dw, Matrix);
-        visit!("v_proj", &mut self.v_proj.w, &self.v_proj.dw, Matrix);
-        visit!("o_proj", &mut self.o_proj.w, &self.o_proj.dw, Matrix);
-        visit!("ffn_norm", &mut self.ffn_norm.w, &self.ffn_norm.dw, Norm);
-        visit!(
-            "ffn.router",
-            &mut self.ffn.router.w,
-            &self.ffn.router.dw,
-            Router
-        );
-        for expert in &mut self.ffn.experts {
+        for block in &mut self.blocks {
             visit!(
-                "ffn.expert.gate_proj",
-                &mut expert.gate_proj.w,
-                &expert.gate_proj.dw,
-                Matrix
+                "attention_norm",
+                &mut block.attention_norm.w,
+                &block.attention_norm.dw,
+                Norm
             );
+            visit!("q_proj", &mut block.q_proj.w, &block.q_proj.dw, Matrix);
+            visit!("k_proj", &mut block.k_proj.w, &block.k_proj.dw, Matrix);
+            visit!("v_proj", &mut block.v_proj.w, &block.v_proj.dw, Matrix);
+            visit!("o_proj", &mut block.o_proj.w, &block.o_proj.dw, Matrix);
+            visit!("ffn_norm", &mut block.ffn_norm.w, &block.ffn_norm.dw, Norm);
             visit!(
-                "ffn.expert.up_proj",
-                &mut expert.up_proj.w,
-                &expert.up_proj.dw,
-                Matrix
+                "ffn.router",
+                &mut block.ffn.router.w,
+                &block.ffn.router.dw,
+                Router
             );
-            visit!(
-                "ffn.expert.down_proj",
-                &mut expert.down_proj.w,
-                &expert.down_proj.dw,
-                Matrix
-            );
+            for expert in &mut block.ffn.experts {
+                visit!(
+                    "ffn.expert.gate_proj",
+                    &mut expert.gate_proj.w,
+                    &expert.gate_proj.dw,
+                    Matrix
+                );
+                visit!(
+                    "ffn.expert.up_proj",
+                    &mut expert.up_proj.w,
+                    &expert.up_proj.dw,
+                    Matrix
+                );
+                visit!(
+                    "ffn.expert.down_proj",
+                    &mut expert.down_proj.w,
+                    &expert.down_proj.dw,
+                    Matrix
+                );
+            }
         }
         visit!(
             "final_norm",

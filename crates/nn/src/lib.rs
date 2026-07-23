@@ -32,7 +32,7 @@ pub use embedding::{Embedding, TokenIds};
 pub use linear::Linear;
 pub use module::{Chain, Module};
 pub use moe::{ExpertFfn, ExpertFfnCtx, MoeFfn, MoeFfnCtx, MoeRouting};
-pub use moe_dense::{MoeDense, MoeDenseCtx};
+pub use moe_dense::{MoeBlock, MoeBlockCtx, MoeDense, MoeDenseCtx};
 pub use rms_norm::RmsNorm;
 pub use rope::Rope;
 pub use swiglu::SwiGlu;

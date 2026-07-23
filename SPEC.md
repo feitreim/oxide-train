@@ -610,8 +610,30 @@ Each gated on tests; correctness before speed at every step.
      same-container result against pre-follow-up main: 171.76 → 160.69 ms full
      step (-6.45%) for both routing changes; `backward.router.weight` 4.890 →
      0.916 ms (5.34×).
-9. Scale/stretch: bigger model, activation checkpointing, (much later)
-   multi-GPU
+9. **Scale-up (in progress)** — depth + width toward MFU. Structural half
+   done: `MoeDense`/`GpuDense` are `L`-block stacks (`MoeBlock`/`GpuBlock`);
+   per-block workspaces split into saved activations (one set per block) vs
+   backward scratch (`d_*` buffers, expert gradient bins, bf16 staging —
+   one shared set), so activation memory scales as
+   `L * saved + 1 * scratch`. Block backward keeps the residual-stream
+   gradient resident in `d_model_1` across the reverse loop (no
+   inter-block copies). Per-block aux losses accumulate into the same loss
+   scalar; checkpoint v4 adds `L` and streams blocks; `GpuDense::initialized`
+   builds one CPU block at a time so the 4.4B-param config never
+   materializes host-side. Canonical config moved to
+   `L=12, D=3072, H=24, HD=128, FF=4096, E=8, K=2` at `B=8, T=2048`
+   (`C=4096` keeps `N·K == E·C`). Gates: CPU deep overfit, two-block
+   CPU/GPU parity on both expert paths, checkpoint v4 bit-identical resume
+   with `L`-mismatch rejection.
+   - ⏳ **tcgen05 flash at HD=128** (#42): both flash generations specialize on
+     `HD == 64` (`TILE_HD` fp32 tiles; the tcgen05 swizzle/SMEM plans bake
+     `TILE_BYTES = 128·64·2`). `HD != 64` currently dispatches to the
+     per-row oracle kernels — correct but serial over keys, so the big
+     config trains at oracle-attention speed until the tcgen05 kernels
+     learn 128 (two 64-wide panels or a 64-row tile re-tiling; the naive
+     SMEM scaling of the persistent kernel would need 384 KiB > 227 KiB).
+   - Then: activation checkpointing if B wants to grow past memory,
+     (much later) multi-GPU
 
 ## 14. Decision log
 

@@ -84,6 +84,19 @@ impl StepProfile {
     pub fn unattributed_milliseconds(&self) -> f64 {
         (self.step_milliseconds - self.kernel_milliseconds()).max(0.0)
     }
+
+    /// Kernel timings summed per name in first-seen order, so a span launched
+    /// once per block reads as one whole-step row.
+    pub fn aggregated_kernels(&self) -> Vec<KernelTiming> {
+        let mut order: Vec<KernelTiming> = Vec::new();
+        for kernel in &self.kernels {
+            match order.iter_mut().find(|entry| entry.name == kernel.name) {
+                Some(entry) => entry.milliseconds += kernel.milliseconds,
+                None => order.push(kernel.clone()),
+            }
+        }
+        order
+    }
 }
 
 impl fmt::Display for StepProfile {
@@ -99,7 +112,7 @@ impl fmt::Display for StepProfile {
         writeln!(f, "GPU training-step profile (CUDA events)")?;
         writeln!(f, "{:<52} {:>10} {:>8}", "kernel", "ms", "% step")?;
         writeln!(f, "{:-<52} {:-<10} {:-<8}", "", "", "")?;
-        for kernel in &self.kernels {
+        for kernel in self.aggregated_kernels() {
             writeln!(
                 f,
                 "{:<52} {:>10.4} {:>7.2}%",
