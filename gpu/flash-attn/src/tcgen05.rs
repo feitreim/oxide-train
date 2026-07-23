@@ -100,12 +100,14 @@ const TILE_BYTES: usize = TILE * HD * 2;
 /// Bytes of one 64-wide `[TILE, 64]` SWIZZLE_128B subtile — half a `TILE_BYTES`
 /// panel, and the footprint of a `[TILE, TILE]` P/dS probability operand.
 const SUBTILE_BYTES: usize = TILE_BYTES / 2;
-/// Phantom-read pad. Every MMA uses the `M128` shape over 64-row tiles (the
-/// `M64` shape mis-pairs operand K-indices for rows ≥16), so the tensor core
-/// reads 128 operand rows and the unused rows 64..128 stream a `TILE_BYTES`
-/// tail past each operand's base. One extra `TILE_BYTES` at the end of every
-/// dynamic-shared plan keeps those reads in bounds; the garbage they pull lands
-/// in accumulator rows 64..128, which are never drained.
+/// Phantom-read pad, used by the three FORWARD kernels (sync, pipelined,
+/// persistent) — all still on the `M128`-over-64-row scheme. Each of their MMAs
+/// reads 128 operand rows but only fills a 64-row tile, so the unused rows
+/// 64..128 stream a `TILE_BYTES` tail past each operand's base; one extra
+/// `TILE_BYTES` at the end of the plan keeps those reads in bounds (the garbage
+/// lands in accumulator rows 64..128, never drained). The BACKWARD kernels
+/// (Design B, #47 item 2) instead PAIR two adjacent 64-row tiles into every
+/// M128 MMA — all 128 rows are real — so their plans carry no `PHANTOM_PAD`.
 const PHANTOM_PAD: usize = TILE_BYTES;
 /// Dynamic shared plan of the synchronous kernel: Q, K, V panels plus the
 /// single P subtile.
@@ -124,14 +126,17 @@ pub const FLASH_PIPELINE_SMEM: usize = (1 + 2 * PIPELINE_STAGES) * TILE_BYTES + 
 /// warpgroup plus the TMA-load warp and the MMA-issue warp.
 pub const FLASH_PIPELINE_BLOCK: usize = TILE + 64;
 
-/// Dynamic shared plan of the synchronous query-parallel backward (kernel A):
-/// the resident Q and dY panels, the streamed K and V panels, and the single
-/// dS subtile.
-pub const FLASH_BACKWARD_Q_SMEM: usize = 4 * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
-/// Dynamic shared plan of the synchronous key-parallel backward (kernel B):
-/// the resident K and V panels, the streamed Q and dY panels, and the Pᵀ and
-/// dSᵀ subtiles.
-pub const FLASH_BACKWARD_KV_SMEM: usize = 4 * TILE_BYTES + 2 * SUBTILE_BYTES + PHANTOM_PAD;
+/// Dynamic shared plan of the PAIRED query-parallel backward (kernel A, Design
+/// B): the resident stacked `[Q_A;Q_B]` and `[dY_A;dY_B]` operands
+/// (`2 * TILE_BYTES` each), the streamed K and V panels, and the single stacked
+/// `[128, 64]` dS tile (`TILE_BYTES`). No `PHANTOM_PAD` — every paired MMA fills
+/// 128 real query rows.
+pub const FLASH_BACKWARD_Q_SMEM: usize = 7 * TILE_BYTES;
+/// Dynamic shared plan of the PAIRED key-parallel backward (kernel B, Design B):
+/// the resident stacked `[K_A;K_B]` and `[V_A;V_B]` operands (`2 * TILE_BYTES`
+/// each), the streamed Q and dY panels, and the stacked `[128, 64]` Pᵀ and dSᵀ
+/// tiles (`TILE_BYTES` each). No `PHANTOM_PAD`.
+pub const FLASH_BACKWARD_KV_SMEM: usize = 8 * TILE_BYTES;
 
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
@@ -818,6 +823,209 @@ pub mod kernels {
         }
     }
 
+    /// PAIRED query-parallel backward register pass (Design B, #47 item 2): the
+    /// 128-thread warpgroup drains ONE stacked `S`/`dP` — warps 0–1 own
+    /// accumulator rows 0..63 (query tile A), warps 2–3 own 64..127 (query tile
+    /// B) — and forms `dS = P·(dP − dot)·scale` for all 128 rows into ONE
+    /// stacked `[128, 64]` dS tile. `warp_id` is the ACTUAL block warp (0..3).
+    /// The paired tiles are adjacent, so `lse2`/`dot` are the pair's 128
+    /// contiguous query rows indexed directly by `row_a`; the causal edge
+    /// compares against the query row WITHIN the tile (`row & 63`). A future
+    /// tile for the lower stream (`key > tile_b` → `key == tile_a`'s partner) is
+    /// fully masked to `dS = 0`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn backward_q_tile_paired(
+        s_tmem: u32,
+        dp_tmem: u32,
+        key: u32,
+        tile_a: u32,
+        tile_b: u32,
+        warp_id: u32,
+        lane: u32,
+        lse2: *const f32,
+        dot: *const f32,
+        ds_smem: *mut u8,
+        ds_phase: usize,
+    ) {
+        unsafe {
+            let quad = (lane % 4) as usize;
+            let row_in_16 = (lane / 4) as usize;
+            let is_a = warp_id < 2;
+            let my_tile = if is_a { tile_a } else { tile_b };
+            let masked_all = key > my_tile;
+            let diagonal = key == my_tile;
+            let mut row_block = 0u32;
+            while row_block < 2 {
+                let tmem_row = warp_id * 32 + row_block * 16;
+                let mut column_block = 0u32;
+                while column_block < 4 {
+                    let column = column_block * 16;
+                    let s_low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
+                    tcgen05_load_wait();
+                    let s_high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
+                    tcgen05_load_wait();
+                    let dp_low = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column);
+                    tcgen05_load_wait();
+                    let dp_high = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column + 8);
+                    tcgen05_load_wait();
+                    let row_a = tmem_row + row_in_16 as u32;
+                    let row_b = row_a + 8;
+                    let qrow_a = row_a & 63;
+                    let qrow_b = row_b & 63;
+                    let col = column + 2 * quad as u32;
+                    let lse_a = *lse2.add(row_a as usize);
+                    let dot_a = *dot.add(row_a as usize);
+                    let lse_b = *lse2.add(row_b as usize);
+                    let dot_b = *dot.add(row_b as usize);
+
+                    let ds_a0 = backward_dscore(
+                        s_low[0], dp_low[0], lse_a, dot_a, SCALE,
+                        !masked_all && (!diagonal || col <= qrow_a),
+                    );
+                    let ds_a1 = backward_dscore(
+                        s_low[1], dp_low[1], lse_a, dot_a, SCALE,
+                        !masked_all && (!diagonal || col + 1 <= qrow_a),
+                    );
+                    let ds_a8 = backward_dscore(
+                        s_high[0], dp_high[0], lse_a, dot_a, SCALE,
+                        !masked_all && (!diagonal || col + 8 <= qrow_a),
+                    );
+                    let ds_a9 = backward_dscore(
+                        s_high[1], dp_high[1], lse_a, dot_a, SCALE,
+                        !masked_all && (!diagonal || col + 9 <= qrow_a),
+                    );
+                    let ds_b0 = backward_dscore(
+                        s_low[2], dp_low[2], lse_b, dot_b, SCALE,
+                        !masked_all && (!diagonal || col <= qrow_b),
+                    );
+                    let ds_b1 = backward_dscore(
+                        s_low[3], dp_low[3], lse_b, dot_b, SCALE,
+                        !masked_all && (!diagonal || col + 1 <= qrow_b),
+                    );
+                    let ds_b8 = backward_dscore(
+                        s_high[2], dp_high[2], lse_b, dot_b, SCALE,
+                        !masked_all && (!diagonal || col + 8 <= qrow_b),
+                    );
+                    let ds_b9 = backward_dscore(
+                        s_high[3], dp_high[3], lse_b, dot_b, SCALE,
+                        !masked_all && (!diagonal || col + 9 <= qrow_b),
+                    );
+                    write_bf16_fragment(
+                        ds_smem, ds_phase, tmem_row, column_block, lane, ds_a0, ds_a1, ds_a8,
+                        ds_a9, ds_b0, ds_b1, ds_b8, ds_b9,
+                    );
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+        }
+    }
+
+    /// PAIRED key-parallel backward register pass (Design B, #47 item 2): the
+    /// 128-thread warpgroup drains ONE stacked transposed `Sᵀ`/`dPᵀ` — warps
+    /// 0–1 own accumulator rows 0..63 (key tile A), warps 2–3 own 64..127 (key
+    /// tile B) — and forms `Pᵀ`/`dSᵀ` for all 128 key rows into ONE stacked
+    /// `[128, 64]` tile each. Rows are key rows, columns are query rows, so the
+    /// per-row statistics index by `col` (the streamed query tile's rows,
+    /// unpaired at 64) and the causal edge compares the key row WITHIN the tile
+    /// (`row & 63`) against the query column. A query tile before the higher
+    /// key stream (`query < key_b` → the shared diagonal query `key_a`) fully
+    /// masks that stream to zero.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn backward_kv_tile_paired(
+        st_tmem: u32,
+        dpt_tmem: u32,
+        query: u32,
+        key_a: u32,
+        key_b: u32,
+        warp_id: u32,
+        lane: u32,
+        lse2: *const f32,
+        dot: *const f32,
+        p_smem: *mut u8,
+        p_phase: usize,
+        ds_smem: *mut u8,
+        ds_phase: usize,
+    ) {
+        unsafe {
+            let quad = (lane % 4) as usize;
+            let row_in_16 = (lane / 4) as usize;
+            let is_a = warp_id < 2;
+            let my_key = if is_a { key_a } else { key_b };
+            let masked_all = query < my_key;
+            let diagonal = query == my_key;
+            let mut row_block = 0u32;
+            while row_block < 2 {
+                let tmem_row = warp_id * 32 + row_block * 16;
+                let mut column_block = 0u32;
+                while column_block < 4 {
+                    let column = column_block * 16;
+                    let s_low = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column);
+                    tcgen05_load_wait();
+                    let s_high = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column + 8);
+                    tcgen05_load_wait();
+                    let dp_low = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column);
+                    tcgen05_load_wait();
+                    let dp_high = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column + 8);
+                    tcgen05_load_wait();
+                    let row_a = tmem_row + row_in_16 as u32;
+                    let row_b = row_a + 8;
+                    let krow_a = row_a & 63;
+                    let krow_b = row_b & 63;
+                    let col = column + 2 * quad as u32;
+                    let lse_c0 = *lse2.add(col as usize);
+                    let dot_c0 = *dot.add(col as usize);
+                    let lse_c1 = *lse2.add(col as usize + 1);
+                    let dot_c1 = *dot.add(col as usize + 1);
+                    let lse_c8 = *lse2.add(col as usize + 8);
+                    let dot_c8 = *dot.add(col as usize + 8);
+                    let lse_c9 = *lse2.add(col as usize + 9);
+                    let dot_c9 = *dot.add(col as usize + 9);
+
+                    let keep_a0 = !masked_all && (!diagonal || krow_a <= col);
+                    let keep_a1 = !masked_all && (!diagonal || krow_a <= col + 1);
+                    let keep_a8 = !masked_all && (!diagonal || krow_a <= col + 8);
+                    let keep_a9 = !masked_all && (!diagonal || krow_a <= col + 9);
+                    let keep_b0 = !masked_all && (!diagonal || krow_b <= col);
+                    let keep_b1 = !masked_all && (!diagonal || krow_b <= col + 1);
+                    let keep_b8 = !masked_all && (!diagonal || krow_b <= col + 8);
+                    let keep_b9 = !masked_all && (!diagonal || krow_b <= col + 9);
+
+                    let p_a0 = if keep_a0 { exp2_approx(s_low[0] - lse_c0) } else { 0.0 };
+                    let p_a1 = if keep_a1 { exp2_approx(s_low[1] - lse_c1) } else { 0.0 };
+                    let p_a8 = if keep_a8 { exp2_approx(s_high[0] - lse_c8) } else { 0.0 };
+                    let p_a9 = if keep_a9 { exp2_approx(s_high[1] - lse_c9) } else { 0.0 };
+                    let p_b0 = if keep_b0 { exp2_approx(s_low[2] - lse_c0) } else { 0.0 };
+                    let p_b1 = if keep_b1 { exp2_approx(s_low[3] - lse_c1) } else { 0.0 };
+                    let p_b8 = if keep_b8 { exp2_approx(s_high[2] - lse_c8) } else { 0.0 };
+                    let p_b9 = if keep_b9 { exp2_approx(s_high[3] - lse_c9) } else { 0.0 };
+
+                    let ds_a0 = p_a0 * (dp_low[0] - dot_c0) * LN2;
+                    let ds_a1 = p_a1 * (dp_low[1] - dot_c1) * LN2;
+                    let ds_a8 = p_a8 * (dp_high[0] - dot_c8) * LN2;
+                    let ds_a9 = p_a9 * (dp_high[1] - dot_c9) * LN2;
+                    let ds_b0 = p_b0 * (dp_low[2] - dot_c0) * LN2;
+                    let ds_b1 = p_b1 * (dp_low[3] - dot_c1) * LN2;
+                    let ds_b8 = p_b8 * (dp_high[2] - dot_c8) * LN2;
+                    let ds_b9 = p_b9 * (dp_high[3] - dot_c9) * LN2;
+
+                    write_bf16_fragment(
+                        p_smem, p_phase, tmem_row, column_block, lane, p_a0, p_a1, p_a8, p_a9,
+                        p_b0, p_b1, p_b8, p_b9,
+                    );
+                    write_bf16_fragment(
+                        ds_smem, ds_phase, tmem_row, column_block, lane, ds_a0, ds_a1, ds_a8,
+                        ds_a9, ds_b0, ds_b1, ds_b8, ds_b9,
+                    );
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+        }
+    }
+
     /// Issue one `dQ/dK/dV += A·Bᵀ` gradient tile (also the forward `O = P·V`)
     /// from the leader thread. `A` (the 64-wide probability/`dS` subtile) walks
     /// four K=16 chunks; `B` (a 128-wide key/query/value operand) is two stacked
@@ -1256,21 +1464,20 @@ pub mod kernels {
         }
     }
 
-    /// Synchronous tcgen05 query-parallel backward (issue #35, phase 4,
-    /// kernel A). Launch with `host::flash_backward_q_config`: grid
-    /// `(T/128, H, B)`, 128 threads, `FLASH_BACKWARD_Q_SMEM` dynamic shared
-    /// bytes (opted in by the loader).
+    /// PAIRED tcgen05 query-parallel backward (Design B for #47 item 2). Launch
+    /// with `host::flash_backward_q_config`: grid `(T/128, H, B)`, 128 threads,
+    /// `FLASH_BACKWARD_Q_SMEM` dynamic shared bytes (opted in by the loader).
     ///
-    /// One CTA owns a 128-query tile of one `(batch, head)` and streams the
-    /// causal key tiles `0..=query_tile`. Q and dY stay resident; per key
-    /// tile it recomputes `S = Q·Kᵀ` and `dP = dY·Vᵀ` into fp32 TMEM, forms
-    /// the true `dS = P·(dP − D)·scale` in registers (§ `backward_q_tile`),
-    /// stores bf16 dS through the swizzle-aware path, and accumulates
-    /// `dQ += dS·K` in a TMEM segment via the transposed-B O-MMA shape (K
-    /// staged unscaled, so `scale` is folded into the bf16 dS). The saved LSE
-    /// is the normalizer — no running-max machinery — and `dot` is the
-    /// pre-staged `Σ dy·y` per query row. `dq` is written directly from the
-    /// register accumulator; blocks own disjoint query tiles, so no atomics.
+    /// One CTA owns a query-tile PAIR `(2p, 2p+1)` of one `(batch, head)` and
+    /// streams the causal key tiles `0..=tile_b`. The two query tiles are
+    /// STACKED into every MMA: `S = [Q_A;Q_B]·Kᵀ` and `dP = [dY_A;dY_B]·Vᵀ`
+    /// fill all 128 accumulator rows, `dS` is formed for all 128 rows into one
+    /// stacked tile, and `dQ += dS·K` drains 128 real rows (rows 0..63 = tile
+    /// A's dQ, 64..127 = tile B's). Q/dY stay resident; the 128-thread
+    /// warpgroup's warps 0–1 drain rows 0..63 and warps 2–3 drain 64..127.
+    /// Because the paired tiles are adjacent their 128 query rows are
+    /// contiguous, so LSE/dot stage directly and `store_grad_tile` writes the
+    /// pair in one shot. Requires `T % 128 == 0` (host eligibility).
     #[allow(clippy::too_many_arguments)]
     #[kernel]
     pub unsafe fn flash_backward_q_tcgen05(
@@ -1293,25 +1500,27 @@ pub mod kernels {
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let q_smem = smem;
-            let dy_smem = smem.add(TILE_BYTES);
-            let k_smem = smem.add(2 * TILE_BYTES);
-            let v_smem = smem.add(3 * TILE_BYTES);
-            let ds_smem = smem.add(4 * TILE_BYTES);
+            let dy_smem = smem.add(2 * TILE_BYTES);
+            let k_smem = smem.add(4 * TILE_BYTES);
+            let v_smem = smem.add(5 * TILE_BYTES);
+            let ds_smem = smem.add(6 * TILE_BYTES);
 
             let tid = thread::threadIdx_x();
-            if thread::blockDim_x() as usize != TILE {
+            if thread::blockDim_x() as usize != 2 * TILE {
                 return;
             }
             let warp_id = warp::warp_id();
             let lane = warp::lane_id();
             let is_leader = tid == 0;
 
-            let query_tile = thread::blockIdx_x();
+            let pair = thread::blockIdx_x();
             let head = thread::blockIdx_y();
             let batch = thread::blockIdx_z();
             let t = sequence_length;
             let h = heads;
             let plane = (batch * h + head) as i32;
+            let tile_a = pair * 2;
+            let tile_b = tile_a + 1;
 
             if is_leader {
                 mbarrier_init(&raw mut TMA_BARRIER, 1);
@@ -1342,18 +1551,33 @@ pub mod kernels {
                 .build()
                 .raw();
 
-            // Q and dY stay operand-A resident for the whole key stream.
+            // The stacked Q/dY pairs stay operand-A resident for the whole key
+            // stream.
             if is_leader {
-                let query_row = (query_tile * TILE as u32) as i32;
-                load_panel(q_smem, q_tma, query_row, plane, &raw mut TMA_BARRIER);
-                load_panel(dy_smem, dy_tma, query_row, plane, &raw mut TMA_BARRIER);
-                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
+                load_q_paired(
+                    q_smem,
+                    q_tma,
+                    (tile_a * TILE as u32) as i32,
+                    (tile_b * TILE as u32) as i32,
+                    true,
+                    plane,
+                    &raw mut TMA_BARRIER,
+                );
+                load_q_paired(
+                    dy_smem,
+                    dy_tma,
+                    (tile_a * TILE as u32) as i32,
+                    (tile_b * TILE as u32) as i32,
+                    true,
+                    plane,
+                    &raw mut TMA_BARRIER,
+                );
+                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 4 * TILE_BYTES as u32);
             }
             while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
 
-            // The TILE query rows' LSE (converted to base-2) and softmax dot,
-            // staged once so the register pass reads them from shared memory.
-            let query_row = (batch * t) as usize + query_tile as usize * TILE + tid as usize;
+            // The pair's 128 contiguous query rows' base-2 LSE and softmax dot.
+            let query_row = (batch * t) as usize + tile_a as usize * TILE + tid as usize;
             let stat_index = query_row * h as usize + head as usize;
             (*(&raw mut LSE2 as *mut f32).add(tid as usize)) = logsumexp[stat_index] * LOG2E;
             (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
@@ -1365,7 +1589,7 @@ pub mod kernels {
             let mut tma_phase = 1u32;
             let mut mma_phase = 0u32;
             let mut key_tile = 0u32;
-            while key_tile <= query_tile {
+            while key_tile <= tile_b {
                 if is_leader {
                     let key_row = (key_tile * TILE as u32) as i32;
                     load_panel(k_smem, k_tma, key_row, plane, &raw mut TMA_BARRIER);
@@ -1376,21 +1600,23 @@ pub mod kernels {
                 tma_phase += 1;
                 thread::sync_threads();
 
-                // S = Q·Kᵀ and dP = dY·Vᵀ, both fresh into their own TMEM.
+                // S = [Q_A;Q_B]·Kᵀ and dP = [dY_A;dY_B]·Vᵀ, both fresh.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    score_mma(s_tmem, q_smem, k_smem, s_instruction);
-                    score_mma(dp_tmem, dy_smem, v_smem, s_instruction);
+                    score_mma_paired(s_tmem, q_smem, k_smem, s_instruction);
+                    score_mma_paired(dp_tmem, dy_smem, v_smem, s_instruction);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
                 mma_phase += 1;
                 thread::sync_threads();
 
-                backward_q_tile(
+                backward_q_tile_paired(
                     s_tmem,
                     dp_tmem,
-                    key_tile == query_tile,
+                    key_tile,
+                    tile_a,
+                    tile_b,
                     warp_id,
                     lane,
                     &raw const LSE2 as *const f32,
@@ -1418,7 +1644,9 @@ pub mod kernels {
             }
 
             merge_output_tile(dq_tmem, warp_id, &mut dq_acc);
-            store_grad_tile(batch, t, h, head, query_tile, warp_id, lane, &dq_acc, &mut dq);
+            // The pair's rows are contiguous, so the block's base tile is
+            // `tile_a` and the warp-derived local row (0..127) lands correctly.
+            store_grad_tile(batch, t, h, head, tile_a, warp_id, lane, &dq_acc, &mut dq);
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
@@ -1432,20 +1660,19 @@ pub mod kernels {
         }
     }
 
-    /// Synchronous tcgen05 key-parallel backward (issue #35, phase 4,
-    /// kernel B). Launch with `host::flash_backward_kv_config`: grid
-    /// `(T/128, H, B)`, 128 threads, `FLASH_BACKWARD_KV_SMEM` dynamic shared
-    /// bytes (opted in by the loader).
+    /// PAIRED tcgen05 key-parallel backward (Design B for #47 item 2). Launch
+    /// with `host::flash_backward_kv_config`: grid `(T/128, H, B)`, 128 threads,
+    /// `FLASH_BACKWARD_KV_SMEM` dynamic shared bytes (opted in by the loader).
     ///
-    /// One CTA owns a 128-key tile of one `(batch, head)` and streams the
-    /// causal query tiles `key_tile..T/128`. K and V stay resident; per query
-    /// tile it recomputes the transposed `Sᵀ = K·Qᵀ` and `dPᵀ = V·dYᵀ` into
-    /// fp32 TMEM, forms the transposed probabilities and `dSᵀ·ln2` in
-    /// registers (§ `backward_kv_tile`), and accumulates `dV += Pᵀ·dY` and
-    /// `dK += dSᵀ·Q` in two TMEM segments. The staged Q carries `scale·log2e`,
-    /// so folding `ln2` into dSᵀ lands `scale` on dK (`ln2·scale·log2e =
-    /// scale`) and dV needs no factor. `dk`/`dv` are written directly from the
-    /// register accumulators; blocks own disjoint key tiles, so no atomics.
+    /// One CTA owns a key-tile PAIR `(2p, 2p+1)` and streams the causal query
+    /// tiles `key_a..T/64`. The two key tiles are STACKED into every MMA: the
+    /// transposed `Sᵀ = [K_A;K_B]·Qᵀ` and `dPᵀ = [V_A;V_B]·dYᵀ` fill all 128
+    /// accumulator rows (rows 0..63 = key A, 64..127 = key B), and `dV += Pᵀ·dY`
+    /// / `dK += dSᵀ·Q` drain 128 real key rows. K/V stay resident; the streamed
+    /// Q/dY are a single 64-row tile. The paired key rows are contiguous, so the
+    /// gradients store in one shot at base tile `key_a`. The staged Q carries
+    /// `scale·log2e`, so folding `ln2` into dSᵀ lands `scale` on dK. Requires
+    /// `T % 128 == 0` (host eligibility).
     #[allow(clippy::too_many_arguments)]
     #[kernel]
     pub unsafe fn flash_backward_kv_tcgen05(
@@ -1469,27 +1696,29 @@ pub mod kernels {
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let k_smem = smem;
-            let v_smem = smem.add(TILE_BYTES);
-            let q_smem = smem.add(2 * TILE_BYTES);
-            let dy_smem = smem.add(3 * TILE_BYTES);
-            let p_smem = smem.add(4 * TILE_BYTES);
-            let ds_smem = smem.add(4 * TILE_BYTES + SUBTILE_BYTES);
+            let v_smem = smem.add(2 * TILE_BYTES);
+            let q_smem = smem.add(4 * TILE_BYTES);
+            let dy_smem = smem.add(5 * TILE_BYTES);
+            let p_smem = smem.add(6 * TILE_BYTES);
+            let ds_smem = smem.add(7 * TILE_BYTES);
 
             let tid = thread::threadIdx_x();
-            if thread::blockDim_x() as usize != TILE {
+            if thread::blockDim_x() as usize != 2 * TILE {
                 return;
             }
             let warp_id = warp::warp_id();
             let lane = warp::lane_id();
             let is_leader = tid == 0;
 
-            let key_tile = thread::blockIdx_x();
+            let pair = thread::blockIdx_x();
             let head = thread::blockIdx_y();
             let batch = thread::blockIdx_z();
             let t = sequence_length;
             let h = heads;
             let plane = (batch * h + head) as i32;
             let tiles = t / TILE as u32;
+            let key_a = pair * 2;
+            let key_b = key_a + 1;
 
             if is_leader {
                 mbarrier_init(&raw mut TMA_BARRIER, 1);
@@ -1502,8 +1731,8 @@ pub mod kernels {
             }
             thread::sync_threads();
             let tmem = *(&raw const TMEM_ADDRESS as *const u32);
-            // S/dP segments are 64 columns; the dV/dK gradient segments are
-            // 128 columns, so they follow at tmem+128 and tmem+256.
+            // Sᵀ/dPᵀ are 64-column segments; the dV/dK gradients are 128
+            // columns, following at tmem+128 and tmem+256.
             let st_tmem = tmem;
             let dpt_tmem = tmem + 64;
             let dv_tmem = tmem + 128;
@@ -1523,12 +1752,28 @@ pub mod kernels {
                 .build()
                 .raw();
 
-            // K and V stay operand-A resident for the whole query stream.
+            // The stacked K/V pairs stay operand-A resident for the whole query
+            // stream.
             if is_leader {
-                let key_row = (key_tile * TILE as u32) as i32;
-                load_panel(k_smem, k_tma, key_row, plane, &raw mut TMA_BARRIER);
-                load_panel(v_smem, v_tma, key_row, plane, &raw mut TMA_BARRIER);
-                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
+                load_q_paired(
+                    k_smem,
+                    k_tma,
+                    (key_a * TILE as u32) as i32,
+                    (key_b * TILE as u32) as i32,
+                    true,
+                    plane,
+                    &raw mut TMA_BARRIER,
+                );
+                load_q_paired(
+                    v_smem,
+                    v_tma,
+                    (key_a * TILE as u32) as i32,
+                    (key_b * TILE as u32) as i32,
+                    true,
+                    plane,
+                    &raw mut TMA_BARRIER,
+                );
+                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 4 * TILE_BYTES as u32);
             }
             while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
 
@@ -1539,7 +1784,7 @@ pub mod kernels {
 
             let mut tma_phase = 1u32;
             let mut mma_phase = 0u32;
-            let mut query_tile = key_tile;
+            let mut query_tile = key_a;
             while query_tile < tiles {
                 if is_leader {
                     let query_row = (query_tile * TILE as u32) as i32;
@@ -1551,29 +1796,35 @@ pub mod kernels {
                 tma_phase += 1;
                 thread::sync_threads();
 
-                // Stage this query tile's TILE rows' base-2 LSE and dot.
-                let global_row =
-                    (batch * t) as usize + query_tile as usize * TILE + tid as usize;
-                let stat_index = global_row * h as usize + head as usize;
-                (*(&raw mut LSE2 as *mut f32).add(tid as usize)) = logsumexp[stat_index] * LOG2E;
-                (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
+                // Stage this query tile's 64 rows' base-2 LSE and dot (indexed
+                // by query column in the transposed register pass).
+                if tid < TILE as u32 {
+                    let global_row =
+                        (batch * t) as usize + query_tile as usize * TILE + tid as usize;
+                    let stat_index = global_row * h as usize + head as usize;
+                    (*(&raw mut LSE2 as *mut f32).add(tid as usize)) =
+                        logsumexp[stat_index] * LOG2E;
+                    (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
+                }
                 thread::sync_threads();
 
-                // Sᵀ = K·Qᵀ and dPᵀ = V·dYᵀ, both fresh into their own TMEM.
+                // Sᵀ = [K_A;K_B]·Qᵀ and dPᵀ = [V_A;V_B]·dYᵀ, both fresh.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    score_mma(st_tmem, k_smem, q_smem, s_instruction);
-                    score_mma(dpt_tmem, v_smem, dy_smem, s_instruction);
+                    score_mma_paired(st_tmem, k_smem, q_smem, s_instruction);
+                    score_mma_paired(dpt_tmem, v_smem, dy_smem, s_instruction);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
                 mma_phase += 1;
                 thread::sync_threads();
 
-                backward_kv_tile(
+                backward_kv_tile_paired(
                     st_tmem,
                     dpt_tmem,
-                    query_tile == key_tile,
+                    query_tile,
+                    key_a,
+                    key_b,
                     warp_id,
                     lane,
                     &raw const LSE2 as *const f32,
@@ -1591,7 +1842,7 @@ pub mod kernels {
                 // dV += Pᵀ·dY and dK += dSᵀ·Q, fresh on the first query tile.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    let fresh = query_tile == key_tile;
+                    let fresh = query_tile == key_a;
                     grad_mma(dv_tmem, p_smem, dy_smem, grad_instruction, fresh);
                     grad_mma(dk_tmem, ds_smem, q_smem, grad_instruction, fresh);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
@@ -1606,8 +1857,8 @@ pub mod kernels {
 
             merge_output_tile(dv_tmem, warp_id, &mut dv_acc);
             merge_output_tile(dk_tmem, warp_id, &mut dk_acc);
-            store_grad_tile(batch, t, h, head, key_tile, warp_id, lane, &dv_acc, &mut dv);
-            store_grad_tile(batch, t, h, head, key_tile, warp_id, lane, &dk_acc, &mut dk);
+            store_grad_tile(batch, t, h, head, key_a, warp_id, lane, &dv_acc, &mut dv);
+            store_grad_tile(batch, t, h, head, key_a, warp_id, lane, &dk_acc, &mut dk);
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
@@ -2028,6 +2279,62 @@ pub mod kernels {
                 mbarrier_inval(&raw mut P_FULL);
                 mbarrier_inval(&raw mut O_FULL);
                 mbarrier_inval(&raw mut VOTE_BARRIER);
+            }
+        }
+    }
+
+    /// Paired `S = [Q_A;Q_B]·Kᵀ` (Design B, #47 item 2): ONE `M128_N64` MMA
+    /// over the STACKED 128-row Q operand — Q_A in accumulator rows 0..63, Q_B
+    /// in 64..127, both REAL. It walks 8 K=16 HD chunks across Q's two
+    /// `[128, 64]` subtiles (subtile stride `TILE_BYTES`) against the shared
+    /// 64-row K's two `[64, 64]` subtiles (subtile stride `SUBTILE_BYTES`). The
+    /// only difference from `score_mma` is Q's wider subtile stride; K's walk
+    /// is unchanged, and no row is phantom so `PHANTOM_PAD` is gone.
+    #[inline(always)]
+    unsafe fn score_mma_paired(s_tmem: u32, q_smem: *mut u8, k_smem: *mut u8, instruction: u32) {
+        unsafe {
+            let mut chunk = 0u64;
+            while chunk < 8 {
+                let a_offset = (chunk / 4) * TILE_BYTES as u64 + (chunk % 4) * 32;
+                let b_offset = (chunk / 4) * SUBTILE_BYTES as u64 + (chunk % 4) * 32;
+                let a_descriptor = smem_descriptor(q_smem as u64 + a_offset);
+                let b_descriptor = smem_descriptor(k_smem as u64 + b_offset);
+                tcgen05_mma_f16(s_tmem, a_descriptor, b_descriptor, instruction, chunk > 0);
+                chunk += 1;
+            }
+        }
+    }
+
+    /// TMA the stacked paired Q operand: Q_A's rows into subtile-rows 0..63 and
+    /// Q_B's into 64..127 of each of the two `[128, 64]` HD subtiles. Four box
+    /// loads (the second pair skipped when the odd tail leaves stream B
+    /// inactive); each box is 64 rows × 64 columns, and because a 64-row half is
+    /// a whole number of `SWIZZLE_128B` periods (8 rows), loading Q_B at
+    /// `+ SUBTILE_BYTES` reproduces exactly the rows-64..127 swizzle a single
+    /// 128-row tile would have. Callers charge `(2 + 2·b_active)·SUBTILE_BYTES`.
+    #[inline(always)]
+    unsafe fn load_q_paired(
+        dst: *mut u8,
+        tma: *const TmaDescriptor,
+        row_a: i32,
+        row_b: i32,
+        b_active: bool,
+        plane: i32,
+        barrier: *mut Barrier,
+    ) {
+        unsafe {
+            cp_async_bulk_tensor_3d_g2s(dst, tma, 0, row_a, plane, barrier);
+            cp_async_bulk_tensor_3d_g2s(dst.add(TILE_BYTES), tma, 64, row_a, plane, barrier);
+            if b_active {
+                cp_async_bulk_tensor_3d_g2s(dst.add(SUBTILE_BYTES), tma, 0, row_b, plane, barrier);
+                cp_async_bulk_tensor_3d_g2s(
+                    dst.add(TILE_BYTES + SUBTILE_BYTES),
+                    tma,
+                    64,
+                    row_b,
+                    plane,
+                    barrier,
+                );
             }
         }
     }

@@ -39,14 +39,15 @@ const PHANTOM_PAD: usize = TILE_BYTES;
 pub const FLASH_DYNAMIC_SMEM_BYTES: u32 = (3 * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD) as u32;
 /// Dynamic shared bytes of the score_mma probe: A panel plus B panel.
 pub const PROBE_DYNAMIC_SMEM_BYTES: u32 = (2 * TILE_BYTES) as u32;
-/// Dynamic shared bytes of the query-parallel backward (kernel A): resident
-/// Q/dY, streamed K/V panels, and the single dS subtile. Mirrors
-/// `FLASH_BACKWARD_Q_SMEM` in `tcgen05.rs`.
-pub const FLASH_BACKWARD_Q_SMEM_BYTES: u32 = (4 * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD) as u32;
-/// Dynamic shared bytes of the key-parallel backward (kernel B): resident
-/// K/V, streamed Q/dY panels, and the Pᵀ and dSᵀ subtiles. Mirrors
-/// `FLASH_BACKWARD_KV_SMEM` in `tcgen05.rs`.
-pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = (4 * TILE_BYTES + 2 * SUBTILE_BYTES + PHANTOM_PAD) as u32;
+/// Dynamic shared bytes of the PAIRED query-parallel backward (kernel A,
+/// Design B): resident stacked `[Q_A;Q_B]`/`[dY_A;dY_B]` (`2 * TILE_BYTES`
+/// each), streamed K/V panels, and the stacked `[128, 64]` dS tile. No
+/// `PHANTOM_PAD`. Mirrors `FLASH_BACKWARD_Q_SMEM` in `tcgen05.rs`.
+pub const FLASH_BACKWARD_Q_SMEM_BYTES: u32 = (7 * TILE_BYTES) as u32;
+/// Dynamic shared bytes of the PAIRED key-parallel backward (kernel B, Design
+/// B): resident stacked `[K_A;K_B]`/`[V_A;V_B]`, streamed Q/dY panels, and the
+/// stacked Pᵀ and dSᵀ tiles. No `PHANTOM_PAD`. Mirrors `FLASH_BACKWARD_KV_SMEM`.
+pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = (8 * TILE_BYTES) as u32;
 /// Dynamic shared allocation for the pipelined forward: Q + K/V rings sized
 /// for the deepest supported `PIPELINE_STAGES` (4) + the P subtile.
 /// The kernel's actual plan (`FLASH_PIPELINE_SMEM`, a function of the swept
@@ -85,25 +86,27 @@ pub fn flash_forward_config(batches: usize, sequence_length: usize, heads: usize
     }
 }
 
-/// Launch for both synchronous tcgen05 backward kernels: grid
-/// `(T/128, H, B)`, 128 threads. `dynamic_smem` is the caller's kernel-A or
-/// kernel-B shared-memory plan.
+/// Launch for both PAIRED tcgen05 backward kernels (Design B): each CTA owns a
+/// tile PAIR, so the grid is `(T/128, H, B)` and the block is 128 threads (the
+/// 4-warp paired warpgroup draining 128 rows). `T` must be a multiple of 128
+/// (two 64-row tiles); non-pairable shapes stay on the fp32 tiled backward.
+/// `dynamic_smem` is the caller's kernel-A or kernel-B shared-memory plan.
 fn flash_backward_config(
     batches: usize,
     sequence_length: usize,
     heads: usize,
     dynamic_smem: u32,
 ) -> LaunchConfig {
-    assert!(sequence_length.is_multiple_of(FLASH_TILE));
+    assert!(sequence_length.is_multiple_of(2 * FLASH_TILE));
     assert!(batches <= u16::MAX as usize && heads <= u16::MAX as usize);
-    assert!(sequence_length / FLASH_TILE <= u32::MAX as usize);
+    assert!(sequence_length / (2 * FLASH_TILE) <= u32::MAX as usize);
     LaunchConfig {
         grid_dim: (
-            (sequence_length / FLASH_TILE) as u32,
+            (sequence_length / (2 * FLASH_TILE)) as u32,
             heads as u32,
             batches as u32,
         ),
-        block_dim: (FLASH_TILE as u32, 1, 1),
+        block_dim: ((2 * FLASH_TILE) as u32, 1, 1),
         shared_mem_bytes: dynamic_smem,
     }
 }

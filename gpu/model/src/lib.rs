@@ -535,7 +535,10 @@ fn tcgen05_linear_eligible(m: usize, k: usize, n: usize) -> bool {
 }
 
 fn tcgen05_attention_eligible(t: usize, head_dim: usize) -> bool {
-    t.is_multiple_of(FLASH_TILE) && head_dim == FLASH_HD
+    // Design B (#47 item 2) pairs two 64-row tiles per MMA in the backward
+    // kernels, so `T` must be a multiple of 128 (an even tile count); odd-tile
+    // shapes fall to the per-row oracle. The canonical T=2048 satisfies it.
+    t.is_multiple_of(2 * FLASH_TILE) && head_dim == FLASH_HD
 }
 
 /// Staged packed-bf16 attention operands for the tcgen05 forward (issue
