@@ -432,6 +432,75 @@ pub mod kernels {
         }
     }
 
+    /// Fused quantize that emits both the packed-bf16 `[rows, cols]` matrix and
+    /// its packed-bf16 transpose `[cols, rows]` from one fp32 read.
+    ///
+    /// The weight-gradient path needs the quantized output gradient in both
+    /// layouts: row-major for the input GEMM and transposed for the weight GEMM.
+    /// Reading fp32 once and writing both packed views folds the standalone
+    /// transpose pass into the already-required convert. Launch with
+    /// [`transpose_pairs_config`]; both dimensions must be multiples of
+    /// `TRANSPOSE_TILE`.
+    #[kernel]
+    pub unsafe fn convert_f32_to_bf16_pairs_and_transpose(
+        input: &[f32],
+        rows: u32,
+        cols: u32,
+        mut normal: DisjointSlice<u32>,
+        mut transposed: DisjointSlice<u32>,
+    ) {
+        static mut VALUES: SharedArray<u32, { TRANSPOSE_TILE * (TRANSPOSE_TILE + 1) }> =
+            SharedArray::UNINIT;
+        const TILE_WORDS_WIDE: usize = TRANSPOSE_TILE / 2;
+
+        let tid = thread::threadIdx_x() as usize;
+        let tile_row = thread::blockIdx_y() as usize * TRANSPOSE_TILE;
+        let tile_col = thread::blockIdx_x() as usize * TRANSPOSE_TILE;
+        let source_cols = cols as usize;
+        let normal_words_per_row = cols as usize / 2;
+        let transposed_words_per_row = rows as usize / 2;
+
+        let mut local = tid;
+        while local < TRANSPOSE_WORDS {
+            let row = local / TILE_WORDS_WIDE;
+            let word_column = local % TILE_WORDS_WIDE;
+            let source = (tile_row + row) * source_cols + tile_col + 2 * word_column;
+            let low = f32_to_bf16_bits(input[source]);
+            let high = f32_to_bf16_bits(input[source + 1]);
+            // Row-major output word [row, wc] packs the two adjacent elements.
+            let normal_global =
+                (tile_row + row) * normal_words_per_row + tile_col / 2 + word_column;
+            // SAFETY: each (tile, local) pair maps to a unique output word.
+            unsafe {
+                *normal.get_unchecked_mut(normal_global) = low as u32 | ((high as u32) << 16);
+                VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column] = low as u32;
+                VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column + 1] = high as u32;
+            }
+            local += TRANSPOSE_THREADS;
+        }
+        thread::sync_threads();
+
+        let mut local = tid;
+        while local < TRANSPOSE_WORDS {
+            // Transposed word [c, p] packs source elements [2p, c] and [2p+1, c].
+            let output_row = local / TILE_WORDS_WIDE;
+            let word_column = local % TILE_WORDS_WIDE;
+            let (low, high) = unsafe {
+                (
+                    VALUES[(2 * word_column) * (TRANSPOSE_TILE + 1) + output_row],
+                    VALUES[(2 * word_column + 1) * (TRANSPOSE_TILE + 1) + output_row],
+                )
+            };
+            let global =
+                (tile_col + output_row) * transposed_words_per_row + tile_row / 2 + word_column;
+            // SAFETY: each (tile, local) pair maps to a unique output word.
+            unsafe {
+                *transposed.get_unchecked_mut(global) = low | (high << 16);
+            }
+            local += TRANSPOSE_THREADS;
+        }
+    }
+
     /// Fused decoupled AdamW over an fp32 master parameter with a packed-bf16
     /// gradient and compute copy: one thread owns one pair.
     ///

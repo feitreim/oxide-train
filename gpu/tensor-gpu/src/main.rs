@@ -143,6 +143,24 @@ fn check_bf16_pairs(
         )?;
     }
     assert_eq!(fused.to_host_vec(stream)?, pack_bf16(&expected));
+
+    // Fused convert-and-transpose emits both the row-major packed matrix and
+    // its transpose from one fp32 read; both must be bit-exact.
+    let mut tee_normal = DeviceBuffer::<u32>::zeroed(stream, ROWS * COLS / 2)?;
+    let mut tee_transposed = DeviceBuffer::<u32>::zeroed(stream, ROWS * COLS / 2)?;
+    unsafe {
+        module.convert_f32_to_bf16_pairs_and_transpose(
+            stream,
+            transpose_pairs_config(ROWS, COLS),
+            &device_source,
+            ROWS as u32,
+            COLS as u32,
+            &mut tee_normal,
+            &mut tee_transposed,
+        )?;
+    }
+    assert_eq!(tee_normal.to_host_vec(stream)?, pack_bf16(source.as_slice()));
+    assert_eq!(tee_transposed.to_host_vec(stream)?, pack_bf16(&expected));
     Ok(())
 }
 

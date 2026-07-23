@@ -669,9 +669,10 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         {
             profiler.measure(stream, names[0], || {
                 // `x` feeds the weight GEMM only as the transposed `lhs_t`
-                // operand: quantize and transpose it in one pass. `dy` is
-                // quantized into `rows` (consumed non-transposed by the input
-                // GEMM below) and then transposed for `rhs_t`.
+                // operand: quantize and transpose it in one pass. `dy` is needed
+                // both non-transposed (as `rows`, for the input GEMM below) and
+                // transposed (as `rhs_t`), so quantize it into both layouts from
+                // a single fp32 read.
                 unsafe {
                     tensor.convert_f32_transpose_bf16_pairs(
                         stream,
@@ -681,20 +682,13 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                         IN as u32,
                         &mut scratch.lhs_t,
                     )?;
-                }
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * OUT / 2),
-                    dy.as_device_buffer(),
-                    &mut scratch.rows,
-                )?;
-                unsafe {
-                    tensor.transpose_bf16_pairs(
+                    tensor.convert_f32_to_bf16_pairs_and_transpose(
                         stream,
                         transpose_pairs_config(N, OUT),
-                        &scratch.rows,
+                        dy.as_device_buffer(),
                         N as u32,
                         OUT as u32,
+                        &mut scratch.rows,
                         &mut scratch.rhs_t,
                     )?;
                     tcgen05.f32_accumulate(
@@ -843,9 +837,10 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         {
             profiler.measure(stream, names[0], || {
                 // `x` feeds the weight GEMM only as the transposed `lhs_t`
-                // operand: quantize and transpose it in one pass. `dy` is
-                // quantized into `rows` (consumed non-transposed by the input
-                // GEMM below) and then transposed for `rhs_t`.
+                // operand: quantize and transpose it in one pass. `dy` is needed
+                // both non-transposed (as `rows`, for the input GEMM below) and
+                // transposed (as `rhs_t`), so quantize it into both layouts from
+                // a single fp32 read.
                 unsafe {
                     tensor.convert_f32_transpose_bf16_pairs(
                         stream,
@@ -855,20 +850,13 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                         IN as u32,
                         &mut scratch.lhs_t,
                     )?;
-                }
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * width / 2),
-                    dy.as_device_buffer(),
-                    &mut scratch.rows,
-                )?;
-                unsafe {
-                    tensor.transpose_bf16_pairs(
+                    tensor.convert_f32_to_bf16_pairs_and_transpose(
                         stream,
                         transpose_pairs_config(N, width),
-                        &scratch.rows,
+                        dy.as_device_buffer(),
                         N as u32,
                         width as u32,
+                        &mut scratch.rows,
                         &mut scratch.rhs_t,
                     )?;
                     tcgen05.f32_accumulate(
@@ -1302,8 +1290,9 @@ fn expert_linear_backward<
         profiler.measure(stream, names[0], || {
             // `input` feeds the weight GEMM only as the transposed `lhs_t`
             // operand, so quantize and transpose it in one pass. `output_gradient`
-            // is quantized into `rows` (needed non-transposed by the input GEMM
-            // below) and then transposed for `rhs_t`.
+            // is needed both non-transposed (as `rows`, for the input GEMM below)
+            // and transposed (as `rhs_t`, for the weight GEMM), so quantize it
+            // into both layouts from a single fp32 read.
             unsafe {
                 tensor.convert_f32_transpose_bf16_pairs(
                     stream,
@@ -1313,20 +1302,13 @@ fn expert_linear_backward<
                     input_width as u32,
                     &mut bf16_scratch.lhs_t,
                 )?;
-            }
-            tensor.convert_f32_to_bf16_pairs(
-                stream,
-                pairs_config(E * C * output_width / 2),
-                output_gradient,
-                &mut bf16_scratch.rows,
-            )?;
-            unsafe {
-                tensor.transpose_bf16_pairs(
+                tensor.convert_f32_to_bf16_pairs_and_transpose(
                     stream,
                     transpose_pairs_config(E * C, output_width),
-                    &bf16_scratch.rows,
+                    output_gradient,
                     (E * C) as u32,
                     output_width as u32,
+                    &mut bf16_scratch.rows,
                     &mut bf16_scratch.rhs_t,
                 )?;
             }
