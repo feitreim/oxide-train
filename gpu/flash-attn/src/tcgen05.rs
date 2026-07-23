@@ -19,8 +19,9 @@
 //! - outputs keep the existing contract: fp32 `y[B*T, H*HD]` and fp32
 //!   `logsumexp[B*T, H]` in natural-log units.
 //!
-//! One CTA workstream owns a 128-query tile of one `(batch, head)` and
-//! streams 128-key tiles: TMA loads Q/K/V into swizzled shared tiles,
+//! One CTA workstream owns a 64-query tile of one `(batch, head)` and
+//! streams 64-key tiles: TMA loads Q/K/V into swizzled shared tiles (each
+//! 128-wide head panel is two stacked 64-wide SWIZZLE_128B subtiles),
 //! `S = Q·Kᵀ` accumulates in fp32 TMEM, a register softmax (mask → row max →
 //! software exp2 → running sum) packs bf16 probabilities back to shared
 //! memory with swizzled `stmatrix` stores, and `O += P·V` accumulates in a
@@ -319,9 +320,9 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
+                    let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column);
                     tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
+                    let high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column + 8);
                     tcgen05_load_wait();
                     let slot_a = (row_block * 2) as usize;
                     let slot_b = slot_a + 1;
@@ -414,9 +415,9 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
+                    let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column);
                     tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
+                    let high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column + 8);
                     tcgen05_load_wait();
                     let slot_a = (row_block * 2) as usize;
                     let slot_b = slot_a + 1;
@@ -489,9 +490,9 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 8 {
                     let column = column_block * 16;
-                    let low = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 16) + column);
+                    let low = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 17) + column);
                     tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 16) + column + 8);
+                    let high = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 17) + column + 8);
                     tcgen05_load_wait();
                     let slot_a = (row_block * 2) as usize;
                     let slot_b = slot_a + 1;
@@ -669,13 +670,13 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let s_low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
+                    let s_low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column);
                     tcgen05_load_wait();
-                    let s_high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
+                    let s_high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 17) + column + 8);
                     tcgen05_load_wait();
-                    let dp_low = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column);
+                    let dp_low = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 17) + column);
                     tcgen05_load_wait();
-                    let dp_high = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column + 8);
+                    let dp_high = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 17) + column + 8);
                     tcgen05_load_wait();
                     let row_a = tmem_row + row_in_16 as u32;
                     let row_b = row_a + 8;
@@ -749,13 +750,13 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let s_low = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column);
+                    let s_low = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 17) + column);
                     tcgen05_load_wait();
-                    let s_high = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column + 8);
+                    let s_high = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 17) + column + 8);
                     tcgen05_load_wait();
-                    let dp_low = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column);
+                    let dp_low = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 17) + column);
                     tcgen05_load_wait();
-                    let dp_high = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column + 8);
+                    let dp_high = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 17) + column + 8);
                     tcgen05_load_wait();
                     let row_a = tmem_row + row_in_16 as u32;
                     let row_b = row_a + 8;
@@ -1020,10 +1021,10 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = (column_block * 16) as usize;
-                    let low = tcgen05_ld_16x256b_pure(tmem + (tmem_row << 16) + column as u32);
+                    let low = tcgen05_ld_16x256b_pure(tmem + (tmem_row << 17) + column as u32);
                     tcgen05_load_wait();
                     let high =
-                        tcgen05_ld_16x256b_pure(tmem + (tmem_row << 16) + column as u32 + 8);
+                        tcgen05_ld_16x256b_pure(tmem + (tmem_row << 17) + column as u32 + 8);
                     tcgen05_load_wait();
                     let row_a = tmem_row as usize + row_in_16;
                     let row_b = row_a + 8;
