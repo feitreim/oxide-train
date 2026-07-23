@@ -7,10 +7,11 @@
 //!
 //! The portable first rung is an fp32 shared-memory/register-tiled kernel.
 //! The Blackwell rung consumes row-major bf16 `A[M,K]` and transposed,
-//! row-major bf16 `B[N,K]`. Its B200 path uses CLC scheduling, CTA-pair UMMA,
-//! four TMA stages, and two fp32 TMEM accumulator stages to produce 256x256
-//! output tiles. Packed-bf16/fp32 overwrite and accumulation modes share that
-//! compute pipeline, so backward parameter gradients need no separate add.
+//! row-major bf16 `B[N,K]`. Its B200 path uses cta_group::2 CTA-pair UMMA,
+//! four TMA stages, and a fp32 TMEM accumulator to produce 256x256 output tiles,
+//! one cluster per tile (exact-cover, no CLC work-stealing). Packed-bf16/fp32
+//! overwrite and accumulation modes share that compute pipeline, so backward
+//! parameter gradients need no separate add.
 //!
 //! bf16 is represented as raw `u16`/packed `u32` until milestone 7d adds the
 //! shared `Element` plumbing.
@@ -20,9 +21,6 @@
 use cuda_device::barrier::{
     Barrier, fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_cluster,
     mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_inval, mbarrier_try_wait_parity,
-};
-use cuda_device::clc::{
-    clc_query_get_first_ctaid_x, clc_query_is_canceled, clc_try_cancel_multicast,
 };
 use cuda_device::cluster;
 use cuda_device::shared::SharedArray;

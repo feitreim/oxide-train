@@ -28,7 +28,15 @@ pub const TC_N_TILE: usize = 256;
 /// Four K64 stages form one complete shared-memory pipeline cycle.
 pub const TC_K_PIPELINE: usize = 256;
 
-/// Launch one B200 CTA pair per M256xN256 output tile.
+/// Exact-cover launch grid: one CTA pair (cluster) per M256xN256 output tile.
+///
+/// `host_work_ids = (m/256) * (n/128)` is expressed in N128 units, so it is
+/// already twice the logical tile count — with `cluster_launch(2,1,1)` that is
+/// exactly one two-CTA cluster per N256 tile. Every cluster owns the single
+/// tile at its block index; none is over- or under-provisioned. The kernel
+/// therefore does not work-steal (see the note in `optimized.rs`), which
+/// removes the cross-cluster CLC cancel/steal handshake that deadlocked a
+/// fraction of launches at small grids.
 pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
     assert!(m.is_multiple_of(TC_M_TILE));
     assert!(n.is_multiple_of(TC_N_TILE));
@@ -38,8 +46,6 @@ pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
         .checked_mul(n / TC_TILE)
         .expect("tcgen05 work grid overflow");
     LaunchConfig {
-        // `host_work_ids` is already twice the logical tile count because it
-        // uses N128 units, exactly matching two CTAs per N256 cluster tile.
         grid_dim: (host_work_ids as u32, 1, 1),
         block_dim: (192, 1, 1),
         shared_mem_bytes: 0,

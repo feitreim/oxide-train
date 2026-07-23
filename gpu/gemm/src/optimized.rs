@@ -121,12 +121,21 @@ pub mod optimized_kernels {
         }
     }
 
-    /// B200 GEMM: CLC + cta_group::2 pair-UMMA + four-stage TMA pipeline.
+    /// B200 GEMM: cta_group::2 pair-UMMA + four-stage TMA pipeline.
     ///
-    /// Each CTA pair computes M256xN256. A producer warp overlaps TMA with an
-    /// MMA warp, while four epilogue warps drain one of two TMEM accumulator
-    /// stages. The host launches one CTA pair per logical output tile; the CLC
-    /// protocol remains available without overprovisioning redundant clusters.
+    /// Each CTA pair (cluster) computes one M256xN256 tile: a producer warp
+    /// overlaps TMA with an MMA warp, while four epilogue warps drain the TMEM
+    /// accumulator. The host launches exactly one cluster per output tile.
+    ///
+    /// This kernel does NOT use CLC work-stealing. The tcgen05 reference it was
+    /// adapted from schedules tiles persistently via `clc_try_cancel`, but that
+    /// cross-cluster cancel/steal handshake deadlocks a fraction of launches at
+    /// small grids (a fast cluster cancels a not-yet-launched peer and the
+    /// cancel accounting stalls; the multi-tile TMEM ACCUM ping-pong it exposes
+    /// only compounds it). With an exact-cover grid, stealing buys nothing —
+    /// every tile already has an owning cluster — so it is removed for a
+    /// deterministic, deadlock-free schedule. The two-stage ACCUM buffer and its
+    /// cross-cluster empty/full barriers are retained but inert (one tile each).
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     pub unsafe fn gemm_tcgen05_bf16_optimized(
@@ -165,8 +174,6 @@ pub mod optimized_kernels {
             static mut ACCUM_EMPTY0: Barrier = Barrier::UNINIT;
             static mut ACCUM_EMPTY1: Barrier = Barrier::UNINIT;
             static mut TILE_READY: Barrier = Barrier::UNINIT;
-            static mut CLC_RESPONSE: SharedArray<u64, 2, 16> = SharedArray::UNINIT;
-            static mut CLC_BAR: Barrier = Barrier::UNINIT;
 
             const TMA_WARP: u32 = 4;
             const MMA_WARP: u32 = 5;
@@ -193,7 +200,6 @@ pub mod optimized_kernels {
                 mbarrier_init(&raw mut ACCUM_EMPTY0, 256);
                 mbarrier_init(&raw mut ACCUM_EMPTY1, 256);
                 mbarrier_init(&raw mut TILE_READY, 1);
-                mbarrier_init(&raw mut CLC_BAR, 1);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
@@ -226,12 +232,17 @@ pub mod optimized_kernels {
             if warp_id == TMA_WARP {
                 let lane_zero = lane_id == 0;
                 let cluster_base = thread::blockIdx_x() - rank;
-                let mut raw_tile = cluster_base / 2;
-                let mut tile_seq = 0u32;
-                let mut clc_iter = 0u32;
-                let response = &raw mut CLC_RESPONSE as *mut u64;
+                let raw_tile = cluster_base / 2;
+                let tile_seq = 0u32;
 
-                loop {
+                // Exact-cover launch (one cluster per output tile): this cluster
+                // owns exactly the tile at its block index, so it produces that
+                // single tile and never steals. CLC work-stealing is deliberately
+                // not used here — its cross-cluster cancel/steal handshake (and
+                // the multi-tile TMEM ACCUM ping-pong it exercises) deadlocks a
+                // fraction of launches at small grids. `tile_seq` stays 0 and the
+                // consumer's `tile_iter` stays 0 to match.
+                {
                     if raw_tile < wide_total {
                         let group_tiles = swizzle_g * tiles_m;
                         let group = raw_tile / group_tiles;
@@ -324,28 +335,15 @@ pub mod optimized_kernels {
                             );
                             k_idx += 4;
                         }
-                        tile_seq += 1;
                     }
 
-                    let clc_parity = clc_iter & 1;
+                    // One tile produced (or none, if this cluster fell outside the
+                    // work range); publish the terminating "no work" record so the
+                    // MMA and epilogue warps drain and exit.
                     if lane_zero {
-                        mbarrier_arrive_expect_tx(&raw const CLC_BAR, 1, 16);
-                        if leader_cta {
-                            clc_try_cancel_multicast(response as *mut u8, &raw mut CLC_BAR);
-                        }
+                        *(&raw mut TILE_INFO as *mut u32).add(2) = 0;
+                        mbarrier_arrive(&raw const TILE_READY);
                     }
-                    while !mbarrier_try_wait_parity(&raw const CLC_BAR, clc_parity) {}
-                    clc_iter += 1;
-                    let lo = *response;
-                    let hi = *response.add(1);
-                    if clc_query_is_canceled(lo, hi) == 0 {
-                        if lane_zero {
-                            *(&raw mut TILE_INFO as *mut u32).add(2) = 0;
-                            mbarrier_arrive(&raw const TILE_READY);
-                        }
-                        break;
-                    }
-                    raw_tile = clc_query_get_first_ctaid_x(lo, hi) / 2;
                 }
             }
 
@@ -571,7 +569,6 @@ pub mod optimized_kernels {
                 mbarrier_inval(&raw mut ACCUM_EMPTY0);
                 mbarrier_inval(&raw mut ACCUM_EMPTY1);
                 mbarrier_inval(&raw mut TILE_READY);
-                mbarrier_inval(&raw mut CLC_BAR);
             }
         }
     }
