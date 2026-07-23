@@ -615,6 +615,39 @@ Each gated on tests; correctness before speed at every step.
        step 81.70 → 80.51 ms; backward unchanged. **Still deferred:** the M64
        operand-K mispairing (issue #47 item 2) — a genuine, distinct operand
        addressing quirk — so the M128-over-64-row path stays.
+     - ✅ **7e15 Design B tile-pairing for the backward kernels** (#47 item 2):
+       `M64` is a proven dead end (the SS operand read broadcasts A-rows across
+       subpartition pairs — only 32 distinct rows, SBO-invariant), so the wasted
+       phantom half is recovered instead by PAIRING two adjacent 64-row tiles
+       into every `M128_N64` MMA: operand A is stored as two stacked `[128, 64]`
+       subtiles (tile A in accumulator rows 0..63, tile B in 64..127, both
+       real), a single `score_mma_paired` walks A at the `TILE_BYTES` subtile
+       stride against the shared unpaired B at `SUBTILE_BYTES`, and the drains
+       run a 128-thread warpgroup (warps 0–1 → lanes 0..63, warps 2–3 →
+       64..127). The causal edge compares the key/query column against the row
+       **within its own tile** (`row & 63`), since the stacked rows 64..127 hold
+       a second tile that restarts its causal count. Because paired tiles are
+       adjacent their 128 rows are contiguous in the global tensors, so the
+       existing `merge_output_tile`/`store_grad_tile` and LSE/dot staging reuse
+       unchanged. Applied to **backward dQ** (pair two query tiles per CTA) and
+       **backward dK/dV** (pair two key tiles); block grows 64→128, grid halves,
+       and the operand plans drop `PHANTOM_PAD` (7·/8·`TILE_BYTES`).
+       `tcgen05_attention_eligible` tightens to `T % 128 == 0` (odd-tile shapes
+       fall to the per-row oracle; canonical T=2048 is unaffected). **Result:**
+       gradients are bit-for-bit the same tolerance as the unpaired kernels
+       (flash-attn in-crate dQ 7.7e-4, dK 7.3e-4, dV 2.9e-3 over
+       `T ∈ {128,256,1024}`; all 15 model gates green, MoE overfit 2.94→1.1e-5),
+       and the kernel bench `[32,1024,24,128]` backward goes **9.28 ms / 118
+       TFLOP/s → 5.42 ms / 202 TFLOP/s (1.71×)** — the phantom-half recovery
+       Design B promised. **Forward NOT paired:** the same pairing on the
+       persistent forward is *correct* but *regresses* (kernel bench 226 →
+       170 TFLOP/s) — fusing the tile pair into one warpgroup sacrifices the
+       two-warpgroup ping-pong (7e14) that made the persistent forward fast
+       (it is scheduling-bound, not MMA-bound), so the forward stays on the
+       ping-pong scheme. The `BASELINE_REF=main` model A/B (baseline
+       `backward.attention.flash_q` 66.5 ms, `flash_kv` 78.7 ms over 12 blocks;
+       full step 748.8 ms) could not capture the candidate side: the Modal
+       workspace was disabled (spend limit) mid-run.
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on
