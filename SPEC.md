@@ -349,9 +349,9 @@ Each gated on tests; correctness before speed at every step.
        head-first — the lm-head is ~70% of this one-block model's GEMM
        FLOPs and the profile's named target; block linears stay fp32
        register-tiled until a profile moves them (rule 17). Vocab padded
-       50,257 → 50,432 (197×256) and token rows padded to `NP` (256) with
+       50,257 → 50,304 (393×128) and token rows padded to `NP` (128) with
        provably inert zeros, so the tuned tcgen05 kernel's M,N ≡ 0 (mod
-       256) contract holds unmodified and checkpoints stay byte-compatible
+       128) contract holds unmodified and checkpoints stay byte-compatible
        (masters stored without padding). Also replaced the naive RMSNorm
        weight-gradient reduction (per-column row-norm recomputation) with a
        block-per-row inverse pass + column-parallel reduce. B200
@@ -506,6 +506,50 @@ Each gated on tests; correctness before speed at every step.
        recorded follow-up (as is the fused single-pass backward and 2-CTA,
        deferred per the issue). compute-sanitizer is unavailable to gate it
        — every tool reports "Device not supported" on B200 (sm_100).
+     - ✅ **7e12 clustered 256×256 tcgen05 GEMM** (#41): replace the
+       single-CTA 128×128 tcgen05 kernel that backs every block linear and
+       the lm-head with a Blackwell `cta_group::2` pair-UMMA kernel (adapted
+       from cuda-oxide's `gemm_sol_final`): two CTAs — a cluster — cooperate
+       on one M256×N256 output tile over a four-stage TMA pipeline and an
+       fp32 TMEM accumulator, one cluster per tile. The eligibility contract
+       tightens from 128 to 256: M, N, K must all be ≡ 0 (mod 256), and any
+       GEMM that is 128- but not 256-aligned silently takes the fp32
+       register-tiled fallback (all production dims qualify — D=1536,
+       FF_expert=2048, 2·FF=4096, C=8192, VP, NP=32768). To keep the lm-head
+       on the tiled path the padded vocabulary re-pads 50,304 (393×128) →
+       50,432 (197×256), the added columns staying provably-inert zeros
+       (7e5). **Root-caused deadlock**: the reference kernel schedules tiles
+       persistently via CLC (`clc_try_cancel`), and that cross-cluster
+       cancel/steal handshake deadlocks a fraction of launches at small
+       grids — a fast cluster cancels a not-yet-launched peer and the cancel
+       accounting stalls on the barrier, compounded by the multi-tile TMEM
+       ACCUM ping-pong the steal path exposes. It was non-deterministic and
+       slipped every gate: a standalone f32-store loop at the gate_up shape
+       [8192,4096,1536] (512 tiles) hung after 5–25 iterations while
+       [32768,·] never did, and 256³ parity is a single cluster / the ≤256
+       model gates a single wave — neither reaches the CLC handoff. In the
+       model the production forward froze in the first warmup expert GEMM.
+       Fix: an exact-cover grid already gives every output tile an owning
+       cluster, so work-stealing buys nothing and is removed — each cluster
+       produces its one block-indexed tile and exits (the ACCUM double-buffer
+       is retained but inert, `tile_iter` ≡ 0). 80× f32-store at the
+       previously hanging shape, the down shape [8192,1536,2048], and 256³
+       now pass. Kernel bench, single container: 4096³ store 1127 /
+       accumulate 551 / f32-store 1054 / f32-accum 531 TFLOP/s; at the tall
+       QKV shape M=32768 N=4608 K=1536 store 883 / accumulate 287 /
+       f32-store 771 / f32-accum 273 — the packed-bf16 RMW accumulate
+       epilogue is bandwidth-bound and falls to ~290 TFLOP/s at M=32768 (the
+       weight-gradient GEMMs run this mode). B200 same-container profile vs
+       main (239.3M, B=32 T=1024): 108.82 → 51.61 ms full step (−52.6%). Key
+       GEMM rows (baseline → candidate ms): forward lm_head 18.41 → 5.50,
+       backward lm_head weight 17.98 → 3.62 / input 17.79 → 3.37 (the lm-head
+       trio 54.2 → 12.5 ms); forward qkv 1.87 → 0.70, o_proj 0.68 → 0.30,
+       experts gate_up 2.98 → 1.28, down 1.72 → 0.78; backward experts
+       gate_up weight 4.94 → 2.29 / input 3.35 → 0.83, down weight 3.29 →
+       1.31 / input 1.48 → 0.65, qkv weight 2.22 → 0.94 / input 1.71 → 0.40,
+       o_proj weight 0.86 → 0.47 / input 0.60 → 0.22. gemm 256³ parity (all
+       four store/accumulate modes) and all 15 model gates pass; the branch
+       is merged onto current main (post-#40).
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on
