@@ -17,7 +17,7 @@ use model::{GpuDense, GpuDenseAdamW, GpuDenseWorkspace};
 const B: usize = 12;
 const T: usize = 2_048;
 const N: usize = B * T;
-const NP: usize = 32_768;
+const NP: usize = 24_576;
 const VOCAB: usize = 50_257;
 const VP: usize = 50_432;
 const D: usize = 3_072;
