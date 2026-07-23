@@ -697,6 +697,19 @@ Each gated on tests; correctness before speed at every step.
      config trains at oracle-attention speed until the tcgen05 kernels
      learn 128 (two 64-wide panels or a 64-row tile re-tiling; the naive
      SMEM scaling of the persistent kernel would need 384 KiB > 227 KiB).
+   - ✅ **`moe_scatter_dy` block-per-pair** (#45): the backward MoE scatter gave
+     each `(token, slot)` pair a single thread that serially walked the whole
+     `D=3072` gradient row — an uncoalesced copy fused with a serial gate dot,
+     ~1% of HBM. Restructured to one block per pair: lanes stride the row for a
+     fully coalesced `gate·dy` bin copy and the gate dot `Σ_d expert_output·dy`
+     reduces in shared memory (fixed-order tree, no atomics; writes stay
+     disjoint per surviving slot). Parity held with forced drops and underfull
+     experts on both expert paths. B200 same-container A/B vs main at the §13.9
+     shape (B=12 T=2048): `backward.router.scatter_dy` 30.77 → 3.66 ms (8.4×,
+     4.11% → 0.51% of step); full step 748.81 → 721.19 ms (-3.7%). Follow-ups:
+     float4-vectorize the row for the sub-1 ms floor, and fold the preceding
+     `backward.router.zero_dy_bins` (3.74 ms `E·C·D` fill) into a dead-slot
+     zeroing pass using the routing `assignment_counts`.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 
