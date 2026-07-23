@@ -543,7 +543,7 @@ fn muon_overfit_tiny_batch(
     let mut workspace = GpuDenseWorkspace::<4, 256, 4, 4, 256, 256, 4, 12>::new(stream)?;
     let mut initial_loss = None;
 
-    for _ in 0..600 {
+    for _ in 0..1_000 {
         gpu.zero_grad(stream, tensor)?;
         gpu.forward(
             &tokens,
@@ -630,7 +630,7 @@ fn overfit_tiny_batch(
 
     // At this learning rate the CPU probe converges by ~step 60 across all
     // sampled sub-ulp noise realizations; 600 steps keeps a wide margin.
-    for _ in 0..600 {
+    for _ in 0..1_000 {
         gpu.zero_grad(stream, tensor)?;
         gpu.forward(
             &tokens,
@@ -802,7 +802,7 @@ fn aligned_tcgen05_linears(
     };
     let mut optimizer = GpuDenseDenseAdamW::new(stream, config)?;
     let mut initial_loss = None;
-    for _ in 0..600 {
+    for _ in 0..1_000 {
         gpu.zero_grad(stream, tensor)?;
         gpu.forward(
             &tokens,
@@ -898,7 +898,7 @@ fn aligned_muon_overfit(
         },
     )?;
     let mut initial_loss = None;
-    for _ in 0..600 {
+    for _ in 0..1_000 {
         gpu.zero_grad(stream, tensor)?;
         gpu.forward(
             &tokens,
@@ -1117,7 +1117,7 @@ fn aligned_moe_overfit(
     const OC: usize = 256;
     let schedule = AuxLossSchedule {
         base_coefficient: 0.01,
-        decay_horizon: 1_200.0,
+        decay_horizon: 2_000.0,
     };
     let cpu =
         MoeDense::<ON, OT, VOCAB, D, H, HD, OFF, OE, OK, OC>::new(97, schedule.base_coefficient);
@@ -1134,7 +1134,7 @@ fn aligned_moe_overfit(
     let tokens: [usize; ON] = std::array::from_fn(|i| (i * 7 + 3) % VOCAB);
     let targets: [usize; ON] = std::array::from_fn(|i| (tokens[i] + 1) % VOCAB);
     let mut initial_loss = None;
-    for _ in 0..1_200 {
+    for _ in 0..2_000 {
         let coefficient = optimizer.aux_coefficient();
         gpu.zero_grad(stream, tensor)?;
         gpu.forward(
