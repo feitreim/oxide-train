@@ -393,6 +393,9 @@ dependencies = [
 [[package]]
 name = "tensor-core"
 version = "0.1.0"
+dependencies = [
+ "half",
+]
 
 [[package]]
 name = "thiserror"

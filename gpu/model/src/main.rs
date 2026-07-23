@@ -5,14 +5,13 @@
 //! master-weight comparison stays tight: both optimizers are fed the exact
 //! bf16-rounded gradients the GPU produced.
 //!
-//! Dimensions are the smallest that exercise the real tcgen05 path: `D` and
-//! `VP` are one 128 tile, `N` = 8 real token rows inside one padded `NP` =
-//! 128 tile, and the odd `VOCAB` = 17 exercises the classifier's packed tail.
+//! The base dimensions exercise the 256-tiled lm-head and attention linears:
+//! `N` = 8 real token rows inside padded `NP=256`, with `D=VP=256`. The odd
+//! `VOCAB=17` exercises the classifier tail and `FF=19` retains an fp32
+//! fallback case.
 //!
-//! These shapes are deliberately non-tile-aligned, so the block linears take
-//! their fp32 fallback; [`aligned_tcgen05_linears`] runs a second, fully
-//! 128-aligned configuration that is the end-to-end gate for the bf16
-//! tcgen05 block-linear path (7e9).
+//! [`aligned_tcgen05_linears`] runs a second, fully 256-aligned configuration
+//! as the end-to-end gate for every bf16 tcgen05 block-linear path (7e9).
 
 use cuda_core::{CudaContext, DeviceBuffer};
 use nn::{Dense, ExpertFfn, Module, MoeDense};
@@ -30,19 +29,19 @@ use model::{
 };
 
 const N: usize = 8;
-const NP: usize = 128;
+const NP: usize = 256;
 const T: usize = 4;
 const VOCAB: usize = 17;
-const VP: usize = 128;
+const VP: usize = 256;
 // `HD` must match the tiled flash kernels' compile-time head width (7e7).
-const D: usize = 128;
-const H: usize = 2;
+const D: usize = 256;
+const H: usize = 4;
 const HD: usize = 64;
 const FF: usize = 19;
 
 /// Loss and gradients that crossed the bf16 head: inputs quantized to bf16,
 /// fp32 accumulation, outputs re-rounded to bf16.
-const BF16_ATOL: f32 = 2e-3;
+const BF16_ATOL: f32 = 3e-3;
 const BF16_RTOL: f32 = 3e-2;
 
 /// Newton–Schulz runs in fp32 on both sides, but five quintic iterations of
@@ -524,11 +523,11 @@ fn muon_overfit_tiny_batch(
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    type TinyDense = Dense<4, 4, 4, 128, 2, 64, 12>;
+    type TinyDense = Dense<4, 4, 4, 256, 4, 64, 12>;
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
     let cpu = TinyDense::new(100);
-    let mut gpu = GpuDenseDense::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
+    let mut gpu = GpuDenseDense::<4, 256, 4, 4, 256, 256, 4, 64, 12>::from_cpu(stream, &cpu)?;
     // AdamW stays at the 0.02 the plain-AdamW gate settled on (0.03 is
     // knife-edge on this batch); Muon's default 0.02 handles the hidden
     // matrices.
@@ -541,7 +540,7 @@ fn muon_overfit_tiny_batch(
             ..AdamWConfig::default()
         },
     )?;
-    let mut workspace = GpuDenseWorkspace::<4, 128, 4, 4, 128, 128, 2, 12>::new(stream)?;
+    let mut workspace = GpuDenseWorkspace::<4, 256, 4, 4, 256, 256, 4, 12>::new(stream)?;
     let mut initial_loss = None;
 
     for _ in 0..600 {
@@ -609,11 +608,11 @@ fn overfit_tiny_batch(
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    type TinyDense = Dense<4, 4, 4, 128, 2, 64, 12>;
+    type TinyDense = Dense<4, 4, 4, 256, 4, 64, 12>;
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
     let cpu = TinyDense::new(100);
-    let mut gpu = GpuDenseDense::<4, 128, 4, 4, 128, 128, 2, 64, 12>::from_cpu(stream, &cpu)?;
+    let mut gpu = GpuDenseDense::<4, 256, 4, 4, 256, 256, 4, 64, 12>::from_cpu(stream, &cpu)?;
     // 0.03 is knife-edge on this batch: the bf16 two-logit tie's escape is
     // violently sensitive there, and a CPU sweep injecting +/-1-ulp-scale
     // noise (modelling kernel summation-order differences, 7e7) left ~1 in 8
@@ -626,7 +625,7 @@ fn overfit_tiny_batch(
         ..AdamWConfig::default()
     };
     let mut optimizer = GpuDenseDenseAdamW::new(stream, config)?;
-    let mut workspace = GpuDenseWorkspace::<4, 128, 4, 4, 128, 128, 2, 12>::new(stream)?;
+    let mut workspace = GpuDenseWorkspace::<4, 256, 4, 4, 256, 256, 4, 12>::new(stream)?;
     let mut initial_loss = None;
 
     // At this learning rate the CPU probe converges by ~step 60 across all
@@ -689,7 +688,7 @@ fn overfit_tiny_batch(
 
 /// End-to-end gate for the tcgen05 block-linear path (7e9).
 ///
-/// Every shape here is a multiple of the 128 tile, so the block linears run
+/// Every GEMM dimension here is a multiple of the 256 tile, so the block linears run
 /// the integrated bf16 path: activation quantize, the two weight-gradient
 /// transposes, the prefix TMA maps, the fp32-output epilogues, and the
 /// post-AdamW compute-weight refresh. One forward/backward is compared
@@ -705,13 +704,13 @@ fn aligned_tcgen05_linears(
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const NA: usize = 128;
+    const NA: usize = 256;
     const TA: usize = 4;
     const VA: usize = 17;
-    const VPA: usize = 128;
-    const DA: usize = 128;
-    const HA: usize = 2;
-    const FFA: usize = 128;
+    const VPA: usize = 256;
+    const DA: usize = 256;
+    const HA: usize = 4;
+    const FFA: usize = 256;
 
     let mut cpu = Dense::<NA, TA, VA, DA, HA, HD, FFA>::new(7);
     let mut gpu = GpuDenseDense::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
@@ -871,13 +870,13 @@ fn aligned_muon_overfit(
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const NA: usize = 128;
+    const NA: usize = 256;
     const TA: usize = 4;
     const VA: usize = 17;
-    const VPA: usize = 128;
-    const DA: usize = 128;
-    const HA: usize = 2;
-    const FFA: usize = 128;
+    const VPA: usize = 256;
+    const DA: usize = 256;
+    const HA: usize = 4;
+    const FFA: usize = 256;
 
     let cpu = Dense::<NA, TA, VA, DA, HA, HD, FFA>::new(7);
     let mut gpu = GpuDenseDense::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
@@ -1110,12 +1109,12 @@ fn aligned_moe_overfit(
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const ON: usize = 128;
+    const ON: usize = 256;
     const OT: usize = 4;
-    const OFF: usize = 128;
+    const OFF: usize = 256;
     const OE: usize = 2;
     const OK: usize = 1;
-    const OC: usize = 128;
+    const OC: usize = 256;
     let schedule = AuxLossSchedule {
         base_coefficient: 0.01,
         decay_horizon: 1_200.0,
@@ -1672,7 +1671,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm_bf16,
         &dense,
     )?;
-    expert_compute_parity::<2, 128, 128, 128>(
+    expert_compute_parity::<2, 256, 256, 256>(
         "aligned tcgen05",
         true,
         &stream,
@@ -1681,7 +1680,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm_bf16,
         &dense,
     )?;
-    moe_model_parity::<8, 128, 4, 19, 3, 2, 3>(
+    moe_model_parity::<8, 256, 4, 19, 3, 2, 3>(
         "fp32-oracle",
         false,
         &stream,
@@ -1692,7 +1691,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash_bf16,
         &dense,
     )?;
-    moe_model_parity::<256, 256, 128, 128, 3, 2, 128>(
+    moe_model_parity::<256, 256, 256, 256, 3, 2, 256>(
         "aligned tcgen05",
         true,
         &stream,

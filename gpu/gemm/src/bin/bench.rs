@@ -8,7 +8,7 @@
 use bench_util::{time_gpu_iters, uniform_vec};
 use cuda_core::{CudaContext, DeviceBuffer};
 use gemm::{
-    BK, BM, BN, TM, TN, create_bf16_tma_map, fp32, fp32_launch_config, kernels,
+    BK, BM, BN, TM, TN, Tcgen05Gemm, create_bf16_tma_map, fp32, fp32_launch_config,
     tcgen05_launch_config,
 };
 use half::bf16;
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
     let stream = context.default_stream();
     let fp32_module = fp32::kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
-    let module = kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
+    let module = Tcgen05Gemm::load_from_ptx(&context, "gemm.ptx")?;
 
     let fp32_a = DeviceBuffer::from_host(&stream, &uniform_vec(FP32_M * FP32_K, 11))?;
     let fp32_b = DeviceBuffer::from_host(&stream, &uniform_vec(FP32_K * FP32_N, 12))?;
@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bf16_store_ms = time_gpu_iters(&stream, 5, 20, || {
         unsafe {
-            module.gemm_tcgen05_bf16_store(
+            module.store(
                 &stream,
                 bf16_config,
                 a_tma.as_ptr(),
@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let bf16_accumulate_ms = time_gpu_iters(&stream, 5, 20, || {
         unsafe {
-            module.gemm_tcgen05_bf16_accumulate(
+            module.accumulate(
                 &stream,
                 bf16_config,
                 a_tma.as_ptr(),
@@ -124,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bf16_f32_c = DeviceBuffer::<f32>::zeroed(&stream, BF16_M * BF16_N)?;
     let bf16_f32_store_ms = time_gpu_iters(&stream, 5, 20, || {
         unsafe {
-            module.gemm_tcgen05_bf16_f32_store(
+            module.f32_store(
                 &stream,
                 bf16_config,
                 a_tma.as_ptr(),
@@ -139,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bf16_f32_accumulate_c = DeviceBuffer::<f32>::zeroed(&stream, BF16_M * BF16_N)?;
     let bf16_f32_accumulate_ms = time_gpu_iters(&stream, 5, 20, || {
         unsafe {
-            module.gemm_tcgen05_bf16_f32_accumulate(
+            module.f32_accumulate(
                 &stream,
                 bf16_config,
                 a_tma.as_ptr(),
@@ -152,7 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(Into::into)
     })?;
 
-    println!("bf16 tcgen05 128x128x64, fp32 TMEM accumulate");
+    println!("bf16 tcgen05 cg2 256x256x64, 4-stage TMA, fp32 TMEM accumulate");
     println!(
         "  store      [{BF16_M},{BF16_K}]x[{BF16_N},{BF16_K}]^T: \
          {bf16_store_ms:8.3} ms  {:8.2} TFLOP/s",

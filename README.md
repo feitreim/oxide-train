@@ -105,7 +105,7 @@ Run the dedicated profiler without a dataset shard:
 ```
 
 The binary uses a fixed, compile-time performance configuration: `B=32`, `T=1024`,
-`VOCAB=50,257` (padded to 50,304 for the bf16 tcgen05 lm-head), `D=1536`,
+`VOCAB=50,257` (padded to 50,432 for the bf16 tcgen05 lm-head), `D=1536`,
 `H=24`, `HD=64`, and `FF=4096` (about 182.7M parameters). It runs two complete
 warmup steps, synchronizes the stream, and then measures one `zero_grad +
 forward + backward + AdamW` step. Normal correctness and training binaries
