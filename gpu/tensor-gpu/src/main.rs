@@ -128,6 +128,21 @@ fn check_bf16_pairs(
         }
     }
     assert_eq!(transposed.to_host_vec(stream)?, pack_bf16(&expected));
+
+    // Fused quantize-and-transpose reads the fp32 source directly and must
+    // match the separate convert-then-transpose bit-for-bit.
+    let mut fused = DeviceBuffer::<u32>::zeroed(stream, ROWS * COLS / 2)?;
+    unsafe {
+        module.convert_f32_transpose_bf16_pairs(
+            stream,
+            transpose_pairs_config(ROWS, COLS),
+            &device_source,
+            ROWS as u32,
+            COLS as u32,
+            &mut fused,
+        )?;
+    }
+    assert_eq!(fused.to_host_vec(stream)?, pack_bf16(&expected));
     Ok(())
 }
 
