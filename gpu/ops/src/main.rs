@@ -14,8 +14,10 @@ use tensor_cpu::CpuTensor;
 #[path = "lib.rs"]
 mod device;
 use device::{
-    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS, NORM_THREADS,
-    NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_WEIGHT_EXPERTS, ROUTER_WEIGHT_ROWS, ROUTER_WEIGHT_THREADS,
+    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS,
+    NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN,
+    ROUTER_GEMM_THREADS, ROUTER_INPUT_THREADS, ROUTER_WEIGHT_EXPERTS, ROUTER_WEIGHT_ROWS,
+    ROUTER_WEIGHT_THREADS,
     kernels,
 };
 use tensor_core::bf16;
@@ -142,19 +144,25 @@ fn check_moe_routing(
     let expert_output_dev = DeviceBuffer::from_host(stream, &expert_outputs)?;
     let mut output_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
 
-    module.router_logits(
-        stream,
-        LaunchConfig {
-            grid_dim: (N as u32, 1, 1),
-            block_dim: (E as u32, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        &x_dev,
-        &weight_dev,
-        D as u32,
-        E as u32,
-        &mut logits_dev,
-    )?;
+    unsafe {
+        module.router_logits(
+            stream,
+            LaunchConfig {
+                grid_dim: (
+                    (E as u32).div_ceil(ROUTER_GEMM_BN as u32),
+                    (N as u32).div_ceil(ROUTER_GEMM_BM as u32),
+                    1,
+                ),
+                block_dim: (ROUTER_GEMM_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &x_dev,
+            &weight_dev,
+            D as u32,
+            E as u32,
+            &mut logits_dev,
+        )?;
+    }
     unsafe {
         module.router_softmax_topk(
             stream,
@@ -424,14 +432,20 @@ fn check_moe_routing(
             &mut dlogits_dev,
         )?;
     }
-    module.router_backward_input(
-        stream,
-        LaunchConfig::for_num_elems((N * D) as u32),
-        &dlogits_dev,
-        &weight_dev,
-        E as u32,
-        &mut router_dx_dev,
-    )?;
+    unsafe {
+        module.router_backward_input(
+            stream,
+            LaunchConfig {
+                grid_dim: (N as u32, 1, 1),
+                block_dim: (ROUTER_INPUT_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &dlogits_dev,
+            &weight_dev,
+            E as u32,
+            &mut router_dx_dev,
+        )?;
+    }
     module.router_backward_weight(
         stream,
         LaunchConfig::for_num_elems((D * E) as u32),
