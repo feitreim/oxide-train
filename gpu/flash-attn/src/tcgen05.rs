@@ -950,16 +950,14 @@ pub mod kernels {
         }
     }
 
-    /// Validation kernel for the transposed-B operand path the `O = P·V` MMA
-    /// depends on: one CTA computes `C[64, 64] = A[64, 64] · B[64, 64]`
-    /// with `B` stored row-major `[K, N]` — the natural V-subtile orientation —
-    /// consumed through `transpose_b` instruction-descriptor bit plus
-    /// 16-row (2048-byte) descriptor advances per K chunk.
-    ///
-    /// The epilogue stores each thread's fragment straight to global memory
-    /// through the decoded (row, column) ownership map, so a failure here
-    /// distinguishes descriptor problems (values transposed/permuted in
-    /// blocks) from fragment-map problems (fine-grained scrambling).
+    /// Validation kernel for the `S = Q·Kᵀ` operand path: one CTA computes
+    /// `C[64, 64] = A[64, 64] · B[64, 64]` over the full 128-wide HD (two
+    /// stacked subtiles, K=128) through the real `score_mma` walk and the
+    /// `M128`-over-64-row accumulator, then drains rows 0..63 through the
+    /// decoded (row, column) fragment map. A failure here isolates the
+    /// operand descriptor / fragment map from the softmax and epilogue — it is
+    /// what caught the `M64`-shape A/B K-mispairing that this conversion
+    /// works around with the `M128` shape.
     #[kernel]
     pub unsafe fn transpose_b_probe(
         a_tma: *const TmaDescriptor,
@@ -971,8 +969,6 @@ pub mod kernels {
             static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
             static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
 
-            // DIAGNOSTIC: exercise the real `score_mma` path (2 HD subtiles,
-            // K=128, non-transpose) and drain to logical rows with <<17.
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let a_smem = smem;
             let b_smem = smem.add(TILE_BYTES);
