@@ -19,7 +19,7 @@ const T: usize = 1_024;
 const N: usize = B * T;
 const NP: usize = 32_768;
 const VOCAB: usize = 50_257;
-const VP: usize = 50_304;
+const VP: usize = 50_432;
 const D: usize = 1_536;
 const H: usize = 24;
 const HD: usize = 64;
@@ -67,9 +67,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dense = model::dense_kernels::load(&ctx)?;
 
     let aux_schedule = AuxLossSchedule::default();
+    eprintln!("profile setup: initializing CPU parameters");
     let cpu = MoeDense::<N, T, VOCAB, D, H, HD, FF, E, K, C>::new(42, aux_schedule.coefficient(0));
+    eprintln!("profile setup: uploading parameters");
     let mut gpu = GpuDense::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>::from_cpu(&stream, &cpu)?;
     drop(cpu);
+    eprintln!("profile setup: allocating optimizer and workspace");
     let mut optimizer = GpuDenseAdamW::new(&stream, AdamWConfig::default(), aux_schedule)?;
     let mut workspace = GpuDenseWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
     let tokens: Vec<usize> = (0..N).map(|i| (i * 7919 + 17) % VOCAB).collect();
@@ -77,9 +80,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokens: &[usize; N] = tokens.as_slice().try_into().expect("length N");
     let targets: &[usize; N] = targets.as_slice().try_into().expect("length N");
 
-    for _ in 0..WARMUP_STEPS {
+    for step in 0..WARMUP_STEPS {
+        eprintln!("warmup {}/{}: zero_grad", step + 1, WARMUP_STEPS);
         let aux_coefficient = optimizer.aux_coefficient();
         gpu.zero_grad(&stream, &tensor)?;
+        stream.synchronize()?;
+        eprintln!("warmup {}/{}: forward", step + 1, WARMUP_STEPS);
         gpu.forward(
             tokens,
             targets,
@@ -93,6 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &flash_bf16,
             &dense,
         )?;
+        stream.synchronize()?;
+        eprintln!("warmup {}/{}: backward", step + 1, WARMUP_STEPS);
         gpu.backward(
             aux_coefficient,
             &mut workspace,
@@ -103,9 +111,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &flash,
             &dense,
         )?;
+        stream.synchronize()?;
+        eprintln!("warmup {}/{}: optimizer", step + 1, WARMUP_STEPS);
         optimizer.update(&mut gpu, &stream, &tensor)?;
+        stream.synchronize()?;
     }
-    stream.synchronize()?;
+    eprintln!("profile: measuring step");
 
     let mut profiler = StepProfiler::start(&stream)?;
     // Gradient fills are named kernel spans. The pinned input H2D copies remain

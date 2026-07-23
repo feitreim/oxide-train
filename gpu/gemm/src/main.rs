@@ -4,7 +4,7 @@
 
 use bench_util::uniform_vec;
 use cuda_core::{CudaContext, DeviceBuffer};
-use gemm::{create_bf16_tma_map, fp32, fp32_launch_config, kernels, tcgen05_launch_config};
+use gemm::{Tcgen05Gemm, create_bf16_tma_map, fp32, fp32_launch_config, tcgen05_launch_config};
 use half::bf16;
 
 fn matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
     let stream = context.default_stream();
     let fp32_module = fp32::kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
-    let module = kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
+    let module = Tcgen05Gemm::load_from_ptx(&context, "gemm.ptx")?;
 
     check_fp32(&stream, &fp32_module)?;
     check_tcgen05_bf16(&stream, &module)?;
@@ -227,13 +227,12 @@ fn check_fp32(
 
 fn check_tcgen05_bf16(
     stream: &cuda_core::CudaStream,
-    module: &kernels::LoadedModule,
+    module: &Tcgen05Gemm,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Multi-CTA grid (2x2) and three k-iterations so the TMA tile offsets and
-    // the mbarrier phase-parity toggle are exercised, not just phase 0.
+    // One full four-stage K pipeline cycle exercises every TMA/MMA stage.
     const M: usize = 256;
     const N: usize = 256;
-    const K: usize = 192;
+    const K: usize = 256;
     let (a_bits, a) = quantize_bf16(&uniform_vec(M * K, 4));
     // tcgen05 consumes B in transposed [N,K] storage so K remains contiguous.
     let (b_bits, b) = quantize_bf16(&uniform_vec(N * K, 5));
@@ -253,7 +252,7 @@ fn check_tcgen05_bf16(
 
     let mut store = DeviceBuffer::<u32>::zeroed(stream, M * N / 2)?;
     unsafe {
-        module.gemm_tcgen05_bf16_store(
+        module.store(
             stream,
             config,
             a_tma.as_ptr(),
@@ -273,7 +272,7 @@ fn check_tcgen05_bf16(
 
     let mut accumulate = DeviceBuffer::from_host(stream, &pack_bf16(&initial))?;
     unsafe {
-        module.gemm_tcgen05_bf16_accumulate(
+        module.accumulate(
             stream,
             config,
             a_tma.as_ptr(),
@@ -293,7 +292,7 @@ fn check_tcgen05_bf16(
 
     let mut f32_store = DeviceBuffer::<f32>::zeroed(stream, M * N)?;
     unsafe {
-        module.gemm_tcgen05_bf16_f32_store(
+        module.f32_store(
             stream,
             config,
             a_tma.as_ptr(),
@@ -313,7 +312,7 @@ fn check_tcgen05_bf16(
 
     let mut f32_accumulate = DeviceBuffer::from_host(stream, &initial)?;
     unsafe {
-        module.gemm_tcgen05_bf16_f32_accumulate(
+        module.f32_accumulate(
             stream,
             config,
             a_tma.as_ptr(),

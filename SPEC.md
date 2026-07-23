@@ -349,9 +349,9 @@ Each gated on tests; correctness before speed at every step.
        head-first — the lm-head is ~70% of this one-block model's GEMM
        FLOPs and the profile's named target; block linears stay fp32
        register-tiled until a profile moves them (rule 17). Vocab padded
-       50,257 → 50,304 (393×128) and token rows padded to `NP` (128) with
+       50,257 → 50,432 (197×256) and token rows padded to `NP` (256) with
        provably inert zeros, so the tuned tcgen05 kernel's M,N ≡ 0 (mod
-       128) contract holds unmodified and checkpoints stay byte-compatible
+       256) contract holds unmodified and checkpoints stay byte-compatible
        (masters stored without padding). Also replaced the naive RMSNorm
        weight-gradient reduction (per-column row-norm recomputation) with a
        block-per-row inverse pass + column-parallel reduce. B200

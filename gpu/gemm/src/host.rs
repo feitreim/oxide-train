@@ -17,20 +17,31 @@ use cuda_core::{
 };
 use cuda_device::tma::TmaDescriptor;
 
-/// tcgen05 CTA output tile edge: `M` and `N` must be multiples of this.
+/// TMA panel edge and packed-storage alignment.
 pub const TC_TILE: usize = 128;
 /// tcgen05 reduction tile: `K` must be a multiple of this.
 pub const TC_BK: usize = 64;
+/// Optimized CTA-pair output rows.
+pub const TC_M_TILE: usize = 256;
+/// Optimized CTA-pair output columns.
+pub const TC_N_TILE: usize = 256;
+/// Four K64 stages form one complete shared-memory pipeline cycle.
+pub const TC_K_PIPELINE: usize = 256;
 
-/// Launch for the fixed Blackwell 128x128 tcgen05 output tile.
+/// Launch one B200 CTA pair per M256xN256 output tile.
 pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
-    assert!(m.is_multiple_of(TC_TILE));
-    assert!(n.is_multiple_of(TC_TILE) && n.is_multiple_of(2));
-    assert!(k.is_multiple_of(TC_BK));
+    assert!(m.is_multiple_of(TC_M_TILE));
+    assert!(n.is_multiple_of(TC_N_TILE));
+    assert!(k.is_multiple_of(TC_K_PIPELINE));
     assert!(m <= u32::MAX as usize && n <= u32::MAX as usize && k <= u32::MAX as usize);
+    let host_work_ids = (m / TC_M_TILE)
+        .checked_mul(n / TC_TILE)
+        .expect("tcgen05 work grid overflow");
     LaunchConfig {
-        grid_dim: ((m / TC_TILE) as u32, (n / TC_TILE) as u32, 1),
-        block_dim: (TC_TILE as u32, 1, 1),
+        // `host_work_ids` is already twice the logical tile count because it
+        // uses N128 units, exactly matching two CTAs per N256 cluster tile.
+        grid_dim: (host_work_ids as u32, 1, 1),
+        block_dim: (192, 1, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -227,17 +238,14 @@ pub unsafe fn create_bf16_pairs_tma_map_region(
     })
 }
 
-/// The two tcgen05 bf16 GEMM kernels, loaded from a `gemm.ptx` built by this
+/// The optimized tcgen05 bf16 GEMM, loaded from a `gemm.ptx` built by this
 /// crate rather than from the calling binary's embedded artifact.
 ///
 /// The launchers mirror the `#[cuda_module]`-generated marshalling exactly:
 /// TMA descriptor pointers and dimensions as scalars, the packed output as a
 /// `(pointer, length)` device-slice pair.
 pub struct Tcgen05Gemm {
-    store: CudaFunction,
-    accumulate: CudaFunction,
-    f32_store: CudaFunction,
-    f32_accumulate: CudaFunction,
+    optimized: CudaFunction,
     _module: Arc<CudaModule>,
 }
 
@@ -250,10 +258,7 @@ impl Tcgen05Gemm {
             )
         })?;
         Ok(Self {
-            store: module.load_function("gemm_tcgen05_bf16_store")?,
-            accumulate: module.load_function("gemm_tcgen05_bf16_accumulate")?,
-            f32_store: module.load_function("gemm_tcgen05_bf16_f32_store")?,
-            f32_accumulate: module.load_function("gemm_tcgen05_bf16_f32_accumulate")?,
+            optimized: module.load_function("gemm_tcgen05_bf16_optimized")?,
             _module: module,
         })
     }
@@ -276,7 +281,19 @@ impl Tcgen05Gemm {
         n: u32,
         k: u32,
     ) -> Result<(), DriverError> {
-        unsafe { launch_tcgen05(&self.store, stream, config, a_tma, b_tma, output, n, k) }
+        unsafe {
+            launch_tcgen05(
+                &self.optimized,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                n,
+                k,
+                0,
+            )
+        }
     }
 
     /// Blackwell bf16 `C += A B^T`; see the kernel for the full contract.
@@ -295,7 +312,19 @@ impl Tcgen05Gemm {
         n: u32,
         k: u32,
     ) -> Result<(), DriverError> {
-        unsafe { launch_tcgen05(&self.accumulate, stream, config, a_tma, b_tma, output, n, k) }
+        unsafe {
+            launch_tcgen05(
+                &self.optimized,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                n,
+                k,
+                1,
+            )
+        }
     }
 
     /// Blackwell bf16 `C = A B^T` with row-major fp32 output.
@@ -318,7 +347,7 @@ impl Tcgen05Gemm {
         let output_elements = output.len();
         unsafe {
             launch_tcgen05_f32(
-                &self.f32_store,
+                &self.optimized,
                 stream,
                 config,
                 a_tma,
@@ -328,6 +357,7 @@ impl Tcgen05Gemm {
                 output_elements,
                 n,
                 k,
+                2,
             )
         }
     }
@@ -354,7 +384,7 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05_f32(
-                &self.f32_store,
+                &self.optimized,
                 stream,
                 config,
                 a_tma,
@@ -364,6 +394,7 @@ impl Tcgen05Gemm {
                 output_elements,
                 n,
                 k,
+                2,
             )
         }
     }
@@ -387,7 +418,7 @@ impl Tcgen05Gemm {
         let output_elements = output.len();
         unsafe {
             launch_tcgen05_f32(
-                &self.f32_accumulate,
+                &self.optimized,
                 stream,
                 config,
                 a_tma,
@@ -397,6 +428,7 @@ impl Tcgen05Gemm {
                 output_elements,
                 n,
                 k,
+                3,
             )
         }
     }
@@ -422,7 +454,7 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05_f32(
-                &self.f32_accumulate,
+                &self.optimized,
                 stream,
                 config,
                 a_tma,
@@ -432,6 +464,7 @@ impl Tcgen05Gemm {
                 output_elements,
                 n,
                 k,
+                3,
             )
         }
     }
@@ -447,7 +480,15 @@ unsafe fn launch_tcgen05(
     output: &mut DeviceBuffer<u32>,
     mut n: u32,
     mut k: u32,
+    mut mode: u32,
 ) -> Result<(), DriverError> {
+    let m = output
+        .len()
+        .checked_mul(2)
+        .expect("tcgen05 packed output size overflow")
+        / n as usize;
+    let mut tiles_m = (m / TC_M_TILE) as u32;
+    let mut tiles_n = (n as usize / TC_TILE) as u32;
     let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
     cuda_host::push_kernel_scalar(&mut args, &mut a_tma);
     cuda_host::push_kernel_scalar(&mut args, &mut b_tma);
@@ -455,12 +496,16 @@ unsafe fn launch_tcgen05(
     cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
     cuda_host::push_kernel_scalar(&mut args, &mut n);
     cuda_host::push_kernel_scalar(&mut args, &mut k);
+    cuda_host::push_kernel_scalar(&mut args, &mut tiles_m);
+    cuda_host::push_kernel_scalar(&mut args, &mut tiles_n);
+    cuda_host::push_kernel_scalar(&mut args, &mut mode);
     unsafe {
-        cuda_core::launch_kernel_on_stream(
+        cuda_core::launch_kernel_ex_on_stream(
             function,
             config.grid_dim,
             config.block_dim,
             config.shared_mem_bytes,
+            (2, 1, 1),
             stream,
             &mut args,
         )
@@ -479,6 +524,7 @@ unsafe fn launch_tcgen05_f32(
     output_elements: usize,
     mut n: u32,
     mut k: u32,
+    mut mode: u32,
 ) -> Result<(), DriverError> {
     let output_end = output_offset
         .checked_add(output_elements)
@@ -495,15 +541,22 @@ unsafe fn launch_tcgen05_f32(
         .checked_add(byte_offset as u64)
         .expect("tcgen05 fp32 output device pointer overflow");
     let mut output_len = output_elements as u64;
+    let m = output_elements / n as usize;
+    let mut tiles_m = (m / TC_M_TILE) as u32;
+    let mut tiles_n = (n as usize / TC_TILE) as u32;
     cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
     cuda_host::push_kernel_scalar(&mut args, &mut n);
     cuda_host::push_kernel_scalar(&mut args, &mut k);
+    cuda_host::push_kernel_scalar(&mut args, &mut tiles_m);
+    cuda_host::push_kernel_scalar(&mut args, &mut tiles_n);
+    cuda_host::push_kernel_scalar(&mut args, &mut mode);
     unsafe {
-        cuda_core::launch_kernel_on_stream(
+        cuda_core::launch_kernel_ex_on_stream(
             function,
             config.grid_dim,
             config.block_dim,
             config.shared_mem_bytes,
+            (2, 1, 1),
             stream,
             &mut args,
         )

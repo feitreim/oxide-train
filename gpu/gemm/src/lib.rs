@@ -7,9 +7,10 @@
 //!
 //! The portable first rung is an fp32 shared-memory/register-tiled kernel.
 //! The Blackwell rung consumes row-major bf16 `A[M,K]` and transposed,
-//! row-major bf16 `B[N,K]`, accumulates in fp32 TMEM with `tcgen05`, and emits
-//! row-major packed-bf16 `C[M,N]`. Both rungs have overwrite and `C += A B`
-//! variants so backward parameter gradients do not need a separate add kernel.
+//! row-major bf16 `B[N,K]`. Its B200 path uses CLC scheduling, CTA-pair UMMA,
+//! four TMA stages, and two fp32 TMEM accumulator stages to produce 256x256
+//! output tiles. Packed-bf16/fp32 overwrite and accumulation modes share that
+//! compute pipeline, so backward parameter gradients need no separate add.
 //!
 //! bf16 is represented as raw `u16`/packed `u32` until milestone 7d adds the
 //! shared `Element` plumbing.
@@ -17,25 +18,34 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use cuda_device::barrier::{
-    Barrier, fence_proxy_async_shared_cta, mbarrier_arrive_expect_tx, mbarrier_init,
-    mbarrier_inval, mbarrier_try_wait_parity,
+    Barrier, fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_cluster,
+    mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_inval, mbarrier_try_wait_parity,
 };
+use cuda_device::clc::{
+    clc_query_get_first_ctaid_x, clc_query_is_canceled, clc_try_cancel_multicast,
+};
+use cuda_device::cluster;
 use cuda_device::shared::SharedArray;
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    cvt_f32x2_bf16x2, stmatrix_m8n8_x2, tcgen05_alloc, tcgen05_commit_shared_cluster,
-    tcgen05_dealloc, tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16,
+    cvt_f32x2_bf16x2, stmatrix_m8n8_x2, tcgen05_alloc, tcgen05_alloc_cg2,
+    tcgen05_commit_multicast_cg2, tcgen05_commit_shared_cluster, tcgen05_dealloc,
+    tcgen05_dealloc_cg2, tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16,
+    tcgen05_mma_f16_cg2, tcgen05_relinquish_alloc_permit_cg2,
 };
-use cuda_device::tma::{TmaDescriptor, cp_async_bulk_tensor_2d_g2s};
-use cuda_device::{DisjointSlice, kernel, thread, warp};
+use cuda_device::tma::{
+    TmaDescriptor, cp_async_bulk_tensor_2d_g2s, cp_async_bulk_tensor_2d_g2s_multicast_cg2,
+};
+use cuda_device::{DisjointSlice, cluster_launch, kernel, thread, warp};
 use cuda_host::cuda_module;
 
 pub mod fp32;
 pub use fp32::{BK, BM, BN, TM, TN, launch_config as fp32_launch_config};
 pub mod host;
 pub use host::{
-    Bf16PairsTmaMap, Bf16TmaMap, TC_BK, TC_TILE, Tcgen05Gemm, create_bf16_pairs_tma_map,
-    create_bf16_pairs_tma_map_prefix, create_bf16_tma_map, tcgen05_launch_config,
+    Bf16PairsTmaMap, Bf16TmaMap, TC_BK, TC_K_PIPELINE, TC_M_TILE, TC_N_TILE, TC_TILE, Tcgen05Gemm,
+    create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_tma_map,
+    tcgen05_launch_config,
 };
 
 #[cuda_module]
@@ -56,7 +66,7 @@ pub mod kernels {
     }
 
     #[inline(always)]
-    fn bf16_to_f32(bits: u16) -> f32 {
+    pub(super) fn bf16_to_f32(bits: u16) -> f32 {
         f32::from_bits((bits as u32) << 16)
     }
 
@@ -68,7 +78,7 @@ pub mod kernels {
     }
 
     #[inline(always)]
-    fn accumulate_bf16_pair(current: u32, update: u32) -> u32 {
+    pub(super) fn accumulate_bf16_pair(current: u32, update: u32) -> u32 {
         let lo = bf16_to_f32(current as u16) + bf16_to_f32(update as u16);
         let hi = bf16_to_f32((current >> 16) as u16) + bf16_to_f32((update >> 16) as u16);
         f32_to_bf16_rne(lo) as u32 | ((f32_to_bf16_rne(hi) as u32) << 16)
@@ -499,3 +509,5 @@ pub mod kernels {
         unsafe { gemm_tcgen05_bf16_f32_impl::<true>(a_tma, b_tma, output, n, k) }
     }
 }
+
+include!("optimized.rs");

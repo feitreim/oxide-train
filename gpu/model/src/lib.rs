@@ -12,7 +12,7 @@
 //!
 //! Two padded dimensions keep every head GEMM inside the tcgen05 tile
 //! contract without touching the tuned kernel:
-//! - `VP` pads the vocabulary (50,257 -> 50,304). The padded weight columns
+//! - `VP` pads the vocabulary (50,257 -> 50,432). The padded weight columns
 //!   are zero at initialization and stay zero: the classifier backward writes
 //!   exact zeros there, so their gradients, moments, and decayed masters never
 //!   move. Checkpoints store the unpadded columns only.
@@ -70,7 +70,8 @@ use flash_host::{
 };
 use gemm_device::launch_config as fp32_launch_config;
 use gemm_host::{
-    Bf16PairsTmaMap, TC_TILE, create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix,
+    Bf16PairsTmaMap, TC_K_PIPELINE, TC_M_TILE, TC_N_TILE, TC_TILE,
+    create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix,
     create_bf16_pairs_tma_map_region, tcgen05_launch_config,
 };
 use tensor_device::{GpuAdamWMoments, GpuMuonMomentum, GpuTensor, transpose_pairs_config};
@@ -518,7 +519,9 @@ impl<const N: usize, const D: usize, const FF: usize> Bf16LinearScratch<N, D, FF
 }
 
 fn tcgen05_linear_eligible(m: usize, k: usize, n: usize) -> bool {
-    m.is_multiple_of(TC_TILE) && k.is_multiple_of(TC_TILE) && n.is_multiple_of(TC_TILE)
+    m.is_multiple_of(TC_M_TILE)
+        && k.is_multiple_of(TC_K_PIPELINE)
+        && n.is_multiple_of(TC_N_TILE)
 }
 
 fn tcgen05_attention_eligible(t: usize, head_dim: usize) -> bool {
@@ -3427,10 +3430,10 @@ impl<
         assert!(N <= u32::MAX as usize);
         assert_eq!(N % T, 0);
         assert_eq!(D, H * HD);
-        assert_eq!(NP, N.next_multiple_of(TC_TILE));
+        assert_eq!(NP, N.next_multiple_of(TC_M_TILE));
         assert!(VP >= VOCAB);
-        assert_eq!(VP % TC_TILE, 0);
-        assert_eq!(D % TC_TILE, 0);
+        assert_eq!(VP % TC_N_TILE, 0);
+        assert_eq!(D % TC_K_PIPELINE, 0);
         assert!(E > 0 && K > 0 && K <= E && C > 0);
         Ok(Self {
             embedding: GpuEmbedding::from_cpu(stream, &model.embedding)?,
@@ -4132,10 +4135,10 @@ impl<
         // tcgen05 head contract: padded tokens and vocabulary are tile
         // multiples, and D serves as both an output dimension (input-gradient
         // N, weight-gradient M) and a reduction width.
-        assert_eq!(NP, N.next_multiple_of(TC_TILE));
+        assert_eq!(NP, N.next_multiple_of(TC_M_TILE));
         assert!(VP >= VOCAB);
-        assert_eq!(VP % TC_TILE, 0);
-        assert_eq!(D % TC_TILE, 0);
+        assert_eq!(VP % TC_N_TILE, 0);
+        assert_eq!(D % TC_K_PIPELINE, 0);
         Ok(Self {
             embedding: GpuEmbedding::from_cpu(stream, &model.embedding)?,
             attention_norm: GpuRmsNorm::from_cpu(stream, &model.attention_norm)?,
