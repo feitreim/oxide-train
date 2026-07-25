@@ -15,10 +15,9 @@ use tensor_cpu::CpuTensor;
 mod device;
 use device::{
     CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS,
-    NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN,
-    ROUTER_GEMM_THREADS, ROUTER_INPUT_THREADS, ROUTER_WEIGHT_EXPERTS, ROUTER_WEIGHT_ROWS,
-    ROUTER_WEIGHT_THREADS,
-    kernels,
+    MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM,
+    ROUTER_GEMM_BN, ROUTER_GEMM_THREADS, ROUTER_INPUT_THREADS, ROUTER_WEIGHT_EXPERTS,
+    ROUTER_WEIGHT_ROWS, ROUTER_WEIGHT_THREADS, kernels,
 };
 use tensor_core::bf16;
 
@@ -318,9 +317,24 @@ fn check_moe_routing(
 
     let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(400);
     let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
-    let mut expert_output_gradient_dev = DeviceBuffer::<f32>::zeroed(stream, E * C * D)?;
+    // Poisoned, not zeroed: the dead-slot pass plus the scatter must between
+    // them rewrite every bin, so a surviving poison value fails the compare.
+    let poison: Vec<f32> = (0..E * C * D).map(|index| index as f32 + 1.0).collect();
+    let mut expert_output_gradient_dev = DeviceBuffer::from_host(stream, &poison)?;
     let mut gate_gradients_dev = DeviceBuffer::<f32>::zeroed(stream, N * K)?;
     unsafe {
+        module.moe_zero_dead_bins(
+            stream,
+            LaunchConfig {
+                grid_dim: ((E * C) as u32, 1, 1),
+                block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &counts_dev,
+            D as u32,
+            C as u32,
+            &mut expert_output_gradient_dev,
+        )?;
         module.moe_scatter_dy(
             stream,
             LaunchConfig {
@@ -500,6 +514,135 @@ fn check_moe_routing(
     );
 
     check_moe_tie_routing(stream, module)?;
+    check_moe_scatter_dy_rows(stream, module)?;
+    Ok(())
+}
+
+/// Exercises the backward scatter row walks at a `D` the float4 path takes and
+/// one it cannot, over a routing with a dropped pair, a partly dead expert, and
+/// an entirely unassigned expert.
+fn check_moe_scatter_dy_rows(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    check_moe_scatter_dy_case::<8>(stream, module)?;
+    check_moe_scatter_dy_case::<5>(stream, module)
+}
+
+fn check_moe_scatter_dy_case<const D: usize>(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 4;
+    const E: usize = 3;
+    const K: usize = 1;
+    const C: usize = 2;
+
+    let selected = [0u32, 0, 0, 1];
+    let gates: Vec<f32> = (0..N * K).map(|pair| 0.25 + pair as f32 * 0.5).collect();
+    let expert_output: Vec<f32> = (0..E * C * D)
+        .map(|index| index as f32 * 0.125 - 1.0)
+        .collect();
+    let dy: Vec<f32> = (0..N * D)
+        .map(|index| 1.0 - index as f32 * 0.0625)
+        .collect();
+    // Poisoned, not zeroed: the dead-slot pass plus the scatter must between
+    // them rewrite every bin, so a surviving poison value fails the compare.
+    let poison: Vec<f32> = (0..E * C * D).map(|index| index as f32 + 1.0).collect();
+
+    let selected_dev = DeviceBuffer::from_host(stream, &selected)?;
+    let gates_dev = DeviceBuffer::from_host(stream, &gates)?;
+    let expert_output_dev = DeviceBuffer::from_host(stream, &expert_output)?;
+    let dy_dev = DeviceBuffer::from_host(stream, &dy)?;
+    let mut slots_dev = DeviceBuffer::<u32>::zeroed(stream, N * K)?;
+    let mut counts_dev = DeviceBuffer::<u32>::zeroed(stream, E)?;
+    let mut gradient_dev = DeviceBuffer::from_host(stream, &poison)?;
+    let mut gate_gradients_dev = DeviceBuffer::<f32>::zeroed(stream, N * K)?;
+
+    unsafe {
+        module.moe_bin_assign_parallel(
+            stream,
+            LaunchConfig {
+                grid_dim: (E as u32, 1, 1),
+                block_dim: (MOE_ASSIGN_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &selected_dev,
+            N as u32,
+            E as u32,
+            K as u32,
+            C as u32,
+            &mut slots_dev,
+            &mut counts_dev,
+        )?;
+        module.moe_zero_dead_bins(
+            stream,
+            LaunchConfig {
+                grid_dim: ((E * C) as u32, 1, 1),
+                block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &counts_dev,
+            D as u32,
+            C as u32,
+            &mut gradient_dev,
+        )?;
+        module.moe_scatter_dy(
+            stream,
+            LaunchConfig {
+                grid_dim: ((N * K) as u32, 1, 1),
+                block_dim: (MOE_SCATTER_DY_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &expert_output_dev,
+            &dy_dev,
+            &selected_dev,
+            &gates_dev,
+            &slots_dev,
+            D as u32,
+            K as u32,
+            C as u32,
+            &mut gradient_dev,
+            &mut gate_gradients_dev,
+        )?;
+    }
+
+    let slots = slots_dev.to_host_vec(stream)?;
+    assert_eq!(
+        slots,
+        [0, 1, MOE_DROPPED_SLOT, 0],
+        "MoE scatter row shape must drop one pair and leave expert 2 empty"
+    );
+    assert_eq!(counts_dev.to_host_vec(stream)?, [3, 1, 0]);
+
+    let mut expected_gradient = vec![0.0f32; E * C * D];
+    let mut expected_gate_gradients = vec![0.0f32; N * K];
+    for pair in 0..N * K {
+        if slots[pair] == MOE_DROPPED_SLOT {
+            continue;
+        }
+        let bin_base = (selected[pair] as usize * C + slots[pair] as usize) * D;
+        let token_base = (pair / K) * D;
+        for column in 0..D {
+            expected_gradient[bin_base + column] = gates[pair] * dy[token_base + column];
+            expected_gate_gradients[pair] +=
+                expert_output[bin_base + column] * dy[token_base + column];
+        }
+    }
+    assert_close(
+        "MoE dead-slot zeroing and scatter cover every bin",
+        &gradient_dev.to_host_vec(stream)?,
+        &expected_gradient,
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "MoE gate gradients over strided rows",
+        &gate_gradients_dev.to_host_vec(stream)?,
+        &expected_gate_gradients,
+        1e-6,
+        1e-6,
+    );
     Ok(())
 }
 
