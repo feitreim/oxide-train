@@ -86,9 +86,42 @@ pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
 /// power of two.
 pub const MOE_SCATTER_DY_THREADS: usize = 256;
 
+/// Threads in one block-per-bin MoE dead-slot zeroing block.
+pub const MOE_ZERO_BINS_THREADS: usize = 256;
+
+/// `f32` lanes in one 16-byte vector memory access.
+///
+/// Rows are walked through `*const u128` / `*mut u128` rather than an
+/// `align(16)` `[f32; 4]` newtype: the codegen scalarizes aggregate loads back
+/// into four `ld.global.b32`, while a `u128` stays one `ld/st.global.v2.b64`.
+/// A row base `row * dim` is 16-byte aligned whenever `dim % QUAD_LANES == 0`,
+/// which is the guard every vectorized row walk below checks.
+pub const QUAD_LANES: usize = 4;
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
+
+    /// Unpacks one 16-byte vector load into its `f32` lanes. The shifts are
+    /// register moves after codegen, not shift instructions.
+    #[inline(always)]
+    fn quad_lanes(bits: u128) -> [f32; QUAD_LANES] {
+        [
+            f32::from_bits(bits as u32),
+            f32::from_bits((bits >> 32) as u32),
+            f32::from_bits((bits >> 64) as u32),
+            f32::from_bits((bits >> 96) as u32),
+        ]
+    }
+
+    /// Packs `f32` lanes back into one 16-byte vector store.
+    #[inline(always)]
+    fn quad_bits(lanes: [f32; QUAD_LANES]) -> u128 {
+        (lanes[0].to_bits() as u128)
+            | ((lanes[1].to_bits() as u128) << 32)
+            | ((lanes[2].to_bits() as u128) << 64)
+            | ((lanes[3].to_bits() as u128) << 96)
+    }
 
     #[inline(always)]
     fn bf16_bits_to_f32(bits: u16) -> f32 {
@@ -1810,6 +1843,13 @@ pub mod kernels {
     /// Lanes stride the `D` row so the bin copy is fully coalesced, and the
     /// gate dot `Σ_d expert_output·dy` reduces in shared memory. The prior
     /// thread-per-pair variant walked the whole row serially on a single lane.
+    ///
+    /// A `dim` divisible by [`QUAD_LANES`] makes every row base 16-byte
+    /// aligned, so each lane moves a whole quad per step instead of one `f32`;
+    /// other `dim` take the scalar walk.
+    ///
+    /// Rows the routing left unassigned are cleared by [`moe_zero_dead_bins`],
+    /// not by this kernel.
     #[kernel]
     pub unsafe fn moe_scatter_dy(
         expert_output: &[f32],
@@ -1867,15 +1907,40 @@ pub mod kernels {
 
         let gate = gate_weights[pair];
         let mut dot = 0.0f32;
-        let mut column = tid;
-        while column < d {
-            let grad = dy[token_base + column];
-            dot += expert_output[bin_base + column] * grad;
-            // SAFETY: each lane owns distinct columns of this block's bin row.
-            unsafe {
-                *expert_output_gradient.get_unchecked_mut(bin_base + column) = gate * grad;
+        if d.is_multiple_of(QUAD_LANES) {
+            // SAFETY: `bin_base` and `token_base` are multiples of `dim`, hence
+            // of `QUAD_LANES`, so both rows are 16-byte aligned inside device
+            // allocations; the row bounds were checked above. Each lane owns
+            // distinct quads of this block's bin row.
+            let dy_row = unsafe { dy.as_ptr().add(token_base) as *const u128 };
+            let output_row = unsafe { expert_output.as_ptr().add(bin_base) as *const u128 };
+            let gradient_row =
+                unsafe { expert_output_gradient.as_mut_ptr().add(bin_base) as *mut u128 };
+            let mut quad = tid;
+            while quad < d / QUAD_LANES {
+                let grad = quad_lanes(unsafe { *dy_row.add(quad) });
+                let output = quad_lanes(unsafe { *output_row.add(quad) });
+                let mut scaled = [0.0f32; QUAD_LANES];
+                for lane in 0..QUAD_LANES {
+                    dot += output[lane] * grad[lane];
+                    scaled[lane] = gate * grad[lane];
+                }
+                unsafe {
+                    *gradient_row.add(quad) = quad_bits(scaled);
+                }
+                quad += MOE_SCATTER_DY_THREADS;
             }
-            column += MOE_SCATTER_DY_THREADS;
+        } else {
+            let mut column = tid;
+            while column < d {
+                let grad = dy[token_base + column];
+                dot += expert_output[bin_base + column] * grad;
+                // SAFETY: each lane owns distinct columns of this block's bin row.
+                unsafe {
+                    *expert_output_gradient.get_unchecked_mut(bin_base + column) = gate * grad;
+                }
+                column += MOE_SCATTER_DY_THREADS;
+            }
         }
         unsafe {
             DOT[tid] = dot;
@@ -1896,6 +1961,62 @@ pub mod kernels {
             // SAFETY: this block exclusively owns `pair`.
             unsafe {
                 *gate_gradients.get_unchecked_mut(pair) = DOT[0];
+            }
+        }
+    }
+
+    /// Zero the expert-bin gradient rows the routing left unassigned.
+    ///
+    /// Capacity assignment hands expert `e` the slots `0..min(count[e], C)` and
+    /// [`moe_scatter_dy`] overwrites exactly those, so the dead tail
+    /// `min(count[e], C)..C` is all that still needs clearing. Together the two
+    /// passes cover the whole `E·C·D` buffer, replacing a full pre-fill. One
+    /// block per `(expert, slot)`, lanes striding the row.
+    #[kernel]
+    pub unsafe fn moe_zero_dead_bins(
+        assignment_counts: &[u32],
+        dim: u32,
+        capacity: u32,
+        mut expert_output_gradient: DisjointSlice<f32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let threads = thread::blockDim_x() as usize;
+        let bin = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        let c = capacity as usize;
+        if d == 0 || c == 0 {
+            return;
+        }
+        let expert = bin / c;
+        let slot = bin % c;
+        let base = bin * d;
+        if expert >= assignment_counts.len() || base + d > expert_output_gradient.len() {
+            return;
+        }
+        if slot < assignment_counts[expert] as usize {
+            return;
+        }
+
+        if d.is_multiple_of(QUAD_LANES) {
+            // SAFETY: `base` is a multiple of `dim`, hence of `QUAD_LANES`, so
+            // the row is 16-byte aligned; bounds were checked above. Each lane
+            // owns distinct quads of this block's dead bin row.
+            let row = unsafe { expert_output_gradient.as_mut_ptr().add(base) as *mut u128 };
+            let mut quad = tid;
+            while quad < d / QUAD_LANES {
+                unsafe {
+                    *row.add(quad) = 0;
+                }
+                quad += threads;
+            }
+        } else {
+            let mut column = tid;
+            while column < d {
+                // SAFETY: each lane owns distinct columns of this dead bin row.
+                unsafe {
+                    *expert_output_gradient.get_unchecked_mut(base + column) = 0.0;
+                }
+                column += threads;
             }
         }
     }

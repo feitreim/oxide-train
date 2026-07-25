@@ -138,6 +138,16 @@ fn moe_scatter_dy_config(pairs: usize) -> LaunchConfig {
     }
 }
 
+/// Launch for the MoE dead-slot zeroing pass: one block per `(expert, slot)`.
+fn moe_zero_bins_config(bins: usize) -> LaunchConfig {
+    assert!(bins <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (bins as u32, 1, 1),
+        block_dim: (dense_device::MOE_ZERO_BINS_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 fn moe_assign_config<const E: usize>() -> LaunchConfig {
     assert!(dense_device::MOE_ASSIGN_THREADS.is_power_of_two());
     assert!(E <= u32::MAX as usize);
@@ -4080,13 +4090,19 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         dense: &dense_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        fill_zero(
-            &mut scratch.experts.d_bin_output,
-            stream,
-            tensor,
-            profiler,
-            "backward.router.zero_dy_bins",
-        )?;
+        // `scatter_dy` below overwrites every assigned bin row, so only the
+        // unassigned capacity tail needs clearing -- a full `E·C·D` pre-fill
+        // would rewrite the whole buffer to no effect.
+        profiler.measure(stream, "backward.router.zero_dead_bins", || unsafe {
+            dense.moe_zero_dead_bins(
+                stream,
+                moe_zero_bins_config(E * C),
+                acts.routing.assignment_counts.as_device_buffer(),
+                D as u32,
+                C as u32,
+                scratch.experts.d_bin_output.as_device_buffer_mut(),
+            )
+        })?;
         profiler.measure(stream, "backward.router.scatter_dy", || unsafe {
             dense.moe_scatter_dy(
                 stream,
