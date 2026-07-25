@@ -396,12 +396,19 @@ def run_sanitizer(kernel: str, bin: str | None = None, tool: str = "memcheck") -
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
 def dump_ptx(kernel: str) -> str:
     proj = _proj(kernel)
-    _run(["cargo", "oxide", "build", kernel], cwd=proj)
-    for root, _, files in __import__("os").walk(proj):
-        for f in sorted(files):
-            if f.endswith(".ptx"):
-                return Path(root, f).read_text()
-    raise SystemExit(f"no .ptx produced under {proj}")
+    # `build` does not auto-detect the GPU arch the way `run` does; without the
+    # pin, bins carrying device atomics or libdevice math fall back to legacy
+    # NVVM IR and fail to compile at all. Same pin `_prepare_flash_ptx` uses.
+    _run(["cargo", "oxide", "build", kernel, "--arch", "sm_100a"], cwd=proj)
+    dumps = [
+        Path(root, f)
+        for root, _, files in __import__("os").walk(proj)
+        for f in sorted(files)
+        if f.endswith(".ptx")
+    ]
+    if not dumps:
+        raise SystemExit(f"no .ptx produced under {proj}")
+    return "\n".join(f"===== {p.relative_to(proj)} =====\n{p.read_text()}" for p in dumps)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=600)
