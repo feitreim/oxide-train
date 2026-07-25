@@ -648,20 +648,33 @@ Each gated on tests; correctness before speed at every step.
        `backward.attention.flash_q` 66.5 ms, `flash_kv` 78.7 ms over 12 blocks;
        full step 748.8 ms) could not capture the candidate side: the Modal
        workspace was disabled (spend limit) mid-run.
-     - ⏳ **7e16 stale `.maxntid` on the two warp-specialized forwards** (#47):
+     - ✅ **7e16 stale `.maxntid` on the two warp-specialized forwards** (#47):
        the HD=128 conversion halved `TILE` and so halved both block widths, but
        the `#[launch_bounds]` literals kept their 128-row-era values — pipelined
        declared 192 threads and launches 128, persistent declared 320 and
-       launches 192. `.maxntid` is what ptxas budgets registers against
-       (`65536 / maxntid` per thread), so the persistent forward was capped at
-       ~204 registers/thread instead of the 255 its 192-thread block allows —
-       and its softmax warpgroup keeps `out_acc[4][32]` (128 fp32) live across
-       the whole key stream. Both now match their block width, pinned by
+       launches 192. `.maxntid` is the divisor ptxas budgets registers against,
+       and the persistent softmax warpgroup keeps `out_acc[4][32]` (128 fp32)
+       live across the whole key stream, so the stale value cost it real
+       registers. Both now match their block width, pinned by
        `const _: () = assert!(FLASH_*_BLOCK == …)` beside the constants (the
-       attribute only takes integer literals). Occupancy is unaffected — TMEM
-       already pins the SM to one CTA — so this can only relax the budget.
-       **Unmeasured:** needs a Modal run to confirm parity is unchanged and to
-       read the register/spill counts and kernel-bench delta.
+       attribute only takes integer literals). Occupancy cannot regress — TMEM
+       already pins the SM to one CTA. **Measured (B200, same-image A/B, only
+       the two literals differing):** persistent **168 → 206 registers/thread**
+       and **227.5 → 230.2/231.9 TFLOP/s** (1.925 → 1.903/1.889 ms at
+       [32,1024,24,128], two post-fix samples); pipelined unchanged at 224 regs
+       and 181 TFLOP/s, as expected since 192 and 128 threads land on the same
+       allocation. Local frame is 592 B on both sides (and on the sync forward
+       at 48 regs), i.e. a fixed frame, not a spill the fix removed. Parity
+       byte-identical across every gate shape. To keep this visible, the flash
+       harness now prints each loaded kernel's ptxas budget
+       (`host::function_profile`, via `cuFuncGetAttribute` NUM_REGS /
+       LOCAL_SIZE_BYTES / MAX_THREADS_PER_BLOCK) — the PTX cannot show it,
+       since ptxas runs after it. Separately, `modal_app.py::dump_ptx` was
+       broken for any crate whose oracle bins carry device atomics: it ran
+       `cargo oxide build` without `--arch sm_100a`, so `PTX=1 ./run.sh
+       flash-attn` failed in legacy NVVM IR. It now pins the arch (matching
+       `_prepare_flash_ptx`) and emits every `.ptx` it finds, not just the
+       first.
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on

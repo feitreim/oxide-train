@@ -303,6 +303,49 @@ fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dy
     Ok(())
 }
 
+/// What ptxas actually gave a loaded kernel. `registers` is per thread and
+/// `spill_bytes` is its local-memory frame — the direct read on whether a
+/// `.maxntid` (i.e. `#[launch_bounds]`) value is squeezing the allocator, which
+/// is invisible in the PTX because ptxas runs after it.
+pub struct FunctionProfile {
+    pub registers: i32,
+    pub spill_bytes: i32,
+    pub max_threads: i32,
+}
+
+fn function_attribute(function: &CudaFunction, attribute: u32) -> Result<i32, Box<dyn Error>> {
+    use cuda_core::sys::{cuFuncGetAttribute, cudaError_enum_CUDA_SUCCESS};
+    let mut value = 0i32;
+    let status = unsafe { cuFuncGetAttribute(&mut value, attribute, function.cu_function()) };
+    if status != cudaError_enum_CUDA_SUCCESS {
+        return Err(format!("cuFuncGetAttribute({attribute}) failed: {status:?}").into());
+    }
+    Ok(value)
+}
+
+/// Read a loaded kernel's register / spill / `.maxntid` facts.
+pub fn function_profile(function: &CudaFunction) -> Result<FunctionProfile, Box<dyn Error>> {
+    use cuda_core::sys::{
+        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS,
+    };
+    Ok(FunctionProfile {
+        registers: function_attribute(
+            function,
+            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS,
+        )?,
+        spill_bytes: function_attribute(
+            function,
+            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+        )?,
+        max_threads: function_attribute(
+            function,
+            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+        )?,
+    })
+}
+
 /// The tcgen05 attention kernels, loaded from a `flash.ptx` built by
 /// `src/bin/flash.rs` rather than from the calling binary's embedded
 /// artifact. The launchers mirror the `#[cuda_module]`-generated
@@ -360,6 +403,18 @@ impl Tcgen05Flash {
     /// `flash_persistent_config`.
     pub fn sm_count(&self) -> usize {
         self.sm_count
+    }
+
+    /// The launched kernels paired with their names, for reporting what ptxas
+    /// gave each one.
+    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 5] {
+        [
+            ("forward sync", &self.forward),
+            ("forward pipelined", &self.forward_pipelined),
+            ("forward persistent", &self.forward_persistent),
+            ("backward q", &self.backward_q),
+            ("backward kv", &self.backward_kv),
+        ]
     }
 
     /// Synchronous tcgen05 causal attention forward over bf16 head-panel
