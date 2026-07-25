@@ -52,15 +52,39 @@ pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
     }
 }
 
-/// Encode a `SWIZZLE_128B` tensor map loading 128x64 bf16 tiles from a
-/// row-major `[height, width]` bf16 matrix at `base` (a device pointer).
+/// Operand orientation, which fixes the TMA box.
+///
+/// A K-major operand is stored `[MN, K]` and streams `TC_TILE x TC_BK` tiles —
+/// K contiguous, one 128-byte swizzle row per MN index. An MN-major operand is
+/// stored `[K, MN]` and streams `TC_BK x TC_BK` subtiles instead: 128B swizzle
+/// caps a TMA box at 128 bytes, so a CTA's 128 MN values arrive as two stacked
+/// subtiles and the MMA's smem descriptor jumps between them via its LBO. See
+/// `src/bin/transpose_probe.rs` for the geometry validation.
+#[derive(Clone, Copy, PartialEq)]
+pub enum TmaLayout {
+    KMajor,
+    MnMajor,
+}
+
+impl TmaLayout {
+    fn box_dimensions(self) -> [u32; 2] {
+        match self {
+            TmaLayout::KMajor => [TC_BK as u32, TC_TILE as u32],
+            TmaLayout::MnMajor => [TC_BK as u32, TC_BK as u32],
+        }
+    }
+}
+
+/// Encode a `SWIZZLE_128B` tensor map over a row-major `[height, width]` bf16
+/// matrix at `base` (a device pointer).
 fn encode_bf16_tma_map(
     stream: &CudaStream,
     base: u64,
     width: usize,
     height: usize,
+    layout: TmaLayout,
 ) -> Result<DeviceBuffer<u64>, Box<dyn Error>> {
-    encode_bf16_tma_map_strided(stream, base, width, height, width)
+    encode_bf16_tma_map_strided(stream, base, width, height, width, layout)
 }
 
 /// Encode a bf16 tensor map whose logical rows are prefixes of wider physical
@@ -72,6 +96,7 @@ fn encode_bf16_tma_map_strided(
     width: usize,
     height: usize,
     row_stride: usize,
+    layout: TmaLayout,
 ) -> Result<DeviceBuffer<u64>, Box<dyn Error>> {
     use cuda_core::sys::{
         CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
@@ -83,12 +108,15 @@ fn encode_bf16_tma_map_strided(
     };
 
     assert!(width.is_multiple_of(TC_BK));
-    assert!(height.is_multiple_of(TC_TILE));
+    assert!(height.is_multiple_of(match layout {
+        TmaLayout::KMajor => TC_TILE,
+        TmaLayout::MnMajor => TC_BK,
+    }));
     assert!(row_stride >= width);
     let mut tensor_map = MaybeUninit::<cuda_core::sys::CUtensorMap>::uninit();
     let global_dimensions = [width as u64, height as u64];
     let global_strides = [(row_stride * 2) as u64];
-    let box_dimensions = [TC_BK as u32, TC_TILE as u32];
+    let box_dimensions = layout.box_dimensions();
     let element_strides = [1u32, 1u32];
     let status = unsafe {
         cuTensorMapEncodeTiled(
@@ -134,10 +162,11 @@ pub fn create_bf16_tma_map<'matrix>(
     matrix: &'matrix DeviceBuffer<u16>,
     width: usize,
     height: usize,
+    layout: TmaLayout,
 ) -> Result<Bf16TmaMap<'matrix>, Box<dyn Error>> {
     assert_eq!(matrix.len(), width * height);
     Ok(Bf16TmaMap {
-        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height)?,
+        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height, layout)?,
         _matrix: PhantomData,
     })
 }
@@ -170,11 +199,12 @@ pub unsafe fn create_bf16_pairs_tma_map(
     matrix: &DeviceBuffer<u32>,
     width: usize,
     height: usize,
+    layout: TmaLayout,
 ) -> Result<Bf16PairsTmaMap, Box<dyn Error>> {
     assert!(width.is_multiple_of(2));
     assert_eq!(matrix.len() * 2, width * height);
     Ok(Bf16PairsTmaMap {
-        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height)?,
+        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height, layout)?,
     })
 }
 
@@ -189,11 +219,12 @@ pub unsafe fn create_bf16_pairs_tma_map_prefix(
     matrix: &DeviceBuffer<u32>,
     width: usize,
     height: usize,
+    layout: TmaLayout,
 ) -> Result<Bf16PairsTmaMap, Box<dyn Error>> {
     assert!(width.is_multiple_of(2));
     assert!(matrix.len() * 2 >= width * height);
     Ok(Bf16PairsTmaMap {
-        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height)?,
+        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height, layout)?,
     })
 }
 
@@ -214,6 +245,7 @@ pub unsafe fn create_bf16_pairs_tma_map_region(
     width: usize,
     height: usize,
     row_stride: usize,
+    layout: TmaLayout,
 ) -> Result<Bf16PairsTmaMap, Box<dyn Error>> {
     assert!(width.is_multiple_of(2));
     assert!(row_stride.is_multiple_of(2));
@@ -240,7 +272,7 @@ pub unsafe fn create_bf16_pairs_tma_map_region(
         .checked_add(byte_offset as u64)
         .expect("bf16 TMA region device pointer overflow");
     Ok(Bf16PairsTmaMap {
-        descriptor: encode_bf16_tma_map_strided(stream, base, width, height, row_stride)?,
+        descriptor: encode_bf16_tma_map_strided(stream, base, width, height, row_stride, layout)?,
     })
 }
 
@@ -298,6 +330,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 0,
+                TmaLayout::KMajor,
             )
         }
     }
@@ -329,6 +362,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 1,
+                TmaLayout::KMajor,
             )
         }
     }
@@ -364,6 +398,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 2,
+                TmaLayout::KMajor,
             )
         }
     }
@@ -401,6 +436,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 2,
+                TmaLayout::KMajor,
             )
         }
     }
@@ -435,6 +471,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 3,
+                TmaLayout::KMajor,
             )
         }
     }
@@ -471,6 +508,116 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 3,
+                TmaLayout::KMajor,
+            )
+        }
+    }
+
+    /// Packed-bf16 weight-gradient form: `C += Aᵀ·B` with both operands read
+    /// MN-major from their native `[K, M]` / `[K, N]` panels (#53). This is the
+    /// lm-head's gradient, whose operands are already bf16.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Tcgen05Gemm::f32_accumulate_transposed_at`], with a
+    /// packed-pair output of `m * n / 2` words.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn accumulate_transposed(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<u32>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            launch_tcgen05(
+                &self.optimized,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                n,
+                k,
+                1,
+                TmaLayout::MnMajor,
+            )
+        }
+    }
+
+    /// Weight-gradient form: `C += Aᵀ·B` with both operands read MN-major
+    /// straight out of their native row-major `[K, M]` and `[K, N]` panels,
+    /// via the descriptor's `transpose_a`/`transpose_b` bits (#53). Nothing is
+    /// transposed in global memory, so the caller stages plain quantized
+    /// activations and output gradients.
+    ///
+    /// # Safety
+    ///
+    /// The maps must be [`TmaLayout::MnMajor`] maps over live `[k, m]` and
+    /// `[k, n]` matrices, and the selected output region must hold exactly one
+    /// `m * n` matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_accumulate_transposed_at(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<f32>,
+        output_offset: usize,
+        output_elements: usize,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            launch_tcgen05_f32(
+                &self.optimized,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                output_offset,
+                output_elements,
+                n,
+                k,
+                3,
+                TmaLayout::MnMajor,
+            )
+        }
+    }
+
+    /// Whole-buffer form of [`Tcgen05Gemm::f32_accumulate_transposed_at`].
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Tcgen05Gemm::f32_accumulate_transposed_at`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_accumulate_transposed(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<f32>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        let output_elements = output.len();
+        unsafe {
+            self.f32_accumulate_transposed_at(
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                0,
+                output_elements,
+                n,
+                k,
             )
         }
     }
@@ -487,6 +634,7 @@ unsafe fn launch_tcgen05(
     mut n: u32,
     mut k: u32,
     mut mode: u32,
+    layout: TmaLayout,
 ) -> Result<(), DriverError> {
     let m = output
         .len()
@@ -505,6 +653,8 @@ unsafe fn launch_tcgen05(
     cuda_host::push_kernel_scalar(&mut args, &mut tiles_m);
     cuda_host::push_kernel_scalar(&mut args, &mut tiles_n);
     cuda_host::push_kernel_scalar(&mut args, &mut mode);
+    let mut transposed = u32::from(layout == TmaLayout::MnMajor);
+    cuda_host::push_kernel_scalar(&mut args, &mut transposed);
     unsafe {
         cuda_core::launch_kernel_ex_on_stream(
             function,
@@ -531,6 +681,7 @@ unsafe fn launch_tcgen05_f32(
     mut n: u32,
     mut k: u32,
     mut mode: u32,
+    layout: TmaLayout,
 ) -> Result<(), DriverError> {
     let output_end = output_offset
         .checked_add(output_elements)
@@ -556,6 +707,8 @@ unsafe fn launch_tcgen05_f32(
     cuda_host::push_kernel_scalar(&mut args, &mut tiles_m);
     cuda_host::push_kernel_scalar(&mut args, &mut tiles_n);
     cuda_host::push_kernel_scalar(&mut args, &mut mode);
+    let mut transposed = u32::from(layout == TmaLayout::MnMajor);
+    cuda_host::push_kernel_scalar(&mut args, &mut transposed);
     unsafe {
         cuda_core::launch_kernel_ex_on_stream(
             function,

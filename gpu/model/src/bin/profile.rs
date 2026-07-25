@@ -90,8 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     eprintln!("profile setup: allocating optimizer and workspace");
     let mut optimizer = GpuDenseAdamW::new(&stream, AdamWConfig::default(), aux_schedule, L)?;
-    let mut workspace =
-        GpuMoeWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C, L>::new(&stream)?;
+    let mut workspace = GpuMoeWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C, L>::new(&stream)?;
     print_vram("after model/optimizer/workspace allocation");
     let tokens: Vec<usize> = (0..N).map(|i| (i * 7919 + 17) % VOCAB).collect();
     let targets: Vec<usize> = (0..N).map(|i| tokens[(i + 1) % N]).collect();

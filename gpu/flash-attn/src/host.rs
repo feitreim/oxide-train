@@ -55,7 +55,8 @@ pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = (8 * TILE_BYTES) as u32;
 /// bin asserts it. Allocating the ceiling keeps stage sweeps a one-const
 /// edit, and costs nothing: TMEM (512 columns per CTA against a 512-column
 /// SM budget) already pins occupancy to one CTA per SM.
-pub const FLASH_PIPELINE_SMEM_BYTES: u32 = ((1 + 2 * 4) * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD) as u32;
+pub const FLASH_PIPELINE_SMEM_BYTES: u32 =
+    ((1 + 2 * 4) * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD) as u32;
 /// Threads of the pipelined forward: the TILE-thread softmax warpgroup plus
 /// the TMA-load warp and the MMA-issue warp. Mirrors `FLASH_PIPELINE_BLOCK`.
 pub const FLASH_PIPELINE_BLOCK_THREADS: u32 = (FLASH_TILE + 64) as u32;
@@ -126,7 +127,12 @@ pub fn flash_backward_kv_config(
     sequence_length: usize,
     heads: usize,
 ) -> LaunchConfig {
-    flash_backward_config(batches, sequence_length, heads, FLASH_BACKWARD_KV_SMEM_BYTES)
+    flash_backward_config(
+        batches,
+        sequence_length,
+        heads,
+        FLASH_BACKWARD_KV_SMEM_BYTES,
+    )
 }
 
 /// Launch for the warp-specialized pipelined forward: same grid, the wider
@@ -172,7 +178,9 @@ pub fn device_sm_count(ctx: &CudaContext) -> Result<usize, Box<dyn Error>> {
         )
     };
     if status != cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuDeviceGetAttribute(multiprocessor count) failed: {status:?}").into());
+        return Err(
+            format!("cuDeviceGetAttribute(multiprocessor count) failed: {status:?}").into(),
+        );
     }
     Ok(count as usize)
 }

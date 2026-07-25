@@ -772,6 +772,46 @@ Each gated on tests; correctness before speed at every step.
      full step 750.85 → 733.77 ms (−2.3%). The lm-head `transpose_dlogits`/
      `transpose_input` are already-bf16 movement with no quantize to fold, so
      the fallback leaves them for the descriptor route.
+   - ✅ **Descriptor-transpose weight gradients** (#53): the deferred phase 2
+     of #43. `gpu/gemm/src/bin/transpose_probe.rs` is a standalone single-CTA
+     probe that TMAs one A and one B tile, chains four `K=16` MMAs and checks
+     the drained accumulator against a CPU oracle, with the *entire* operand
+     walk (smem descriptor LBO/SBO/swizzle, TMA tile stacking, byte step per
+     chunk) as launch parameters — so one Modal run sweeps a candidate table
+     instead of costing one run per guess, which is exactly the blind-iteration
+     risk that deferred this. Five A geometries × two B geometries × four
+     encodings; the encodings follow the #47 lesson that operands uniform in
+     `K` hide K-permutation bugs (random, an exact `(m+1)(n+1)` outer product
+     mapping M/N, and two delta-in-`K` walks that read out which `K` index each
+     operand paired with). **Result:** an MN-major operand under `SWIZZLE_128B`
+     is two stacked 64-wide subtiles and the descriptor's **LBO is a subtile
+     jump** (8192), SBO stays 1024, and a `K=16` chunk steps 16 rows (2048 B)
+     instead of 32 B — so a transposed `M128` A stays fully swizzled. The
+     competing "LBO is always the 16-byte core-matrix step, on a 256-byte
+     unswizzled pitch" reading fails, and `M64` fails identically for K-major
+     and MN-major A, which puts SPEC 7e15's `M64` dead end on the *shape*, not
+     the operand layout. That geometry is now `transposed=1` in
+     `gemm_tcgen05_bf16_optimized` (gated by a transposed `M256xN256xK256`
+     accumulate in the gpu/gemm parity harness), and every weight gradient
+     consumes its native row-major panels: the #50 fused quantize+transpose
+     kernels become plain quantizes, the `rhs_t` operand disappears (the input
+     GEMM's own `rows` buffer doubles as the weight GEMM's B), and the lm-head
+     `transpose_input`/`transpose_dlogits` passes are deleted outright.
+     **B200 same-container A/B vs main at §13.9 (B=12):** the four weight-gemm
+     spans are unchanged within run-to-run noise (`gate_up_weight_gemm`
+     53.55 → 53.30, `down_weight_gemm` 28.52 → 28.98, `qkv_proj.weight_gemm`
+     18.66 → 18.71, `o_proj.weight_gemm` 6.97 → 7.16 ms, against a ±0.4 ms
+     noise floor on untouched kernels — `forward.attention.flash`, which this
+     change cannot reach, moved +0.36), `backward.lm_head.transpose_dlogits` +
+     `transpose_input` 1.17 → 0 ms, full step 620.4 → 622.1 ms (noise). The win
+     is **memory**: workspace VRAM 167.9 → 164.3 GiB, i.e. free headroom 10.4 →
+     14.1 GiB (+35%), from dropping `rhs_t` in both the dense and expert
+     scratches and `head_input_t`/`dlogits_t` in the workspace. **Conclusion:**
+     the transposes were never what made these spans slow — at these shapes
+     each output tile re-reads its full `K = E*C = 49152` operand slice, so the
+     weight-grad GEMM is operand-DRAM-bandwidth bound, and closing the gap to
+     forward parity needs the tile-shape/weight-reuse work (#54), not operand
+     orientation. This lands anyway for the headroom and for two fewer kernels.
    - ✅ **tcgen05 flash at HD=128** (#42): landed via #46/#48/#51 — see the
      7e13/7e14/7e15 milestone entries (64-row tiles, stacked 64-wide
      swizzle subtiles, M128 pairing in the backwards).
@@ -874,10 +914,12 @@ Each gated on tests; correctness before speed at every step.
      not an A/B. Attention (`flash` fwd + `flash_q`/`flash_kv` + staging +
      `flash_dot`) is 130.8 ms (21.2%), expert GEMMs + staging 216.5 ms
      (35.0%), and no single non-GEMM kernel exceeds 2.1%. Remaining
-     levers tracked in #47 (M128-pairing model-shape A/B), #53
-     (descriptor-transpose TN weight grads), #54 (router weight-reuse,
-     since landed, 14.64 to 3.19 ms), #55 (vectorized scatter +
-     `zero_dy_bins` fold, since landed, 7.49 to 3.31 ms).
+     levers tracked in #47 (M128-pairing model-shape A/B); #53
+     (descriptor-transpose weight grads) landed flat on time but freed
+     3.6 GiB and showed operand orientation is not a weight-grad lever —
+     weight reuse is the only one left there; #54 (router weight-reuse)
+     since landed, 14.64 to 3.19 ms; #55 (vectorized scatter +
+     `zero_dy_bins` fold) since landed, 7.49 to 3.31 ms.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 

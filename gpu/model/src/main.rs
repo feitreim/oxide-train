@@ -1244,8 +1244,10 @@ fn moe_checkpoint_gate(
         ..AdamWConfig::default()
     };
     const CL: usize = 2;
-    let cpu =
-        MoeDense::<CN, CT, VOCAB, D, H, HD, CFF, CE, CK, CC, CL>::new(123, schedule.base_coefficient);
+    let cpu = MoeDense::<CN, CT, VOCAB, D, H, HD, CFF, CE, CK, CC, CL>::new(
+        123,
+        schedule.base_coefficient,
+    );
     let mut gpu =
         GpuDense::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC, CL>::from_cpu(stream, &cpu)?;
     let mut optimizer = GpuDenseAdamW::new(stream, config, schedule, CL)?;
@@ -1738,15 +1740,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash_bf16,
         &dense,
     )?;
-    aligned_moe_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
-    moe_checkpoint_gate(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
+    aligned_moe_overfit(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
+    moe_checkpoint_gate(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
     // The parity helpers own temporary expert workspaces. Their device frees
     // are stream-ordered; complete those frees before the independent overfit
     // gates begin allocating models and workspaces of their own.
     stream.synchronize()?;
-    overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
-    muon_overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
-    aligned_tcgen05_linears(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
-    aligned_muon_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
+    overfit_tiny_batch(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
+    muon_overfit_tiny_batch(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
+    aligned_tcgen05_linears(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
+    aligned_muon_overfit(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
     Ok(())
 }

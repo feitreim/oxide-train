@@ -293,12 +293,11 @@ pub fn load<
     let next_batch = read_u64(&mut reader)?;
     let (config, aux_schedule) = read_config(&mut reader)?;
 
-    let mut model =
-        GpuDense::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>::initialized(
-            stream,
-            0,
-            aux_schedule.base_coefficient,
-        )?;
+    let mut model = GpuDense::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>::initialized(
+        stream,
+        0,
+        aux_schedule.base_coefficient,
+    )?;
     let mut optimizer = GpuDenseAdamW::new(stream, config, aux_schedule, L)?;
 
     macro_rules! read_parameter {
