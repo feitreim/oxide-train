@@ -71,7 +71,7 @@ use flash_host::{
 use gemm_device::launch_config as fp32_launch_config;
 use gemm_host::{
     Bf16PairsTmaMap, TC_K_PIPELINE, TC_M_TILE, TC_N_TILE, TC_TILE,
-    create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix,
+    TmaLayout, create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix,
     create_bf16_pairs_tma_map_region, tcgen05_launch_config,
 };
 use tensor_device::{GpuAdamWMoments, GpuMuonMomentum, GpuTensor, transpose_pairs_config};
@@ -448,9 +448,9 @@ impl Bf16LinearWeights {
         let transposed = DeviceBuffer::from_host(stream, &packed_t)?;
         // SAFETY: both allocations live beside their maps and are never
         // replaced. Optimizer refreshes mutate their contents in place.
-        let normal_tma = unsafe { create_bf16_pairs_tma_map(stream, &normal, columns, rows)? };
+        let normal_tma = unsafe { create_bf16_pairs_tma_map(stream, &normal, columns, rows, TmaLayout::KMajor)? };
         let transposed_tma =
-            unsafe { create_bf16_pairs_tma_map(stream, &transposed, rows, columns)? };
+            unsafe { create_bf16_pairs_tma_map(stream, &transposed, rows, columns, TmaLayout::KMajor)? };
         Ok(Self {
             normal,
             transposed,
@@ -549,9 +549,9 @@ impl<const N: usize, const D: usize, const FF: usize> Bf16LinearScratch<N, D, FF
     ) -> Result<Bf16LinearMaps, Box<dyn Error>> {
         let make = |width| unsafe {
             if transposed {
-                create_bf16_pairs_tma_map_prefix(stream, buffer, N, width)
+                create_bf16_pairs_tma_map_prefix(stream, buffer, N, width, TmaLayout::KMajor)
             } else {
-                create_bf16_pairs_tma_map_prefix(stream, buffer, width, N)
+                create_bf16_pairs_tma_map_prefix(stream, buffer, width, N, TmaLayout::KMajor)
             }
         };
         Ok(Bf16LinearMaps {
@@ -1023,6 +1023,7 @@ impl StackedBf16Weights {
                     columns,
                     rows,
                     columns,
+                    TmaLayout::KMajor,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1035,6 +1036,7 @@ impl StackedBf16Weights {
                     rows,
                     columns,
                     total_rows,
+                    TmaLayout::KMajor,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1149,6 +1151,7 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize>
                             capacity,
                             width,
                             experts * capacity,
+                            TmaLayout::KMajor,
                         )
                     } else {
                         create_bf16_pairs_tma_map_region(
@@ -1158,6 +1161,7 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize>
                             width,
                             capacity,
                             width,
+                            TmaLayout::KMajor,
                         )
                     }
                 })
@@ -2154,8 +2158,8 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         let dw = DeviceBuffer::zeroed(stream, D * VP / 2)?;
         // SAFETY: `w` and `w_t` live in this struct beside their maps and are
         // never reallocated.
-        let w_tma = unsafe { create_bf16_pairs_tma_map(stream, &w, VP, D)? };
-        let w_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &w_t, D, VP)? };
+        let w_tma = unsafe { create_bf16_pairs_tma_map(stream, &w, VP, D, TmaLayout::KMajor)? };
+        let w_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &w_t, D, VP, TmaLayout::KMajor)? };
         Ok(Self {
             master,
             w,
@@ -3455,10 +3459,10 @@ impl<
         let dlogits_t = DeviceBuffer::zeroed(stream, VP * NP / 2)?;
         // SAFETY: the mapped buffers live in this workspace beside their maps
         // and are never reallocated.
-        let head_input_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input, D, NP)? };
-        let head_input_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input_t, NP, D)? };
-        let logits_tma = unsafe { create_bf16_pairs_tma_map(stream, &logits, VP, NP)? };
-        let dlogits_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &dlogits_t, NP, VP)? };
+        let head_input_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input, D, NP, TmaLayout::KMajor)? };
+        let head_input_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input_t, NP, D, TmaLayout::KMajor)? };
+        let logits_tma = unsafe { create_bf16_pairs_tma_map(stream, &logits, VP, NP, TmaLayout::KMajor)? };
+        let dlogits_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &dlogits_t, NP, VP, TmaLayout::KMajor)? };
         Ok(Self {
             tokens: GpuTensor::zeros(stream)?,
             targets: GpuTensor::zeros(stream)?,
@@ -3658,10 +3662,10 @@ impl<
         let dlogits_t = DeviceBuffer::zeroed(stream, VP * NP / 2)?;
         // SAFETY: the mapped buffers live in this workspace beside their maps
         // and are never reallocated.
-        let head_input_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input, D, NP)? };
-        let head_input_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input_t, NP, D)? };
-        let logits_tma = unsafe { create_bf16_pairs_tma_map(stream, &logits, VP, NP)? };
-        let dlogits_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &dlogits_t, NP, VP)? };
+        let head_input_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input, D, NP, TmaLayout::KMajor)? };
+        let head_input_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &head_input_t, NP, D, TmaLayout::KMajor)? };
+        let logits_tma = unsafe { create_bf16_pairs_tma_map(stream, &logits, VP, NP, TmaLayout::KMajor)? };
+        let dlogits_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &dlogits_t, NP, VP, TmaLayout::KMajor)? };
         Ok(Self {
             tokens: GpuTensor::zeros(stream)?,
             targets: GpuTensor::zeros(stream)?,
