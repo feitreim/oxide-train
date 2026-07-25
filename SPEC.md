@@ -648,6 +648,20 @@ Each gated on tests; correctness before speed at every step.
        `backward.attention.flash_q` 66.5 ms, `flash_kv` 78.7 ms over 12 blocks;
        full step 748.8 ms) could not capture the candidate side: the Modal
        workspace was disabled (spend limit) mid-run.
+     - ⏳ **7e16 stale `.maxntid` on the two warp-specialized forwards** (#47):
+       the HD=128 conversion halved `TILE` and so halved both block widths, but
+       the `#[launch_bounds]` literals kept their 128-row-era values — pipelined
+       declared 192 threads and launches 128, persistent declared 320 and
+       launches 192. `.maxntid` is what ptxas budgets registers against
+       (`65536 / maxntid` per thread), so the persistent forward was capped at
+       ~204 registers/thread instead of the 255 its 192-thread block allows —
+       and its softmax warpgroup keeps `out_acc[4][32]` (128 fp32) live across
+       the whole key stream. Both now match their block width, pinned by
+       `const _: () = assert!(FLASH_*_BLOCK == …)` beside the constants (the
+       attribute only takes integer literals). Occupancy is unaffected — TMEM
+       already pins the SM to one CTA — so this can only relax the budget.
+       **Unmeasured:** needs a Modal run to confirm parity is unchanged and to
+       read the register/spill counts and kernel-bench delta.
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on

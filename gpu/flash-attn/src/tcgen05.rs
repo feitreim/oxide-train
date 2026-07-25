@@ -108,6 +108,17 @@ const SUBTILE_BYTES: usize = TILE_BYTES / 2;
 /// lands in accumulator rows 64..128, never drained). The BACKWARD kernels
 /// (Design B, #47 item 2) instead PAIR two adjacent 64-row tiles into every
 /// M128 MMA — all 128 rows are real — so their plans carry no `PHANTOM_PAD`.
+///
+/// The natural `M64_N64` shape is NOT an option: its shared-memory A operand
+/// reads only 32 distinct rows. Measured with `transpose_b_probe` (`A[m,k]=m`,
+/// `B=1`), accumulator row `m` reads A-row `16*(m>>5) + (m&15)` — rows `m` and
+/// `m+16` alias and A-rows 32..63 are never read at all, i.e. the read drops
+/// datapath-lane bits [5:4]. It is a property of the `M64` SS-operand→datapath
+/// mapping, not of the descriptor: sweeping the A stride-byte-offset
+/// (512/1024/2048) moves *which* 32 rows are read and never reaches 64. The
+/// forward pairing that would recover the wasted half is correct but measured
+/// SLOWER (226 → 170 TFLOP/s) — it fuses the two query tiles into one
+/// warpgroup and so destroys the persistent kernel's ping-pong.
 const PHANTOM_PAD: usize = TILE_BYTES;
 /// Dynamic shared plan of the synchronous kernel: Q, K, V panels plus the
 /// single P subtile.
@@ -125,6 +136,13 @@ pub const FLASH_PIPELINE_SMEM: usize = (1 + 2 * PIPELINE_STAGES) * TILE_BYTES + 
 /// Threads of the pipelined kernel: the softmax/correction/epilogue
 /// warpgroup plus the TMA-load warp and the MMA-issue warp.
 pub const FLASH_PIPELINE_BLOCK: usize = TILE + 64;
+/// `#[launch_bounds]` only accepts integer literals, so the kernel's
+/// `.maxntid` is spelled out; keep it equal to the block width. Declaring more
+/// threads than are launched makes ptxas budget registers for a block that
+/// never exists (`65536 / maxntid` per thread), which is how the HD=128
+/// conversion's stale 128-row-era values silently squeezed the register-hungry
+/// softmax warpgroup.
+const _: () = assert!(FLASH_PIPELINE_BLOCK == 128);
 
 /// Dynamic shared plan of the PAIRED query-parallel backward (kernel A, Design
 /// B): the resident stacked `[Q_A;Q_B]` and `[dY_A;dY_B]` operands
@@ -155,6 +173,8 @@ pub const FLASH_PERSISTENT_SMEM: usize =
 /// Threads of the persistent kernel: two softmax warpgroups plus the
 /// TMA-load warp and the MMA-issue warp.
 pub const FLASH_PERSISTENT_BLOCK: usize = 2 * TILE + 64;
+/// Mirrors the `FLASH_PIPELINE_BLOCK` `.maxntid` note.
+const _: () = assert!(FLASH_PERSISTENT_BLOCK == 192);
 
 /// Finite stand-in for "masked" in the base-2 score domain; far enough below
 /// any real score that `exp2` flushes it to a subnormal-scale value while the
@@ -1166,9 +1186,16 @@ pub mod kernels {
     /// stacked subtiles, K=128) through the real `score_mma` walk and the
     /// `M128`-over-64-row accumulator, then drains rows 0..63 through the
     /// decoded (row, column) fragment map. A failure here isolates the
-    /// operand descriptor / fragment map from the softmax and epilogue — it is
-    /// what caught the `M64`-shape A/B K-mispairing that this conversion
-    /// works around with the `M128` shape.
+    /// operand descriptor / fragment map from the softmax and epilogue.
+    ///
+    /// It is also the harness that settled why `M64_N64` is unusable (see
+    /// `PHANTOM_PAD`): seed A and B host-side with structured encodings and
+    /// solve the raw dump offline. `A[m,k]=m, B=1` reads back the A-row each
+    /// accumulator row actually consumed — the M-broadcast probe; `A[m,k]=k`
+    /// against one-hot `B` reads back the K-index pairing (identity, so there
+    /// is no K-permutation); `A=1, B[n,k]=2^(k/16)` reads back the per-chunk
+    /// histogram. Only dense random `A·B` fails, because every other encoding
+    /// is invariant under the row aliasing.
     #[kernel]
     pub unsafe fn transpose_b_probe(
         a_tma: *const TmaDescriptor,
@@ -1263,7 +1290,7 @@ pub mod kernels {
     }
 
     /// Synchronous tcgen05 causal attention forward. Launch with
-    /// `host::flash_forward_config`: grid `(T/128, H, B)`, 128 threads,
+    /// `host::flash_forward_config`: grid `(T/64, H, B)`, 64 threads,
     /// `FLASH_DYNAMIC_SMEM` dynamic shared bytes (opted in by the loader).
     /// `correction_counts` gets one word per CTA (`plane * tiles +
     /// query_tile`): how many mid-stream O-segment corrections the key
@@ -1978,7 +2005,7 @@ pub mod kernels {
     }
 
     /// Warp-specialized pipelined causal forward (issue #35, phase 2).
-    /// Launch with `host::flash_pipelined_config`: grid `(T/128, H, B)`,
+    /// Launch with `host::flash_pipelined_config`: grid `(T/64, H, B)`,
     /// `FLASH_PIPELINE_BLOCK` threads, `host::FLASH_PIPELINE_SMEM_BYTES`
     /// dynamic shared bytes (opted in by the loader). Same operand and
     /// output contract as `flash_forward_tcgen05`.
@@ -2010,7 +2037,7 @@ pub mod kernels {
     /// producer's next completion transitively requires the previous
     /// consumer wait.
     #[kernel]
-    #[launch_bounds(192, 1)]
+    #[launch_bounds(128, 1)]
     pub unsafe fn flash_forward_pipelined(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -2554,7 +2581,7 @@ pub mod kernels {
     /// two consumer streams normally, one when the last odd pair leaves
     /// stream B inactive.
     #[kernel]
-    #[launch_bounds(320, 1)]
+    #[launch_bounds(192, 1)]
     pub unsafe fn flash_forward_persistent(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
