@@ -5,8 +5,7 @@
 use bench_util::uniform_vec;
 use cuda_core::{CudaContext, DeviceBuffer};
 use gemm::{
-    Tcgen05Gemm, TmaLayout, create_bf16_tma_map, fp32, fp32_launch_config,
-    tcgen05_launch_config,
+    Tcgen05Gemm, TmaLayout, create_bf16_tma_map, fp32, fp32_launch_config, tcgen05_launch_config,
 };
 use half::bf16;
 

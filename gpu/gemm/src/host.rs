@@ -513,6 +513,41 @@ impl Tcgen05Gemm {
         }
     }
 
+    /// Packed-bf16 weight-gradient form: `C += Aᵀ·B` with both operands read
+    /// MN-major from their native `[K, M]` / `[K, N]` panels (#53). This is the
+    /// lm-head's gradient, whose operands are already bf16.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Tcgen05Gemm::f32_accumulate_transposed_at`], with a
+    /// packed-pair output of `m * n / 2` words.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn accumulate_transposed(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<u32>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            launch_tcgen05(
+                &self.optimized,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                n,
+                k,
+                1,
+                TmaLayout::MnMajor,
+            )
+        }
+    }
+
     /// Weight-gradient form: `C += Aᵀ·B` with both operands read MN-major
     /// straight out of their native row-major `[K, M]` and `[K, N]` panels,
     /// via the descriptor's `transpose_a`/`transpose_b` bits (#53). Nothing is

@@ -537,12 +537,7 @@ fn instruction(a: &Layout, b: &Layout, m: usize) -> u32 {
 
 /// Compare the drained rows and, on failure, print the readout the encoding
 /// was designed to expose.
-fn check(
-    encoding: Encoding,
-    rows: usize,
-    actual: &[f32],
-    expected: &[f32],
-) -> Result<f32, String> {
+fn check(encoding: Encoding, rows: usize, actual: &[f32], expected: &[f32]) -> Result<f32, String> {
     let (atol, rtol) = encoding.tolerance();
     let mut max_abs = 0.0f32;
     let mut failures = Vec::new();
@@ -669,9 +664,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let control = index_of("a_k_major", "b_k_major");
     if !passed(control) {
-        return Err("control case (both operands K-major) failed: the probe harness, \
+        return Err(
+            "control case (both operands K-major) failed: the probe harness, \
                     not the transpose bits, is wrong"
-            .into());
+                .into(),
+        );
     }
     println!("\n✓ control: K-major x K-major matches the oracle on every encoding");
 
@@ -698,13 +695,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!(
                 "\n✓ weight-gradient geometry: A layout `{}` (M{rows}) with an MN-major B\n  \
                  A: LBO {} SBO {} swizzle {} , {} TMA tile(s) of {} bytes, {} bytes per K=16 chunk",
-                a.name, a.leading_bytes, a.stride_bytes, a.swizzle, a.tiles, a.tile_bytes,
+                a.name,
+                a.leading_bytes,
+                a.stride_bytes,
+                a.swizzle,
+                a.tiles,
+                a.tile_bytes,
                 a.chunk_step
             );
             Ok(())
         }
-        None => Err("no transposed-A geometry reproduced the oracle; see the table above \
+        None => Err(
+            "no transposed-A geometry reproduced the oracle; see the table above \
                      for which axis each candidate got wrong"
-            .into()),
+                .into(),
+        ),
     }
 }
