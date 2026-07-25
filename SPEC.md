@@ -17,7 +17,8 @@ bindings.
 
 ## 2. Toolchain & dev environment
 
-- **cuda-oxide** (pinned `v0.2.1`, upstream stock backend) compiles `#[kernel]`
+- **cuda-oxide** (pinned upstream revision
+  `b099f64c1a32869b74be99f4f88242fb68655b51`) compiles `#[kernel]`
   Rust to PTX through a real rustc codegen backend. Kernels monomorphize like
   host Rust — const generics included — which is what makes the static-shape
   design (§3) real.
@@ -826,3 +827,4 @@ Each gated on tests; correctness before speed at every step.
 | 20 | Block tcgen05 keeps fp32 model tensors | Quantize operands into persistent scratch and use concrete fp32-output store/accumulate epilogues; buffers, optimizer/checkpoint layout, and the naive fp32 fallback stay fp32, though epilogue values are bf16-rounded (the drain reuses the packed-bf16 shared-memory staging, so each GEMM result carries bf16 mantissa precision after full-K fp32 accumulation — doubling SMEM_OUT for true fp32 staging wasn't warranted) |
 | 21 | MoE aux-loss coefficient is runtime config, not const | Const generics are reserved for values the compiler specializes on — `E`/`K`/`C` size buffers, bins, and launch grids; the coefficient is one scalar FMA that shapes nothing, needs a step schedule, and must be sweepable without a Modal rebuild (stable Rust also forbids f32 const generics). It flows host→kernel per step like `learning_rate` and is recorded in the checkpoint header like `AdamWConfig` |
 | 22 | MoE router is fp32 over bf16 experts | Routing is discrete: bf16 rounding near a top-k boundary doesn't perturb the output, it reassigns the token (the 7e7 bf16 two-logit tie showed how violently trajectories react to that). The router GEMM is `[N,D]×[D,E]` — skinny, off the tcgen05 tile contract, and a rounding-error share of step FLOPs — so fp32 costs nothing measurable while keeping gate weights and the aux loss in the precision gradcheck trusts |
+| 23 | Pin cuda-oxide to immutable upstream revisions | The tcgen05 generated-intrinsics API evolves between releases; one SHA keeps the codegen backend, proc macros, device crates, lockfiles, and Modal image reproducible and unlocks `tcgen05.st` without carrying a fork |

@@ -71,19 +71,24 @@ fn check_bf16_pairs(
 
     // fill_u32 overwrites stale packed contents in place.
     let mut filled = DeviceBuffer::<u32>::from_host(stream, &vec![u32::MAX; 96])?;
-    module.fill_u32(stream, LaunchConfig::for_num_elems(96), 0, &mut filled)?;
+    // SAFETY: the launch covers exactly the 96 allocated words.
+    unsafe { module.fill_u32(stream, LaunchConfig::for_num_elems(96), 0, &mut filled) }?;
     assert!(filled.to_host_vec(stream)?.iter().all(|&word| word == 0));
 
     // f32 -> packed pairs matches host round-to-nearest-even bit-for-bit and
     // leaves padding words beyond the input untouched.
     let device_source = DeviceBuffer::from_host(stream, source.as_slice())?;
     let mut packed = DeviceBuffer::<u32>::zeroed(stream, ROWS * COLS / 2 + 64)?;
-    module.convert_f32_to_bf16_pairs(
-        stream,
-        LaunchConfig::for_num_elems((ROWS * COLS / 2) as u32),
-        &device_source,
-        &mut packed,
-    )?;
+    // SAFETY: source has two f32 values per launched pair and packed is larger
+    // than the launched output range.
+    unsafe {
+        module.convert_f32_to_bf16_pairs(
+            stream,
+            LaunchConfig::for_num_elems((ROWS * COLS / 2) as u32),
+            &device_source,
+            &mut packed,
+        )
+    }?;
     let packed_host = packed.to_host_vec(stream)?;
     assert_eq!(
         &packed_host[..ROWS * COLS / 2],
@@ -93,12 +98,16 @@ fn check_bf16_pairs(
 
     // packed pairs -> f32 round-trips the rounded values exactly.
     let mut widened = DeviceBuffer::<f32>::zeroed(stream, ROWS * COLS)?;
-    module.convert_bf16_pairs_to_f32(
-        stream,
-        LaunchConfig::for_num_elems((ROWS * COLS) as u32),
-        &packed,
-        &mut widened,
-    )?;
+    // SAFETY: packed contains one word per two output values, and widened has
+    // exactly ROWS * COLS elements.
+    unsafe {
+        module.convert_bf16_pairs_to_f32(
+            stream,
+            LaunchConfig::for_num_elems((ROWS * COLS) as u32),
+            &packed,
+            &mut widened,
+        )
+    }?;
     assert_close(
         "convert_bf16_pairs_to_f32",
         &widened.to_host_vec(stream)?,
@@ -180,22 +189,26 @@ fn check_adamw_master(
     let mut first = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
     let mut second = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
     let mut compute = DeviceBuffer::<u32>::zeroed(stream, LEN / 2)?;
-    module.adamw_master_bf16(
-        stream,
-        LaunchConfig::for_num_elems((LEN / 2) as u32),
-        &device_gradient,
-        learning_rate,
-        beta1,
-        beta2,
-        epsilon,
-        weight_decay,
-        first_correction,
-        second_correction,
-        &mut master,
-        &mut first,
-        &mut second,
-        &mut compute,
-    )?;
+    // SAFETY: every f32 state buffer has LEN elements and each packed buffer
+    // has LEN / 2 words, exactly matching the launched pair count.
+    unsafe {
+        module.adamw_master_bf16(
+            stream,
+            LaunchConfig::for_num_elems((LEN / 2) as u32),
+            &device_gradient,
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+            first_correction,
+            second_correction,
+            &mut master,
+            &mut first,
+            &mut second,
+            &mut compute,
+        )
+    }?;
 
     // Reference update on the exact bf16-rounded gradients the kernel saw.
     let rounded = unpack_bf16(&gradient_packed);

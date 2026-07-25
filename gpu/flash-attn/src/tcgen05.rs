@@ -74,12 +74,12 @@ use cuda_device::barrier::{
 use cuda_device::shared::{DynamicSharedArray, SharedArray};
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    cvt_f32x2_bf16x2, stmatrix_m8n8_x2, tcgen05_alloc, tcgen05_commit_shared_cluster,
+    cvt_f32x2_bf16x2, tcgen05_alloc, tcgen05_commit_shared_cluster,
     tcgen05_dealloc, tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync,
     tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16,
 };
 use cuda_device::tma::{TmaDescriptor, cp_async_bulk_tensor_3d_g2s};
-use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
+use cuda_device::{cuda_module, kernel, launch_bounds, ptx_asm, thread, warp};
 
 // Tile contract; `host.rs` mirrors these as FLASH_TILE / FLASH_HD (kept
 // non-pub here so SWEEP's one-definition rule never sees two copies).
@@ -172,6 +172,21 @@ pub mod kernels {
     /// `log2(e)`, converting the saved natural-log LSE into the base-2 domain
     /// the recomputed probabilities live in.
     const LOG2E: f32 = 1.442_695_04;
+
+    /// Stores two packed b16 matrix fragments without routing through the
+    /// unresolved LLVM stmatrix declaration emitted by cuda-oxide b099f64.
+    #[inline(always)]
+    unsafe fn stmatrix_m8n8_x2(smem_ptr: *mut u8, r0: u32, r1: u32) {
+        unsafe {
+            ptx_asm!(
+                "{ .reg .u64 smem; cvta.to.shared.u64 smem, %0; stmatrix.sync.aligned.m8n8.x2.shared.b16 [smem], {%1, %2}; }",
+                in("l") smem_ptr as u64,
+                in("r") r0,
+                in("r") r1,
+                clobber("memory"),
+            );
+        }
+    }
 
     /// Same encoding as gemm's operand descriptors: SWIZZLE_128B tiles with a
     /// 16-byte leading offset and 1024-byte stride.

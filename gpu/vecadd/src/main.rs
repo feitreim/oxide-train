@@ -24,15 +24,18 @@ fn main() {
             .expect("load vecadd.ptx"),
     )
     .expect("wrap loaded module");
-    module
-        .vecadd(
+    // SAFETY: all three buffers contain N elements, and the launch covers
+    // exactly indices 0..N, matching the kernel's unchecked input indexing.
+    unsafe {
+        module.vecadd(
             &stream,
             LaunchConfig::for_num_elems(N as u32),
             &a,
             &b,
             &mut c,
         )
-        .expect("kernel launch");
+    }
+    .expect("kernel launch");
 
     let c_host = c.to_host_vec(&stream).unwrap();
 

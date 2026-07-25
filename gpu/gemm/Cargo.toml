@@ -9,9 +9,9 @@ default-run = "gemm"
 [workspace]
 
 [dependencies]
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
 bench-util = { path = "../bench-util" }
 half = "2.4"
 

@@ -930,13 +930,16 @@ impl<S: Shape> GpuTensor<f32, S> {
         module: &kernels::LoadedModule,
     ) -> Result<Self, DriverError> {
         let mut out = Self::zeros(stream)?;
-        module.add(
-            stream,
-            elementwise_config::<S>(),
-            &self.data,
-            &rhs.data,
-            &mut out.data,
-        )?;
+        // SAFETY: typed tensors guarantee equally sized input/output buffers.
+        unsafe {
+            module.add(
+                stream,
+                elementwise_config::<S>(),
+                &self.data,
+                &rhs.data,
+                &mut out.data,
+            )
+        }?;
         Ok(out)
     }
 
@@ -947,13 +950,16 @@ impl<S: Shape> GpuTensor<f32, S> {
         module: &kernels::LoadedModule,
     ) -> Result<Self, DriverError> {
         let mut out = Self::zeros(stream)?;
-        module.mul(
-            stream,
-            elementwise_config::<S>(),
-            &self.data,
-            &rhs.data,
-            &mut out.data,
-        )?;
+        // SAFETY: typed tensors guarantee equally sized input/output buffers.
+        unsafe {
+            module.mul(
+                stream,
+                elementwise_config::<S>(),
+                &self.data,
+                &rhs.data,
+                &mut out.data,
+            )
+        }?;
         Ok(out)
     }
 
@@ -964,13 +970,16 @@ impl<S: Shape> GpuTensor<f32, S> {
         module: &kernels::LoadedModule,
     ) -> Result<Self, DriverError> {
         let mut out = Self::zeros(stream)?;
-        module.scale(
-            stream,
-            elementwise_config::<S>(),
-            &self.data,
-            factor,
-            &mut out.data,
-        )?;
+        // SAFETY: typed tensors guarantee equally sized input/output buffers.
+        unsafe {
+            module.scale(
+                stream,
+                elementwise_config::<S>(),
+                &self.data,
+                factor,
+                &mut out.data,
+            )
+        }?;
         Ok(out)
     }
 
@@ -981,13 +990,16 @@ impl<S: Shape> GpuTensor<f32, S> {
         stream: &CudaStream,
         module: &kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        module.add_scaled(
-            stream,
-            elementwise_config::<S>(),
-            &rhs.data,
-            factor,
-            &mut self.data,
-        )
+        // SAFETY: typed tensors guarantee equally sized input/output buffers.
+        unsafe {
+            module.add_scaled(
+                stream,
+                elementwise_config::<S>(),
+                &rhs.data,
+                factor,
+                &mut self.data,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1005,21 +1017,24 @@ impl<S: Shape> GpuTensor<f32, S> {
         stream: &CudaStream,
         module: &kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        module.adamw(
-            stream,
-            elementwise_config::<S>(),
-            gradient.as_device_buffer(),
-            learning_rate,
-            beta1,
-            beta2,
-            epsilon,
-            weight_decay,
-            first_correction,
-            second_correction,
-            self.as_device_buffer_mut(),
-            moments.first.as_device_buffer_mut(),
-            moments.second.as_device_buffer_mut(),
-        )
+        // SAFETY: the parameter, gradient, and both moment tensors share S.
+        unsafe {
+            module.adamw(
+                stream,
+                elementwise_config::<S>(),
+                gradient.as_device_buffer(),
+                learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+                weight_decay,
+                first_correction,
+                second_correction,
+                self.as_device_buffer_mut(),
+                moments.first.as_device_buffer_mut(),
+                moments.second.as_device_buffer_mut(),
+            )
+        }
     }
 
     pub fn sum(
@@ -1029,13 +1044,16 @@ impl<S: Shape> GpuTensor<f32, S> {
     ) -> Result<GpuTensor<f32, Rank1<1>>, DriverError> {
         assert!(S::NUM_ELEMENTS <= u32::MAX as usize);
         let mut out = GpuTensor::zeros(stream)?;
-        module.sum(
-            stream,
-            reduction_config(),
-            &self.data,
-            S::NUM_ELEMENTS as u32,
-            &mut out.data,
-        )?;
+        // SAFETY: n is the input length and out has one accumulator element.
+        unsafe {
+            module.sum(
+                stream,
+                reduction_config(),
+                &self.data,
+                S::NUM_ELEMENTS as u32,
+                &mut out.data,
+            )
+        }?;
         Ok(out)
     }
 
@@ -1047,14 +1065,17 @@ impl<S: Shape> GpuTensor<f32, S> {
     ) -> Result<GpuTensor<f32, Rank1<1>>, DriverError> {
         assert!(S::NUM_ELEMENTS <= u32::MAX as usize);
         let mut out = GpuTensor::zeros(stream)?;
-        module.dot(
-            stream,
-            reduction_config(),
-            &self.data,
-            &rhs.data,
-            S::NUM_ELEMENTS as u32,
-            &mut out.data,
-        )?;
+        // SAFETY: both typed inputs have n elements; out has one accumulator.
+        unsafe {
+            module.dot(
+                stream,
+                reduction_config(),
+                &self.data,
+                &rhs.data,
+                S::NUM_ELEMENTS as u32,
+                &mut out.data,
+            )
+        }?;
         Ok(out)
     }
 }
@@ -1068,16 +1089,19 @@ impl<const M: usize, const K: usize> GpuTensor<f32, Rank2<M, K>> {
     ) -> Result<GpuTensor<f32, Rank2<M, N>>, DriverError> {
         assert!(K <= u32::MAX as usize);
         let mut out = GpuTensor::zeros(stream)?;
-        module.gemm_naive(
-            stream,
-            gemm_config::<M, N>(),
-            M as u32,
-            N as u32,
-            K as u32,
-            &self.data,
-            &rhs.data,
-            &mut out.data,
-        )?;
+        // SAFETY: Rank2 types guarantee the MxK, KxN, and MxN buffer sizes.
+        unsafe {
+            module.gemm_naive(
+                stream,
+                gemm_config::<M, N>(),
+                M as u32,
+                N as u32,
+                K as u32,
+                &self.data,
+                &rhs.data,
+                &mut out.data,
+            )
+        }?;
         Ok(out)
     }
 
@@ -1090,16 +1114,19 @@ impl<const M: usize, const K: usize> GpuTensor<f32, Rank2<M, K>> {
     ) -> Result<GpuTensor<f32, Rank2<M, N>>, DriverError> {
         assert!(K <= u32::MAX as usize);
         let mut out = GpuTensor::zeros(stream)?;
-        module.gemm_tiled(
-            stream,
-            gemm_config::<M, N>(),
-            M as u32,
-            N as u32,
-            K as u32,
-            &self.data,
-            &rhs.data,
-            &mut out.data,
-        )?;
+        // SAFETY: Rank2 types guarantee the MxK, KxN, and MxN buffer sizes.
+        unsafe {
+            module.gemm_tiled(
+                stream,
+                gemm_config::<M, N>(),
+                M as u32,
+                N as u32,
+                K as u32,
+                &self.data,
+                &rhs.data,
+                &mut out.data,
+            )
+        }?;
         Ok(out)
     }
 
@@ -1111,16 +1138,19 @@ impl<const M: usize, const K: usize> GpuTensor<f32, Rank2<M, K>> {
     ) -> Result<GpuTensor<f32, Rank2<K, N>>, DriverError> {
         assert!(M <= u32::MAX as usize);
         let mut out = GpuTensor::zeros(stream)?;
-        module.gemm_tn(
-            stream,
-            gemm_config::<K, N>(),
-            M as u32,
-            N as u32,
-            K as u32,
-            &self.data,
-            &rhs.data,
-            &mut out.data,
-        )?;
+        // SAFETY: Rank2 types guarantee the MxK, MxN, and KxN buffer sizes.
+        unsafe {
+            module.gemm_tn(
+                stream,
+                gemm_config::<K, N>(),
+                M as u32,
+                N as u32,
+                K as u32,
+                &self.data,
+                &rhs.data,
+                &mut out.data,
+            )
+        }?;
         Ok(out)
     }
 
@@ -1132,16 +1162,19 @@ impl<const M: usize, const K: usize> GpuTensor<f32, Rank2<M, K>> {
     ) -> Result<GpuTensor<f32, Rank2<M, N>>, DriverError> {
         assert!(K <= u32::MAX as usize);
         let mut out = GpuTensor::zeros(stream)?;
-        module.gemm_nt(
-            stream,
-            gemm_config::<M, N>(),
-            M as u32,
-            N as u32,
-            K as u32,
-            &self.data,
-            &rhs.data,
-            &mut out.data,
-        )?;
+        // SAFETY: Rank2 types guarantee the MxK, NxK, and MxN buffer sizes.
+        unsafe {
+            module.gemm_nt(
+                stream,
+                gemm_config::<M, N>(),
+                M as u32,
+                N as u32,
+                K as u32,
+                &self.data,
+                &rhs.data,
+                &mut out.data,
+            )
+        }?;
         Ok(out)
     }
 }

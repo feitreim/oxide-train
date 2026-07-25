@@ -106,8 +106,14 @@ pub mod kernels {
         let index = thread::index_1d();
         let i = index.get();
         let d = dim as usize;
+        if d == 0 || i >= x.len() || i >= y.len() || d > weight.len() {
+            return;
+        }
         let row = i / d;
         let base = row * d;
+        if base + d > x.len() {
+            return;
+        }
         let mut sum_sq = 0.0f32;
         for col in 0..d {
             let value = x[base + col];
@@ -132,8 +138,19 @@ pub mod kernels {
         let index = thread::index_1d();
         let i = index.get();
         let d = dim as usize;
+        if d == 0
+            || i >= x.len()
+            || i >= dy.len()
+            || i >= dx.len()
+            || d > weight.len()
+        {
+            return;
+        }
         let row = i / d;
         let base = row * d;
+        if base + d > x.len() || base + d > dy.len() {
+            return;
+        }
         let mut sum_sq = 0.0f32;
         let mut dot = 0.0f32;
         for col in 0..d {
@@ -628,8 +645,14 @@ pub mod kernels {
         let index = thread::index_1d();
         let i = index.get();
         let c = classes as usize;
+        if c == 0 || i >= logits.len() || i >= probabilities.len() {
+            return;
+        }
         let row = i / c;
         let base = row * c;
+        if base + c > logits.len() {
+            return;
+        }
         let mut max = f32::NEG_INFINITY;
         for col in 0..c {
             max = max.max(logits[base + col]);
