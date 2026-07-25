@@ -812,6 +812,38 @@ Each gated on tests; correctness before speed at every step.
      43.78 → 18.52 ms, full step 748.0 → 719.9 ms (−3.8%). Input-backward
      and weight-grad remain L2-weight-bandwidth bound (a full skinny-GEMM
      weight-reuse pass without the block overhead is the next lever).
+   - ✅ **Router backward weight-reuse pass** (#54, phase 2 of #44): both
+     remaining router matmuls were re-tiled so each operand byte feeds a
+     register tile instead of being re-read from L2.
+     `backward.router.input` now owns a `[64 token, 1024 column]` tile per
+     CTA: each lane keeps the `[E]` weight rows of its four columns in
+     registers for the whole 64-token sweep, so the `[D,E]` weight is read
+     `N/64` times instead of once per token (2.36 GB → 74 MB of weight
+     traffic per layer) while the lane-major columns keep the write-bound
+     `dx` store a full coalesced sector. Registers rather than shared
+     memory hold the staged weight: a lane's columns are private to it, so
+     a shared tile would be the same values plus an `LDS` in the inner
+     loop. `backward.router.weight` becomes an explicit split-K pair:
+     `router_backward_weight_split` gives each CTA `ROUTER_WGRAD_BM=1024`
+     model rows of one of `ROUTER_WGRAD_SPLITS=256` contiguous token
+     partitions (`D·E` outputs alone cannot fill 148 SMs), each lane
+     holding `[E]` accumulators per owned row so one coalesced `x` load
+     feeds `E` FMAs against a warp-uniform gate row, and
+     `router_backward_weight_merge` sums the partitions. The reduction
+     order changes from the old lane-interleaved one to plain ascending
+     token order (a lane sums its partition alone, partitions merge in
+     ascending order): still fixed, atomic-free, and independent of block
+     scheduling, and the ops parity binary now asserts the gradient is
+     bit-identical across launches. The 25 MB `[SPLITS,E,D]` partials
+     buffer is one backward-only workspace temporary shared by all blocks.
+     B200 same-container A/B vs main (2 reps each, spread <1%):
+     `backward.router.input` 6.63 → 1.10 ms (6.02×),
+     `backward.router.weight` 8.01 → 1.79 + 0.29 ms merge = 2.09 ms
+     (3.83×); the two combined 14.64 → 3.19 ms (4.59×), full step
+     617.9 → 605.7 ms (−2.0%). Both now sit ~2–4× off their pure-HBM
+     floors (0.64 and 0.56 ms for 12 layers); the remaining gap is
+     bytes-in-flight per SM, so float4-vectorized `x`/`dx` rows are the
+     next lever, as they are for the scatter path in #55.
    - ✅ **Combined stack** (#43+#44+#45, merged as #49/#50/#52): single
      B200 §10.1 profile at the canonical config after all three merges:
      **full step 618.1 ms** (from the 748–751 ms pre-stack baselines,
@@ -822,8 +854,8 @@ Each gated on tests; correctness before speed at every step.
      `flash_dot`) is 130.8 ms (21.2%), expert GEMMs + staging 216.5 ms
      (35.0%), and no single non-GEMM kernel exceeds 2.1%. Remaining
      levers tracked in #47 (M128-pairing model-shape A/B), #53
-     (descriptor-transpose TN weight grads), #54 (router weight-reuse),
-     #55 (float4 scatter + `zero_dy_bins` fold).
+     (descriptor-transpose TN weight grads), #54 (router weight-reuse,
+     since landed), #55 (float4 scatter + `zero_dy_bins` fold).
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 

@@ -14,11 +14,10 @@ use tensor_cpu::CpuTensor;
 #[path = "lib.rs"]
 mod device;
 use device::{
-    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS,
-    NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN,
-    ROUTER_GEMM_THREADS, ROUTER_INPUT_THREADS, ROUTER_WEIGHT_EXPERTS, ROUTER_WEIGHT_ROWS,
-    ROUTER_WEIGHT_THREADS,
-    kernels,
+    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS, NORM_THREADS,
+    NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN, ROUTER_GEMM_THREADS,
+    ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM,
+    ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, kernels,
 };
 use tensor_core::bf16;
 
@@ -415,6 +414,8 @@ fn check_moe_routing(
     let mut dlogits_dev = DeviceBuffer::<f32>::zeroed(stream, N * E)?;
     let mut router_dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let mut router_dweight_dev = DeviceBuffer::<f32>::zeroed(stream, D * E)?;
+    let mut router_dweight_partials_dev =
+        DeviceBuffer::<f32>::zeroed(stream, ROUTER_WGRAD_SPLITS * E * D)?;
     let mut serial_router_dweight_dev = DeviceBuffer::<f32>::zeroed(stream, D * E)?;
     unsafe {
         module.router_backward(
@@ -436,7 +437,11 @@ fn check_moe_routing(
         module.router_backward_input(
             stream,
             LaunchConfig {
-                grid_dim: (N as u32, 1, 1),
+                grid_dim: (
+                    D.div_ceil(ROUTER_INPUT_BN) as u32,
+                    N.div_ceil(ROUTER_INPUT_TOKENS) as u32,
+                    1,
+                ),
                 block_dim: (ROUTER_INPUT_THREADS as u32, 1, 1),
                 shared_mem_bytes: 0,
             },
@@ -456,30 +461,75 @@ fn check_moe_routing(
         &mut serial_router_dweight_dev,
     )?;
     unsafe {
-        module.router_backward_weight_tiled(
+        module.router_backward_weight_split(
             stream,
             LaunchConfig {
                 grid_dim: (
-                    D.div_ceil(ROUTER_WEIGHT_ROWS) as u32,
-                    E.div_ceil(ROUTER_WEIGHT_EXPERTS) as u32,
+                    D.div_ceil(ROUTER_WGRAD_BM) as u32,
+                    ROUTER_WGRAD_SPLITS as u32,
                     1,
                 ),
-                block_dim: (ROUTER_WEIGHT_THREADS as u32, 1, 1),
+                block_dim: (ROUTER_WGRAD_THREADS as u32, 1, 1),
                 shared_mem_bytes: 0,
             },
             &x_dev,
             &dlogits_dev,
             N as u32,
             E as u32,
+            D as u32,
+            &mut router_dweight_partials_dev,
+        )?;
+    }
+    unsafe {
+        module.router_backward_weight_merge(
+            stream,
+            LaunchConfig::for_num_elems((D * E) as u32),
+            &router_dweight_partials_dev,
+            E as u32,
             &mut router_dweight_dev,
         )?;
     }
     assert_close(
-        "tiled MoE router weight gradient vs serial GPU oracle",
+        "split MoE router weight gradient vs serial GPU oracle",
         &router_dweight_dev.to_host_vec(stream)?,
         &serial_router_dweight_dev.to_host_vec(stream)?,
         2e-6,
         2e-6,
+    );
+    // The split reduction owes its determinism to a fixed order, not to a
+    // fixed schedule: relaunching must reproduce the gradient bit for bit.
+    let mut repeat_dweight_dev = DeviceBuffer::<f32>::zeroed(stream, D * E)?;
+    unsafe {
+        module.router_backward_weight_split(
+            stream,
+            LaunchConfig {
+                grid_dim: (
+                    D.div_ceil(ROUTER_WGRAD_BM) as u32,
+                    ROUTER_WGRAD_SPLITS as u32,
+                    1,
+                ),
+                block_dim: (ROUTER_WGRAD_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &x_dev,
+            &dlogits_dev,
+            N as u32,
+            E as u32,
+            D as u32,
+            &mut router_dweight_partials_dev,
+        )?;
+        module.router_backward_weight_merge(
+            stream,
+            LaunchConfig::for_num_elems((D * E) as u32),
+            &router_dweight_partials_dev,
+            E as u32,
+            &mut repeat_dweight_dev,
+        )?;
+    }
+    assert_eq!(
+        repeat_dweight_dev.to_host_vec(stream)?,
+        router_dweight_dev.to_host_vec(stream)?,
+        "split MoE router weight gradient must be bit-identical across launches"
     );
     cpu.backward(cpu_ctx, dy);
     assert_close(
