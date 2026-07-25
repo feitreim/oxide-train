@@ -757,10 +757,31 @@ Each gated on tests; correctness before speed at every step.
      disjoint per surviving slot). Parity held with forced drops and underfull
      experts on both expert paths. B200 same-container A/B vs main at the §13.9
      shape (B=12 T=2048): `backward.router.scatter_dy` 30.77 → 3.66 ms (8.4×,
-     4.11% → 0.51% of step); full step 748.81 → 721.19 ms (-3.7%). Follow-ups:
-     float4-vectorize the row for the sub-1 ms floor, and fold the preceding
-     `backward.router.zero_dy_bins` (3.74 ms `E·C·D` fill) into a dead-slot
-     zeroing pass using the routing `assignment_counts`.
+     4.11% → 0.51% of step); full step 748.81 → 721.19 ms (-3.7%). Follow-ups
+     landed in #55.
+   - ✅ **`moe_scatter_dy` vectorized rows + dead-slot zeroing** (#55): the two
+     levers #45 left open. (1) Row copies are 16-byte vectorized — `dim`
+     divisible by four makes every row base `row * dim` 16-byte aligned, so a
+     lane moves a quad per step instead of one `f32`. The quad is carried as a
+     `u128`, not an `align(16)` `[f32; 4]` newtype: PTX inspection showed the
+     codegen scalarizes aggregate *loads* back into four `ld.global.b32` (only
+     the store vectorized), while a `u128` survives as one `ld.global.v2.b64`.
+     Both hot loops now emit only vector accesses. (2) `backward.router
+     .zero_dy_bins`, a full `E·C·D` pre-fill, is gone: capacity assignment
+     hands expert `e` slots `0..min(count[e], C)` and the scatter overwrites
+     exactly those, so `moe_zero_dead_bins` clears only the dead tail
+     `min(count[e], C)..C`, one block per `(expert, slot)`, driven by the
+     routing `assignment_counts`. The two passes partition the buffer. The bin
+     gradients stay bit-identical; the gate dot's summation order changes (as
+     it already did in #45), so `gate_gradients` is deterministic but not
+     bit-identical. B200 same-container A/B vs main at the §13.9 shape (B=12
+     T=2048): `zero_dy_bins` 3.80 → `zero_dead_bins` 0.50 ms (7.6×),
+     `scatter_dy` 3.69 → 2.81 ms (1.31×); the pair 7.49 → 3.31 ms (2.27×,
+     1.20% → 0.54% of step). Full step 623.84 → 614.53 ms (−1.5%), though
+     step-level run-to-run spread (~8 ms across the two passes) is larger than
+     the 4.19 ms kernel delta, so the kernel numbers are the reliable signal.
+     Landed short of the 1–2 ms target: `scatter_dy` still reads two rows and
+     writes one per pair, so it is bound by that 3× traffic, not by issue rate.
    - ✅ **Router fp32 kernels re-tiled for D=3072** (#44): the three fp32
      router matmuls sat ~30× off HBM-bound at `D=3072` on launch geometry,
      not precision. `forward.router.logits` (eight threads per token, each
@@ -795,8 +816,9 @@ Each gated on tests; correctness before speed at every step.
      `flash_dot`) is 130.8 ms (21.2%), expert GEMMs + staging 216.5 ms
      (35.0%), and no single non-GEMM kernel exceeds 2.1%. Remaining
      levers tracked in #47 (M128-pairing model-shape A/B), #53
-     (descriptor-transpose TN weight grads), #54 (router weight-reuse),
-     #55 (float4 scatter + `zero_dy_bins` fold).
+     (descriptor-transpose TN weight grads), #54 (router weight-reuse).
+     #55 (vectorized scatter + `zero_dy_bins` fold) has since landed, taking
+     that pair from 7.49 to 3.31 ms.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 
