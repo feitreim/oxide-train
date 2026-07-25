@@ -396,7 +396,9 @@ def run_sanitizer(kernel: str, bin: str | None = None, tool: str = "memcheck") -
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
 def dump_ptx(kernel: str) -> str:
     proj = _proj(kernel)
-    _run(["cargo", "oxide", "build", kernel], cwd=proj)
+    # Same reason as run_sanitizer: without an explicit arch the build takes the
+    # legacy NVVM IR path, which rejects device atomics and tcgen05.
+    _run(["cargo", "oxide", "build", kernel, "--arch", "sm_100a"], cwd=proj)
     for root, _, files in __import__("os").walk(proj):
         for f in sorted(files):
             if f.endswith(".ptx"):
