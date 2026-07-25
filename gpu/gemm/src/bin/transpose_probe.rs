@@ -56,6 +56,16 @@
 //! All three structured encodings are exact in bf16 (integers ≤ 128) and in
 //! fp32 accumulation, so a mismatch is unambiguous rather than a tolerance
 //! judgement, and a failure prints the observed readout.
+//!
+//! # What it found
+//!
+//! `a_mn_split` wins on every encoding, alone and with a transposed B: under
+//! 128B swizzle the LBO of an MN-major operand *is* a subtile jump, so a
+//! transposed `M128` A stays fully swizzled as two stacked 64-wide subtiles.
+//! `a_mn_unswizzled` fails, and both `M64` cases fail identically, which puts
+//! SPEC 7e15's `M64` dead end on the shape rather than the operand layout.
+//! `optimized.rs`'s `transposed` path is that geometry; this binary stays as
+//! the isolated regression gate for it.
 
 use std::error::Error;
 use std::io::Write;
