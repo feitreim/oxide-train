@@ -13,7 +13,7 @@ pub use muon::{
 };
 
 use nn::{Dense, MoeDense};
-use tensor_core::{Rank1, Rank2, Shape, bf16};
+use tensor_core::{Rank1, Rank2, Shape, bf16, bf16_stochastic, rng};
 use tensor_cpu::CpuTensor;
 
 /// Hyperparameters for decoupled AdamW.
@@ -146,6 +146,84 @@ impl Default for AdamWConfig {
     }
 }
 
+/// How an fp32 update is committed into a bf16 master weight.
+///
+/// bf16 carries eight mantissa bits, so at learning-rate scale a single step's
+/// update is regularly smaller than half an ulp of the weight it lands on.
+/// Round-to-nearest drops those updates outright — the plateau
+/// `examples/overfit_probe.rs` reproduces — while stochastic rounding keeps
+/// them in expectation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MasterRounding {
+    /// Round to nearest even, the `bf16::from_f32` conversion.
+    Nearest,
+    /// Round up with probability equal to the discarded mantissa fraction,
+    /// drawn from a splitmix64 stream keyed on `(step, parameter id, element
+    /// index)`. Deterministic by construction: no runtime entropy, so reruns
+    /// and checkpoint resumes stay bit-identical.
+    Stochastic,
+}
+
+/// Storage dtype of the parameter an optimizer writes back into.
+///
+/// The GPU keeps bf16 masters for every matrix-shaped parameter (SPEC §7,
+/// decision #8 successor); norms, the router, and all optimizer moments stay
+/// fp32. The CPU reference keeps `f32` storage throughout but snaps a bf16
+/// master onto the bf16 grid after each update, so both sides walk the same
+/// grid and a parity comparison compares the same trajectory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MasterStorage {
+    Fp32,
+    Bf16 {
+        rounding: MasterRounding,
+        /// Keys the stochastic stream; ignored by [`MasterRounding::Nearest`].
+        parameter_id: u64,
+    },
+}
+
+impl MasterStorage {
+    /// Round one already-updated parameter value into its storage dtype.
+    pub(crate) fn commit(self, value: f32, step: u64, element: usize) -> f32 {
+        match self {
+            Self::Fp32 => value,
+            Self::Bf16 {
+                rounding: MasterRounding::Nearest,
+                ..
+            } => bf16::from_f32(value).to_f32(),
+            Self::Bf16 {
+                rounding: MasterRounding::Stochastic,
+                parameter_id,
+            } => {
+                let seed = rng::stream_seed(step, parameter_id);
+                bf16_stochastic(value, rng::stream_draw(seed, element as u64)).to_f32()
+            }
+        }
+    }
+}
+
+/// Snap every element of a parameter onto the bf16 grid.
+///
+/// Initialization runs in fp32 on both sides; the GPU rounds when it uploads
+/// the master, so the CPU reference has to round too or the two models start
+/// one rounding apart and parity measures that instead of the update.
+pub fn round_to_bf16_master<S: Shape>(parameter: &mut CpuTensor<f32, S>) {
+    for value in parameter.as_mut_slice() {
+        *value = bf16::from_f32(*value).to_f32();
+    }
+}
+
+/// Whether the GPU stores this parameter kind as a bf16 master.
+///
+/// Norms are `2·L+1` vectors of `D` with no memory leverage and high
+/// sensitivity; the router is fp32 end-to-end because rounding near a top-k
+/// boundary reassigns tokens rather than perturbing outputs (decision #22).
+pub fn kind_has_bf16_master(kind: ParameterKind) -> bool {
+    match kind {
+        ParameterKind::Embedding | ParameterKind::Matrix | ParameterKind::Head => true,
+        ParameterKind::Norm | ParameterKind::Router => false,
+    }
+}
+
 /// AdamW's first and second moments for one statically shaped parameter.
 pub struct AdamWMoments<S: Shape> {
     pub first: CpuTensor<f32, S>,
@@ -164,23 +242,26 @@ impl<S: Shape> AdamWMoments<S> {
 /// Apply one reference AdamW update.
 ///
 /// Weight decay is decoupled from the gradient moments:
-/// `p -= lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * p)`.
+/// `p -= lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * p)`. Moments are
+/// always fp32; `storage` decides only how the new parameter value is stored.
 pub fn adamw_step<S: Shape>(
     parameter: &mut CpuTensor<f32, S>,
     gradient: &CpuTensor<f32, S>,
     moments: &mut AdamWMoments<S>,
     config: AdamWConfig,
     step: u64,
+    storage: MasterStorage,
 ) {
     config.validate();
     let (first_correction, second_correction) = config.bias_correction(step);
 
-    for (((parameter, &gradient), first), second) in parameter
+    for (element, (((parameter, &gradient), first), second)) in parameter
         .as_mut_slice()
         .iter_mut()
         .zip(gradient.as_slice())
         .zip(moments.first.as_mut_slice())
         .zip(moments.second.as_mut_slice())
+        .enumerate()
     {
         *first = config.beta1 * *first + (1.0 - config.beta1) * gradient;
         *second = config.beta2 * *second + (1.0 - config.beta2) * gradient * gradient;
@@ -188,7 +269,7 @@ pub fn adamw_step<S: Shape>(
         let second_hat = *second * second_correction;
         let update =
             first_hat / (second_hat.sqrt() + config.epsilon) + config.weight_decay * *parameter;
-        *parameter -= config.learning_rate * update;
+        *parameter = storage.commit(*parameter - config.learning_rate * update, step, element);
     }
 }
 
@@ -332,8 +413,12 @@ impl<
 }
 
 /// AdamW state for the single-block reference Dense.
+///
+/// Mirrors the GPU's storage split: embeddings, hidden matrices, and the head
+/// are bf16 masters; norms stay fp32.
 pub struct DenseAdamW<const VOCAB: usize, const D: usize, const FF: usize> {
     config: AdamWConfig,
+    master_rounding: MasterRounding,
     step: u64,
     pub embedding: AdamWMoments<Rank2<VOCAB, D>>,
     pub attention_norm: AdamWMoments<Rank1<D>>,
@@ -351,9 +436,14 @@ pub struct DenseAdamW<const VOCAB: usize, const D: usize, const FF: usize> {
 
 impl<const VOCAB: usize, const D: usize, const FF: usize> DenseAdamW<VOCAB, D, FF> {
     pub fn new(config: AdamWConfig) -> Self {
+        Self::with_master_rounding(config, MasterRounding::Nearest)
+    }
+
+    pub fn with_master_rounding(config: AdamWConfig, master_rounding: MasterRounding) -> Self {
         config.validate();
         Self {
             config,
+            master_rounding,
             step: 0,
             embedding: AdamWMoments::zeros(),
             attention_norm: AdamWMoments::zeros(),
@@ -382,31 +472,44 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> DenseAdamW<VOCAB, D, F
         let step = self.step;
         let decay = self.config;
         let no_decay = self.config.without_weight_decay();
+        let rounding = self.master_rounding;
 
         macro_rules! update {
-            ($field:ident, $config:expr) => {
+            ($field:ident, $config:expr, $storage:expr) => {
                 adamw_step(
                     &mut model.$field.w,
                     &model.$field.dw,
                     &mut self.$field,
                     $config,
                     step,
+                    $storage,
                 );
             };
         }
+        // Parameter ids are the parameter's position in
+        // `visit_cpu_parameters` order: structural, so they survive a
+        // checkpoint round-trip and keep the noise stream reproducible.
+        macro_rules! master {
+            ($id:literal) => {
+                MasterStorage::Bf16 {
+                    rounding,
+                    parameter_id: $id,
+                }
+            };
+        }
 
-        update!(embedding, decay);
-        update!(attention_norm, no_decay);
-        update!(q_proj, decay);
-        update!(k_proj, decay);
-        update!(v_proj, decay);
-        update!(o_proj, decay);
-        update!(ffn_norm, no_decay);
-        update!(gate_proj, decay);
-        update!(up_proj, decay);
-        update!(down_proj, decay);
-        update!(final_norm, no_decay);
-        update!(lm_head, decay);
+        update!(embedding, decay, master!(0));
+        update!(attention_norm, no_decay, MasterStorage::Fp32);
+        update!(q_proj, decay, master!(2));
+        update!(k_proj, decay, master!(3));
+        update!(v_proj, decay, master!(4));
+        update!(o_proj, decay, master!(5));
+        update!(ffn_norm, no_decay, MasterStorage::Fp32);
+        update!(gate_proj, decay, master!(7));
+        update!(up_proj, decay, master!(8));
+        update!(down_proj, decay, master!(9));
+        update!(final_norm, no_decay, MasterStorage::Fp32);
+        update!(lm_head, decay, master!(11));
     }
 }
 
@@ -417,6 +520,7 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> DenseAdamW<VOCAB, D, F
 pub struct DenseMuon<const VOCAB: usize, const D: usize, const FF: usize> {
     muon_config: MuonConfig,
     adamw_config: AdamWConfig,
+    master_rounding: MasterRounding,
     step: u64,
     pub embedding: AdamWMoments<Rank2<VOCAB, D>>,
     pub attention_norm: AdamWMoments<Rank1<D>>,
@@ -434,11 +538,20 @@ pub struct DenseMuon<const VOCAB: usize, const D: usize, const FF: usize> {
 
 impl<const VOCAB: usize, const D: usize, const FF: usize> DenseMuon<VOCAB, D, FF> {
     pub fn new(muon_config: MuonConfig, adamw_config: AdamWConfig) -> Self {
+        Self::with_master_rounding(muon_config, adamw_config, MasterRounding::Nearest)
+    }
+
+    pub fn with_master_rounding(
+        muon_config: MuonConfig,
+        adamw_config: AdamWConfig,
+        master_rounding: MasterRounding,
+    ) -> Self {
         muon_config.validate();
         adamw_config.validate();
         Self {
             muon_config,
             adamw_config,
+            master_rounding,
             step: 0,
             embedding: AdamWMoments::zeros(),
             attention_norm: AdamWMoments::zeros(),
@@ -476,40 +589,53 @@ impl<const VOCAB: usize, const D: usize, const FF: usize> DenseMuon<VOCAB, D, FF
         let decay = self.adamw_config;
         let no_decay = self.adamw_config.without_weight_decay();
 
+        let rounding = self.master_rounding;
+
         macro_rules! adamw {
-            ($field:ident, $config:expr) => {
+            ($field:ident, $config:expr, $storage:expr) => {
                 adamw_step(
                     &mut model.$field.w,
                     &model.$field.dw,
                     &mut self.$field,
                     $config,
                     step,
+                    $storage,
                 );
             };
         }
         macro_rules! muon {
-            ($field:ident) => {
+            ($field:ident, $id:literal) => {
                 muon_step(
                     &mut model.$field.w,
                     &model.$field.dw,
                     &mut self.$field,
                     self.muon_config,
+                    step,
+                    master!($id),
                 );
             };
         }
+        macro_rules! master {
+            ($id:literal) => {
+                MasterStorage::Bf16 {
+                    rounding,
+                    parameter_id: $id,
+                }
+            };
+        }
 
-        adamw!(embedding, decay);
-        adamw!(attention_norm, no_decay);
-        muon!(q_proj);
-        muon!(k_proj);
-        muon!(v_proj);
-        muon!(o_proj);
-        adamw!(ffn_norm, no_decay);
-        muon!(gate_proj);
-        muon!(up_proj);
-        muon!(down_proj);
-        adamw!(final_norm, no_decay);
-        adamw!(lm_head, decay);
+        adamw!(embedding, decay, master!(0));
+        adamw!(attention_norm, no_decay, MasterStorage::Fp32);
+        muon!(q_proj, 2);
+        muon!(k_proj, 3);
+        muon!(v_proj, 4);
+        muon!(o_proj, 5);
+        adamw!(ffn_norm, no_decay, MasterStorage::Fp32);
+        muon!(gate_proj, 7);
+        muon!(up_proj, 8);
+        muon!(down_proj, 9);
+        adamw!(final_norm, no_decay, MasterStorage::Fp32);
+        adamw!(lm_head, decay, master!(11));
     }
 }
 
@@ -584,7 +710,14 @@ mod tests {
         let gradient = CpuTensor::from_slice(&[0.5, -0.25]);
         let mut moments = AdamWMoments::zeros();
 
-        adamw_step(&mut parameter, &gradient, &mut moments, config, 1);
+        adamw_step(
+            &mut parameter,
+            &gradient,
+            &mut moments,
+            config,
+            1,
+            MasterStorage::Fp32,
+        );
 
         // On step one, bias-corrected moments are g and g^2.
         let expected = [

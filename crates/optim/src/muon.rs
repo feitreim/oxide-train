@@ -9,6 +9,8 @@
 use tensor_core::{Rank2, Shape};
 use tensor_cpu::CpuTensor;
 
+use crate::MasterStorage;
+
 /// Quintic iteration coefficients, shared with the GPU implementation.
 pub const NEWTON_SCHULZ_A: f32 = 3.4445;
 pub const NEWTON_SCHULZ_B: f32 = -4.7750;
@@ -142,11 +144,16 @@ fn newton_schulz_wide<const ROWS: usize, const COLS: usize>(
 /// `p = (1 - lr * weight_decay) * p - adjusted_lr * orthogonalized_update`
 ///
 /// where `adjusted_lr = lr * sqrt(max(1, ROWS / COLS))`.
+///
+/// Momentum and the whole Newton--Schulz iteration stay fp32; `storage` only
+/// decides how the final value lands in the parameter.
 pub fn muon_step<const ROWS: usize, const COLS: usize>(
     parameter: &mut CpuTensor<f32, Rank2<ROWS, COLS>>,
     gradient: &CpuTensor<f32, Rank2<ROWS, COLS>>,
     state: &mut MuonMomentum<Rank2<ROWS, COLS>>,
     config: MuonConfig,
+    step: u64,
+    storage: MasterStorage,
 ) {
     config.validate();
 
@@ -171,8 +178,13 @@ pub fn muon_step<const ROWS: usize, const COLS: usize>(
     let decay = 1.0 - config.learning_rate * config.weight_decay;
     let update_scale = config.learning_rate * aspect_ratio_scale;
 
-    for (parameter, &update) in parameter.as_mut_slice().iter_mut().zip(update.as_slice()) {
-        *parameter = decay * *parameter - update_scale * update;
+    for (element, (parameter, &update)) in parameter
+        .as_mut_slice()
+        .iter_mut()
+        .zip(update.as_slice())
+        .enumerate()
+    {
+        *parameter = storage.commit(decay * *parameter - update_scale * update, step, element);
     }
 }
 
@@ -281,7 +293,14 @@ mod tests {
             newton_schulz_steps: 5,
         };
 
-        muon_step(&mut parameter, &gradient, &mut state, config);
+        muon_step(
+            &mut parameter,
+            &gradient,
+            &mut state,
+            config,
+            1,
+            MasterStorage::Fp32,
+        );
 
         assert_eq!(state.momentum.as_slice(), &[1.0, 0.0, 0.0, 0.5]);
         let orthogonalized = zeroth_power_via_newton_schulz(&state.momentum, 5);
