@@ -53,23 +53,30 @@ pub const ROUTER_GEMM_BK: usize = 16;
 /// Threads in a router logits GEMM block: one lane per output element.
 pub const ROUTER_GEMM_THREADS: usize = ROUTER_GEMM_BM * ROUTER_GEMM_BN;
 
-/// Lanes per token row in the router input-backward kernel: one block owns a
-/// token, stages its `E`-wide gate row once, and strides `D` with coalesced
-/// `dx` writes.
+/// Threads in one router input-backward block.
 pub const ROUTER_INPUT_THREADS: usize = 256;
+/// Token rows one router input-backward block sweeps. The block's slice of the
+/// `[D,E]` weight is read once and reused across all of them, so weight traffic
+/// falls by this factor.
+pub const ROUTER_INPUT_TOKENS: usize = 64;
+/// Model columns each router input-backward lane owns. The lane keeps their
+/// `[E]` weight rows in registers for the whole token sweep.
+pub const ROUTER_INPUT_COLUMNS: usize = 4;
+/// Model columns one router input-backward block owns. Lane-major so every
+/// `dx` store is a full coalesced sector.
+pub const ROUTER_INPUT_BN: usize = ROUTER_INPUT_THREADS * ROUTER_INPUT_COLUMNS;
 
-/// Router weight-gradient output rows computed by one block. Eight consecutive
-/// `D` rows form one coalesced 32-byte load sector per token.
-pub const ROUTER_WEIGHT_ROWS: usize = 8;
-/// Router weight-gradient expert columns computed by one block.
-pub const ROUTER_WEIGHT_EXPERTS: usize = 8;
-/// Token rows staged by each router weight-gradient iteration.
-pub const ROUTER_WEIGHT_K: usize = 64;
-/// Fixed token partitions reduced for each router weight-gradient output.
-pub const ROUTER_WEIGHT_SPLITS: usize = 8;
-/// Threads in the skinny router weight-gradient kernel.
-pub const ROUTER_WEIGHT_THREADS: usize =
-    ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_EXPERTS * ROUTER_WEIGHT_SPLITS;
+/// Threads in one router weight-gradient partition block.
+pub const ROUTER_WGRAD_THREADS: usize = 256;
+/// Model rows each router weight-gradient lane owns. The lane holds their
+/// `[E]` accumulators in registers, so one coalesced `x` load feeds `E` FMAs.
+pub const ROUTER_WGRAD_ROWS: usize = 4;
+/// Model rows one router weight-gradient block owns.
+pub const ROUTER_WGRAD_BM: usize = ROUTER_WGRAD_THREADS * ROUTER_WGRAD_ROWS;
+/// Contiguous token partitions the router weight gradient is split into. Each
+/// partition is summed by one block and the partitions are merged in ascending
+/// order, which fixes the reduction order independently of block scheduling.
+pub const ROUTER_WGRAD_SPLITS: usize = 256;
 
 /// Sentinel written by deterministic MoE binning for a capacity-dropped pair.
 pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
@@ -1328,14 +1335,12 @@ pub mod kernels {
         }
     }
 
-    /// Register-tiled fp32 `C[m,n] = A[m,k] B'` shared by the two router
-    /// forward/backward matmuls. `TRANSPOSE_B` selects `B` stored `[k,n]`
-    /// (logits) or `[n,k]` (input backward, `B` is the router weight). The
+    /// Register-tiled fp32 `C[m,n] = A[m,k] B[k,n]` for the router logits. The
     /// token tile `BM` is loaded once per `BK` step and reused across the
     /// experts, so the router weight is streamed from L2 rather than re-read
     /// per token. One lane owns one output; the skinny expert width fits `BN`.
     #[inline(always)]
-    unsafe fn router_gemm_impl<const TRANSPOSE_B: bool>(
+    unsafe fn router_gemm_impl(
         m: usize,
         n: usize,
         k: usize,
@@ -1379,23 +1384,14 @@ pub mod kernels {
 
             local = tid;
             while local < ROUTER_GEMM_BK * ROUTER_GEMM_BN {
-                // `B^T` is stored `[n,k]`, so lanes advance through `k` rather
-                // than issue strided reads across `n`.
-                let (tile_row, tile_col) = if TRANSPOSE_B {
-                    (local % ROUTER_GEMM_BK, local / ROUTER_GEMM_BK)
-                } else {
-                    (local / ROUTER_GEMM_BN, local % ROUTER_GEMM_BN)
-                };
+                let tile_row = local / ROUTER_GEMM_BN;
+                let tile_col = local % ROUTER_GEMM_BN;
                 let global_row = k_base + tile_row;
                 let global_col = block_col + tile_col;
                 unsafe {
                     TILE_B[tile_row * ROUTER_GEMM_BN + tile_col] =
                         if global_row < k && global_col < n {
-                            if TRANSPOSE_B {
-                                b[global_col * k + global_row]
-                            } else {
-                                b[global_row * n + global_col]
-                            }
+                            b[global_row * n + global_col]
                         } else {
                             0.0
                         };
@@ -1440,7 +1436,7 @@ pub mod kernels {
             return;
         }
         let n = x.len() / d;
-        unsafe { router_gemm_impl::<false>(n, e, d, x, weight, logits) }
+        unsafe { router_gemm_impl(n, e, d, x, weight, logits) }
     }
 
     /// Per-token softmax, deterministic top-k, and selected-probability
@@ -2021,11 +2017,17 @@ pub mod kernels {
     }
 
     /// Router linear backward with respect to its input:
-    /// `dx[N,D] = dlogits[N,E] x weight[D,E]^T`. One block owns a token row and
-    /// stages that token's 32-byte `dlogits` row in shared once, then the lanes
-    /// stride the `D` row writing coalesced `dx`. The gate row is broadcast,
-    /// never re-read per output element as the thread-per-`(token, d)` version
-    /// did. `dx` is write-bound.
+    /// `dx[N,D] = dlogits[N,E] x weight[D,E]^T`.
+    ///
+    /// A block owns a `[ROUTER_INPUT_TOKENS, ROUTER_INPUT_BN]` output tile. Its
+    /// slice of the `[D,E]` weight is read once into registers — each lane keeps
+    /// the `[E]` weight rows of its `ROUTER_INPUT_COLUMNS` columns — and reused
+    /// across the whole token sweep, so the weight is read `N /
+    /// ROUTER_INPUT_TOKENS` times instead of once per token. Registers rather
+    /// than shared memory hold the staged weight because a lane's columns are
+    /// private to it: the shared tile would just be the same values with an
+    /// `LDS` in the inner loop. Lane-major columns keep every `dx` store a full
+    /// coalesced sector, which is what the write-bound tile is paced by.
     #[kernel]
     pub unsafe fn router_backward_input(
         dlogits: &[f32],
@@ -2033,8 +2035,6 @@ pub mod kernels {
         experts: u32,
         mut dx: DisjointSlice<f32>,
     ) {
-        static mut GATES: SharedArray<f32, ROUTER_MAX_EXPERTS> = SharedArray::UNINIT;
-
         let tid = thread::threadIdx_x() as usize;
         if thread::blockDim_x() as usize != ROUTER_INPUT_THREADS {
             return;
@@ -2044,32 +2044,66 @@ pub mod kernels {
             return;
         }
         let d = weight.len() / e;
-        let token = thread::blockIdx_x() as usize;
-        if d == 0 || token * e + e > dlogits.len() || (token + 1) * d > dx.len() {
+        if d == 0 || !dx.len().is_multiple_of(d) {
+            return;
+        }
+        let n = dx.len() / d;
+        let token_base = thread::blockIdx_y() as usize * ROUTER_INPUT_TOKENS;
+        let column_base = thread::blockIdx_x() as usize * ROUTER_INPUT_BN + tid;
+        if token_base >= n || n * e > dlogits.len() {
             return;
         }
 
-        if tid < e {
-            unsafe {
-                GATES[tid] = dlogits[token * e + tid];
+        let mut staged = [[0.0f32; ROUTER_MAX_EXPERTS]; ROUTER_INPUT_COLUMNS];
+        let mut slot = 0usize;
+        while slot < ROUTER_INPUT_COLUMNS {
+            let column = column_base + slot * ROUTER_INPUT_THREADS;
+            let mut expert = 0usize;
+            while expert < ROUTER_MAX_EXPERTS {
+                staged[slot][expert] = if column < d && expert < e {
+                    weight[column * e + expert]
+                } else {
+                    0.0
+                };
+                expert += 1;
             }
+            slot += 1;
         }
-        thread::sync_threads();
 
-        let base = token * d;
-        let mut column = tid;
-        while column < d {
-            let weight_base = column * e;
-            let mut value = 0.0f32;
-            for expert in 0..ROUTER_MAX_EXPERTS {
-                if expert < e {
-                    value += unsafe { GATES[expert] } * weight[weight_base + expert];
+        let token_end = (token_base + ROUTER_INPUT_TOKENS).min(n);
+        let mut token = token_base;
+        while token < token_end {
+            // The gate row is warp-uniform, so this is one broadcast load per
+            // expert for the whole token, amortized over the register tile.
+            let mut gates = [0.0f32; ROUTER_MAX_EXPERTS];
+            let mut expert = 0usize;
+            while expert < ROUTER_MAX_EXPERTS {
+                gates[expert] = if expert < e {
+                    dlogits[token * e + expert]
+                } else {
+                    0.0
+                };
+                expert += 1;
+            }
+
+            let row_base = token * d;
+            let mut slot = 0usize;
+            while slot < ROUTER_INPUT_COLUMNS {
+                let column = column_base + slot * ROUTER_INPUT_THREADS;
+                if column < d {
+                    let mut value = 0.0f32;
+                    let mut expert = 0usize;
+                    while expert < ROUTER_MAX_EXPERTS {
+                        value += gates[expert] * staged[slot][expert];
+                        expert += 1;
+                    }
+                    unsafe {
+                        *dx.get_unchecked_mut(row_base + column) = value;
+                    }
                 }
+                slot += 1;
             }
-            unsafe {
-                *dx.get_unchecked_mut(base + column) = value;
-            }
-            column += ROUTER_INPUT_THREADS;
+            token += 1;
         }
     }
 
@@ -2101,119 +2135,124 @@ pub mod kernels {
         }
     }
 
-    /// Tiled router weight gradient for skinny expert dimensions.
+    /// One contiguous token partition of the router weight gradient
+    /// `dweight[D,E] = x[N,D]^T dlogits[N,E]`, written to
+    /// `partials[SPLITS, E, D]` for `router_backward_weight_merge` to sum.
     ///
-    /// A block owns a `[ROUTER_WEIGHT_ROWS, ROUTER_WEIGHT_EXPERTS]` output tile.
-    /// `ROUTER_WEIGHT_SPLITS` lanes cooperate on each output by accumulating
-    /// fixed interleaved token positions, then lane zero combines those partials
-    /// in a fixed order. This exposes 256-way parallelism per tile without
-    /// atomics or nondeterministic accumulation.
+    /// `D*E` is far too few outputs to fill the machine on its own, so the
+    /// token dimension is split across blocks. A block owns
+    /// `ROUTER_WGRAD_BM` model rows of one partition, lane-major so each `x`
+    /// read is a full coalesced sector, and each lane keeps `[E]` accumulators
+    /// per owned row in registers: one `x` load feeds `E` FMAs and the gate row
+    /// is a warp-uniform broadcast shared by the whole register tile.
+    ///
+    /// The reduction order is fixed: a lane owns its outputs alone and sums its
+    /// partition in ascending token order, and the merge sums partitions in
+    /// ascending order. No lane, block, or launch ordering can perturb it.
     #[kernel]
-    pub unsafe fn router_backward_weight_tiled(
+    pub unsafe fn router_backward_weight_split(
         x: &[f32],
         dlogits: &[f32],
         tokens: u32,
         experts: u32,
-        mut dweight: DisjointSlice<f32>,
+        dim: u32,
+        mut partials: DisjointSlice<f32>,
     ) {
-        static mut TILE_X: SharedArray<f32, { ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_K }> =
-            SharedArray::UNINIT;
-        static mut TILE_DLOGITS: SharedArray<f32, { ROUTER_WEIGHT_K * ROUTER_WEIGHT_EXPERTS }> =
-            SharedArray::UNINIT;
-        static mut PARTIALS: SharedArray<f32, ROUTER_WEIGHT_THREADS> = SharedArray::UNINIT;
-
         let tid = thread::threadIdx_x() as usize;
-        if thread::blockDim_x() as usize != ROUTER_WEIGHT_THREADS {
-            return;
-        }
-        if !ROUTER_WEIGHT_K.is_multiple_of(ROUTER_WEIGHT_SPLITS) {
+        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS {
             return;
         }
         let n = tokens as usize;
         let e = experts as usize;
-        if n == 0 || e == 0 || !dweight.len().is_multiple_of(e) || n * e > dlogits.len() {
+        let d = dim as usize;
+        if e == 0 || e > ROUTER_MAX_EXPERTS || d == 0 || n * d > x.len() || n * e > dlogits.len() {
+            return;
+        }
+        let split = thread::blockIdx_y() as usize;
+        let row_base = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM + tid;
+        if (split + 1) * e * d > partials.len() {
+            return;
+        }
+
+        let partition = n.div_ceil(ROUTER_WGRAD_SPLITS);
+        let token_end = ((split + 1) * partition).min(n);
+        let mut token = (split * partition).min(n);
+
+        let mut accumulators = [[0.0f32; ROUTER_MAX_EXPERTS]; ROUTER_WGRAD_ROWS];
+        while token < token_end {
+            let mut gates = [0.0f32; ROUTER_MAX_EXPERTS];
+            let mut expert = 0usize;
+            while expert < ROUTER_MAX_EXPERTS {
+                gates[expert] = if expert < e {
+                    dlogits[token * e + expert]
+                } else {
+                    0.0
+                };
+                expert += 1;
+            }
+
+            let row_offset = token * d;
+            let mut slot = 0usize;
+            while slot < ROUTER_WGRAD_ROWS {
+                let row = row_base + slot * ROUTER_WGRAD_THREADS;
+                let value = if row < d { x[row_offset + row] } else { 0.0 };
+                let mut expert = 0usize;
+                while expert < ROUTER_MAX_EXPERTS {
+                    accumulators[slot][expert] += value * gates[expert];
+                    expert += 1;
+                }
+                slot += 1;
+            }
+            token += 1;
+        }
+
+        let mut slot = 0usize;
+        while slot < ROUTER_WGRAD_ROWS {
+            let row = row_base + slot * ROUTER_WGRAD_THREADS;
+            if row < d {
+                let mut expert = 0usize;
+                while expert < e {
+                    unsafe {
+                        *partials.get_unchecked_mut((split * e + expert) * d + row) =
+                            accumulators[slot][expert];
+                    }
+                    expert += 1;
+                }
+            }
+            slot += 1;
+        }
+    }
+
+    /// Sum the router weight-gradient token partitions in ascending order and
+    /// accumulate into `dweight[D,E]`. Threads walk `partials` expert-major so
+    /// the wide read is coalesced; the narrow `dweight` update is not, and does
+    /// not matter at `D*E` elements.
+    #[kernel]
+    pub unsafe fn router_backward_weight_merge(
+        partials: &[f32],
+        experts: u32,
+        mut dweight: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let e = experts as usize;
+        if e == 0 || !dweight.len().is_multiple_of(e) || i >= dweight.len() {
             return;
         }
         let d = dweight.len() / e;
-        if n * d > x.len() {
+        let expert = i / d;
+        let row = i % d;
+        if ROUTER_WGRAD_SPLITS * e * d > partials.len() {
             return;
         }
 
-        let row_base = thread::blockIdx_x() as usize * ROUTER_WEIGHT_ROWS;
-        let expert_base = thread::blockIdx_y() as usize * ROUTER_WEIGHT_EXPERTS;
-        let outputs_per_tile = ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_EXPERTS;
-        let output = tid % outputs_per_tile;
-        let split = tid / outputs_per_tile;
-        let tile_row = output / ROUTER_WEIGHT_EXPERTS;
-        let tile_expert = output % ROUTER_WEIGHT_EXPERTS;
-        let mut accumulator = 0.0f32;
-
-        let mut token_base = 0usize;
-        while token_base < n {
-            let mut local = tid;
-            while local < ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_K {
-                // Traverse X in its physical `[N,D]` order, then scatter it
-                // into the logical transposed `[D,N]` shared-memory tile.
-                let staged_row = local % ROUTER_WEIGHT_ROWS;
-                let staged_token = local / ROUTER_WEIGHT_ROWS;
-                let global_row = row_base + staged_row;
-                let global_token = token_base + staged_token;
-                unsafe {
-                    TILE_X[staged_row * ROUTER_WEIGHT_K + staged_token] =
-                        if global_row < d && global_token < n {
-                            x[global_token * d + global_row]
-                        } else {
-                            0.0
-                        };
-                }
-                local += ROUTER_WEIGHT_THREADS;
-            }
-
-            local = tid;
-            while local < ROUTER_WEIGHT_K * ROUTER_WEIGHT_EXPERTS {
-                let staged_token = local / ROUTER_WEIGHT_EXPERTS;
-                let staged_expert = local % ROUTER_WEIGHT_EXPERTS;
-                let global_token = token_base + staged_token;
-                let global_expert = expert_base + staged_expert;
-                unsafe {
-                    TILE_DLOGITS[local] = if global_token < n && global_expert < e {
-                        dlogits[global_token * e + global_expert]
-                    } else {
-                        0.0
-                    };
-                }
-                local += ROUTER_WEIGHT_THREADS;
-            }
-            thread::sync_threads();
-
-            let mut inner = split;
-            while inner < ROUTER_WEIGHT_K {
-                unsafe {
-                    accumulator += TILE_X[tile_row * ROUTER_WEIGHT_K + inner]
-                        * TILE_DLOGITS[inner * ROUTER_WEIGHT_EXPERTS + tile_expert];
-                }
-                inner += ROUTER_WEIGHT_SPLITS;
-            }
-            thread::sync_threads();
-            token_base += ROUTER_WEIGHT_K;
+        let mut value = 0.0f32;
+        let mut split = 0usize;
+        while split < ROUTER_WGRAD_SPLITS {
+            value += partials[(split * e + expert) * d + row];
+            split += 1;
         }
-
         unsafe {
-            PARTIALS[tid] = accumulator;
-        }
-        thread::sync_threads();
-        if split == 0 {
-            let global_row = row_base + tile_row;
-            let global_expert = expert_base + tile_expert;
-            if global_row < d && global_expert < e {
-                let mut value = 0.0f32;
-                for partition in 0..ROUTER_WEIGHT_SPLITS {
-                    value += unsafe { PARTIALS[partition * outputs_per_tile + output] };
-                }
-                unsafe {
-                    *dweight.get_unchecked_mut(global_row * e + global_expert) += value;
-                }
-            }
+            *dweight.get_unchecked_mut(row * e + expert) += value;
         }
     }
 }

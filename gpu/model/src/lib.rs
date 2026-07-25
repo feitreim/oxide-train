@@ -163,32 +163,33 @@ fn router_gemm_config(m: usize, n: usize) -> LaunchConfig {
     }
 }
 
-/// Launch for the router input-backward kernel: one block per token row.
-fn router_input_config<const N: usize>() -> LaunchConfig {
-    assert!(N <= u32::MAX as usize);
+/// Launch for the router input-backward kernel: one block per
+/// `[ROUTER_INPUT_TOKENS, ROUTER_INPUT_BN]` tile of `dx`.
+fn router_input_config<const N: usize, const D: usize>() -> LaunchConfig {
+    assert!(N <= u32::MAX as usize && D <= u32::MAX as usize);
     LaunchConfig {
-        grid_dim: (N as u32, 1, 1),
+        grid_dim: (
+            D.div_ceil(dense_device::ROUTER_INPUT_BN) as u32,
+            N.div_ceil(dense_device::ROUTER_INPUT_TOKENS) as u32,
+            1,
+        ),
         block_dim: (dense_device::ROUTER_INPUT_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
 }
 
-fn router_weight_config<const D: usize, const E: usize>() -> LaunchConfig {
-    assert_eq!(
-        dense_device::ROUTER_WEIGHT_THREADS,
-        dense_device::ROUTER_WEIGHT_ROWS
-            * dense_device::ROUTER_WEIGHT_EXPERTS
-            * dense_device::ROUTER_WEIGHT_SPLITS
-    );
-    assert!(dense_device::ROUTER_WEIGHT_K.is_multiple_of(dense_device::ROUTER_WEIGHT_SPLITS));
-    assert!(D <= u32::MAX as usize && E <= u32::MAX as usize);
+/// Launch for one router weight-gradient token partition: one block per
+/// `ROUTER_WGRAD_BM` model rows of each of the `ROUTER_WGRAD_SPLITS`
+/// partitions.
+fn router_wgrad_split_config<const D: usize>() -> LaunchConfig {
+    assert!(D <= u32::MAX as usize);
     LaunchConfig {
         grid_dim: (
-            D.div_ceil(dense_device::ROUTER_WEIGHT_ROWS) as u32,
-            E.div_ceil(dense_device::ROUTER_WEIGHT_EXPERTS) as u32,
+            D.div_ceil(dense_device::ROUTER_WGRAD_BM) as u32,
+            dense_device::ROUTER_WGRAD_SPLITS as u32,
             1,
         ),
-        block_dim: (dense_device::ROUTER_WEIGHT_THREADS as u32, 1, 1),
+        block_dim: (dense_device::ROUTER_WGRAD_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -3340,6 +3341,9 @@ struct GpuBlockScratch<
     gate_gradients: GpuTensor<f32, Rank2<N, K>>,
     dlogits: GpuTensor<f32, Rank2<N, E>>,
     router_dx: GpuTensor<f32, Rank2<N, D>>,
+    /// One `[E,D]` router weight gradient per token partition, merged in
+    /// ascending partition order by `router_backward_weight_merge`.
+    router_dweight_partials: GpuTensor<f32, Rank3<{ dense_device::ROUTER_WGRAD_SPLITS }, E, D>>,
     experts: GpuExpertScratch<E, C, D, FF>,
     d_model_0: GpuTensor<f32, Rank2<N, D>>,
     d_model_1: GpuTensor<f32, Rank2<N, D>>,
@@ -3369,6 +3373,7 @@ impl<
             gate_gradients: GpuTensor::zeros(stream)?,
             dlogits: GpuTensor::zeros(stream)?,
             router_dx: GpuTensor::zeros(stream)?,
+            router_dweight_partials: GpuTensor::zeros(stream)?,
             experts: GpuExpertScratch::new(stream)?,
             d_model_0: GpuTensor::zeros(stream)?,
             d_model_1: GpuTensor::zeros(stream)?,
@@ -4140,7 +4145,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         profiler.measure(stream, "backward.router.input", || unsafe {
             dense.router_backward_input(
                 stream,
-                router_input_config::<N>(),
+                router_input_config::<N, D>(),
                 scratch.dlogits.as_device_buffer(),
                 self.router.as_device_buffer(),
                 E as u32,
@@ -4148,12 +4153,22 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             )
         })?;
         profiler.measure(stream, "backward.router.weight", || unsafe {
-            dense.router_backward_weight_tiled(
+            dense.router_backward_weight_split(
                 stream,
-                router_weight_config::<D, E>(),
+                router_wgrad_split_config::<D>(),
                 acts.ffn_normalized.as_device_buffer(),
                 scratch.dlogits.as_device_buffer(),
                 N as u32,
+                E as u32,
+                D as u32,
+                scratch.router_dweight_partials.as_device_buffer_mut(),
+            )
+        })?;
+        profiler.measure(stream, "backward.router.weight_merge", || unsafe {
+            dense.router_backward_weight_merge(
+                stream,
+                LaunchConfig::for_num_elems((D * E) as u32),
+                scratch.router_dweight_partials.as_device_buffer(),
                 E as u32,
                 self.d_router.as_device_buffer_mut(),
             )
