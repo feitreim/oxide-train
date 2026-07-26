@@ -2023,7 +2023,7 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize>
         let aligned = expert_tcgen05_aligned::<C, D, FF>();
         Ok(Self {
             gate_up: GpuTensor::zeros(stream)?,
-            d_bin_output: ExpertPanel::new(stream, E, C, D, false)?,
+            d_bin_output: ExpertPanel::new(stream, E, C, D, aligned)?,
             d_activated: GpuTensor::zeros(stream)?,
             d_gate: GpuTensor::zeros(stream)?,
             d_up: GpuTensor::zeros(stream)?,
