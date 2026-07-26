@@ -3,7 +3,7 @@
 //! Runs the canonical 12-block MoE configuration (matching bin/profile.rs)
 //! on real `TOK1` shards end to end.
 
-use std::env;
+use std::{env, time::Instant};
 
 use cuda_core::CudaContext;
 use data::{Batches, TokenFile};
@@ -27,6 +27,14 @@ const E: usize = 8;
 const K: usize = 2;
 const C: usize = 6_144;
 const L: usize = 12;
+const B200_BF16_PEAK_FLOPS: f64 = 2.25e15;
+
+fn training_flops_per_token() -> f64 {
+    let linear_parameters = D * VP + L * (4 * D * D + D * E + 3 * K * D * FF);
+    let linear_flops = 6 * linear_parameters;
+    let attention_flops = 12 * L * T * H * HD;
+    (linear_flops + attention_flops) as f64
+}
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
     env::var(name)
@@ -142,6 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shard.len(),
     );
     let mut batches = Batches::<B, T>::new(shard.tokens());
+    let mut timing_start = None;
     for _ in 0..next_batch % batches_per_epoch as u64 {
         let _ = batches.next();
     }
@@ -194,6 +203,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &dense,
         )?;
         optimizer.update(&mut gpu, &stream, &tensor)?;
+        if step == starting_step + 1 && step < max_steps {
+            stream.synchronize()?;
+            timing_start = Some(Instant::now());
+        }
 
         let periodic_checkpoint = checkpoint_every > 0 && step % checkpoint_every == 0;
         let final_checkpoint = step == max_steps;
@@ -205,6 +218,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(start) = timing_start {
+        stream.synchronize()?;
+        let elapsed = start.elapsed().as_secs_f64();
+        let measured_steps = max_steps - starting_step - 1;
+        let measured_tokens = measured_steps * N;
+        let tokens_per_second = measured_tokens as f64 / elapsed;
+        let flops_per_token = training_flops_per_token();
+        let mfu = tokens_per_second * flops_per_token / B200_BF16_PEAK_FLOPS;
+        println!(
+            "throughput={tokens_per_second:.1} tokens/s mfu={:.2}% measured_steps={measured_steps} elapsed={elapsed:.3}s flops/token={flops_per_token:.3e} peak_bf16={:.2} PFLOP/s",
+            100.0 * mfu,
+            B200_BF16_PEAK_FLOPS / 1e15,
+        );
+    }
     println!("finished {} AdamW steps", optimizer.step());
     Ok(())
 }
