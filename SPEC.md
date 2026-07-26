@@ -197,23 +197,24 @@ converted panels plus the deleted staging:
 
 | span | main | #59 | Δ |
 |---|---|---|---|
-| `forward.experts.swiglu` | 11.04 | 6.41 | −4.63 |
-| `forward.router.scatter` | 8.23 | 4.67 | −3.56 |
-| `forward.router.zero_bins` | 3.71 | 1.88 | −1.83 |
-| `forward.experts.gate_up_gemm` | 32.08 | 29.29 | −2.79 |
-| `forward.experts.down_gemm` | 17.05 | 13.35 | −3.71 |
-| `backward.experts.gate_up_join` | 12.08 | 5.44 | −6.64 |
-| `backward.experts.gate_up_weight_gemm` | 53.48 | 43.72 | −9.76 |
-| `backward.experts.down_weight_gemm` | 28.97 | 22.67 | −6.30 |
-| `backward.router.scatter_dy` | 2.80 | 2.56 | −0.24 |
+| `backward.experts.gate_up_weight_gemm` | 53.61 | 43.74 | −9.87 |
+| `backward.experts.gate_up_join` | 12.11 | 5.45 | −6.66 |
+| `backward.experts.down_weight_gemm` | 29.05 | 22.59 | −6.46 |
+| `forward.experts.swiglu` | 11.04 | 6.40 | −4.63 |
+| `forward.experts.down_gemm` | 17.05 | 13.35 | −3.70 |
+| `forward.router.scatter` | 8.23 | 4.66 | −3.57 |
+| `forward.experts.gate_up_gemm` | 32.08 | 29.29 | −2.78 |
+| `forward.router.zero_bins` | 3.68 | 1.88 | −1.81 |
+| `backward.router.scatter_dy` | 2.79 | 2.55 | −0.24 |
 
 The deleted quantizes do not appear as spans going to zero: each ran inside
 its GEMM's `profiler.measure`, so the win shows up as the GEMM span shrinking.
-The two input GEMMs, which only swap a descriptor, are flat
-(`down_input_gemm` 15.93 → 16.05, `gate_up_input_gemm` 22.69 → 22.72), which
-is the noise floor — as is the untouched flash backward (+0.40/+0.70 ms).
-Full step 602.02 → 564.60 ms (−6.2%); workspace VRAM 164.3 → 153.9 GiB, free
-headroom 14.0 → 24.5 GiB (+75%).
+Every other span in the step moved by at most 0.17 ms, which is this pass's
+noise floor — including the two input GEMMs, which only swap a descriptor
+(`down_input_gemm` +0.07, `gate_up_input_gemm` +0.01) and the untouched
+attention backward (`flash_q` −0.10, `flash_kv` +0.01). Full step
+603.11 → 563.23 ms (−6.6%); workspace VRAM 164.3 → 153.9 GiB, free headroom
+14.0 → 24.5 GiB (+75%).
 
 Deferred with evidence: `attention_normalized`, `q`/`k`/`v` and `attended`
 (20 GiB fp32 live between them) are genuine candidates by the same test — the
@@ -1024,9 +1025,10 @@ Each gated on tests; correctness before speed at every step.
      (decision #22). The `moe_scatter_dy` gate dot still accumulates fp32 over
      the same quads in the same lane order, so router gradients are
      bit-identical. B200 same-container A/B vs main at the §13.9 shape (B=12
-     T=2048): full step 602.0 → 564.6 ms (−6.2%), workspace VRAM
+     T=2048): full step 603.1 → 563.2 ms (−6.6%), workspace VRAM
      164.3 → 153.9 GiB (free headroom 14.0 → 24.5 GiB, +75%); per-span table in
-     §7.1. The largest single win is `gate_up_weight_gemm` 53.48 → 43.72 ms,
+     §7.1, with every untouched span inside a 0.17 ms noise floor. The largest
+     single win is `gate_up_weight_gemm` 53.61 → 43.74 ms,
      confirming #53's read that these GEMMs are operand-DRAM-bandwidth bound —
      halving the operand bytes moves them where re-orienting them did not.
    - Then: activation checkpointing if B wants to grow past memory,
