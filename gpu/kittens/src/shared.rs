@@ -135,11 +135,38 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// `[R, SUBTILE_COLS]`, and `sem` must be an initialized TMA barrier.
     #[inline(always)]
     pub unsafe fn tma_load(self, map: *const TmaDescriptor, row: i32, plane: i32, sem: Semaphore) {
+        unsafe { self.tma_load_at(map, 0, row, plane, sem) }
+    }
+
+    /// [`Self::tma_load`] landing at subtile row `dst_row` instead of the top —
+    /// how a tile taller than the map's box gets built out of several global
+    /// row ranges (the backward kernels stack two adjacent 64-row tiles into
+    /// one 128-row operand, `dst_row = 0` then `dst_row = 64`).
+    ///
+    /// The stacking is layout-free precisely because a box height is a whole
+    /// number of swizzle periods (8 rows of 128 bytes): landing a box at row
+    /// 64 of a subtile reproduces exactly the swizzle rows 64.. of one tall
+    /// tile would have had. The caller charges the bytes actually in flight —
+    /// `box_rows * C * E::BYTES` per call, not [`Self::BYTES`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::tma_load`], plus `dst_row + box_rows <= R` and `dst_row` a
+    /// multiple of the 8-row swizzle period.
+    #[inline(always)]
+    pub unsafe fn tma_load_at(
+        self,
+        map: *const TmaDescriptor,
+        dst_row: usize,
+        row: i32,
+        plane: i32,
+        sem: Semaphore,
+    ) {
         unsafe {
             let mut i = 0usize;
             while i < Self::SUBTILES {
                 cp_async_bulk_tensor_3d_g2s(
-                    self.subtile(i),
+                    self.subtile(i).add(dst_row * S::ATOM_BYTES),
                     map,
                     (i * Self::SUBTILE_COLS) as i32,
                     row,

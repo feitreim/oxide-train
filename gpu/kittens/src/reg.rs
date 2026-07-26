@@ -223,6 +223,21 @@ impl<const N: usize> RegVec<N> {
 #[derive(Clone, Copy)]
 pub struct RegTile<const SLOTS: usize, const VALUES: usize>(pub [[f32; VALUES]; SLOTS]);
 
+/// The `[2, 4]` piece of a fragment-mapped tile one [`crate::tmem::TmemTile`]
+/// drain returns: the two rows a thread owns in a 16-row block, times the four
+/// values it owns in a 16-column block. Every register pass over a TMEM
+/// accumulator is a loop over these.
+pub type Fragment = RegTile<2, 4>;
+
+/// Column of value `v` relative to the lane's own column pair: values come in
+/// fours at offsets `{0, 1, 8, 9}` of successive 16-column blocks. The
+/// coordinate a masking or per-column-statistic pass needs, and the inverse of
+/// the packing [`crate::ldst::store_fragment_bf16`] undoes.
+#[inline(always)]
+pub const fn value_column(value: usize) -> usize {
+    (value / 4) * 16 + [0, 1, 8, 9][value % 4]
+}
+
 impl<const SLOTS: usize, const VALUES: usize> RegTile<SLOTS, VALUES> {
     /// The additive identity — a fresh accumulator.
     #[inline(always)]
@@ -334,6 +349,21 @@ mod tests {
         tile.0[2][5] = 4.0;
         tile.scale_rows(factor);
         assert_eq!(tile.0[2][5], 4.0 * factor.0[2]);
+    }
+
+    #[test]
+    fn value_columns_are_the_fragment_maps_offsets() {
+        // The {0,1,8,9}-per-16-block pattern every drain loop spells by hand.
+        assert_eq!(
+            (0..8).map(value_column).collect::<Vec<_>>(),
+            [0, 1, 8, 9, 16, 17, 24, 25]
+        );
+        // A RegTile<4, 32>'s 32 values cover 128 columns exactly once.
+        let mut columns = (0..32).map(value_column).collect::<Vec<_>>();
+        columns.sort();
+        columns.dedup();
+        assert_eq!(columns.len(), 32);
+        assert_eq!(columns[31], 121);
     }
 
     #[test]

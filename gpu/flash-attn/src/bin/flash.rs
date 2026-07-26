@@ -53,6 +53,16 @@ use host::{
 /// init after the TMEM alloc cost pipelined +3 more and was reverted, so
 /// the init-before-alloc ordering is deliberate. Sync stays 40, backwards
 /// untouched. No occupancy boundary anywhere near (TMEM pins 1 CTA/SM).
+///
+/// Phase-5 re-pins (2026-07-26): the backward/probe port (`Fragment` drains
+/// and swizzled stores, `PhasedSemaphore`, `tma_load_at`, `alloc_block`)
+/// ratchets backward q 62→52 and kv 64→60 — the first port in this series
+/// where the allocator gave registers back. PTX is +9/+8 instructions, all
+/// of it the fall-through `bra.uni` block splits `alloc_block`'s guard
+/// introduces; against that the kv register pass lost five `or.pred`s
+/// (looped causal masking shares the `masked_all` term eight hand-written
+/// `keep_*` expressions each re-derived) and three `cvta.shared`s. Local
+/// frames unchanged to the byte, forwards byte-identical, bench flat.
 const KERNEL_BUDGETS: [KernelBudget; 5] = [
     KernelBudget {
         name: "forward sync",
@@ -71,12 +81,12 @@ const KERNEL_BUDGETS: [KernelBudget; 5] = [
     },
     KernelBudget {
         name: "backward q",
-        max_registers: 62,
+        max_registers: 52,
         max_spill_bytes: 512,
     },
     KernelBudget {
         name: "backward kv",
-        max_registers: 64,
+        max_registers: 60,
         max_spill_bytes: 1024,
     },
 ];

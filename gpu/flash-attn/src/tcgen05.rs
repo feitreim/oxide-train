@@ -52,7 +52,7 @@
 //!   warp, and CTAs run a static persistent work-item loop. See the kernel
 //!   doc for the scheduling and barrier story.
 //!
-//! Phase 4 adds two synchronous backward kernels sharing the same idioms —
+//! Two synchronous backward kernels share the same idioms —
 //! the swizzle-aware bf16 fragment writes, the transposed-B gradient MMA
 //! shape, and the fp32 TMEM accumulators. `flash_backward_q_tcgen05`
 //! (query-parallel) recomputes `S`/`dP` per key tile and accumulates
@@ -67,25 +67,22 @@
 //! device slices, and write fp32 `dq`/`dk`/`dv`.
 
 use cuda_device::DisjointSlice;
-use cuda_device::barrier::{
-    Barrier, fence_proxy_async_shared_cta, mbarrier_arrive_expect_tx, mbarrier_init,
-    mbarrier_inval, mbarrier_try_wait_parity,
-};
+use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::{DynamicSharedArray, SharedArray};
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    cvt_f32x2_bf16x2, tcgen05_alloc, tcgen05_commit_shared_cluster, tcgen05_dealloc,
-    tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync, tcgen05_ld_16x256b_pure,
-    tcgen05_load_wait,
+    cvt_f32x2_bf16x2, tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync,
 };
-use cuda_device::tma::{TmaDescriptor, cp_async_bulk_tensor_3d_g2s};
+use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
-use kittens::ldst::stmatrix_m8n8_x2;
+use kittens::ldst::{stmatrix_m8n8_x2, store_fragment_bf16};
 use kittens::mma::{self, mma_ab, mma_abt};
 use kittens::pipeline;
-use kittens::reg::{RegTile, RegVec, exp2_approx, fmax, log2_approx, online_rescale};
+use kittens::reg::{
+    Fragment, RegTile, RegVec, exp2_approx, fmax, log2_approx, online_rescale, value_column,
+};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
-use kittens::sync::{Semaphore, SemaphoreRing};
+use kittens::sync::{PhasedSemaphore, Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
 
 // Tile contract; `host.rs` mirrors these as FLASH_TILE / FLASH_HD (kept
@@ -123,7 +120,7 @@ type PTile = SharedTile<Bf16, TILE, TILE, Swizzle128B>;
 /// K/V for backward dK/dV).
 type PairedPanel = SharedTile<Bf16, { 2 * TILE }, HD, Swizzle128B>;
 /// The paired single-subtile `[2·TILE, TILE]` bf16 operand the backward
-/// kernels store through `write_bf16_fragment` (dS, Pᵀ, dSᵀ): 128 swizzled
+/// kernels store through `store_fragment_bf16` (dS, Pᵀ, dSᵀ): 128 swizzled
 /// 128-byte rows feeding the gradient MMAs' A side.
 type PairedPTile = SharedTile<Bf16, { 2 * TILE }, TILE, Swizzle128B>;
 const _: () = assert!(Panel::BYTES == TILE_BYTES && Panel::SUBTILE_BYTES == SUBTILE_BYTES);
@@ -246,25 +243,6 @@ pub mod kernels {
     // (score/gradient, plain and 7e15-paired) now live in kittens::shared
     // (`operand_descriptor`) and kittens::mma (`mma_abt`/`mma_ab`) — same
     // bits, same issue order.
-
-    /// TMA one `[TILE, HD]` head-panel row range into two stacked 64-wide
-    /// SWIZZLE_128B subtiles: the descriptor's box is 64 columns, so the
-    /// second load lifts the leading (HD) coordinate by 64 to fetch columns
-    /// 64..128 into `dst + SUBTILE_BYTES`. Callers still charge one
-    /// `TILE_BYTES` (= 2·SUBTILE_BYTES) of expected transaction bytes.
-    #[inline(always)]
-    unsafe fn load_panel(
-        dst: *mut u8,
-        tma: *const TmaDescriptor,
-        row: i32,
-        plane: i32,
-        barrier: *mut Barrier,
-    ) {
-        unsafe {
-            cp_async_bulk_tensor_3d_g2s(dst, tma, 0, row, plane, barrier);
-            cp_async_bulk_tensor_3d_g2s(dst.add(SUBTILE_BYTES), tma, 64, row, plane, barrier);
-        }
-    }
 
     // The pure-PTX-safe scalar maps (fmax/fmin/exp2_approx/log2_approx) and
     // the quad reductions now live in kittens::reg; the swizzled stmatrix
@@ -626,56 +604,6 @@ pub mod kernels {
         unsafe { mma_abt(s_tmem, q, k, s_instruction, false) }
     }
 
-    /// Store one thread's eight-value bf16 fragment into a stacked
-    /// SWIZZLE_128B `[128, 128]` subtile pair, exactly like `softmax_tile`'s
-    /// pass-2 P-write: the two `stmatrix` targets carry the 16-byte-chunk XOR
-    /// the TMA swizzle would produce, folding in the tile base's absolute
-    /// 128-byte row phase, so the accumulating MMA reads the operand like a
-    /// TMA-loaded tile. Shared by both backward kernels (dS for kernel A, Pᵀ
-    /// and dSᵀ for kernel B).
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn write_bf16_fragment(
-        smem: *mut u8,
-        phase: usize,
-        tmem_row: u32,
-        column_block: u32,
-        lane: u32,
-        a0: f32,
-        a1: f32,
-        a8: f32,
-        a9: f32,
-        b0: f32,
-        b1: f32,
-        b8: f32,
-        b9: f32,
-    ) {
-        unsafe {
-            // The dS / Pᵀ / dSᵀ operands are a single 64-wide subtile
-            // (128-byte rows), so the eight 16-byte chunks index the row.
-            let chunk_low = (column_block * 2) as usize;
-            let chunk = if (8..16).contains(&lane) {
-                chunk_low + 1
-            } else {
-                chunk_low
-            };
-            let row_low = tmem_row as usize + (lane % 8) as usize;
-            let row_high = row_low + 8;
-            let address_low = smem.add(row_low * 128 + (chunk ^ ((row_low + phase) & 7)) * 16);
-            let address_high = smem.add(row_high * 128 + (chunk ^ ((row_high + phase) & 7)) * 16);
-            stmatrix_m8n8_x2(
-                address_low,
-                cvt_f32x2_bf16x2(a0, a1),
-                cvt_f32x2_bf16x2(a8, a9),
-            );
-            stmatrix_m8n8_x2(
-                address_high,
-                cvt_f32x2_bf16x2(b0, b1),
-                cvt_f32x2_bf16x2(b8, b9),
-            );
-        }
-    }
-
     /// True `dS = P·(dP − D)·scale` for one score element, base-2 domain.
     /// `s` is the staged pre-scaled score (`scale·log2e·(q·k)`) so the
     /// probability is `exp2(s − lse2)`; `keep` is false only on masked
@@ -692,270 +620,13 @@ pub mod kernels {
         }
     }
 
-    /// One key tile of the query-parallel backward register pass (kernel A):
-    /// drain `S` and `dP` from TMEM through the 16x256b fragment map,
-    /// recompute `P = exp2(s − lse2[row])`, form `dS = P·(dP − dot[row])·scale`
-    /// (diagonal positions past the causal edge are zero), and store the bf16
-    /// dS into the two stacked SWIZZLE_128B subtiles. `lse2`/`dot` are the
-    /// query tile's per-row statistics staged in shared memory; rows are query
-    /// rows, so both index by the fragment's row coordinate.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn backward_q_tile(
-        s_tmem: STmem,
-        dp_tmem: STmem,
-        diagonal: bool,
-        warp_id: u32,
-        lane: u32,
-        lse2: *const f32,
-        dot: *const f32,
-        ds_smem: *mut u8,
-        ds_phase: usize,
-    ) {
-        unsafe {
-            let quad = (lane % 4) as usize;
-            let row_in_16 = (lane / 4) as usize;
-            let mut row_block = 0u32;
-            while row_block < 2 {
-                let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column_block = 0u32;
-                while column_block < 4 {
-                    let column = column_block * 16;
-                    let (s_low, s_high) = s_tmem.fragment(tmem_row, column);
-                    let (dp_low, dp_high) = dp_tmem.fragment(tmem_row, column);
-                    let row_a = tmem_row + row_in_16 as u32;
-                    let row_b = row_a + 8;
-                    let col = column + 2 * quad as u32;
-                    let lse_a = *lse2.add(row_a as usize);
-                    let dot_a = *dot.add(row_a as usize);
-                    let lse_b = *lse2.add(row_b as usize);
-                    let dot_b = *dot.add(row_b as usize);
-
-                    let ds_a0 = backward_dscore(
-                        s_low[0],
-                        dp_low[0],
-                        lse_a,
-                        dot_a,
-                        SCALE,
-                        !diagonal || col <= row_a,
-                    );
-                    let ds_a1 = backward_dscore(
-                        s_low[1],
-                        dp_low[1],
-                        lse_a,
-                        dot_a,
-                        SCALE,
-                        !diagonal || col + 1 <= row_a,
-                    );
-                    let ds_a8 = backward_dscore(
-                        s_high[0],
-                        dp_high[0],
-                        lse_a,
-                        dot_a,
-                        SCALE,
-                        !diagonal || col + 8 <= row_a,
-                    );
-                    let ds_a9 = backward_dscore(
-                        s_high[1],
-                        dp_high[1],
-                        lse_a,
-                        dot_a,
-                        SCALE,
-                        !diagonal || col + 9 <= row_a,
-                    );
-                    let ds_b0 = backward_dscore(
-                        s_low[2],
-                        dp_low[2],
-                        lse_b,
-                        dot_b,
-                        SCALE,
-                        !diagonal || col <= row_b,
-                    );
-                    let ds_b1 = backward_dscore(
-                        s_low[3],
-                        dp_low[3],
-                        lse_b,
-                        dot_b,
-                        SCALE,
-                        !diagonal || col + 1 <= row_b,
-                    );
-                    let ds_b8 = backward_dscore(
-                        s_high[2],
-                        dp_high[2],
-                        lse_b,
-                        dot_b,
-                        SCALE,
-                        !diagonal || col + 8 <= row_b,
-                    );
-                    let ds_b9 = backward_dscore(
-                        s_high[3],
-                        dp_high[3],
-                        lse_b,
-                        dot_b,
-                        SCALE,
-                        !diagonal || col + 9 <= row_b,
-                    );
-                    write_bf16_fragment(
-                        ds_smem,
-                        ds_phase,
-                        tmem_row,
-                        column_block,
-                        lane,
-                        ds_a0,
-                        ds_a1,
-                        ds_a8,
-                        ds_a9,
-                        ds_b0,
-                        ds_b1,
-                        ds_b8,
-                        ds_b9,
-                    );
-                    column_block += 1;
-                }
-                row_block += 1;
-            }
-        }
-    }
-
-    /// One query tile of the key-parallel backward register pass (kernel B):
-    /// drain the transposed `Sᵀ` and `dPᵀ` from TMEM, recompute the
-    /// transposed probabilities `Pᵀ = exp2(sᵀ − lse2[col])` and
-    /// `dSᵀ = Pᵀ·(dPᵀ − dot[col])·ln2`, and store both into their own stacked
-    /// subtile pairs. Rows are key rows and columns are query rows, so the
-    /// statistics index by the fragment's *column* coordinate and the causal
-    /// mask zeroes positions where the key row leads the query column.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn backward_kv_tile(
-        st_tmem: STmem,
-        dpt_tmem: STmem,
-        diagonal: bool,
-        warp_id: u32,
-        lane: u32,
-        lse2: *const f32,
-        dot: *const f32,
-        p_smem: *mut u8,
-        p_phase: usize,
-        ds_smem: *mut u8,
-        ds_phase: usize,
-    ) {
-        unsafe {
-            let quad = (lane % 4) as usize;
-            let row_in_16 = (lane / 4) as usize;
-            let mut row_block = 0u32;
-            while row_block < 2 {
-                let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column_block = 0u32;
-                while column_block < 4 {
-                    let column = column_block * 16;
-                    let (s_low, s_high) = st_tmem.fragment(tmem_row, column);
-                    let (dp_low, dp_high) = dpt_tmem.fragment(tmem_row, column);
-                    let row_a = tmem_row + row_in_16 as u32;
-                    let row_b = row_a + 8;
-                    let col = column + 2 * quad as u32;
-                    let lse_c0 = *lse2.add(col as usize);
-                    let dot_c0 = *dot.add(col as usize);
-                    let lse_c1 = *lse2.add(col as usize + 1);
-                    let dot_c1 = *dot.add(col as usize + 1);
-                    let lse_c8 = *lse2.add(col as usize + 8);
-                    let dot_c8 = *dot.add(col as usize + 8);
-                    let lse_c9 = *lse2.add(col as usize + 9);
-                    let dot_c9 = *dot.add(col as usize + 9);
-
-                    let p_a0 = if !diagonal || row_a <= col {
-                        exp2_approx(s_low[0] - lse_c0)
-                    } else {
-                        0.0
-                    };
-                    let p_a1 = if !diagonal || row_a <= col + 1 {
-                        exp2_approx(s_low[1] - lse_c1)
-                    } else {
-                        0.0
-                    };
-                    let p_a8 = if !diagonal || row_a <= col + 8 {
-                        exp2_approx(s_high[0] - lse_c8)
-                    } else {
-                        0.0
-                    };
-                    let p_a9 = if !diagonal || row_a <= col + 9 {
-                        exp2_approx(s_high[1] - lse_c9)
-                    } else {
-                        0.0
-                    };
-                    let p_b0 = if !diagonal || row_b <= col {
-                        exp2_approx(s_low[2] - lse_c0)
-                    } else {
-                        0.0
-                    };
-                    let p_b1 = if !diagonal || row_b <= col + 1 {
-                        exp2_approx(s_low[3] - lse_c1)
-                    } else {
-                        0.0
-                    };
-                    let p_b8 = if !diagonal || row_b <= col + 8 {
-                        exp2_approx(s_high[2] - lse_c8)
-                    } else {
-                        0.0
-                    };
-                    let p_b9 = if !diagonal || row_b <= col + 9 {
-                        exp2_approx(s_high[3] - lse_c9)
-                    } else {
-                        0.0
-                    };
-
-                    let ds_a0 = p_a0 * (dp_low[0] - dot_c0) * LN2;
-                    let ds_a1 = p_a1 * (dp_low[1] - dot_c1) * LN2;
-                    let ds_a8 = p_a8 * (dp_high[0] - dot_c8) * LN2;
-                    let ds_a9 = p_a9 * (dp_high[1] - dot_c9) * LN2;
-                    let ds_b0 = p_b0 * (dp_low[2] - dot_c0) * LN2;
-                    let ds_b1 = p_b1 * (dp_low[3] - dot_c1) * LN2;
-                    let ds_b8 = p_b8 * (dp_high[2] - dot_c8) * LN2;
-                    let ds_b9 = p_b9 * (dp_high[3] - dot_c9) * LN2;
-
-                    write_bf16_fragment(
-                        p_smem,
-                        p_phase,
-                        tmem_row,
-                        column_block,
-                        lane,
-                        p_a0,
-                        p_a1,
-                        p_a8,
-                        p_a9,
-                        p_b0,
-                        p_b1,
-                        p_b8,
-                        p_b9,
-                    );
-                    write_bf16_fragment(
-                        ds_smem,
-                        ds_phase,
-                        tmem_row,
-                        column_block,
-                        lane,
-                        ds_a0,
-                        ds_a1,
-                        ds_a8,
-                        ds_a9,
-                        ds_b0,
-                        ds_b1,
-                        ds_b8,
-                        ds_b9,
-                    );
-                    column_block += 1;
-                }
-                row_block += 1;
-            }
-        }
-    }
-
     /// PAIRED query-parallel backward register pass (Design B, #47 item 2): the
     /// 128-thread warpgroup drains ONE stacked `S`/`dP` — warps 0–1 own
     /// accumulator rows 0..63 (query tile A), warps 2–3 own 64..127 (query tile
     /// B) — and forms `dS = P·(dP − dot)·scale` for all 128 rows into ONE
     /// stacked `[128, 64]` dS tile. `warp_id` is the ACTUAL block warp (0..3).
     /// The paired tiles are adjacent, so `lse2`/`dot` are the pair's 128
-    /// contiguous query rows indexed directly by `row_a`; the causal edge
+    /// contiguous query rows and index by the fragment's ROW; the causal edge
     /// compares against the query row WITHIN the tile (`row & 63`). A future
     /// tile for the lower stream (`key > tile_b` → `key == tile_a`'s partner) is
     /// fully masked to `dS = 0`.
@@ -971,114 +642,46 @@ pub mod kernels {
         lane: u32,
         lse2: *const f32,
         dot: *const f32,
-        ds_smem: *mut u8,
-        ds_phase: usize,
+        ds: PairedPTile,
     ) {
         unsafe {
-            let quad = (lane % 4) as usize;
-            let row_in_16 = (lane / 4) as usize;
-            let is_a = warp_id < 2;
-            let my_tile = if is_a { tile_a } else { tile_b };
+            let ds_chunks = ds.chunk_writer();
+            let lane_column = 2 * (lane % 4);
+            let row_in_16 = lane / 4;
+            let my_tile = if warp_id < 2 { tile_a } else { tile_b };
             let masked_all = key > my_tile;
             let diagonal = key == my_tile;
             let mut row_block = 0u32;
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column_block = 0u32;
-                while column_block < 4 {
-                    let column = column_block * 16;
-                    let (s_low, s_high) = s_tmem.fragment(tmem_row, column);
-                    let (dp_low, dp_high) = dp_tmem.fragment(tmem_row, column);
-                    let row_a = tmem_row + row_in_16 as u32;
-                    let row_b = row_a + 8;
-                    let qrow_a = row_a & 63;
-                    let qrow_b = row_b & 63;
-                    let col = column + 2 * quad as u32;
-                    let lse_a = *lse2.add(row_a as usize);
-                    let dot_a = *dot.add(row_a as usize);
-                    let lse_b = *lse2.add(row_b as usize);
-                    let dot_b = *dot.add(row_b as usize);
-
-                    let ds_a0 = backward_dscore(
-                        s_low[0],
-                        dp_low[0],
-                        lse_a,
-                        dot_a,
-                        SCALE,
-                        !masked_all && (!diagonal || col <= qrow_a),
-                    );
-                    let ds_a1 = backward_dscore(
-                        s_low[1],
-                        dp_low[1],
-                        lse_a,
-                        dot_a,
-                        SCALE,
-                        !masked_all && (!diagonal || col + 1 <= qrow_a),
-                    );
-                    let ds_a8 = backward_dscore(
-                        s_high[0],
-                        dp_high[0],
-                        lse_a,
-                        dot_a,
-                        SCALE,
-                        !masked_all && (!diagonal || col + 8 <= qrow_a),
-                    );
-                    let ds_a9 = backward_dscore(
-                        s_high[1],
-                        dp_high[1],
-                        lse_a,
-                        dot_a,
-                        SCALE,
-                        !masked_all && (!diagonal || col + 9 <= qrow_a),
-                    );
-                    let ds_b0 = backward_dscore(
-                        s_low[2],
-                        dp_low[2],
-                        lse_b,
-                        dot_b,
-                        SCALE,
-                        !masked_all && (!diagonal || col <= qrow_b),
-                    );
-                    let ds_b1 = backward_dscore(
-                        s_low[3],
-                        dp_low[3],
-                        lse_b,
-                        dot_b,
-                        SCALE,
-                        !masked_all && (!diagonal || col + 1 <= qrow_b),
-                    );
-                    let ds_b8 = backward_dscore(
-                        s_high[2],
-                        dp_high[2],
-                        lse_b,
-                        dot_b,
-                        SCALE,
-                        !masked_all && (!diagonal || col + 8 <= qrow_b),
-                    );
-                    let ds_b9 = backward_dscore(
-                        s_high[3],
-                        dp_high[3],
-                        lse_b,
-                        dot_b,
-                        SCALE,
-                        !masked_all && (!diagonal || col + 9 <= qrow_b),
-                    );
-                    write_bf16_fragment(
-                        ds_smem,
-                        ds_phase,
-                        tmem_row,
-                        column_block,
-                        lane,
-                        ds_a0,
-                        ds_a1,
-                        ds_a8,
-                        ds_a9,
-                        ds_b0,
-                        ds_b1,
-                        ds_b8,
-                        ds_b9,
-                    );
-                    column_block += 1;
+                let mut column = 0u32;
+                while column < TILE as u32 {
+                    let s = s_tmem.fragment_tile(tmem_row, column);
+                    let dp = dp_tmem.fragment_tile(tmem_row, column);
+                    let mut ds_tile = Fragment::zero();
+                    let mut slot = 0usize;
+                    while slot < 2 {
+                        let row = tmem_row + row_in_16 + 8 * slot as u32;
+                        let query_row = row & 63;
+                        let lse_row = *lse2.add(row as usize);
+                        let dot_row = *dot.add(row as usize);
+                        let mut value = 0usize;
+                        while value < 4 {
+                            let key_column = column + lane_column + value_column(value) as u32;
+                            ds_tile.0[slot][value] = backward_dscore(
+                                s.0[slot][value],
+                                dp.0[slot][value],
+                                lse_row,
+                                dot_row,
+                                SCALE,
+                                !masked_all && (!diagonal || key_column <= query_row),
+                            );
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                    store_fragment_bf16(ds_chunks, tmem_row, column, lane, ds_tile);
+                    column += 16;
                 }
                 row_block += 1;
             }
@@ -1089,9 +692,10 @@ pub mod kernels {
     /// 128-thread warpgroup drains ONE stacked transposed `Sᵀ`/`dPᵀ` — warps
     /// 0–1 own accumulator rows 0..63 (key tile A), warps 2–3 own 64..127 (key
     /// tile B) — and forms `Pᵀ`/`dSᵀ` for all 128 key rows into ONE stacked
-    /// `[128, 64]` tile each. Rows are key rows, columns are query rows, so the
-    /// per-row statistics index by `col` (the streamed query tile's rows,
-    /// unpaired at 64) and the causal edge compares the key row WITHIN the tile
+    /// `[128, 64]` tile each. Rows are key rows and columns are query rows, so
+    /// this is the transpose of kernel A's indexing in both directions: the
+    /// per-row statistics become a per-VALUE gather over the streamed query
+    /// tile's 64 rows, and the causal edge compares the key row within the tile
     /// (`row & 63`) against the query column. A query tile before the higher
     /// key stream (`query < key_b` → the shared diagonal query `key_a`) fully
     /// masks that stream to zero.
@@ -1107,160 +711,60 @@ pub mod kernels {
         lane: u32,
         lse2: *const f32,
         dot: *const f32,
-        p_smem: *mut u8,
-        p_phase: usize,
-        ds_smem: *mut u8,
-        ds_phase: usize,
+        p: PairedPTile,
+        ds: PairedPTile,
     ) {
         unsafe {
-            let quad = (lane % 4) as usize;
-            let row_in_16 = (lane / 4) as usize;
-            let is_a = warp_id < 2;
-            let my_key = if is_a { key_a } else { key_b };
+            let p_chunks = p.chunk_writer();
+            let ds_chunks = ds.chunk_writer();
+            let lane_column = 2 * (lane % 4);
+            let row_in_16 = lane / 4;
+            let my_key = if warp_id < 2 { key_a } else { key_b };
             let masked_all = query < my_key;
             let diagonal = query == my_key;
             let mut row_block = 0u32;
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column_block = 0u32;
-                while column_block < 4 {
-                    let column = column_block * 16;
-                    let (s_low, s_high) = st_tmem.fragment(tmem_row, column);
-                    let (dp_low, dp_high) = dpt_tmem.fragment(tmem_row, column);
-                    let row_a = tmem_row + row_in_16 as u32;
-                    let row_b = row_a + 8;
-                    let krow_a = row_a & 63;
-                    let krow_b = row_b & 63;
-                    let col = column + 2 * quad as u32;
-                    let lse_c0 = *lse2.add(col as usize);
-                    let dot_c0 = *dot.add(col as usize);
-                    let lse_c1 = *lse2.add(col as usize + 1);
-                    let dot_c1 = *dot.add(col as usize + 1);
-                    let lse_c8 = *lse2.add(col as usize + 8);
-                    let dot_c8 = *dot.add(col as usize + 8);
-                    let lse_c9 = *lse2.add(col as usize + 9);
-                    let dot_c9 = *dot.add(col as usize + 9);
-
-                    let keep_a0 = !masked_all && (!diagonal || krow_a <= col);
-                    let keep_a1 = !masked_all && (!diagonal || krow_a <= col + 1);
-                    let keep_a8 = !masked_all && (!diagonal || krow_a <= col + 8);
-                    let keep_a9 = !masked_all && (!diagonal || krow_a <= col + 9);
-                    let keep_b0 = !masked_all && (!diagonal || krow_b <= col);
-                    let keep_b1 = !masked_all && (!diagonal || krow_b <= col + 1);
-                    let keep_b8 = !masked_all && (!diagonal || krow_b <= col + 8);
-                    let keep_b9 = !masked_all && (!diagonal || krow_b <= col + 9);
-
-                    let p_a0 = if keep_a0 {
-                        exp2_approx(s_low[0] - lse_c0)
-                    } else {
-                        0.0
-                    };
-                    let p_a1 = if keep_a1 {
-                        exp2_approx(s_low[1] - lse_c1)
-                    } else {
-                        0.0
-                    };
-                    let p_a8 = if keep_a8 {
-                        exp2_approx(s_high[0] - lse_c8)
-                    } else {
-                        0.0
-                    };
-                    let p_a9 = if keep_a9 {
-                        exp2_approx(s_high[1] - lse_c9)
-                    } else {
-                        0.0
-                    };
-                    let p_b0 = if keep_b0 {
-                        exp2_approx(s_low[2] - lse_c0)
-                    } else {
-                        0.0
-                    };
-                    let p_b1 = if keep_b1 {
-                        exp2_approx(s_low[3] - lse_c1)
-                    } else {
-                        0.0
-                    };
-                    let p_b8 = if keep_b8 {
-                        exp2_approx(s_high[2] - lse_c8)
-                    } else {
-                        0.0
-                    };
-                    let p_b9 = if keep_b9 {
-                        exp2_approx(s_high[3] - lse_c9)
-                    } else {
-                        0.0
-                    };
-
-                    let ds_a0 = p_a0 * (dp_low[0] - dot_c0) * LN2;
-                    let ds_a1 = p_a1 * (dp_low[1] - dot_c1) * LN2;
-                    let ds_a8 = p_a8 * (dp_high[0] - dot_c8) * LN2;
-                    let ds_a9 = p_a9 * (dp_high[1] - dot_c9) * LN2;
-                    let ds_b0 = p_b0 * (dp_low[2] - dot_c0) * LN2;
-                    let ds_b1 = p_b1 * (dp_low[3] - dot_c1) * LN2;
-                    let ds_b8 = p_b8 * (dp_high[2] - dot_c8) * LN2;
-                    let ds_b9 = p_b9 * (dp_high[3] - dot_c9) * LN2;
-
-                    write_bf16_fragment(
-                        p_smem,
-                        p_phase,
-                        tmem_row,
-                        column_block,
-                        lane,
-                        p_a0,
-                        p_a1,
-                        p_a8,
-                        p_a9,
-                        p_b0,
-                        p_b1,
-                        p_b8,
-                        p_b9,
-                    );
-                    write_bf16_fragment(
-                        ds_smem,
-                        ds_phase,
-                        tmem_row,
-                        column_block,
-                        lane,
-                        ds_a0,
-                        ds_a1,
-                        ds_a8,
-                        ds_a9,
-                        ds_b0,
-                        ds_b1,
-                        ds_b8,
-                        ds_b9,
-                    );
-                    column_block += 1;
+                let mut column = 0u32;
+                while column < TILE as u32 {
+                    let st = st_tmem.fragment_tile(tmem_row, column);
+                    let dpt = dpt_tmem.fragment_tile(tmem_row, column);
+                    let mut lse_column = [0.0f32; 4];
+                    let mut dot_column = [0.0f32; 4];
+                    let mut value = 0usize;
+                    while value < 4 {
+                        let query_row = (column + lane_column) as usize + value_column(value);
+                        lse_column[value] = *lse2.add(query_row);
+                        dot_column[value] = *dot.add(query_row);
+                        value += 1;
+                    }
+                    let mut p_tile = Fragment::zero();
+                    let mut ds_tile = Fragment::zero();
+                    let mut slot = 0usize;
+                    while slot < 2 {
+                        let key_row = (tmem_row + row_in_16 + 8 * slot as u32) & 63;
+                        let mut value = 0usize;
+                        while value < 4 {
+                            let query_column = column + lane_column + value_column(value) as u32;
+                            let keep = !masked_all && (!diagonal || key_row <= query_column);
+                            let probability = if keep {
+                                exp2_approx(st.0[slot][value] - lse_column[value])
+                            } else {
+                                0.0
+                            };
+                            p_tile.0[slot][value] = probability;
+                            ds_tile.0[slot][value] =
+                                probability * (dpt.0[slot][value] - dot_column[value]) * LN2;
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                    store_fragment_bf16(p_chunks, tmem_row, column, lane, p_tile);
+                    store_fragment_bf16(ds_chunks, tmem_row, column, lane, ds_tile);
+                    column += 16;
                 }
                 row_block += 1;
             }
-        }
-    }
-
-    /// Issue one `dQ/dK/dV += A·Bᵀ` gradient tile (also the forward `O = P·V`)
-    /// from the leader thread. `A` (the 64-wide probability/`dS` subtile) walks
-    /// four K=16 chunks; `B` (a 128-wide key/query/value operand) is two stacked
-    /// HD subtiles, so the 128-column output is two chained `M128_N64`
-    /// transpose_b accumulations (over the 64-row tile; phantom rows 64..128 as
-    /// in `score_mma`), one per subtile, into `acc_tmem` and `acc_tmem + 64`.
-    /// `fresh` starts a new TMEM accumulator (the block's first visited tile);
-    /// otherwise it accumulates with `enable_d`.
-    #[inline(always)]
-    unsafe fn grad_mma(
-        acc_tmem: u32,
-        a_smem: *mut u8,
-        b_smem: *mut u8,
-        instruction: u32,
-        fresh: bool,
-    ) {
-        unsafe {
-            mma_ab(
-                acc_tmem,
-                PTile::from_raw(a_smem),
-                Panel::from_raw(b_smem),
-                instruction,
-                !fresh,
-            );
         }
     }
 
@@ -1338,17 +842,19 @@ pub mod kernels {
             static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tile = PTile::from_raw(smem);
+            let tma = Semaphore::attach(&raw mut TMA_BARRIER);
             let tid = thread::threadIdx_x();
             if tid == 0 {
-                mbarrier_init(&raw mut TMA_BARRIER, 1);
+                tma.init(1);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
             if tid == 0 {
-                cp_async_bulk_tensor_3d_g2s(smem, src_tma, 0, 0, 0, &raw mut TMA_BARRIER);
-                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, SUBTILE_BYTES as u32);
+                tile.tma_load(src_tma, 0, 0, tma);
+                tma.expect_tx(PTile::BYTES as u32);
             }
-            while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
+            tma.wait(0);
             thread::sync_threads();
 
             let words = smem as *const u32;
@@ -1358,11 +864,11 @@ pub mod kernels {
                 index += TILE;
             }
             if tid == 0 {
-                *output.get_unchecked_mut(SUBTILE_BYTES / 4) = ((smem as usize >> 7) & 7) as u32;
+                *output.get_unchecked_mut(SUBTILE_BYTES / 4) = tile.swizzle_phase() as u32;
             }
             thread::sync_threads();
             if tid == 0 {
-                mbarrier_inval(&raw mut TMA_BARRIER);
+                tma.inval();
             }
         }
     }
@@ -1394,32 +900,31 @@ pub mod kernels {
             static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let a_smem = smem;
-            let b_smem = smem.add(TILE_BYTES);
+            let a = Panel::from_raw(smem);
+            let b = Panel::from_raw(smem.add(TILE_BYTES));
 
             let tid = thread::threadIdx_x();
             let warp_id = warp::warp_id();
             let lane = warp::lane_id();
             let is_leader = tid == 0;
 
+            let tma = Semaphore::attach(&raw mut TMA_BARRIER);
+            let mma = Semaphore::attach(&raw mut MMA_BARRIER);
             if is_leader {
-                mbarrier_init(&raw mut TMA_BARRIER, 1);
-                mbarrier_init(&raw mut MMA_BARRIER, 1);
+                tma.init(1);
+                mma.init(1);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
-            if warp_id == 0 {
-                tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            }
-            thread::sync_threads();
-            let tmem = *(&raw const TMEM_ADDRESS as *const u32);
+            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
+            let c_tmem = STmem::from_raw(tmem);
 
             if is_leader {
-                load_panel(a_smem, a_tma, 0, 0, &raw mut TMA_BARRIER);
-                load_panel(b_smem, b_tma, 0, 0, &raw mut TMA_BARRIER);
-                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, (2 * TILE_BYTES) as u32);
+                a.tma_load(a_tma, 0, 0, tma);
+                b.tma_load(b_tma, 0, 0, tma);
+                tma.expect_tx((2 * TILE_BYTES) as u32);
             }
-            while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
+            tma.wait(0);
             thread::sync_threads();
 
             let instruction = Tcgen05InstructionDescriptor::builder()
@@ -1429,52 +934,41 @@ pub mod kernels {
                 .build()
                 .raw();
             if is_leader {
-                score_mma(
-                    tmem,
-                    Panel::from_raw(a_smem),
-                    Panel::from_raw(b_smem),
-                    instruction,
-                );
-                tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                score_mma(c_tmem.raw(), a, b, instruction);
+                mma::commit(mma);
             }
-            while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, 0) {}
+            mma.wait(0);
             thread::sync_threads();
 
-            let quad = (lane % 4) as usize;
+            let lane_column = 2 * (lane % 4) as usize;
             let row_in_16 = (lane / 4) as usize;
             let mut row_block = 0u32;
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column_block = 0u32;
-                while column_block < 4 {
-                    let column = (column_block * 16) as usize;
-                    let low = tcgen05_ld_16x256b_pure(tmem + (tmem_row << 16) + column as u32);
-                    tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(tmem + (tmem_row << 16) + column as u32 + 8);
-                    tcgen05_load_wait();
-                    let row_a = tmem_row as usize + row_in_16;
-                    let row_b = row_a + 8;
-                    let col = column + 2 * quad;
-                    *output.get_unchecked_mut(row_a * TILE + col) = low[0];
-                    *output.get_unchecked_mut(row_a * TILE + col + 1) = low[1];
-                    *output.get_unchecked_mut(row_b * TILE + col) = low[2];
-                    *output.get_unchecked_mut(row_b * TILE + col + 1) = low[3];
-                    *output.get_unchecked_mut(row_a * TILE + col + 8) = high[0];
-                    *output.get_unchecked_mut(row_a * TILE + col + 9) = high[1];
-                    *output.get_unchecked_mut(row_b * TILE + col + 8) = high[2];
-                    *output.get_unchecked_mut(row_b * TILE + col + 9) = high[3];
-                    column_block += 1;
+                let mut column = 0u32;
+                while column < TILE as u32 {
+                    let c = c_tmem.fragment_tile(tmem_row, column);
+                    let mut slot = 0usize;
+                    while slot < 2 {
+                        let row = tmem_row as usize + row_in_16 + 8 * slot;
+                        let mut value = 0usize;
+                        while value < 4 {
+                            let out_column = column as usize + lane_column + value_column(value);
+                            *output.get_unchecked_mut(row * TILE + out_column) = c.0[slot][value];
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                    column += 16;
                 }
                 row_block += 1;
             }
 
             thread::sync_threads();
-            if warp_id == 0 {
-                tcgen05_dealloc(tmem, 512);
-            }
+            dealloc_block(tmem, 512);
             if is_leader {
-                mbarrier_inval(&raw mut TMA_BARRIER);
-                mbarrier_inval(&raw mut MMA_BARRIER);
+                tma.inval();
+                mma.inval();
             }
         }
     }
@@ -1701,11 +1195,11 @@ pub mod kernels {
             static mut DOTS: SharedArray<f32, 128> = SharedArray::UNINIT;
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let q_smem = smem;
-            let dy_smem = smem.add(2 * TILE_BYTES);
-            let k_smem = smem.add(4 * TILE_BYTES);
-            let v_smem = smem.add(5 * TILE_BYTES);
-            let ds_smem = smem.add(6 * TILE_BYTES);
+            let q = PairedPanel::from_raw(smem);
+            let dy = PairedPanel::from_raw(smem.add(2 * TILE_BYTES));
+            let k = Panel::from_raw(smem.add(4 * TILE_BYTES));
+            let v = Panel::from_raw(smem.add(5 * TILE_BYTES));
+            let ds = PairedPTile::from_raw(smem.add(6 * TILE_BYTES));
 
             let tid = thread::threadIdx_x();
             if thread::blockDim_x() as usize != 2 * TILE {
@@ -1724,17 +1218,15 @@ pub mod kernels {
             let tile_a = pair * 2;
             let tile_b = tile_a + 1;
 
+            let mut tma = PhasedSemaphore::attach(&raw mut TMA_BARRIER);
+            let mut mma = PhasedSemaphore::attach(&raw mut MMA_BARRIER);
             if is_leader {
-                mbarrier_init(&raw mut TMA_BARRIER, 1);
-                mbarrier_init(&raw mut MMA_BARRIER, 1);
+                tma.sem().init(1);
+                mma.sem().init(1);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
-            if warp_id == 0 {
-                tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            }
-            thread::sync_threads();
-            let tmem = *(&raw const TMEM_ADDRESS as *const u32);
+            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
             let s_tmem = STmem::from_raw(tmem);
             let dp_tmem = STmem::from_raw(tmem + 128);
             let dq_tmem = AccTmem::from_raw(tmem + 256);
@@ -1754,29 +1246,16 @@ pub mod kernels {
                 .raw();
 
             // The stacked Q/dY pairs stay operand-A resident for the whole key
-            // stream.
+            // stream: tile A's rows land at the operand's row 0, tile B's at
+            // row TILE, one box per HD subtile each.
             if is_leader {
-                load_q_paired(
-                    q_smem,
-                    q_tma,
-                    (tile_a * TILE as u32) as i32,
-                    (tile_b * TILE as u32) as i32,
-                    true,
-                    plane,
-                    &raw mut TMA_BARRIER,
-                );
-                load_q_paired(
-                    dy_smem,
-                    dy_tma,
-                    (tile_a * TILE as u32) as i32,
-                    (tile_b * TILE as u32) as i32,
-                    true,
-                    plane,
-                    &raw mut TMA_BARRIER,
-                );
-                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 4 * TILE_BYTES as u32);
+                q.tma_load_at(q_tma, 0, (tile_a * TILE as u32) as i32, plane, tma.sem());
+                q.tma_load_at(q_tma, TILE, (tile_b * TILE as u32) as i32, plane, tma.sem());
+                dy.tma_load_at(dy_tma, 0, (tile_a * TILE as u32) as i32, plane, tma.sem());
+                dy.tma_load_at(dy_tma, TILE, (tile_b * TILE as u32) as i32, plane, tma.sem());
+                tma.sem().expect_tx(4 * TILE_BYTES as u32);
             }
-            while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
+            tma.wait_next();
 
             // The pair's 128 contiguous query rows' base-2 LSE and softmax dot.
             let query_row = (batch * t) as usize + tile_a as usize * TILE + tid as usize;
@@ -1785,32 +1264,27 @@ pub mod kernels {
             (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
             thread::sync_threads();
 
-            let ds_phase = (ds_smem as usize >> 7) & 7;
             let mut dq_acc = RegTile::<4, 32>::zero();
 
-            let mut tma_phase = 1u32;
-            let mut mma_phase = 0u32;
             let mut key_tile = 0u32;
             while key_tile <= tile_b {
                 if is_leader {
                     let key_row = (key_tile * TILE as u32) as i32;
-                    load_panel(k_smem, k_tma, key_row, plane, &raw mut TMA_BARRIER);
-                    load_panel(v_smem, v_tma, key_row, plane, &raw mut TMA_BARRIER);
-                    mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
+                    k.tma_load(k_tma, key_row, plane, tma.sem());
+                    v.tma_load(v_tma, key_row, plane, tma.sem());
+                    tma.sem().expect_tx(2 * TILE_BYTES as u32);
                 }
-                while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, tma_phase & 1) {}
-                tma_phase += 1;
+                tma.wait_next();
                 thread::sync_threads();
 
                 // S = [Q_A;Q_B]·Kᵀ and dP = [dY_A;dY_B]·Vᵀ, both fresh.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    score_mma_paired(s_tmem.raw(), q_smem, k_smem, s_instruction);
-                    score_mma_paired(dp_tmem.raw(), dy_smem, v_smem, s_instruction);
-                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                    mma_abt(s_tmem.raw(), q, k, s_instruction, false);
+                    mma_abt(dp_tmem.raw(), dy, v, s_instruction, false);
+                    mma::commit(mma.sem());
                 }
-                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
-                mma_phase += 1;
+                mma.wait_next();
                 thread::sync_threads();
 
                 backward_q_tile_paired(
@@ -1823,8 +1297,7 @@ pub mod kernels {
                     lane,
                     &raw const LSE2 as *const f32,
                     &raw const DOTS as *const f32,
-                    ds_smem,
-                    ds_phase,
+                    ds,
                 );
 
                 fence_proxy_async_shared_cta();
@@ -1834,17 +1307,10 @@ pub mod kernels {
                 // dQ += dS·K, continuing the accumulator (fresh on key 0).
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    grad_mma(
-                        dq_tmem.raw(),
-                        ds_smem,
-                        k_smem,
-                        grad_instruction,
-                        key_tile == 0,
-                    );
-                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                    mma_ab(dq_tmem.raw(), ds, k, grad_instruction, key_tile != 0);
+                    mma::commit(mma.sem());
                 }
-                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
-                mma_phase += 1;
+                mma.wait_next();
 
                 tcgen05_fence_before_thread_sync();
                 thread::sync_threads();
@@ -1858,12 +1324,10 @@ pub mod kernels {
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            if warp_id == 0 {
-                tcgen05_dealloc(tmem, 512);
-            }
+            dealloc_block(tmem, 512);
             if is_leader {
-                mbarrier_inval(&raw mut TMA_BARRIER);
-                mbarrier_inval(&raw mut MMA_BARRIER);
+                tma.sem().inval();
+                mma.sem().inval();
             }
         }
     }
@@ -1903,12 +1367,12 @@ pub mod kernels {
             static mut DOTS: SharedArray<f32, 128> = SharedArray::UNINIT;
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let k_smem = smem;
-            let v_smem = smem.add(2 * TILE_BYTES);
-            let q_smem = smem.add(4 * TILE_BYTES);
-            let dy_smem = smem.add(5 * TILE_BYTES);
-            let p_smem = smem.add(6 * TILE_BYTES);
-            let ds_smem = smem.add(7 * TILE_BYTES);
+            let k = PairedPanel::from_raw(smem);
+            let v = PairedPanel::from_raw(smem.add(2 * TILE_BYTES));
+            let q = Panel::from_raw(smem.add(4 * TILE_BYTES));
+            let dy = Panel::from_raw(smem.add(5 * TILE_BYTES));
+            let p = PairedPTile::from_raw(smem.add(6 * TILE_BYTES));
+            let ds = PairedPTile::from_raw(smem.add(7 * TILE_BYTES));
 
             let tid = thread::threadIdx_x();
             if thread::blockDim_x() as usize != 2 * TILE {
@@ -1928,17 +1392,15 @@ pub mod kernels {
             let key_a = pair * 2;
             let key_b = key_a + 1;
 
+            let mut tma = PhasedSemaphore::attach(&raw mut TMA_BARRIER);
+            let mut mma = PhasedSemaphore::attach(&raw mut MMA_BARRIER);
             if is_leader {
-                mbarrier_init(&raw mut TMA_BARRIER, 1);
-                mbarrier_init(&raw mut MMA_BARRIER, 1);
+                tma.sem().init(1);
+                mma.sem().init(1);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
-            if warp_id == 0 {
-                tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            }
-            thread::sync_threads();
-            let tmem = *(&raw const TMEM_ADDRESS as *const u32);
+            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
             // Sᵀ/dPᵀ are 64-column segments; the dV/dK gradients are 128
             // columns, following at tmem+128 and tmem+256.
             let st_tmem = STmem::from_raw(tmem);
@@ -1963,45 +1425,26 @@ pub mod kernels {
             // The stacked K/V pairs stay operand-A resident for the whole query
             // stream.
             if is_leader {
-                load_q_paired(
-                    k_smem,
-                    k_tma,
-                    (key_a * TILE as u32) as i32,
-                    (key_b * TILE as u32) as i32,
-                    true,
-                    plane,
-                    &raw mut TMA_BARRIER,
-                );
-                load_q_paired(
-                    v_smem,
-                    v_tma,
-                    (key_a * TILE as u32) as i32,
-                    (key_b * TILE as u32) as i32,
-                    true,
-                    plane,
-                    &raw mut TMA_BARRIER,
-                );
-                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 4 * TILE_BYTES as u32);
+                k.tma_load_at(k_tma, 0, (key_a * TILE as u32) as i32, plane, tma.sem());
+                k.tma_load_at(k_tma, TILE, (key_b * TILE as u32) as i32, plane, tma.sem());
+                v.tma_load_at(v_tma, 0, (key_a * TILE as u32) as i32, plane, tma.sem());
+                v.tma_load_at(v_tma, TILE, (key_b * TILE as u32) as i32, plane, tma.sem());
+                tma.sem().expect_tx(4 * TILE_BYTES as u32);
             }
-            while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
+            tma.wait_next();
 
-            let p_phase = (p_smem as usize >> 7) & 7;
-            let ds_phase = (ds_smem as usize >> 7) & 7;
             let mut dv_acc = RegTile::<4, 32>::zero();
             let mut dk_acc = RegTile::<4, 32>::zero();
 
-            let mut tma_phase = 1u32;
-            let mut mma_phase = 0u32;
             let mut query_tile = key_a;
             while query_tile < tiles {
                 if is_leader {
                     let query_row = (query_tile * TILE as u32) as i32;
-                    load_panel(q_smem, q_tma, query_row, plane, &raw mut TMA_BARRIER);
-                    load_panel(dy_smem, dy_tma, query_row, plane, &raw mut TMA_BARRIER);
-                    mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
+                    q.tma_load(q_tma, query_row, plane, tma.sem());
+                    dy.tma_load(dy_tma, query_row, plane, tma.sem());
+                    tma.sem().expect_tx(2 * TILE_BYTES as u32);
                 }
-                while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, tma_phase & 1) {}
-                tma_phase += 1;
+                tma.wait_next();
                 thread::sync_threads();
 
                 // Stage this query tile's 64 rows' base-2 LSE and dot (indexed
@@ -2019,12 +1462,11 @@ pub mod kernels {
                 // Sᵀ = [K_A;K_B]·Qᵀ and dPᵀ = [V_A;V_B]·dYᵀ, both fresh.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    score_mma_paired(st_tmem.raw(), k_smem, q_smem, s_instruction);
-                    score_mma_paired(dpt_tmem.raw(), v_smem, dy_smem, s_instruction);
-                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                    mma_abt(st_tmem.raw(), k, q, s_instruction, false);
+                    mma_abt(dpt_tmem.raw(), v, dy, s_instruction, false);
+                    mma::commit(mma.sem());
                 }
-                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
-                mma_phase += 1;
+                mma.wait_next();
                 thread::sync_threads();
 
                 backward_kv_tile_paired(
@@ -2037,10 +1479,8 @@ pub mod kernels {
                     lane,
                     &raw const LSE2 as *const f32,
                     &raw const DOTS as *const f32,
-                    p_smem,
-                    p_phase,
-                    ds_smem,
-                    ds_phase,
+                    p,
+                    ds,
                 );
 
                 fence_proxy_async_shared_cta();
@@ -2050,13 +1490,12 @@ pub mod kernels {
                 // dV += Pᵀ·dY and dK += dSᵀ·Q, fresh on the first query tile.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    let fresh = query_tile == key_a;
-                    grad_mma(dv_tmem.raw(), p_smem, dy_smem, grad_instruction, fresh);
-                    grad_mma(dk_tmem.raw(), ds_smem, q_smem, grad_instruction, fresh);
-                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                    let accumulate = query_tile != key_a;
+                    mma_ab(dv_tmem.raw(), p, dy, grad_instruction, accumulate);
+                    mma_ab(dk_tmem.raw(), ds, q, grad_instruction, accumulate);
+                    mma::commit(mma.sem());
                 }
-                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
-                mma_phase += 1;
+                mma.wait_next();
 
                 tcgen05_fence_before_thread_sync();
                 thread::sync_threads();
@@ -2070,12 +1509,10 @@ pub mod kernels {
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            if warp_id == 0 {
-                tcgen05_dealloc(tmem, 512);
-            }
+            dealloc_block(tmem, 512);
             if is_leader {
-                mbarrier_inval(&raw mut TMA_BARRIER);
-                mbarrier_inval(&raw mut MMA_BARRIER);
+                tma.sem().inval();
+                mma.sem().inval();
             }
         }
     }
@@ -2402,60 +1839,6 @@ pub mod kernels {
                 kv_full.inval_all();
                 kv_free.inval_all();
                 stream.inval();
-            }
-        }
-    }
-
-    /// Paired `S = [Q_A;Q_B]·Kᵀ` (Design B, #47 item 2): ONE `M128_N64` MMA
-    /// over the STACKED 128-row Q operand — Q_A in accumulator rows 0..63, Q_B
-    /// in 64..127, both REAL. It walks 8 K=16 HD chunks across Q's two
-    /// `[128, 64]` subtiles (subtile stride `TILE_BYTES`) against the shared
-    /// 64-row K's two `[64, 64]` subtiles (subtile stride `SUBTILE_BYTES`). The
-    /// only difference from `score_mma` is Q's wider subtile stride; K's walk
-    /// is unchanged, and no row is phantom so `PHANTOM_PAD` is gone.
-    #[inline(always)]
-    unsafe fn score_mma_paired(s_tmem: u32, q_smem: *mut u8, k_smem: *mut u8, instruction: u32) {
-        unsafe {
-            mma_abt(
-                s_tmem,
-                PairedPanel::from_raw(q_smem),
-                Panel::from_raw(k_smem),
-                instruction,
-                false,
-            );
-        }
-    }
-
-    /// TMA the stacked paired Q operand: Q_A's rows into subtile-rows 0..63 and
-    /// Q_B's into 64..127 of each of the two `[128, 64]` HD subtiles. Four box
-    /// loads (the second pair skipped when the odd tail leaves stream B
-    /// inactive); each box is 64 rows × 64 columns, and because a 64-row half is
-    /// a whole number of `SWIZZLE_128B` periods (8 rows), loading Q_B at
-    /// `+ SUBTILE_BYTES` reproduces exactly the rows-64..127 swizzle a single
-    /// 128-row tile would have. Callers charge `(2 + 2·b_active)·SUBTILE_BYTES`.
-    #[inline(always)]
-    unsafe fn load_q_paired(
-        dst: *mut u8,
-        tma: *const TmaDescriptor,
-        row_a: i32,
-        row_b: i32,
-        b_active: bool,
-        plane: i32,
-        barrier: *mut Barrier,
-    ) {
-        unsafe {
-            cp_async_bulk_tensor_3d_g2s(dst, tma, 0, row_a, plane, barrier);
-            cp_async_bulk_tensor_3d_g2s(dst.add(TILE_BYTES), tma, 64, row_a, plane, barrier);
-            if b_active {
-                cp_async_bulk_tensor_3d_g2s(dst.add(SUBTILE_BYTES), tma, 0, row_b, plane, barrier);
-                cp_async_bulk_tensor_3d_g2s(
-                    dst.add(TILE_BYTES + SUBTILE_BYTES),
-                    tma,
-                    64,
-                    row_b,
-                    plane,
-                    barrier,
-                );
             }
         }
     }

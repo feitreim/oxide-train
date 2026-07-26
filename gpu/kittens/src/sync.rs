@@ -120,6 +120,53 @@ impl Semaphore {
     }
 }
 
+/// A semaphore that owns its phase counter: [`Self::wait_next`] spins out the
+/// barrier's next completion and advances the parity, so a block-synchronous
+/// kernel never spells `phase & 1` — the `tma_phase`/`mma_phase` locals the
+/// backward kernels used to thread by hand. Every thread keeps its own copy in
+/// registers and they advance in lockstep, which is exactly why those locals
+/// worked; a kernel whose warps wait different numbers of times wants
+/// [`SemaphoreRing`] (or explicit parities) instead.
+#[derive(Clone, Copy)]
+pub struct PhasedSemaphore {
+    sem: Semaphore,
+    phase: u32,
+}
+
+impl PhasedSemaphore {
+    /// Wrap an mbarrier word at phase zero.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Semaphore::attach`], and every thread that waits on
+    /// this barrier must attach at the same point in the kernel.
+    #[inline(always)]
+    pub const unsafe fn attach(bar: *mut Barrier) -> Self {
+        Self {
+            sem: unsafe { Semaphore::attach(bar) },
+            phase: 0,
+        }
+    }
+
+    /// The stateless handle, for the phase-free producer side: `init`,
+    /// `expect_tx`, `arrive`, `inval`, and MMA commits.
+    #[inline(always)]
+    pub const fn sem(self) -> Semaphore {
+        self.sem
+    }
+
+    /// Spin until the barrier's next completion, then advance the phase.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Semaphore::wait`].
+    #[inline(always)]
+    pub unsafe fn wait_next(&mut self) {
+        unsafe { self.sem.wait(self.phase & 1) }
+        self.phase += 1;
+    }
+}
+
 /// `N` semaphores backing an `N`-stage pipeline ring, with the
 /// `index → (stage, parity)` arithmetic in one place: tile `i` uses stage
 /// `i % N`, whose barrier completes once per `N` tiles, so tile `i`'s

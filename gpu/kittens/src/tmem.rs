@@ -18,6 +18,8 @@ use cuda_device::tcgen05::{
 };
 use cuda_device::{thread, warp};
 
+use crate::reg::{Fragment, RegTile};
+
 /// CTA-wide TMEM allocation, the lifecycle every tcgen05 kernel opens with:
 /// warp 0 allocates `columns` into the shared staging word, a block sync
 /// publishes it, and every thread reads back the address.
@@ -104,6 +106,25 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
             let high = tcgen05_ld_16x256b_pure(self.at(row, column + 8));
             tcgen05_load_wait();
             (low, high)
+        }
+    }
+
+    /// [`Self::fragment`] as a [`Fragment`] tile — the same eight values with
+    /// the simd pair's interleaving resolved into `[slot][value]` order, so a
+    /// register pass indexes by row and column instead of by which of the two
+    /// collective loads a value arrived in.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::fragment`].
+    #[inline(always)]
+    pub unsafe fn fragment_tile(self, row: u32, column: u32) -> Fragment {
+        unsafe {
+            let (low, high) = self.fragment(row, column);
+            RegTile([
+                [low[0], low[1], high[0], high[1]],
+                [low[2], low[3], high[2], high[3]],
+            ])
         }
     }
 }

@@ -27,7 +27,7 @@ pub mod shared;
 pub mod sync;
 pub mod tmem;
 
-pub use reg::{RegTile, RegVec};
+pub use reg::{Fragment, RegTile, RegVec};
 pub use shared::{Bf16, Element, OperandWalk, SharedTile, SharedTileRing, Swizzle, Swizzle128B};
-pub use sync::{Semaphore, SemaphoreRing};
+pub use sync::{PhasedSemaphore, Semaphore, SemaphoreRing};
 pub use tmem::TmemTile;
