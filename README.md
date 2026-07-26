@@ -12,7 +12,6 @@ parameters.
 Also includes a thunderkittens style abstraction for writing kernels that are fast and easy to write and understand.
 
 
-
 ## CPU-side development (local)
 
 ```bash
