@@ -2,7 +2,7 @@
 //!
 //! Run on B200 with `./run.sh gemm`.
 
-use bench_util::uniform_vec;
+use bench_util::{KernelBudget, enforce_kernel_budgets, uniform_vec};
 use cuda_core::{CudaContext, DeviceBuffer};
 use gemm::{
     Tcgen05Gemm, TmaLayout, create_bf16_tma_map, fp32, fp32_launch_config, tcgen05_launch_config,
@@ -93,11 +93,22 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
         .collect()
 }
 
+/// ptxas allocation pins for the production kernel (SPEC §13, 7e17): hard
+/// ceiling on regression, ratchet hint on improvement. Pinned at the kittens
+/// port's gated measurement (2026-07-26, B200): 48 regs, no spill — identical
+/// to the pre-port allocation, measured the same day.
+const KERNEL_BUDGETS: [KernelBudget; 1] = [KernelBudget {
+    name: "gemm_tcgen05_bf16_optimized",
+    max_registers: 48,
+    max_spill_bytes: 0,
+}];
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
     let stream = context.default_stream();
     let fp32_module = fp32::kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
     let module = Tcgen05Gemm::load_from_ptx(&context, "gemm.ptx")?;
+    enforce_kernel_budgets(&module.kernels(), &KERNEL_BUDGETS)?;
 
     check_fp32(&stream, &fp32_module)?;
     check_tcgen05_bf16(&stream, &module)?;
