@@ -284,14 +284,9 @@ fn check_expert_compute_copies<const E: usize, const D: usize, const FF: usize>(
     stream: &cuda_core::CudaStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let gate_up_master = experts.gate_up.to_f32_host(stream)?;
-    let (gate_up, gate_up_t) = experts
-        .gate_up_compute_words()
+    let gate_up_t = experts
+        .gate_up_transposed_words()
         .expect("aligned experts must own gate/up compute weights");
-    assert_eq!(
-        gate_up.to_host_vec(stream)?,
-        pack_bf16(&gate_up_master),
-        "expert gate/up compute copy is not the rounded master"
-    );
     assert_eq!(
         gate_up_t.to_host_vec(stream)?,
         expected_global_transpose_words(&gate_up_master, E * D, 2 * FF),
@@ -299,14 +294,9 @@ fn check_expert_compute_copies<const E: usize, const D: usize, const FF: usize>(
     );
 
     let down_master = experts.down.to_f32_host(stream)?;
-    let (down, down_t) = experts
-        .down_compute_words()
+    let down_t = experts
+        .down_transposed_words()
         .expect("aligned experts must own down compute weights");
-    assert_eq!(
-        down.to_host_vec(stream)?,
-        pack_bf16(&down_master),
-        "expert down compute copy is not the rounded master"
-    );
     assert_eq!(
         down_t.to_host_vec(stream)?,
         expected_global_transpose_words(&down_master, E * FF, D),
@@ -565,20 +555,14 @@ fn check_head_gradients(
     Ok(())
 }
 
-/// The compute copies are exact rounded shadows of the master: `w` is
-/// bf16(master) bit-for-bit and `w_t` is its element transpose.
+/// `w_t` is the element transpose of the rounded master. The untransposed
+/// operand needs no check since #58: it is the master's own words.
 fn check_head_compute_copies(
     head: &model::GpuBf16Head<D, VP>,
     stream: &cuda_core::CudaStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let master = head.master.to_f32_host(stream)?;
-    let expected_w = pack_bf16(&master);
-    assert_eq!(
-        head.w_words().to_host_vec(stream)?,
-        expected_w,
-        "lm_head.w is not the rounded master"
-    );
-    let rounded = unpack_bf16(&expected_w);
+    let rounded = unpack_bf16(&pack_bf16(&master));
     let mut transposed = vec![0.0f32; VP * D];
     for row in 0..D {
         for column in 0..VP {

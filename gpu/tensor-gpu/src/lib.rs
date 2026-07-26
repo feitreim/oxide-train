@@ -1018,6 +1018,31 @@ impl<S: Shape> GpuBf16Tensor<S> {
         })
     }
 
+    /// Overwrite the master in place from rounded fp32 host values.
+    ///
+    /// Checkpoint resume must refill a master rather than replace it: TMA
+    /// descriptors are encoded against the words' device address (#58), so a
+    /// fresh allocation would leave every compute map pointing at freed memory.
+    pub fn load_f32_host(
+        &mut self,
+        stream: &CudaStream,
+        values: &[f32],
+    ) -> Result<(), DriverError> {
+        assert_eq!(values.len(), Self::LEN, "slice length != shape volume");
+        let packed = pack_bf16_pairs(values);
+        // SAFETY: `packed` is exactly the buffer's own word count, and the
+        // synchronize keeps the host slice alive until the copy retires.
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                self.words.cu_deviceptr(),
+                packed.as_ptr(),
+                std::mem::size_of_val(packed.as_slice()),
+                stream.cu_stream(),
+            )?;
+        }
+        stream.synchronize()
+    }
+
     /// Download and widen. Every value is exactly bf16-representable.
     pub fn to_f32_host(&self, stream: &CudaStream) -> Result<Vec<f32>, DriverError> {
         Ok(unpack_bf16_pairs(&self.words.to_host_vec(stream)?))
