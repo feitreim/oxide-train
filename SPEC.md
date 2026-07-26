@@ -121,20 +121,142 @@ trait Module {
 2. **Phase 2: bf16 compute + fp32 master weights and optimizer states**
    (tcgen05 GEMMs want bf16 inputs). Loss scaling not expected to be needed
    for bf16; revisit if grads underflow.
+3. **Phase 3: bf16 masters** (#57) — the fp32 masters were phase 2's
+   gradcheck-clarity choice, not a numerical requirement. Optimizer moments,
+   gradients, activations, and every accumulator stay fp32.
 
 Phase 2 was adopted head-first (7e5), then extended to the block linears after
 the post-7e7 profile put their fp32 GEMMs at 47.3% of the step (7e9). The
 lm-head keeps packed-bf16 outputs/gradients; block linears use bf16 operands
-with fp32 store/accumulate tcgen05 epilogues so activations, gradient
-accumulation, AdamW state, and checkpoints remain fp32. Device-side bf16 is
-stored as packed pairs (`u32` = two adjacent row elements). The master-weight
-mechanism is observable: the tiny overfit gate plateaus while per-step updates
-are below one bf16 ulp of the compute weights, then escapes once the fp32
-master crosses a rounding boundary
-(`crates/optim/examples/overfit_probe.rs` reproduces this on CPU).
+with fp32 store/accumulate tcgen05 epilogues so activations and gradient
+accumulation remain fp32. Device-side bf16 is stored as packed pairs (`u32` =
+two adjacent row elements).
+
+**What is bf16 and what is not**, as of phase 3:
+
+| | dtype | why |
+|---|---|---|
+| embedding, `qkv_proj`, `o_proj`, stacked experts, `lm_head` | bf16 master | 4.39B of the 4.39B params; the compute copies were already bf16 |
+| norm weights | fp32 | `2·L+1` vectors of `D` — no memory leverage, high sensitivity |
+| router | fp32 | decision #22: rounding near a top-k boundary reassigns tokens |
+| AdamW first/second moments | fp32 | the second moment sits inside a `sqrt` in a denominator |
+| Muon momentum + Newton–Schulz | fp32 (f64 norm) | deliberately; it reads the bf16 master and widens |
+| weight gradients, tcgen05 epilogues | fp32 | decision #20 |
+| activation/gradient buffers | fp32 except four expert panels | audited buffer by buffer in §7.1 (#59) |
+
+The write-back is the whole numerical question: `w -= lr·update` computed in
+fp32 and then rounded drops any update below half a bf16 ulp of `w`. Both
+roundings live in the same fused kernel behind `model::MASTER_ROUNDING` —
+round-to-nearest (shipped) and deterministic stochastic rounding, whose draws
+come from a splitmix64 stream keyed on `(step, parameter id, element index)`
+and never from runtime entropy, so reruns and checkpoint resumes stay
+bit-identical under either. The master-weight plateau is still observable and
+still escapes under both: the tiny overfit gate stalls while per-step updates
+are below one bf16 ulp, then escapes once a weight crosses a rounding
+boundary (`crates/optim/examples/overfit_probe.rs` reproduces this on CPU and
+now runs both roundings side by side).
+
+The CPU reference mirrors the master dtype: it keeps `f32` storage but snaps
+every bf16-master parameter onto the bf16 grid at construction
+(`optim::Bf16MasterInit`) and after each update (`optim::MasterStorage`), so
+GPU/CPU parity compares the same trajectory rather than two dtypes. Post-update
+masters are compared *on the bf16 grid* — one integer ulp, not a float
+tolerance — because a sub-ulp fp32 difference in summation order can straddle a
+rounding boundary and move the stored weight a whole ulp, and a float tolerance
+wide enough to allow that would hide real defects.
 
 CPU reference reductions accumulate in f64 so the reference never loses to
 the thing it checks.
+
+### 7.1 Activation & gradient buffer audit (#59)
+
+This section covers *buffers*; parameters are §7's table above, where every
+master has been bf16 since #57. One question decides every activation and
+gradient buffer: **is anything accumulated or compared in it, or is it pure
+storage between two kernels?**
+Accumulation and comparison keep fp32; pure storage whose only consumers
+quantize it to a bf16 tcgen05 operand is stored packed once instead, and the
+`convert_f32_to_bf16_pairs` launch that fed the GEMM is deleted.
+
+Sizes below are the canonical training config (`bin/profile.rs`, `bin/train.rs`):
+`L=12`, `B=12`, `T=2048` so `N=24576`, `D=3072`, `FF=4096`, `H=24`, `E=8`,
+`K=2`, `C=6144`. "Live" is the resident total: per-block activations are
+allocated `L` times, scratch once.
+
+#### Expert bins — `GpuExpertActs` (per block) and `GpuExpertScratch` (shared)
+
+| Buffer | Shape | fp32 live | Written by | Read by | Verdict |
+|---|---|---|---|---|---|
+| `acts.gate` | `[E,C,FF]` | 9.0 GiB | `split_group2` | `swiglu_forward`, `swiglu_backward_gate/up` | **fp32** — the SwiGLU pointwise math (`sigmoid`, `dsilu`) reads it three times and is the one real fp32 consumer the issue flags |
+| `acts.up` | `[E,C,FF]` | 9.0 GiB | `split_group2` | `swiglu_forward`, `swiglu_backward_gate` | **fp32** — same pointwise math |
+| `acts.activated` | `[E,C,FF]` | 9.0 GiB | `swiglu_forward` | down-GEMM forward (quantized), down-weight-GEMM backward (quantized) | ✅ **bf16** — both consumers quantize it; single writer, no accumulation. −4.5 GiB, 2 quantizes deleted |
+| `acts.bin_input` | `[E,C,D]` | 6.75 GiB | `moe_scatter` | gate/up-GEMM forward (quantized), gate/up-weight-GEMM backward (quantized) | ✅ **bf16** — deterministic bin assignment gives one writer per slot; both consumers quantize. −3.375 GiB, 2 quantizes deleted |
+| `acts.bin_output` | `[E,C,D]` | 6.75 GiB | tcgen05 down-GEMM epilogue | `moe_gather_combine` (gate-weighted `+=` over top-k), `moe_scatter_dy` (gate-gradient dot product) | **fp32** — decision #20 epilogue, and the gate-gradient dot accumulates the whole `D` row |
+| `scratch.d_gate_up` | `[E,C,2,FF]` | 1.5 GiB | `join_group2` | gate/up-weight-GEMM and gate/up-input-GEMM backward (both quantize it) | ✅ **bf16** — pure restaging of `d_gate`/`d_up`. −0.75 GiB, 1 quantize deleted |
+| `scratch.gate_up` | `[E,C,2,FF]` | 1.5 GiB | tcgen05 gate/up-GEMM epilogue | `split_group2` | **fp32** — decision #20 epilogue |
+| `scratch.d_activated` | `[E,C,FF]` | 0.75 GiB | tcgen05 down-input-GEMM epilogue | `swiglu_backward_gate/up` | **fp32** — decision #20 epilogue feeding pointwise math |
+| `scratch.d_gate` | `[E,C,FF]` | 0.75 GiB | `swiglu_backward_gate` | `join_group2` | **fp32** — a bf16 round here and again in `d_gate_up` would double-round the same value; the better win is fusing the join into the SwiGLU backward (out of scope) |
+| `scratch.d_up` | `[E,C,FF]` | 0.75 GiB | `swiglu_backward_up` | `join_group2` | **fp32** — same |
+| `scratch.d_bin_output` | `[E,C,D]` | 0.56 GiB | `moe_zero_dead_bins` + `moe_scatter_dy` | down-weight-GEMM and down-input-GEMM backward (both quantize it) | ✅ **bf16** — single writer per row, both consumers quantize; the gate-gradient dot stays fp32 over the same quads in the same lane order, so router gradients are bit-identical. −0.28 GiB, 1 quantize deleted |
+| `scratch.d_bin_input` | `[E,C,D]` | 0.56 GiB | tcgen05 gate/up-input-GEMM epilogue | `moe_gather_dx` (sums top-k paths) | **fp32** — decision #20 epilogue |
+| `scratch.linears.bf16.{rows,lhs}` | `[E·C,2FF]` bf16 | 1.5 GiB | the quantize launches above | every expert tcgen05 GEMM | ✅ **deleted** — with all four panels packed no expert GEMM stages anything, so the buffers and their three map sets are gone. −1.5 GiB |
+
+#### Residual stream and attention — `GpuBlockActs` / `GpuBlockScratch`
+
+| Buffer | Shape | fp32 live | Verdict |
+|---|---|---|---|
+| `acts.input` | `[N,D]` | 3.4 GiB | **fp32** — RMSNorm forward and backward both reduce over it |
+| `acts.ffn_input` | `[N,D]` | 3.4 GiB | **fp32** — same, plus it is a residual summand |
+| `acts.ffn_normalized` | `[N,D]` | 3.4 GiB | **fp32** — router logits and `router_backward_weight_split` read it; router is fp32 end to end (decision #22) |
+| `acts.attention_normalized` | `[N,D]` | 3.4 GiB | **fp32 for now** — both consumers (qkv forward, qkv weight-grad) do quantize it, so it is a genuine candidate, but it shares `Bf16LinearScratch` with the lm-head and o_proj; deferred to a follow-up rather than mixed into the expert-bin work |
+| `acts.q`, `acts.k`, `acts.v` | `[N,D]` ×3 | 10.1 GiB | **fp32 for now** — flash re-stages them into `FlashAttentionScratch` as bf16, so they are candidates, but the backward re-reads all three and RoPE writes `q`/`k`; deferred with `attention_normalized` |
+| `acts.attended` | `[N,D]` | 3.4 GiB | **fp32 for now** — same family as above |
+| `acts.attention_logsumexp` | `[N,H]` | 27 MiB | **fp32** — softmax internals |
+| `acts.routing.probabilities`, `gate_weights` | `[N,E]`, `[N,K]` | 11 MiB | **fp32** — router, decision #22 |
+| `scratch.d_model_0..4` | `[N,D]` ×5 | 1.4 GiB | **fp32** — `d_model_1` carries the residual-stream gradient across the whole reverse block loop; bf16 would drop low-order bits `L` times |
+| `scratch.qkv` | `[N,3D]` | 864 MiB | **fp32** — written by a tcgen05 epilogue (#20), and the backward join writes it before the weight GEMM quantizes it |
+| `scratch.projection_output` | `[N,D]` | 288 MiB | **fp32** — `moe_gather_combine` accumulates the top-k paths into it |
+| `scratch.router_logits`, `dlogits`, `router_dx`, `router_dweight_partials`, `gate_gradients` | — | 314 MiB | **fp32** — router end to end, decision #22, re-affirmed by the #44/#52 determinism constraints |
+| `scratch.attention_dot`, `norm_backward_inv`, `probability_sums` | — | 2.3 MiB | **fp32** — reduction accumulators |
+
+#### Rejections
+
+None. Every buffer the survey cleared converted and held parity on the first
+run; nothing had to be reverted. A rejected buffer belongs here with its
+evidence so it is not re-attempted blind.
+
+#### Landed (#59)
+
+B200 same-container A/B vs main at the §13.9 shape (B=12, T=2048), the four
+converted panels plus the deleted staging:
+
+| span | main | #59 | Δ |
+|---|---|---|---|
+| `backward.experts.gate_up_weight_gemm` | 53.61 | 43.74 | −9.87 |
+| `backward.experts.gate_up_join` | 12.11 | 5.45 | −6.66 |
+| `backward.experts.down_weight_gemm` | 29.05 | 22.59 | −6.46 |
+| `forward.experts.swiglu` | 11.04 | 6.40 | −4.63 |
+| `forward.experts.down_gemm` | 17.05 | 13.35 | −3.70 |
+| `forward.router.scatter` | 8.23 | 4.66 | −3.57 |
+| `forward.experts.gate_up_gemm` | 32.08 | 29.29 | −2.78 |
+| `forward.router.zero_bins` | 3.68 | 1.88 | −1.81 |
+| `backward.router.scatter_dy` | 2.79 | 2.55 | −0.24 |
+
+The deleted quantizes do not appear as spans going to zero: each ran inside
+its GEMM's `profiler.measure`, so the win shows up as the GEMM span shrinking.
+Every other span in the step moved by at most 0.17 ms, which is this pass's
+noise floor — including the two input GEMMs, which only swap a descriptor
+(`down_input_gemm` +0.07, `gate_up_input_gemm` +0.01) and the untouched
+attention backward (`flash_q` −0.10, `flash_kv` +0.01). Full step
+603.11 → 563.23 ms (−6.6%); workspace VRAM 164.3 → 153.9 GiB, free headroom
+14.0 → 24.5 GiB (+75%).
+
+Deferred with evidence: `attention_normalized`, `q`/`k`/`v` and `attended`
+(20 GiB fp32 live between them) are genuine candidates by the same test — the
+qkv/o_proj GEMMs and the flash staging all quantize them — but they share
+`Bf16LinearScratch` with the lm-head and `FlashAttentionScratch` with the
+attention backward, so they need their own follow-up rather than riding on the
+expert-bin work.
 
 ## 8. Optimizers
 
@@ -649,6 +771,33 @@ Each gated on tests; correctness before speed at every step.
        `backward.attention.flash_q` 66.5 ms, `flash_kv` 78.7 ms over 12 blocks;
        full step 748.8 ms) could not capture the candidate side: the Modal
        workspace was disabled (spend limit) mid-run.
+     - ✅ **7e16 stale `.maxntid` on the two warp-specialized forwards** (#47):
+       the HD=128 conversion halved `TILE` and so halved both block widths, but
+       the `#[launch_bounds]` literals kept their 128-row-era values — pipelined
+       declared 192 threads and launches 128, persistent declared 320 and
+       launches 192. `.maxntid` is the divisor ptxas budgets registers against,
+       and the persistent softmax warpgroup keeps `out_acc[4][32]` (128 fp32)
+       live across the whole key stream, so the stale value cost it real
+       registers. Both now match their block width, pinned by
+       `const _: () = assert!(FLASH_*_BLOCK == …)` beside the constants (the
+       attribute only takes integer literals). Occupancy cannot regress — TMEM
+       already pins the SM to one CTA. **Measured (B200, same-image A/B, only
+       the two literals differing):** persistent **168 → 206 registers/thread**
+       and **227.5 → 230.2/231.9 TFLOP/s** (1.925 → 1.903/1.889 ms at
+       [32,1024,24,128], two post-fix samples); pipelined unchanged at 224 regs
+       and 181 TFLOP/s, as expected since 192 and 128 threads land on the same
+       allocation. Local frame is 592 B on both sides (and on the sync forward
+       at 48 regs), i.e. a fixed frame, not a spill the fix removed. Parity
+       byte-identical across every gate shape. To keep this visible, the flash
+       harness now prints each loaded kernel's ptxas budget
+       (`host::function_profile`, via `cuFuncGetAttribute` NUM_REGS /
+       LOCAL_SIZE_BYTES / MAX_THREADS_PER_BLOCK) — the PTX cannot show it,
+       since ptxas runs after it. Separately, `modal_app.py::dump_ptx` was
+       broken for any crate whose oracle bins carry device atomics: it ran
+       `cargo oxide build` without `--arch sm_100a`, so `PTX=1 ./run.sh
+       flash-attn` failed in legacy NVVM IR. It now pins the arch (matching
+       `_prepare_flash_ptx`) and emits every `.ptx` it finds, not just the
+       first.
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on
@@ -717,12 +866,12 @@ Each gated on tests; correctness before speed at every step.
    `L * saved + 1 * scratch`. Block backward keeps the residual-stream
    gradient resident in `d_model_1` across the reverse loop (no
    inter-block copies). Per-block aux losses accumulate into the same loss
-   scalar; checkpoint v4 adds `L` and streams blocks; `GpuDense::initialized`
+   scalar; checkpoint v4 added `L` and streams blocks (v5 since #57); `GpuDense::initialized`
    builds one CPU block at a time so the 4.4B-param config never
    materializes host-side. Canonical config moved to
    `L=12, D=3072, H=24, HD=128, FF=4096, E=8, K=2` at `B=8, T=2048`
    (`C=4096` keeps `N·K == E·C`). Gates: CPU deep overfit, two-block
-   CPU/GPU parity on both expert paths, checkpoint v4 bit-identical resume
+   CPU/GPU parity on both expert paths, checkpoint bit-identical resume
    with `L`-mismatch rejection.
    - ✅ **Weight-gradient staging fusion** (#43): the weight-grad GEMM staged
      both operands with a separate `convert_f32_to_bf16_pairs` then a full
@@ -746,6 +895,46 @@ Each gated on tests; correctness before speed at every step.
      full step 750.85 → 733.77 ms (−2.3%). The lm-head `transpose_dlogits`/
      `transpose_input` are already-bf16 movement with no quantize to fold, so
      the fallback leaves them for the descriptor route.
+   - ✅ **Descriptor-transpose weight gradients** (#53): the deferred phase 2
+     of #43. `gpu/gemm/src/bin/transpose_probe.rs` is a standalone single-CTA
+     probe that TMAs one A and one B tile, chains four `K=16` MMAs and checks
+     the drained accumulator against a CPU oracle, with the *entire* operand
+     walk (smem descriptor LBO/SBO/swizzle, TMA tile stacking, byte step per
+     chunk) as launch parameters — so one Modal run sweeps a candidate table
+     instead of costing one run per guess, which is exactly the blind-iteration
+     risk that deferred this. Five A geometries × two B geometries × four
+     encodings; the encodings follow the #47 lesson that operands uniform in
+     `K` hide K-permutation bugs (random, an exact `(m+1)(n+1)` outer product
+     mapping M/N, and two delta-in-`K` walks that read out which `K` index each
+     operand paired with). **Result:** an MN-major operand under `SWIZZLE_128B`
+     is two stacked 64-wide subtiles and the descriptor's **LBO is a subtile
+     jump** (8192), SBO stays 1024, and a `K=16` chunk steps 16 rows (2048 B)
+     instead of 32 B — so a transposed `M128` A stays fully swizzled. The
+     competing "LBO is always the 16-byte core-matrix step, on a 256-byte
+     unswizzled pitch" reading fails, and `M64` fails identically for K-major
+     and MN-major A, which puts SPEC 7e15's `M64` dead end on the *shape*, not
+     the operand layout. That geometry is now `transposed=1` in
+     `gemm_tcgen05_bf16_optimized` (gated by a transposed `M256xN256xK256`
+     accumulate in the gpu/gemm parity harness), and every weight gradient
+     consumes its native row-major panels: the #50 fused quantize+transpose
+     kernels become plain quantizes, the `rhs_t` operand disappears (the input
+     GEMM's own `rows` buffer doubles as the weight GEMM's B), and the lm-head
+     `transpose_input`/`transpose_dlogits` passes are deleted outright.
+     **B200 same-container A/B vs main at §13.9 (B=12):** the four weight-gemm
+     spans are unchanged within run-to-run noise (`gate_up_weight_gemm`
+     53.55 → 53.30, `down_weight_gemm` 28.52 → 28.98, `qkv_proj.weight_gemm`
+     18.66 → 18.71, `o_proj.weight_gemm` 6.97 → 7.16 ms, against a ±0.4 ms
+     noise floor on untouched kernels — `forward.attention.flash`, which this
+     change cannot reach, moved +0.36), `backward.lm_head.transpose_dlogits` +
+     `transpose_input` 1.17 → 0 ms, full step 620.4 → 622.1 ms (noise). The win
+     is **memory**: workspace VRAM 167.9 → 164.3 GiB, i.e. free headroom 10.4 →
+     14.1 GiB (+35%), from dropping `rhs_t` in both the dense and expert
+     scratches and `head_input_t`/`dlogits_t` in the workspace. **Conclusion:**
+     the transposes were never what made these spans slow — at these shapes
+     each output tile re-reads its full `K = E*C = 49152` operand slice, so the
+     weight-grad GEMM is operand-DRAM-bandwidth bound, and closing the gap to
+     forward parity needs the tile-shape/weight-reuse work (#54), not operand
+     orientation. This lands anyway for the headroom and for two fewer kernels.
    - ✅ **tcgen05 flash at HD=128** (#42): landed via #46/#48/#51 — see the
      7e13/7e14/7e15 milestone entries (64-row tiles, stacked 64-wide
      swizzle subtiles, M128 pairing in the backwards).
@@ -758,10 +947,31 @@ Each gated on tests; correctness before speed at every step.
      disjoint per surviving slot). Parity held with forced drops and underfull
      experts on both expert paths. B200 same-container A/B vs main at the §13.9
      shape (B=12 T=2048): `backward.router.scatter_dy` 30.77 → 3.66 ms (8.4×,
-     4.11% → 0.51% of step); full step 748.81 → 721.19 ms (-3.7%). Follow-ups:
-     float4-vectorize the row for the sub-1 ms floor, and fold the preceding
-     `backward.router.zero_dy_bins` (3.74 ms `E·C·D` fill) into a dead-slot
-     zeroing pass using the routing `assignment_counts`.
+     4.11% → 0.51% of step); full step 748.81 → 721.19 ms (-3.7%). Follow-ups
+     landed in #55.
+   - ✅ **`moe_scatter_dy` vectorized rows + dead-slot zeroing** (#55): the two
+     levers #45 left open. (1) Row copies are 16-byte vectorized — `dim`
+     divisible by four makes every row base `row * dim` 16-byte aligned, so a
+     lane moves a quad per step instead of one `f32`. The quad is carried as a
+     `u128`, not an `align(16)` `[f32; 4]` newtype: PTX inspection showed the
+     codegen scalarizes aggregate *loads* back into four `ld.global.b32` (only
+     the store vectorized), while a `u128` survives as one `ld.global.v2.b64`.
+     Both hot loops now emit only vector accesses. (2) `backward.router
+     .zero_dy_bins`, a full `E·C·D` pre-fill, is gone: capacity assignment
+     hands expert `e` slots `0..min(count[e], C)` and the scatter overwrites
+     exactly those, so `moe_zero_dead_bins` clears only the dead tail
+     `min(count[e], C)..C`, one block per `(expert, slot)`, driven by the
+     routing `assignment_counts`. The two passes partition the buffer. The bin
+     gradients stay bit-identical; the gate dot's summation order changes (as
+     it already did in #45), so `gate_gradients` is deterministic but not
+     bit-identical. B200 same-container A/B vs main at the §13.9 shape (B=12
+     T=2048): `zero_dy_bins` 3.80 → `zero_dead_bins` 0.50 ms (7.6×),
+     `scatter_dy` 3.69 → 2.81 ms (1.31×); the pair 7.49 → 3.31 ms (2.27×,
+     1.20% → 0.54% of step). Full step 623.84 → 614.53 ms (−1.5%), though
+     step-level run-to-run spread (~8 ms across the two passes) is larger than
+     the 4.19 ms kernel delta, so the kernel numbers are the reliable signal.
+     Landed short of the 1–2 ms target: `scatter_dy` still reads two rows and
+     writes one per pair, so it is bound by that 3× traffic, not by issue rate.
    - ✅ **Router fp32 kernels re-tiled for D=3072** (#44): the three fp32
      router matmuls sat ~30× off HBM-bound at `D=3072` on launch geometry,
      not precision. `forward.router.logits` (eight threads per token, each
@@ -786,6 +996,38 @@ Each gated on tests; correctness before speed at every step.
      43.78 → 18.52 ms, full step 748.0 → 719.9 ms (−3.8%). Input-backward
      and weight-grad remain L2-weight-bandwidth bound (a full skinny-GEMM
      weight-reuse pass without the block overhead is the next lever).
+   - ✅ **Router backward weight-reuse pass** (#54, phase 2 of #44): both
+     remaining router matmuls were re-tiled so each operand byte feeds a
+     register tile instead of being re-read from L2.
+     `backward.router.input` now owns a `[64 token, 1024 column]` tile per
+     CTA: each lane keeps the `[E]` weight rows of its four columns in
+     registers for the whole 64-token sweep, so the `[D,E]` weight is read
+     `N/64` times instead of once per token (2.36 GB → 74 MB of weight
+     traffic per layer) while the lane-major columns keep the write-bound
+     `dx` store a full coalesced sector. Registers rather than shared
+     memory hold the staged weight: a lane's columns are private to it, so
+     a shared tile would be the same values plus an `LDS` in the inner
+     loop. `backward.router.weight` becomes an explicit split-K pair:
+     `router_backward_weight_split` gives each CTA `ROUTER_WGRAD_BM=1024`
+     model rows of one of `ROUTER_WGRAD_SPLITS=256` contiguous token
+     partitions (`D·E` outputs alone cannot fill 148 SMs), each lane
+     holding `[E]` accumulators per owned row so one coalesced `x` load
+     feeds `E` FMAs against a warp-uniform gate row, and
+     `router_backward_weight_merge` sums the partitions. The reduction
+     order changes from the old lane-interleaved one to plain ascending
+     token order (a lane sums its partition alone, partitions merge in
+     ascending order): still fixed, atomic-free, and independent of block
+     scheduling, and the ops parity binary now asserts the gradient is
+     bit-identical across launches. The 25 MB `[SPLITS,E,D]` partials
+     buffer is one backward-only workspace temporary shared by all blocks.
+     B200 same-container A/B vs main (2 reps each, spread <1%):
+     `backward.router.input` 6.63 → 1.10 ms (6.02×),
+     `backward.router.weight` 8.01 → 1.79 + 0.29 ms merge = 2.09 ms
+     (3.83×); the two combined 14.64 → 3.19 ms (4.59×), full step
+     617.9 → 605.7 ms (−2.0%). Both now sit ~2–4× off their pure-HBM
+     floors (0.64 and 0.56 ms for 12 layers); the remaining gap is
+     bytes-in-flight per SM, so float4-vectorized `x`/`dx` rows are the
+     next lever, as they are for the scatter path in #55.
    - ✅ **Combined stack** (#43+#44+#45, merged as #49/#50/#52): single
      B200 §10.1 profile at the canonical config after all three merges:
      **full step 618.1 ms** (from the 748–751 ms pre-stack baselines,
@@ -795,9 +1037,116 @@ Each gated on tests; correctness before speed at every step.
      not an A/B. Attention (`flash` fwd + `flash_q`/`flash_kv` + staging +
      `flash_dot`) is 130.8 ms (21.2%), expert GEMMs + staging 216.5 ms
      (35.0%), and no single non-GEMM kernel exceeds 2.1%. Remaining
-     levers tracked in #47 (M128-pairing model-shape A/B), #53
-     (descriptor-transpose TN weight grads), #54 (router weight-reuse),
-     #55 (float4 scatter + `zero_dy_bins` fold).
+     levers tracked in #47 (M128-pairing model-shape A/B); #53
+     (descriptor-transpose weight grads) landed flat on time but freed
+     3.6 GiB and showed operand orientation is not a weight-grad lever —
+     weight reuse is the only one left there; #54 (router weight-reuse)
+     since landed, 14.64 to 3.19 ms; #55 (vectorized scatter +
+     `zero_dy_bins` fold) since landed, 7.49 to 3.31 ms.
+   - ✅ **Expert bin panels stored bf16** (#59): the SPEC §7.1 audit asked one
+     question of every activation and gradient buffer — is anything accumulated
+     or compared in it, or is it pure storage between two kernels? Four expert
+     panels (`bin_input`, `activated`, `d_bin_output`, `d_gate_up`) had a single
+     writer and only bf16 tcgen05 operands as readers, so they now live as
+     packed-bf16 `ExpertPanel`s with their own per-expert K-major and MN-major
+     descriptors: the producing kernel rounds once (`moe_scatter_bf16`,
+     `swiglu_forward_bf16`, `moe_scatter_dy_bf16`, `join_group2_bf16`,
+     `moe_zero_dead_bins_bf16`) and every GEMM addresses the panel in place.
+     Six `convert_f32_to_bf16_pairs` launches disappear, and with no operand
+     left to stage the shared `rows`/`lhs` scratch and its three map sets are
+     deleted outright — after #53 removed the transposes, #59 removes the
+     staging itself. `gate`/`up` stay fp32 (SwiGLU pointwise math), as do every
+     tcgen05 epilogue target (decision #20), the residual stream, and the router
+     (decision #22). The `moe_scatter_dy` gate dot still accumulates fp32 over
+     the same quads in the same lane order, so router gradients are
+     bit-identical. B200 same-container A/B vs main at the §13.9 shape (B=12
+     T=2048): full step 603.1 → 563.2 ms (−6.6%), workspace VRAM
+     164.3 → 153.9 GiB (free headroom 14.0 → 24.5 GiB, +75%); per-span table in
+     §7.1, with every untouched span inside a 0.17 ms noise floor. The largest
+     single win is `gate_up_weight_gemm` 53.61 → 43.74 ms,
+     confirming #53's read that these GEMMs are operand-DRAM-bandwidth bound —
+     halving the operand bytes moves them where re-orienting them did not.
+   - ✅ **bf16 master weights** (#57, SPEC §7 phase 3, decision #23): the
+     embedding, `qkv_proj`/`o_proj`, the stacked experts, and the lm-head store
+     their masters as packed bf16 — the same `u32` pair layout every compute
+     copy already used — while moments, gradients, norms, the router, and Muon's
+     fp32 internals stay fp32. The update is unchanged fp32 arithmetic against
+     fp32 moments; the only new numerics is the write-back rounding, which lives
+     in one fused kernel per gradient dtype (`adamw_bf16_master`,
+     `adamw_bf16_master_packed_grad`, `muon_apply_bf16`) behind
+     `model::MASTER_ROUNDING`. That collapsed each `adamw` + `sync_compute` pair
+     into one pass: `sync_from_master` is now a device copy plus the transpose
+     rather than a quantize, since master and compute share a dtype.
+     Two structural consequences worth remembering. (1) Muon can no longer apply
+     per group — `width` may be odd, so a packed word straddles two groups and
+     two group launches would race for it; each group now scatters its
+     orthogonalized result back into the shared update buffer and one flat
+     `muon_apply_bf16` runs at the end. (2) The fp32 register-tiled oracle reads
+     fp32 weights and is reachable by *tile-aligned* weights too (the token
+     count decides), so its widened weight operand is shared workspace staging
+     allocated only when some linear can reach the fallback — never at a real
+     training shape — instead of a per-linear fp32 shadow, which would have
+     given back most of the win.
+     **B200 same-container A/B vs main at the §13.9 shape (B=12 T=2048):** VRAM
+     164.3 → 156.1 GiB (−8.2 GiB, free headroom 14.0 → 22.2 GiB), full step
+     607.22 → 585.20 ms (−3.6%). The optimizer span is the reliable signal and
+     moved as predicted by the traffic: `experts.gate_up.adamw` 17.60 → 10.04 ms
+     (−43%), `experts.down.adamw` 8.85 → 5.06 (−43%), `experts.sync_compute`
+     8.74 → 5.52 (−37%), `qkv_proj.adamw` 2.54 → 1.49 (−42%),
+     `embedding.adamw` 1.17 → 0.67 (−43%), `o_proj.adamw` 0.91 → 0.55 (−40%);
+     the whole optimizer 42.15 → 24.33 ms (−42%). The fp32 parameters are the
+     control and did not move (`attention_norm` 0.086 → 0.087, `router`
+     0.097 → 0.093). Only `lm_head.sync_w_t` regressed, 0.146 → 0.242 ms, because
+     it now copies `w` from the master as well as transposing it — #58 deletes
+     that span entirely. Checkpoints halve their parameter section (v5).
+     **Rounding decision, on evidence:** round-to-nearest, with stochastic
+     rounding implemented beside it rather than adopted. All fourteen gates pass
+     on nearest across two full reruns with no flake, overfit finals
+     `1.526702 → 0.000002` (AdamW), `→ 0.000000` (Muon), `3.105938 → 0.000039`
+     / `0.000051` (aligned linears, the two reruns), `→ 0.000000` (aligned
+     Muon), `2.949433 → 0.000017` (MoE with aux loss) — no stall anywhere, so
+     nothing demands the alternative. The stochastic path is gated at the kernel
+     level in `gpu/tensor-gpu` (reproducible across launches, provably within
+     one bf16 ulp of nearest, and actually different from it) and both roundings
+     converge in `crates/optim/examples/overfit_probe.rs` at the documented
+     knife-edge lr 0.03. Running the model gates on it also produced a result
+     worth recording: the first AdamW parity gate passes (one stochastic step
+     stays inside the one-ulp budget) and the *second*, chained one fails at 9
+     ulps on an embedding element, because the two sides draw independent
+     streams and a near-cancelling update amplifies one ulp at `w ≈ 2e-2` into
+     nine at `w ≈ 1e-3`. No keying fixes that — the grouped `qkv`/`gate_up`
+     masters are one interleaved parameter on the GPU and three or two separate
+     ones on the CPU — so adopting stochastic rounding means re-deciding what
+     the master parity gates compare, not widening them.
+   - ✅ **#57 + #59 integrated**: the two landed independently and both rewrote
+     `expert_linear_forward`/`backward`, so the union needed deciding rather
+     than merging. #59's `ExpertPanel` inputs and #57's packed-bf16 weights
+     compose directly on the tcgen05 path — every operand is already addressed
+     in place — but the fp32 register-tiled oracle needs *both* operands wide,
+     and after #59 a packed panel has no fp32 copy at all while after #57 the
+     weights have none either. Resolution: the oracle widens the master into the
+     staging buffer it already owned (`ExpertFp32Scratch.b`), which is why
+     `tensor_kernels` comes back as a parameter #59 had just removed — the same
+     argument, needed again for the opposite reason.
+     That exposed a latent hazard in the panel-packing predicate and fixed it.
+     `expert_tcgen05_aligned` tested 128-alignment while the GEMMs test 256, so
+     a shape in between (`C=D=FF=128`) would store panels packed and then fall
+     back to the oracle, which would ask a packed panel for `wide()` and panic.
+     The predicate is now literally the two expert GEMMs' eligibility, making
+     packed storage and the tcgen05 path the same condition — `wide()` and the
+     `fp32_staging` expect are invariants now, not hazards. Behaviour is
+     unchanged for the canonical config and every gate shape, which sit on one
+     side or the other of both predicates.
+     **Combined B200 same-container A/B vs pre-#57 main (64e74a4) at the §13.9
+     shape (B=12 T=2048):** VRAM 164.3 → 145.7 GiB (−18.6 GiB, exactly the two
+     issues' −8.2 and −10.4 summed; free headroom 14.0 → 32.6 GiB, +133%), full
+     step 608.08 → 552.80 ms (−9.1%). Both sets of spans survive the merge
+     intact: the optimizer 42.33 → 24.63 ms (−42%, #57) alongside
+     `forward.experts.swiglu` 11.40 → 6.57, `forward.router.scatter`
+     8.42 → 4.74, `forward.experts.down_gemm` 17.05 → 13.33 (#59). The step
+     delta is a little under the sum of the two individual measurements
+     (−55.3 vs −61.9 ms), which is the expected small overlap plus
+     container-to-container spread.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 
@@ -827,4 +1176,5 @@ Each gated on tests; correctness before speed at every step.
 | 20 | Block tcgen05 keeps fp32 model tensors | Quantize operands into persistent scratch and use concrete fp32-output store/accumulate epilogues; buffers, optimizer/checkpoint layout, and the naive fp32 fallback stay fp32, though epilogue values are bf16-rounded (the drain reuses the packed-bf16 shared-memory staging, so each GEMM result carries bf16 mantissa precision after full-K fp32 accumulation — doubling SMEM_OUT for true fp32 staging wasn't warranted) |
 | 21 | MoE aux-loss coefficient is runtime config, not const | Const generics are reserved for values the compiler specializes on — `E`/`K`/`C` size buffers, bins, and launch grids; the coefficient is one scalar FMA that shapes nothing, needs a step schedule, and must be sweepable without a Modal rebuild (stable Rust also forbids f32 const generics). It flows host→kernel per step like `learning_rate` and is recorded in the checkpoint header like `AdamWConfig` |
 | 22 | MoE router is fp32 over bf16 experts | Routing is discrete: bf16 rounding near a top-k boundary doesn't perturb the output, it reassigns the token (the 7e7 bf16 two-logit tie showed how violently trajectories react to that). The router GEMM is `[N,D]×[D,E]` — skinny, off the tcgen05 tile contract, and a rounding-error share of step FLOPs — so fp32 costs nothing measurable while keeping gate weights and the aux loss in the precision gradcheck trusts |
-| 23 | Pin cuda-oxide to immutable upstream revisions | The tcgen05 generated-intrinsics API evolves between releases; one SHA keeps the codegen backend, proc macros, device crates, lockfiles, and Modal image reproducible and unlocks `tcgen05.st` without carrying a fork |
+| 23 | bf16 masters (successor to #8) | #8's fp32 masters bought gradcheck clarity, and the price rose with the model: 16.3 GiB of the 4.39B config and half of every checkpoint, duplicating bf16 compute copies that already existed beside them. The update stays fp32 against fp32 moments — only the write-back is bf16 — so what was actually given up is sub-half-ulp accumulation across steps, and the overfit gates (the documented knife-edge sensor) converge on round-to-nearest with margin. Stochastic rounding is implemented in the same kernel behind one constant for when they stop, deterministic by construction (splitmix64 keyed on step/parameter/element, never runtime entropy) so bit-identical reruns and resumes survive either choice. Norms, the router (#22), moments, and Muon's fp32 internals stay fp32 — all cheap and all numerically load-bearing |
+| 24 | Pin cuda-oxide to immutable upstream revisions | The tcgen05 generated-intrinsics API evolves between releases; one SHA keeps the codegen backend, proc macros, device crates, lockfiles, and Modal image reproducible and unlocks `tcgen05.st` without carrying a fork |

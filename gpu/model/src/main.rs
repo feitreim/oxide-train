@@ -1,9 +1,11 @@
 //! End-to-end forward/backward parity against `nn::Dense`.
 //!
-//! The network is fp32 except the bf16 tcgen05 lm-head, so quantities
-//! downstream of the logits carry bf16 tolerances while the fused-AdamW
-//! master-weight comparison stays tight: both optimizers are fed the exact
-//! bf16-rounded gradients the GPU produced.
+//! Activations and gradients are fp32 except where the bf16 tcgen05 lm-head
+//! and block linears round them, so quantities downstream of the logits carry
+//! bf16 tolerances. Master weights are bf16 on both sides (#57): the CPU
+//! reference is snapped onto the bf16 grid at construction and after every
+//! update, and the post-update comparison is made *on that grid* — see
+//! [`assert_master_close`].
 //!
 //! The base dimensions exercise the 256-tiled lm-head and attention linears:
 //! `N` = 8 real token rows inside padded `NP=256`, with `D=VP=256`. The odd
@@ -16,7 +18,8 @@
 use cuda_core::{CudaContext, DeviceBuffer};
 use nn::{Dense, ExpertFfn, Module, MoeDense};
 use optim::{
-    AdamWConfig, AuxLossSchedule, DenseAdamW, DenseMuon, MuonConfig, zeroth_power_via_newton_schulz,
+    AdamWConfig, AuxLossSchedule, Bf16MasterInit, DenseAdamW, DenseMuon, MuonConfig,
+    VisitCpuParameters, round_to_bf16_master, zeroth_power_via_newton_schulz,
 };
 use tensor_core::{Rank2, Rank3, Rank4, Shape, bf16, rng::uniform_vec};
 use tensor_cpu::CpuTensor;
@@ -45,6 +48,23 @@ const FF: usize = 19;
 const BF16_ATOL: f32 = 3e-3;
 const BF16_RTOL: f32 = 3e-2;
 
+/// Post-update masters are compared on the bf16 grid, where one ulp is one
+/// integer step. Both sides compute the update in fp32 from the same
+/// gradients, so they agree to fp32 rounding — but that is enough to land on
+/// either side of a bf16 rounding boundary, which moves the stored weight by
+/// exactly one ulp. Anything larger is a real defect and still fails.
+const MASTER_ULPS: i32 = 1;
+
+/// Absolute floor carried over unchanged from the fp32-master gate. Kept
+/// because the ulp budget is a relative statement and a near-cancelling update
+/// (`w - lr·update` landing within 1e-8 of zero from an O(0.01) weight) has
+/// unbounded relative error on both sides.
+const MASTER_ATOL: f32 = 2e-6;
+
+/// Budget for a master whose *input* was already a rounding apart: the second
+/// update in a sequence inherits the first's ulp and can add its own.
+const MASTER_ULPS_CHAINED: i32 = 2;
+
 /// Newton–Schulz runs in fp32 on both sides, but five quintic iterations of
 /// GEMMs amplify summation-order differences between the CPU loops and the
 /// register-tiled GPU kernels (the map's slope reaches ~3.4 per iteration on
@@ -52,6 +72,15 @@ const BF16_RTOL: f32 = 3e-2;
 /// a transposed operand — sit orders of magnitude above this.
 const NS_ATOL: f32 = 5e-4;
 const NS_RTOL: f32 = 5e-3;
+
+/// One bf16 ulp, relative: bf16 keeps seven stored mantissa bits.
+const BF16_ULP_RTOL: f32 = 1.0 / 128.0;
+
+/// Muon's hidden matrices land in a bf16 master, so the Newton–Schulz
+/// divergence above and the master's own rounding stack. The iteration's
+/// spread is far wider than an ulp here, which is why this path keeps a float
+/// tolerance instead of the grid comparison the AdamW masters use.
+const MUON_MASTER_RTOL: f32 = NS_RTOL + BF16_ULP_RTOL;
 
 fn assert_close<S: Shape>(
     name: &str,
@@ -63,6 +92,83 @@ fn assert_close<S: Shape>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let actual = gpu.to_host(stream)?;
     assert_close_slices(name, &actual, cpu.as_slice(), atol, rtol);
+    Ok(())
+}
+
+/// Total order over bf16 values, so "one ulp apart" is one integer step.
+fn bf16_order(value: f32) -> i32 {
+    let bits = bf16::from_f32(value).to_bits();
+    if bits & 0x8000 != 0 {
+        -((bits & 0x7fff) as i32)
+    } else {
+        bits as i32
+    }
+}
+
+/// Compare two bf16 masters on the bf16 grid instead of with a relative float
+/// tolerance.
+///
+/// Both sides store these parameters as bf16 (#57) and take the same
+/// gradients, so their fp32 updates agree to fp32 rounding — but a difference
+/// that small can straddle a bf16 rounding boundary and move the *stored*
+/// weight a whole ulp (2^-8 to 2^-7 relative). A relative tolerance wide enough
+/// to allow that would be wide enough to hide a real defect; the ulp distance
+/// is the honest statement, and it fails loudly on anything larger.
+///
+/// [`MASTER_ATOL`] still applies beside it, unchanged from the fp32-master
+/// gate: where a step's update nearly cancels the weight, the result's relative
+/// error is unbounded while its absolute error is not, and an ulp count says
+/// nothing useful about it.
+fn assert_master_close(name: &str, actual: &[f32], expected: &[f32], max_ulps: i32) {
+    assert_eq!(actual.len(), expected.len(), "{name}: length mismatch");
+    for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+        let ulps = (bf16_order(a) - bf16_order(e)).abs();
+        assert!(
+            ulps <= max_ulps || (a - e).abs() <= MASTER_ATOL,
+            "{name} mismatch at {i}: gpu={a}, cpu={e}, {ulps} bf16 ulps apart \
+             (max {max_ulps}, atol {MASTER_ATOL})"
+        );
+    }
+}
+
+fn assert_master_tensor_close<S: Shape>(
+    name: &str,
+    gpu: &model::tensor_device::GpuBf16Tensor<S>,
+    cpu: &CpuTensor<f32, S>,
+    stream: &cuda_core::CudaStream,
+    max_ulps: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_master_close(name, &gpu.to_f32_host(stream)?, cpu.as_slice(), max_ulps);
+    Ok(())
+}
+
+/// Interleave `GROUPS` separate `[IN, OUT]` reference matrices into the GPU's
+/// `[IN, GROUPS, OUT]` layout.
+fn interleave_groups<const IN: usize, const GROUPS: usize, const OUT: usize>(
+    expected: [&CpuTensor<f32, Rank2<IN, OUT>>; GROUPS],
+) -> Vec<f32> {
+    let mut interleaved = Vec::with_capacity(IN * GROUPS * OUT);
+    for input in 0..IN {
+        for expected in expected {
+            interleaved.extend_from_slice(&expected.as_slice()[input * OUT..(input + 1) * OUT]);
+        }
+    }
+    interleaved
+}
+
+fn assert_grouped_master_close<const IN: usize, const GROUPS: usize, const OUT: usize>(
+    name: &str,
+    gpu: &model::tensor_device::GpuBf16Tensor<Rank3<IN, GROUPS, OUT>>,
+    expected: [&CpuTensor<f32, Rank2<IN, OUT>>; GROUPS],
+    stream: &cuda_core::CudaStream,
+    max_ulps: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_master_close(
+        name,
+        &gpu.to_f32_host(stream)?,
+        &interleave_groups(expected),
+        max_ulps,
+    );
     Ok(())
 }
 
@@ -177,7 +283,7 @@ fn check_expert_compute_copies<const E: usize, const D: usize, const FF: usize>(
     experts: &GpuExpertFfn<E, D, FF>,
     stream: &cuda_core::CudaStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let gate_up_master = experts.gate_up.to_host(stream)?;
+    let gate_up_master = experts.gate_up.to_f32_host(stream)?;
     let (gate_up, gate_up_t) = experts
         .gate_up_compute_words()
         .expect("aligned experts must own gate/up compute weights");
@@ -192,7 +298,7 @@ fn check_expert_compute_copies<const E: usize, const D: usize, const FF: usize>(
         "expert gate/up transposed compute copy is stale"
     );
 
-    let down_master = experts.down.to_host(stream)?;
+    let down_master = experts.down.to_f32_host(stream)?;
     let (down, down_t) = experts
         .down_compute_words()
         .expect("aligned experts must own down compute weights");
@@ -219,8 +325,14 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
     gemm_bf16: &model::Tcgen05Gemm,
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cpu: [ExpertFfn<C, D, FF>; E] =
-        std::array::from_fn(|expert| ExpertFfn::initialized(700 + 3 * expert as u64));
+    let mut cpu: [ExpertFfn<C, D, FF>; E] = std::array::from_fn(|expert| {
+        let mut expert = ExpertFfn::initialized(700 + 3 * expert as u64);
+        // The GPU rounds these on upload; the reference has to start there too.
+        round_to_bf16_master(&mut expert.gate_proj.w);
+        round_to_bf16_master(&mut expert.up_proj.w);
+        round_to_bf16_master(&mut expert.down_proj.w);
+        expert
+    });
     let mut gpu = GpuExpertFfn::from_cpu(stream, &cpu)?;
     let mut workspace = GpuExpertWorkspace::<E, C, D, FF>::new(stream)?;
     assert_eq!(
@@ -459,7 +571,7 @@ fn check_head_compute_copies(
     head: &model::GpuBf16Head<D, VP>,
     stream: &cuda_core::CudaStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let master = head.master.to_host(stream)?;
+    let master = head.master.to_f32_host(stream)?;
     let expected_w = pack_bf16(&master);
     assert_eq!(
         head.w_words().to_host_vec(stream)?,
@@ -714,6 +826,7 @@ fn aligned_tcgen05_linears(
     const FFA: usize = 256;
 
     let mut cpu = Dense::<NA, TA, VA, DA, HA, HD, FFA>::new(7);
+    cpu.visit_cpu_parameters(&mut Bf16MasterInit);
     let mut gpu = GpuDenseDense::<NA, NA, TA, VA, VPA, DA, HA, HD, FFA>::from_cpu(stream, &cpu)?;
     let mut workspace = GpuDenseWorkspace::<NA, NA, TA, VA, VPA, DA, HA, FFA>::new(stream)?;
     assert!(
@@ -979,6 +1092,7 @@ fn moe_model_parity<
 ) -> Result<(), Box<dyn std::error::Error>> {
     const AUX: f32 = 0.02;
     let mut cpu = MoeDense::<MN, MT, VOCAB, D, H, HD, MFF, ME, MK, MC, ML>::new(71, AUX);
+    cpu.visit_cpu_parameters(&mut Bf16MasterInit);
     // Deterministic ties force experts 0/1 over capacity while all remaining
     // experts stay underfull, covering both dispatch edge cases.
     for block in &mut cpu.blocks {
@@ -1244,8 +1358,11 @@ fn moe_checkpoint_gate(
         ..AdamWConfig::default()
     };
     const CL: usize = 2;
-    let cpu =
-        MoeDense::<CN, CT, VOCAB, D, H, HD, CFF, CE, CK, CC, CL>::new(123, schedule.base_coefficient);
+    let mut cpu = MoeDense::<CN, CT, VOCAB, D, H, HD, CFF, CE, CK, CC, CL>::new(
+        123,
+        schedule.base_coefficient,
+    );
+    cpu.visit_cpu_parameters(&mut Bf16MasterInit);
     let mut gpu =
         GpuDense::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC, CL>::from_cpu(stream, &cpu)?;
     let mut optimizer = GpuDenseAdamW::new(stream, config, schedule, CL)?;
@@ -1286,6 +1403,7 @@ fn moe_checkpoint_gate(
     let continued_path = base.with_extension("continued-a");
     let resumed_path = base.with_extension("continued-b");
     let tampered_path = base.with_extension("tampered");
+    let legacy_path = base.with_extension("v4");
     model::checkpoint::save(&checkpoint_path, &gpu, &optimizer, 7, stream)?;
     let loaded = model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC, CL>(
         &checkpoint_path,
@@ -1389,10 +1507,35 @@ fn moe_checkpoint_gate(
         .is_err(),
         "tampered aux-loss schedule was accepted"
     );
-    for path in [checkpoint_path, continued_path, resumed_path, tampered_path] {
+
+    // v4 carried fp32 masters. Its parameter payload is twice the size and
+    // cannot be reinterpreted, so the version check has to refuse it outright
+    // rather than let a resume read garbage.
+    let mut legacy = std::fs::read(&checkpoint_path)?;
+    legacy[8..12].copy_from_slice(&4u32.to_le_bytes());
+    std::fs::write(&legacy_path, legacy)?;
+    assert!(
+        model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC, CL>(
+            &legacy_path,
+            stream,
+            tensor
+        )
+        .is_err(),
+        "fp32-master checkpoint v4 was accepted by a v5 build"
+    );
+
+    for path in [
+        checkpoint_path,
+        continued_path,
+        resumed_path,
+        tampered_path,
+        legacy_path,
+    ] {
         let _ = std::fs::remove_file(path);
     }
-    println!("✓ checkpoint v4 resumes bit-identically and rejects E/K/C/L or schedule mismatches");
+    println!(
+        "✓ checkpoint v5 (bf16 masters) resumes bit-identically, rejects v4, and rejects E/K/C/L or schedule mismatches"
+    );
     Ok(())
 }
 
@@ -1407,6 +1550,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dense = model::dense_kernels::load(&ctx)?;
 
     let mut cpu = Dense::<N, T, VOCAB, D, H, HD, FF>::new(42);
+    // Both sides keep bf16 masters (#57); the GPU rounds on upload, so the
+    // reference starts on the same grid instead of one rounding away.
+    cpu.visit_cpu_parameters(&mut Bf16MasterInit);
     let mut gpu = GpuDenseDense::<N, NP, T, VOCAB, VP, D, H, HD, FF>::from_cpu(&stream, &cpu)?;
     let mut workspace = GpuDenseWorkspace::<N, NP, T, VOCAB, VP, D, H, FF>::new(&stream)?;
     let tokens = [1, 5, 5, 2, 9, 3, 16, 0];
@@ -1557,7 +1703,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cpu_optimizer.update(&mut cpu);
     gpu_optimizer.update(&mut gpu, &stream, &tensor)?;
 
-    macro_rules! weight {
+    // Norms keep fp32 storage, so they keep the tight fp32 tolerance; every
+    // bf16 master is compared on the bf16 grid instead.
+    macro_rules! master_weight {
+        ($field:ident) => {
+            assert_master_tensor_close(
+                concat!(stringify!($field), ".w after AdamW"),
+                &gpu.$field.w,
+                &cpu.$field.w,
+                &stream,
+                MASTER_ULPS,
+            )?;
+        };
+    }
+    macro_rules! norm_weight {
         ($field:ident) => {
             assert_close(
                 concat!(stringify!($field), ".w after AdamW"),
@@ -1569,35 +1728,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         };
     }
-    weight!(embedding);
-    weight!(attention_norm);
-    assert_grouped_close(
+    master_weight!(embedding);
+    norm_weight!(attention_norm);
+    assert_grouped_master_close(
         "qkv_proj.w after AdamW",
         &gpu.qkv_proj.w,
         [&cpu.q_proj.w, &cpu.k_proj.w, &cpu.v_proj.w],
         &stream,
-        2e-6,
-        2e-6,
+        MASTER_ULPS,
     )?;
-    weight!(o_proj);
-    weight!(ffn_norm);
-    assert_grouped_close(
+    master_weight!(o_proj);
+    norm_weight!(ffn_norm);
+    assert_grouped_master_close(
         "gate_up_proj.w after AdamW",
         &gpu.gate_up_proj.w,
         [&cpu.gate_proj.w, &cpu.up_proj.w],
         &stream,
-        2e-6,
-        2e-6,
+        MASTER_ULPS,
     )?;
-    weight!(down_proj);
-    weight!(final_norm);
-    let master = gpu.lm_head.master.to_host(&stream)?;
-    assert_close_slices(
+    master_weight!(down_proj);
+    norm_weight!(final_norm);
+    let master = gpu.lm_head.master.to_f32_host(&stream)?;
+    assert_master_close(
         "lm_head master after AdamW",
         &strip_vocab_padding("lm_head.master", &master),
         cpu.lm_head.w.as_slice(),
-        2e-6,
-        2e-6,
+        MASTER_ULPS,
     );
     check_head_compute_copies(&gpu.lm_head, &stream)?;
 
@@ -1641,35 +1797,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     macro_rules! muon_weight {
         ($field:ident) => {
-            assert_close(
+            assert_close_slices(
                 concat!(stringify!($field), ".w after Muon"),
-                &gpu.$field.w,
-                &cpu.$field.w,
-                &stream,
+                &gpu.$field.w.to_f32_host(&stream)?,
+                cpu.$field.w.as_slice(),
                 NS_ATOL,
-                NS_RTOL,
-            )?;
+                MUON_MASTER_RTOL,
+            );
         };
     }
-    assert_grouped_close(
+    assert_close_slices(
         "qkv_proj.w after Muon",
-        &gpu.qkv_proj.w,
-        [&cpu.q_proj.w, &cpu.k_proj.w, &cpu.v_proj.w],
-        &stream,
+        &gpu.qkv_proj.w.to_f32_host(&stream)?,
+        &interleave_groups([&cpu.q_proj.w, &cpu.k_proj.w, &cpu.v_proj.w]),
         NS_ATOL,
-        NS_RTOL,
-    )?;
+        MUON_MASTER_RTOL,
+    );
     muon_weight!(o_proj);
-    assert_grouped_close(
+    assert_close_slices(
         "gate_up_proj.w after Muon",
-        &gpu.gate_up_proj.w,
-        [&cpu.gate_proj.w, &cpu.up_proj.w],
-        &stream,
+        &gpu.gate_up_proj.w.to_f32_host(&stream)?,
+        &interleave_groups([&cpu.gate_proj.w, &cpu.up_proj.w]),
         NS_ATOL,
-        NS_RTOL,
-    )?;
+        MUON_MASTER_RTOL,
+    );
     muon_weight!(down_proj);
-    macro_rules! muon_aux_weight {
+    macro_rules! muon_norm_weight {
         ($field:ident) => {
             assert_close(
                 concat!(stringify!($field), ".w after Muon's AdamW"),
@@ -1681,17 +1834,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         };
     }
-    muon_aux_weight!(embedding);
-    muon_aux_weight!(attention_norm);
-    muon_aux_weight!(ffn_norm);
-    muon_aux_weight!(final_norm);
-    let master = gpu.lm_head.master.to_host(&stream)?;
-    assert_close_slices(
+    assert_master_tensor_close(
+        "embedding.w after Muon's AdamW",
+        &gpu.embedding.w,
+        &cpu.embedding.w,
+        &stream,
+        MASTER_ULPS_CHAINED,
+    )?;
+    muon_norm_weight!(attention_norm);
+    muon_norm_weight!(ffn_norm);
+    muon_norm_weight!(final_norm);
+    let master = gpu.lm_head.master.to_f32_host(&stream)?;
+    assert_master_close(
         "lm_head master after Muon's AdamW",
         &strip_vocab_padding("lm_head.master", &master),
         cpu.lm_head.w.as_slice(),
-        1e-5,
-        1e-5,
+        MASTER_ULPS_CHAINED,
     );
     check_head_compute_copies(&gpu.lm_head, &stream)?;
     gpu.zero_grad(&stream, &tensor)?;
@@ -1738,15 +1896,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash_bf16,
         &dense,
     )?;
-    aligned_moe_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
-    moe_checkpoint_gate(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
+    aligned_moe_overfit(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
+    moe_checkpoint_gate(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
     // The parity helpers own temporary expert workspaces. Their device frees
     // are stream-ordered; complete those frees before the independent overfit
     // gates begin allocating models and workspaces of their own.
     stream.synchronize()?;
-    overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
-    muon_overfit_tiny_batch(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
-    aligned_tcgen05_linears(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
-    aligned_muon_overfit(&stream, &tensor, &gemm, &gemm_bf16, &flash, &flash_bf16, &dense)?;
+    overfit_tiny_batch(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
+    muon_overfit_tiny_batch(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
+    aligned_tcgen05_linears(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
+    aligned_muon_overfit(
+        &stream,
+        &tensor,
+        &gemm,
+        &gemm_bf16,
+        &flash,
+        &flash_bf16,
+        &dense,
+    )?;
     Ok(())
 }

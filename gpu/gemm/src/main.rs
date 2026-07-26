@@ -4,7 +4,9 @@
 
 use bench_util::uniform_vec;
 use cuda_core::{CudaContext, DeviceBuffer};
-use gemm::{Tcgen05Gemm, create_bf16_tma_map, fp32, fp32_launch_config, tcgen05_launch_config};
+use gemm::{
+    Tcgen05Gemm, TmaLayout, create_bf16_tma_map, fp32, fp32_launch_config, tcgen05_launch_config,
+};
 use half::bf16;
 
 fn matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
@@ -99,7 +101,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     check_fp32(&stream, &fp32_module)?;
     check_tcgen05_bf16(&stream, &module)?;
+    check_tcgen05_bf16_transposed(&stream, &module)?;
     println!("✓ fp32 and tcgen05 bf16 GEMM store/accumulate parity passed");
+    Ok(())
+}
+
+/// Weight-gradient orientation (#53): `dW += Aᵀ·B` with both operands read
+/// MN-major out of their native `[K, M]` / `[K, N]` row-major panels through
+/// the descriptor's `transpose_a`/`transpose_b` bits — no transposed staging
+/// buffers anywhere. The operand geometry is the one
+/// `src/bin/transpose_probe.rs` pinned down on a single tile; this gate is the
+/// same geometry inside the real M256xN256 cta_group::2 pair-UMMA pipeline.
+fn check_tcgen05_bf16_transposed(
+    stream: &cuda_core::CudaStream,
+    module: &Tcgen05Gemm,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const M: usize = 256;
+    const N: usize = 256;
+    const K: usize = 256;
+    // Native panels: `a[k, m]` and `b[k, n]`, exactly how a backward pass has
+    // its activations and output gradients lying in memory.
+    let (a_bits, a) = quantize_bf16(&uniform_vec(K * M, 7));
+    let (b_bits, b) = quantize_bf16(&uniform_vec(K * N, 8));
+    let (_, initial) = quantize_bf16(&uniform_vec(M * N, 9));
+
+    let mut expected = initial.clone();
+    for row in 0..M {
+        for column in 0..N {
+            let mut sum = 0.0f64;
+            for inner in 0..K {
+                sum += a[inner * M + row] as f64 * b[inner * N + column] as f64;
+            }
+            expected[row * N + column] += sum as f32;
+        }
+    }
+
+    let device_a = DeviceBuffer::from_host(stream, &a_bits)?;
+    let device_b = DeviceBuffer::from_host(stream, &b_bits)?;
+    let a_tma = create_bf16_tma_map(stream, &device_a, M, K, TmaLayout::MnMajor)?;
+    let b_tma = create_bf16_tma_map(stream, &device_b, N, K, TmaLayout::MnMajor)?;
+    let mut accumulate = DeviceBuffer::from_host(stream, &initial)?;
+    unsafe {
+        module.f32_accumulate_transposed(
+            stream,
+            tcgen05_launch_config(M, N, K),
+            a_tma.as_ptr(),
+            b_tma.as_ptr(),
+            &mut accumulate,
+            N as u32,
+            K as u32,
+        )
+    }?;
+    assert_close(
+        "tcgen05 bf16 transposed f32 accumulate",
+        &accumulate.to_host_vec(stream)?,
+        &expected,
+        0.03,
+        0.01,
+    );
     Ok(())
 }
 
@@ -246,8 +305,8 @@ fn check_tcgen05_bf16(
 
     let device_a = DeviceBuffer::from_host(stream, &a_bits)?;
     let device_b = DeviceBuffer::from_host(stream, &b_bits)?;
-    let a_tma = create_bf16_tma_map(stream, &device_a, K, M)?;
-    let b_tma = create_bf16_tma_map(stream, &device_b, K, N)?;
+    let a_tma = create_bf16_tma_map(stream, &device_a, K, M, TmaLayout::KMajor)?;
+    let b_tma = create_bf16_tma_map(stream, &device_b, K, N, TmaLayout::KMajor)?;
     let config = tcgen05_launch_config(M, N, K);
 
     let mut store = DeviceBuffer::<u32>::zeroed(stream, M * N / 2)?;

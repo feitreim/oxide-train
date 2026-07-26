@@ -53,23 +53,30 @@ pub const ROUTER_GEMM_BK: usize = 16;
 /// Threads in a router logits GEMM block: one lane per output element.
 pub const ROUTER_GEMM_THREADS: usize = ROUTER_GEMM_BM * ROUTER_GEMM_BN;
 
-/// Lanes per token row in the router input-backward kernel: one block owns a
-/// token, stages its `E`-wide gate row once, and strides `D` with coalesced
-/// `dx` writes.
+/// Threads in one router input-backward block.
 pub const ROUTER_INPUT_THREADS: usize = 256;
+/// Token rows one router input-backward block sweeps. The block's slice of the
+/// `[D,E]` weight is read once and reused across all of them, so weight traffic
+/// falls by this factor.
+pub const ROUTER_INPUT_TOKENS: usize = 64;
+/// Model columns each router input-backward lane owns. The lane keeps their
+/// `[E]` weight rows in registers for the whole token sweep.
+pub const ROUTER_INPUT_COLUMNS: usize = 4;
+/// Model columns one router input-backward block owns. Lane-major so every
+/// `dx` store is a full coalesced sector.
+pub const ROUTER_INPUT_BN: usize = ROUTER_INPUT_THREADS * ROUTER_INPUT_COLUMNS;
 
-/// Router weight-gradient output rows computed by one block. Eight consecutive
-/// `D` rows form one coalesced 32-byte load sector per token.
-pub const ROUTER_WEIGHT_ROWS: usize = 8;
-/// Router weight-gradient expert columns computed by one block.
-pub const ROUTER_WEIGHT_EXPERTS: usize = 8;
-/// Token rows staged by each router weight-gradient iteration.
-pub const ROUTER_WEIGHT_K: usize = 64;
-/// Fixed token partitions reduced for each router weight-gradient output.
-pub const ROUTER_WEIGHT_SPLITS: usize = 8;
-/// Threads in the skinny router weight-gradient kernel.
-pub const ROUTER_WEIGHT_THREADS: usize =
-    ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_EXPERTS * ROUTER_WEIGHT_SPLITS;
+/// Threads in one router weight-gradient partition block.
+pub const ROUTER_WGRAD_THREADS: usize = 256;
+/// Model rows each router weight-gradient lane owns. The lane holds their
+/// `[E]` accumulators in registers, so one coalesced `x` load feeds `E` FMAs.
+pub const ROUTER_WGRAD_ROWS: usize = 4;
+/// Model rows one router weight-gradient block owns.
+pub const ROUTER_WGRAD_BM: usize = ROUTER_WGRAD_THREADS * ROUTER_WGRAD_ROWS;
+/// Contiguous token partitions the router weight gradient is split into. Each
+/// partition is summed by one block and the partitions are merged in ascending
+/// order, which fixes the reduction order independently of block scheduling.
+pub const ROUTER_WGRAD_SPLITS: usize = 256;
 
 /// Sentinel written by deterministic MoE binning for a capacity-dropped pair.
 pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
@@ -79,9 +86,42 @@ pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
 /// power of two.
 pub const MOE_SCATTER_DY_THREADS: usize = 256;
 
+/// Threads in one block-per-bin MoE dead-slot zeroing block.
+pub const MOE_ZERO_BINS_THREADS: usize = 256;
+
+/// `f32` lanes in one 16-byte vector memory access.
+///
+/// Rows are walked through `*const u128` / `*mut u128` rather than an
+/// `align(16)` `[f32; 4]` newtype: the codegen scalarizes aggregate loads back
+/// into four `ld.global.b32`, while a `u128` stays one `ld/st.global.v2.b64`.
+/// A row base `row * dim` is 16-byte aligned whenever `dim % QUAD_LANES == 0`,
+/// which is the guard every vectorized row walk below checks.
+pub const QUAD_LANES: usize = 4;
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
+
+    /// Unpacks one 16-byte vector load into its `f32` lanes. The shifts are
+    /// register moves after codegen, not shift instructions.
+    #[inline(always)]
+    fn quad_lanes(bits: u128) -> [f32; QUAD_LANES] {
+        [
+            f32::from_bits(bits as u32),
+            f32::from_bits((bits >> 32) as u32),
+            f32::from_bits((bits >> 64) as u32),
+            f32::from_bits((bits >> 96) as u32),
+        ]
+    }
+
+    /// Packs `f32` lanes back into one 16-byte vector store.
+    #[inline(always)]
+    fn quad_bits(lanes: [f32; QUAD_LANES]) -> u128 {
+        (lanes[0].to_bits() as u128)
+            | ((lanes[1].to_bits() as u128) << 32)
+            | ((lanes[2].to_bits() as u128) << 64)
+            | ((lanes[3].to_bits() as u128) << 96)
+    }
 
     #[inline(always)]
     fn bf16_bits_to_f32(bits: u16) -> f32 {
@@ -138,12 +178,7 @@ pub mod kernels {
         let index = thread::index_1d();
         let i = index.get();
         let d = dim as usize;
-        if d == 0
-            || i >= x.len()
-            || i >= dy.len()
-            || i >= dx.len()
-            || d > weight.len()
-        {
+        if d == 0 || i >= x.len() || i >= dy.len() || i >= dx.len() || d > weight.len() {
             return;
         }
         let row = i / d;
@@ -446,6 +481,29 @@ pub mod kernels {
         }
     }
 
+    /// [`swiglu_forward`] storing packed-bf16 pairs, one word per thread.
+    ///
+    /// The expert `activated` panel is only ever read as a bf16 tcgen05
+    /// operand, so it is rounded once here instead of stored wide and
+    /// quantized again by each of the two GEMMs that read it (#59).
+    #[kernel]
+    pub fn swiglu_forward_bf16(gate: &[f32], up: &[f32], mut y: DisjointSlice<u32>) {
+        let index = thread::index_1d();
+        let pair = index.get();
+        if 2 * pair + 1 >= gate.len() || 2 * pair + 1 >= up.len() {
+            return;
+        }
+        if let Some(slot) = y.get_mut(index) {
+            let mut packed = 0u32;
+            for half in 0..2 {
+                let i = 2 * pair + half;
+                let sigmoid = 1.0 / (1.0 + (-gate[i]).exp());
+                packed |= (f32_to_bf16_bits(gate[i] * sigmoid * up[i]) as u32) << (16 * half);
+            }
+            *slot = packed;
+        }
+    }
+
     #[kernel]
     pub fn swiglu_backward_gate(
         gate: &[f32],
@@ -516,6 +574,43 @@ pub mod kernels {
         }
     }
 
+    /// [`join_group2`] storing packed-bf16 pairs, one word per thread per
+    /// group. `width` counts f32 columns per group and must be even; the two
+    /// groups land `width / 2` words apart inside each interleaved row (#59).
+    #[kernel]
+    pub unsafe fn join_group2_bf16(
+        first: &[f32],
+        second: &[f32],
+        width: u32,
+        mut output: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        let width = width as usize;
+        if width == 0 || !width.is_multiple_of(2) {
+            return;
+        }
+        let half = width / 2;
+        let row = i / half;
+        let column = i % half;
+        let source = row * width + 2 * column;
+        if source + 1 >= first.len() || source + 1 >= second.len() {
+            return;
+        }
+        let base = row * width + column;
+        if base + half >= output.len() {
+            return;
+        }
+        let low = f32_to_bf16_bits(first[source]) as u32
+            | ((f32_to_bf16_bits(first[source + 1]) as u32) << 16);
+        let high = f32_to_bf16_bits(second[source]) as u32
+            | ((f32_to_bf16_bits(second[source + 1]) as u32) << 16);
+        // SAFETY: both indices were bounds-checked and one thread owns each.
+        unsafe {
+            *output.get_unchecked_mut(base) = low;
+            *output.get_unchecked_mut(base + half) = high;
+        }
+    }
+
     #[kernel]
     pub fn split_group3(
         input: &[f32],
@@ -567,14 +662,18 @@ pub mod kernels {
     }
 
     #[kernel]
-    pub fn embedding_forward(weight: &[f32], tokens: &[u32], dim: u32, mut y: DisjointSlice<f32>) {
+    pub fn embedding_forward(weight: &[u32], tokens: &[u32], dim: u32, mut y: DisjointSlice<f32>) {
         let index = thread::index_1d();
         let i = index.get();
         if let Some(slot) = y.get_mut(index) {
             let d = dim as usize;
             let row = i / d;
             let col = i % d;
-            *slot = weight[tokens[row] as usize * d + col];
+            // The embedding master is bf16 (#57), stored as packed pairs.
+            let element = tokens[row] as usize * d + col;
+            let word = weight[element / 2];
+            let bits = (if element % 2 == 0 { word } else { word >> 16 }) as u16;
+            *slot = f32::from_bits((bits as u32) << 16);
         }
     }
 
@@ -1351,14 +1450,12 @@ pub mod kernels {
         }
     }
 
-    /// Register-tiled fp32 `C[m,n] = A[m,k] B'` shared by the two router
-    /// forward/backward matmuls. `TRANSPOSE_B` selects `B` stored `[k,n]`
-    /// (logits) or `[n,k]` (input backward, `B` is the router weight). The
+    /// Register-tiled fp32 `C[m,n] = A[m,k] B[k,n]` for the router logits. The
     /// token tile `BM` is loaded once per `BK` step and reused across the
     /// experts, so the router weight is streamed from L2 rather than re-read
     /// per token. One lane owns one output; the skinny expert width fits `BN`.
     #[inline(always)]
-    unsafe fn router_gemm_impl<const TRANSPOSE_B: bool>(
+    unsafe fn router_gemm_impl(
         m: usize,
         n: usize,
         k: usize,
@@ -1402,23 +1499,14 @@ pub mod kernels {
 
             local = tid;
             while local < ROUTER_GEMM_BK * ROUTER_GEMM_BN {
-                // `B^T` is stored `[n,k]`, so lanes advance through `k` rather
-                // than issue strided reads across `n`.
-                let (tile_row, tile_col) = if TRANSPOSE_B {
-                    (local % ROUTER_GEMM_BK, local / ROUTER_GEMM_BK)
-                } else {
-                    (local / ROUTER_GEMM_BN, local % ROUTER_GEMM_BN)
-                };
+                let tile_row = local / ROUTER_GEMM_BN;
+                let tile_col = local % ROUTER_GEMM_BN;
                 let global_row = k_base + tile_row;
                 let global_col = block_col + tile_col;
                 unsafe {
                     TILE_B[tile_row * ROUTER_GEMM_BN + tile_col] =
                         if global_row < k && global_col < n {
-                            if TRANSPOSE_B {
-                                b[global_col * k + global_row]
-                            } else {
-                                b[global_row * n + global_col]
-                            }
+                            b[global_row * n + global_col]
                         } else {
                             0.0
                         };
@@ -1463,7 +1551,7 @@ pub mod kernels {
             return;
         }
         let n = x.len() / d;
-        unsafe { router_gemm_impl::<false>(n, e, d, x, weight, logits) }
+        unsafe { router_gemm_impl(n, e, d, x, weight, logits) }
     }
 
     /// Per-token softmax, deterministic top-k, and selected-probability
@@ -1788,6 +1876,52 @@ pub mod kernels {
         }
     }
 
+    /// [`moe_scatter`] storing packed-bf16 pairs, one word per thread.
+    ///
+    /// Both readers of the expert input panel are bf16 tcgen05 operands, so
+    /// the routing copy rounds once here rather than writing a wide panel that
+    /// two quantize launches then re-read (#59). `dim` must be even.
+    #[kernel]
+    pub unsafe fn moe_scatter_bf16(
+        x: &[f32],
+        selected_experts: &[u32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut expert_input: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if d == 0 || k == 0 || !d.is_multiple_of(2) {
+            return;
+        }
+        let half = d / 2;
+        let pair = i / half;
+        let column = i % half;
+        if pair >= selected_experts.len() || pair >= slots.len() {
+            return;
+        }
+        let slot = slots[pair];
+        if slot == MOE_DROPPED_SLOT {
+            return;
+        }
+        let expert = selected_experts[pair] as usize;
+        let token = pair / k;
+        let output = (expert * c + slot as usize) * half + column;
+        let source = token * d + 2 * column;
+        if source + 1 >= x.len() || output >= expert_input.len() {
+            return;
+        }
+        // Deterministic bin assignment guarantees one writer per accepted slot.
+        unsafe {
+            *expert_input.get_unchecked_mut(output) = f32_to_bf16_bits(x[source]) as u32
+                | ((f32_to_bf16_bits(x[source + 1]) as u32) << 16);
+        }
+    }
+
     /// Gather expert outputs to token order using the renormalized gate weights.
     #[kernel]
     pub fn moe_gather_combine(
@@ -1837,6 +1971,13 @@ pub mod kernels {
     /// Lanes stride the `D` row so the bin copy is fully coalesced, and the
     /// gate dot `Σ_d expert_output·dy` reduces in shared memory. The prior
     /// thread-per-pair variant walked the whole row serially on a single lane.
+    ///
+    /// A `dim` divisible by [`QUAD_LANES`] makes every row base 16-byte
+    /// aligned, so each lane moves a whole quad per step instead of one `f32`;
+    /// other `dim` take the scalar walk.
+    ///
+    /// Rows the routing left unassigned are cleared by [`moe_zero_dead_bins`],
+    /// not by this kernel.
     #[kernel]
     pub unsafe fn moe_scatter_dy(
         expert_output: &[f32],
@@ -1894,15 +2035,40 @@ pub mod kernels {
 
         let gate = gate_weights[pair];
         let mut dot = 0.0f32;
-        let mut column = tid;
-        while column < d {
-            let grad = dy[token_base + column];
-            dot += expert_output[bin_base + column] * grad;
-            // SAFETY: each lane owns distinct columns of this block's bin row.
-            unsafe {
-                *expert_output_gradient.get_unchecked_mut(bin_base + column) = gate * grad;
+        if d.is_multiple_of(QUAD_LANES) {
+            // SAFETY: `bin_base` and `token_base` are multiples of `dim`, hence
+            // of `QUAD_LANES`, so both rows are 16-byte aligned inside device
+            // allocations; the row bounds were checked above. Each lane owns
+            // distinct quads of this block's bin row.
+            let dy_row = unsafe { dy.as_ptr().add(token_base) as *const u128 };
+            let output_row = unsafe { expert_output.as_ptr().add(bin_base) as *const u128 };
+            let gradient_row =
+                unsafe { expert_output_gradient.as_mut_ptr().add(bin_base) as *mut u128 };
+            let mut quad = tid;
+            while quad < d / QUAD_LANES {
+                let grad = quad_lanes(unsafe { *dy_row.add(quad) });
+                let output = quad_lanes(unsafe { *output_row.add(quad) });
+                let mut scaled = [0.0f32; QUAD_LANES];
+                for lane in 0..QUAD_LANES {
+                    dot += output[lane] * grad[lane];
+                    scaled[lane] = gate * grad[lane];
+                }
+                unsafe {
+                    *gradient_row.add(quad) = quad_bits(scaled);
+                }
+                quad += MOE_SCATTER_DY_THREADS;
             }
-            column += MOE_SCATTER_DY_THREADS;
+        } else {
+            let mut column = tid;
+            while column < d {
+                let grad = dy[token_base + column];
+                dot += expert_output[bin_base + column] * grad;
+                // SAFETY: each lane owns distinct columns of this block's bin row.
+                unsafe {
+                    *expert_output_gradient.get_unchecked_mut(bin_base + column) = gate * grad;
+                }
+                column += MOE_SCATTER_DY_THREADS;
+            }
         }
         unsafe {
             DOT[tid] = dot;
@@ -1923,6 +2089,240 @@ pub mod kernels {
             // SAFETY: this block exclusively owns `pair`.
             unsafe {
                 *gate_gradients.get_unchecked_mut(pair) = DOT[0];
+            }
+        }
+    }
+
+    /// [`moe_scatter_dy`] storing the bin gradient as packed-bf16 pairs.
+    ///
+    /// Both readers of that panel are bf16 tcgen05 operands (#59). The gate dot
+    /// product still accumulates in fp32 over the same quads in the same lane
+    /// order, so it is bit-identical to the wide kernel wherever `dim` is a
+    /// multiple of [`QUAD_LANES`]; only the store narrows.
+    #[kernel]
+    pub unsafe fn moe_scatter_dy_bf16(
+        expert_output: &[f32],
+        dy: &[f32],
+        selected_experts: &[u32],
+        gate_weights: &[f32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut expert_output_gradient: DisjointSlice<u32>,
+        mut gate_gradients: DisjointSlice<f32>,
+    ) {
+        static mut DOT: SharedArray<f32, MOE_SCATTER_DY_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != MOE_SCATTER_DY_THREADS {
+            return;
+        }
+        let pair = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if pair >= selected_experts.len()
+            || pair >= gate_weights.len()
+            || pair >= slots.len()
+            || pair >= gate_gradients.len()
+            || d == 0
+            || k == 0
+            || !d.is_multiple_of(2)
+        {
+            return;
+        }
+
+        let slot = slots[pair];
+        if slot == MOE_DROPPED_SLOT {
+            if tid == 0 {
+                // SAFETY: this block exclusively owns `pair`.
+                unsafe {
+                    *gate_gradients.get_unchecked_mut(pair) = 0.0;
+                }
+            }
+            return;
+        }
+
+        let token = pair / k;
+        let expert = selected_experts[pair] as usize;
+        let bin_base = (expert * c + slot as usize) * d;
+        let token_base = token * d;
+        if bin_base + d > expert_output.len()
+            || (bin_base + d) / 2 > expert_output_gradient.len()
+            || token_base + d > dy.len()
+        {
+            return;
+        }
+
+        let gate = gate_weights[pair];
+        let mut dot = 0.0f32;
+        if d.is_multiple_of(QUAD_LANES) {
+            // SAFETY: `bin_base` and `token_base` are multiples of `dim`, hence
+            // of `QUAD_LANES`, so both fp32 rows are 16-byte aligned and the
+            // packed row's `bin_base / 2` base is 8-byte aligned; the row
+            // bounds were checked above. Each lane owns distinct quads.
+            let dy_row = unsafe { dy.as_ptr().add(token_base) as *const u128 };
+            let output_row = unsafe { expert_output.as_ptr().add(bin_base) as *const u128 };
+            let gradient_row =
+                unsafe { expert_output_gradient.as_mut_ptr().add(bin_base / 2) as *mut u64 };
+            let mut quad = tid;
+            while quad < d / QUAD_LANES {
+                let grad = quad_lanes(unsafe { *dy_row.add(quad) });
+                let output = quad_lanes(unsafe { *output_row.add(quad) });
+                let mut packed = 0u64;
+                for lane in 0..QUAD_LANES {
+                    dot += output[lane] * grad[lane];
+                    packed |= (f32_to_bf16_bits(gate * grad[lane]) as u64) << (16 * lane);
+                }
+                unsafe {
+                    *gradient_row.add(quad) = packed;
+                }
+                quad += MOE_SCATTER_DY_THREADS;
+            }
+        } else {
+            let mut word = tid;
+            while word < d / 2 {
+                let column = 2 * word;
+                let low = dy[token_base + column];
+                let high = dy[token_base + column + 1];
+                dot += expert_output[bin_base + column] * low
+                    + expert_output[bin_base + column + 1] * high;
+                // SAFETY: each lane owns distinct words of this block's bin row.
+                unsafe {
+                    *expert_output_gradient.get_unchecked_mut(bin_base / 2 + word) =
+                        f32_to_bf16_bits(gate * low) as u32
+                            | ((f32_to_bf16_bits(gate * high) as u32) << 16);
+                }
+                word += MOE_SCATTER_DY_THREADS;
+            }
+        }
+        unsafe {
+            DOT[tid] = dot;
+        }
+        thread::sync_threads();
+
+        let mut stride = MOE_SCATTER_DY_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    DOT[tid] += DOT[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            // SAFETY: this block exclusively owns `pair`.
+            unsafe {
+                *gate_gradients.get_unchecked_mut(pair) = DOT[0];
+            }
+        }
+    }
+
+    /// Zero the expert-bin gradient rows the routing left unassigned.
+    ///
+    /// Capacity assignment hands expert `e` the slots `0..min(count[e], C)` and
+    /// [`moe_scatter_dy`] overwrites exactly those, so the dead tail
+    /// `min(count[e], C)..C` is all that still needs clearing. Together the two
+    /// passes cover the whole `E·C·D` buffer, replacing a full pre-fill. One
+    /// block per `(expert, slot)`, lanes striding the row.
+    #[kernel]
+    pub unsafe fn moe_zero_dead_bins(
+        assignment_counts: &[u32],
+        dim: u32,
+        capacity: u32,
+        mut expert_output_gradient: DisjointSlice<f32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let threads = thread::blockDim_x() as usize;
+        let bin = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        let c = capacity as usize;
+        if d == 0 || c == 0 {
+            return;
+        }
+        let expert = bin / c;
+        let slot = bin % c;
+        let base = bin * d;
+        if expert >= assignment_counts.len() || base + d > expert_output_gradient.len() {
+            return;
+        }
+        if slot < assignment_counts[expert] as usize {
+            return;
+        }
+
+        if d.is_multiple_of(QUAD_LANES) {
+            // SAFETY: `base` is a multiple of `dim`, hence of `QUAD_LANES`, so
+            // the row is 16-byte aligned; bounds were checked above. Each lane
+            // owns distinct quads of this block's dead bin row.
+            let row = unsafe { expert_output_gradient.as_mut_ptr().add(base) as *mut u128 };
+            let mut quad = tid;
+            while quad < d / QUAD_LANES {
+                unsafe {
+                    *row.add(quad) = 0;
+                }
+                quad += threads;
+            }
+        } else {
+            let mut column = tid;
+            while column < d {
+                // SAFETY: each lane owns distinct columns of this dead bin row.
+                unsafe {
+                    *expert_output_gradient.get_unchecked_mut(base + column) = 0.0;
+                }
+                column += threads;
+            }
+        }
+    }
+
+    /// [`moe_zero_dead_bins`] over a packed-bf16 gradient panel (#59).
+    #[kernel]
+    pub unsafe fn moe_zero_dead_bins_bf16(
+        assignment_counts: &[u32],
+        dim: u32,
+        capacity: u32,
+        mut expert_output_gradient: DisjointSlice<u32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let threads = thread::blockDim_x() as usize;
+        let bin = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        let c = capacity as usize;
+        if d == 0 || c == 0 || !d.is_multiple_of(2) {
+            return;
+        }
+        let words = d / 2;
+        let expert = bin / c;
+        let slot = bin % c;
+        let base = bin * words;
+        if expert >= assignment_counts.len() || base + words > expert_output_gradient.len() {
+            return;
+        }
+        if slot < assignment_counts[expert] as usize {
+            return;
+        }
+
+        if words.is_multiple_of(QUAD_LANES) {
+            // SAFETY: `base` is a multiple of `words`, hence of `QUAD_LANES`,
+            // so the row is 16-byte aligned; bounds were checked above. Each
+            // lane owns distinct quads of this block's dead bin row.
+            let row = unsafe { expert_output_gradient.as_mut_ptr().add(base) as *mut u128 };
+            let mut quad = tid;
+            while quad < words / QUAD_LANES {
+                unsafe {
+                    *row.add(quad) = 0;
+                }
+                quad += threads;
+            }
+        } else {
+            let mut column = tid;
+            while column < words {
+                // SAFETY: each lane owns distinct words of this dead bin row.
+                unsafe {
+                    *expert_output_gradient.get_unchecked_mut(base + column) = 0;
+                }
+                column += threads;
             }
         }
     }
@@ -2044,11 +2444,17 @@ pub mod kernels {
     }
 
     /// Router linear backward with respect to its input:
-    /// `dx[N,D] = dlogits[N,E] x weight[D,E]^T`. One block owns a token row and
-    /// stages that token's 32-byte `dlogits` row in shared once, then the lanes
-    /// stride the `D` row writing coalesced `dx`. The gate row is broadcast,
-    /// never re-read per output element as the thread-per-`(token, d)` version
-    /// did. `dx` is write-bound.
+    /// `dx[N,D] = dlogits[N,E] x weight[D,E]^T`.
+    ///
+    /// A block owns a `[ROUTER_INPUT_TOKENS, ROUTER_INPUT_BN]` output tile. Its
+    /// slice of the `[D,E]` weight is read once into registers — each lane keeps
+    /// the `[E]` weight rows of its `ROUTER_INPUT_COLUMNS` columns — and reused
+    /// across the whole token sweep, so the weight is read `N /
+    /// ROUTER_INPUT_TOKENS` times instead of once per token. Registers rather
+    /// than shared memory hold the staged weight because a lane's columns are
+    /// private to it: the shared tile would just be the same values with an
+    /// `LDS` in the inner loop. Lane-major columns keep every `dx` store a full
+    /// coalesced sector, which is what the write-bound tile is paced by.
     #[kernel]
     pub unsafe fn router_backward_input(
         dlogits: &[f32],
@@ -2056,8 +2462,6 @@ pub mod kernels {
         experts: u32,
         mut dx: DisjointSlice<f32>,
     ) {
-        static mut GATES: SharedArray<f32, ROUTER_MAX_EXPERTS> = SharedArray::UNINIT;
-
         let tid = thread::threadIdx_x() as usize;
         if thread::blockDim_x() as usize != ROUTER_INPUT_THREADS {
             return;
@@ -2067,32 +2471,66 @@ pub mod kernels {
             return;
         }
         let d = weight.len() / e;
-        let token = thread::blockIdx_x() as usize;
-        if d == 0 || token * e + e > dlogits.len() || (token + 1) * d > dx.len() {
+        if d == 0 || !dx.len().is_multiple_of(d) {
+            return;
+        }
+        let n = dx.len() / d;
+        let token_base = thread::blockIdx_y() as usize * ROUTER_INPUT_TOKENS;
+        let column_base = thread::blockIdx_x() as usize * ROUTER_INPUT_BN + tid;
+        if token_base >= n || n * e > dlogits.len() {
             return;
         }
 
-        if tid < e {
-            unsafe {
-                GATES[tid] = dlogits[token * e + tid];
+        let mut staged = [[0.0f32; ROUTER_MAX_EXPERTS]; ROUTER_INPUT_COLUMNS];
+        let mut slot = 0usize;
+        while slot < ROUTER_INPUT_COLUMNS {
+            let column = column_base + slot * ROUTER_INPUT_THREADS;
+            let mut expert = 0usize;
+            while expert < ROUTER_MAX_EXPERTS {
+                staged[slot][expert] = if column < d && expert < e {
+                    weight[column * e + expert]
+                } else {
+                    0.0
+                };
+                expert += 1;
             }
+            slot += 1;
         }
-        thread::sync_threads();
 
-        let base = token * d;
-        let mut column = tid;
-        while column < d {
-            let weight_base = column * e;
-            let mut value = 0.0f32;
-            for expert in 0..ROUTER_MAX_EXPERTS {
-                if expert < e {
-                    value += unsafe { GATES[expert] } * weight[weight_base + expert];
+        let token_end = (token_base + ROUTER_INPUT_TOKENS).min(n);
+        let mut token = token_base;
+        while token < token_end {
+            // The gate row is warp-uniform, so this is one broadcast load per
+            // expert for the whole token, amortized over the register tile.
+            let mut gates = [0.0f32; ROUTER_MAX_EXPERTS];
+            let mut expert = 0usize;
+            while expert < ROUTER_MAX_EXPERTS {
+                gates[expert] = if expert < e {
+                    dlogits[token * e + expert]
+                } else {
+                    0.0
+                };
+                expert += 1;
+            }
+
+            let row_base = token * d;
+            let mut slot = 0usize;
+            while slot < ROUTER_INPUT_COLUMNS {
+                let column = column_base + slot * ROUTER_INPUT_THREADS;
+                if column < d {
+                    let mut value = 0.0f32;
+                    let mut expert = 0usize;
+                    while expert < ROUTER_MAX_EXPERTS {
+                        value += gates[expert] * staged[slot][expert];
+                        expert += 1;
+                    }
+                    unsafe {
+                        *dx.get_unchecked_mut(row_base + column) = value;
+                    }
                 }
+                slot += 1;
             }
-            unsafe {
-                *dx.get_unchecked_mut(base + column) = value;
-            }
-            column += ROUTER_INPUT_THREADS;
+            token += 1;
         }
     }
 
@@ -2124,119 +2562,124 @@ pub mod kernels {
         }
     }
 
-    /// Tiled router weight gradient for skinny expert dimensions.
+    /// One contiguous token partition of the router weight gradient
+    /// `dweight[D,E] = x[N,D]^T dlogits[N,E]`, written to
+    /// `partials[SPLITS, E, D]` for `router_backward_weight_merge` to sum.
     ///
-    /// A block owns a `[ROUTER_WEIGHT_ROWS, ROUTER_WEIGHT_EXPERTS]` output tile.
-    /// `ROUTER_WEIGHT_SPLITS` lanes cooperate on each output by accumulating
-    /// fixed interleaved token positions, then lane zero combines those partials
-    /// in a fixed order. This exposes 256-way parallelism per tile without
-    /// atomics or nondeterministic accumulation.
+    /// `D*E` is far too few outputs to fill the machine on its own, so the
+    /// token dimension is split across blocks. A block owns
+    /// `ROUTER_WGRAD_BM` model rows of one partition, lane-major so each `x`
+    /// read is a full coalesced sector, and each lane keeps `[E]` accumulators
+    /// per owned row in registers: one `x` load feeds `E` FMAs and the gate row
+    /// is a warp-uniform broadcast shared by the whole register tile.
+    ///
+    /// The reduction order is fixed: a lane owns its outputs alone and sums its
+    /// partition in ascending token order, and the merge sums partitions in
+    /// ascending order. No lane, block, or launch ordering can perturb it.
     #[kernel]
-    pub unsafe fn router_backward_weight_tiled(
+    pub unsafe fn router_backward_weight_split(
         x: &[f32],
         dlogits: &[f32],
         tokens: u32,
         experts: u32,
-        mut dweight: DisjointSlice<f32>,
+        dim: u32,
+        mut partials: DisjointSlice<f32>,
     ) {
-        static mut TILE_X: SharedArray<f32, { ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_K }> =
-            SharedArray::UNINIT;
-        static mut TILE_DLOGITS: SharedArray<f32, { ROUTER_WEIGHT_K * ROUTER_WEIGHT_EXPERTS }> =
-            SharedArray::UNINIT;
-        static mut PARTIALS: SharedArray<f32, ROUTER_WEIGHT_THREADS> = SharedArray::UNINIT;
-
         let tid = thread::threadIdx_x() as usize;
-        if thread::blockDim_x() as usize != ROUTER_WEIGHT_THREADS {
-            return;
-        }
-        if !ROUTER_WEIGHT_K.is_multiple_of(ROUTER_WEIGHT_SPLITS) {
+        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS {
             return;
         }
         let n = tokens as usize;
         let e = experts as usize;
-        if n == 0 || e == 0 || !dweight.len().is_multiple_of(e) || n * e > dlogits.len() {
+        let d = dim as usize;
+        if e == 0 || e > ROUTER_MAX_EXPERTS || d == 0 || n * d > x.len() || n * e > dlogits.len() {
+            return;
+        }
+        let split = thread::blockIdx_y() as usize;
+        let row_base = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM + tid;
+        if (split + 1) * e * d > partials.len() {
+            return;
+        }
+
+        let partition = n.div_ceil(ROUTER_WGRAD_SPLITS);
+        let token_end = ((split + 1) * partition).min(n);
+        let mut token = (split * partition).min(n);
+
+        let mut accumulators = [[0.0f32; ROUTER_MAX_EXPERTS]; ROUTER_WGRAD_ROWS];
+        while token < token_end {
+            let mut gates = [0.0f32; ROUTER_MAX_EXPERTS];
+            let mut expert = 0usize;
+            while expert < ROUTER_MAX_EXPERTS {
+                gates[expert] = if expert < e {
+                    dlogits[token * e + expert]
+                } else {
+                    0.0
+                };
+                expert += 1;
+            }
+
+            let row_offset = token * d;
+            let mut slot = 0usize;
+            while slot < ROUTER_WGRAD_ROWS {
+                let row = row_base + slot * ROUTER_WGRAD_THREADS;
+                let value = if row < d { x[row_offset + row] } else { 0.0 };
+                let mut expert = 0usize;
+                while expert < ROUTER_MAX_EXPERTS {
+                    accumulators[slot][expert] += value * gates[expert];
+                    expert += 1;
+                }
+                slot += 1;
+            }
+            token += 1;
+        }
+
+        let mut slot = 0usize;
+        while slot < ROUTER_WGRAD_ROWS {
+            let row = row_base + slot * ROUTER_WGRAD_THREADS;
+            if row < d {
+                let mut expert = 0usize;
+                while expert < e {
+                    unsafe {
+                        *partials.get_unchecked_mut((split * e + expert) * d + row) =
+                            accumulators[slot][expert];
+                    }
+                    expert += 1;
+                }
+            }
+            slot += 1;
+        }
+    }
+
+    /// Sum the router weight-gradient token partitions in ascending order and
+    /// accumulate into `dweight[D,E]`. Threads walk `partials` expert-major so
+    /// the wide read is coalesced; the narrow `dweight` update is not, and does
+    /// not matter at `D*E` elements.
+    #[kernel]
+    pub unsafe fn router_backward_weight_merge(
+        partials: &[f32],
+        experts: u32,
+        mut dweight: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let e = experts as usize;
+        if e == 0 || !dweight.len().is_multiple_of(e) || i >= dweight.len() {
             return;
         }
         let d = dweight.len() / e;
-        if n * d > x.len() {
+        let expert = i / d;
+        let row = i % d;
+        if ROUTER_WGRAD_SPLITS * e * d > partials.len() {
             return;
         }
 
-        let row_base = thread::blockIdx_x() as usize * ROUTER_WEIGHT_ROWS;
-        let expert_base = thread::blockIdx_y() as usize * ROUTER_WEIGHT_EXPERTS;
-        let outputs_per_tile = ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_EXPERTS;
-        let output = tid % outputs_per_tile;
-        let split = tid / outputs_per_tile;
-        let tile_row = output / ROUTER_WEIGHT_EXPERTS;
-        let tile_expert = output % ROUTER_WEIGHT_EXPERTS;
-        let mut accumulator = 0.0f32;
-
-        let mut token_base = 0usize;
-        while token_base < n {
-            let mut local = tid;
-            while local < ROUTER_WEIGHT_ROWS * ROUTER_WEIGHT_K {
-                // Traverse X in its physical `[N,D]` order, then scatter it
-                // into the logical transposed `[D,N]` shared-memory tile.
-                let staged_row = local % ROUTER_WEIGHT_ROWS;
-                let staged_token = local / ROUTER_WEIGHT_ROWS;
-                let global_row = row_base + staged_row;
-                let global_token = token_base + staged_token;
-                unsafe {
-                    TILE_X[staged_row * ROUTER_WEIGHT_K + staged_token] =
-                        if global_row < d && global_token < n {
-                            x[global_token * d + global_row]
-                        } else {
-                            0.0
-                        };
-                }
-                local += ROUTER_WEIGHT_THREADS;
-            }
-
-            local = tid;
-            while local < ROUTER_WEIGHT_K * ROUTER_WEIGHT_EXPERTS {
-                let staged_token = local / ROUTER_WEIGHT_EXPERTS;
-                let staged_expert = local % ROUTER_WEIGHT_EXPERTS;
-                let global_token = token_base + staged_token;
-                let global_expert = expert_base + staged_expert;
-                unsafe {
-                    TILE_DLOGITS[local] = if global_token < n && global_expert < e {
-                        dlogits[global_token * e + global_expert]
-                    } else {
-                        0.0
-                    };
-                }
-                local += ROUTER_WEIGHT_THREADS;
-            }
-            thread::sync_threads();
-
-            let mut inner = split;
-            while inner < ROUTER_WEIGHT_K {
-                unsafe {
-                    accumulator += TILE_X[tile_row * ROUTER_WEIGHT_K + inner]
-                        * TILE_DLOGITS[inner * ROUTER_WEIGHT_EXPERTS + tile_expert];
-                }
-                inner += ROUTER_WEIGHT_SPLITS;
-            }
-            thread::sync_threads();
-            token_base += ROUTER_WEIGHT_K;
+        let mut value = 0.0f32;
+        let mut split = 0usize;
+        while split < ROUTER_WGRAD_SPLITS {
+            value += partials[(split * e + expert) * d + row];
+            split += 1;
         }
-
         unsafe {
-            PARTIALS[tid] = accumulator;
-        }
-        thread::sync_threads();
-        if split == 0 {
-            let global_row = row_base + tile_row;
-            let global_expert = expert_base + tile_expert;
-            if global_row < d && global_expert < e {
-                let mut value = 0.0f32;
-                for partition in 0..ROUTER_WEIGHT_SPLITS {
-                    value += unsafe { PARTIALS[partition * outputs_per_tile + output] };
-                }
-                unsafe {
-                    *dweight.get_unchecked_mut(global_row * e + global_expert) += value;
-                }
-            }
+            *dweight.get_unchecked_mut(row * e + expert) += value;
         }
     }
 }

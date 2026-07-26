@@ -41,7 +41,7 @@ pub use fp32::{BK, BM, BN, TM, TN, launch_config as fp32_launch_config};
 pub mod host;
 pub use host::{
     Bf16PairsTmaMap, Bf16TmaMap, TC_BK, TC_K_PIPELINE, TC_M_TILE, TC_N_TILE, TC_TILE, Tcgen05Gemm,
-    create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_tma_map,
+    TmaLayout, create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_tma_map,
     tcgen05_launch_config,
 };
 

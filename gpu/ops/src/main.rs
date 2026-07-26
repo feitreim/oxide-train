@@ -14,10 +14,10 @@ use tensor_cpu::CpuTensor;
 #[path = "lib.rs"]
 mod device;
 use device::{
-    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS, NORM_THREADS,
-    NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN, ROUTER_GEMM_THREADS,
-    ROUTER_INPUT_THREADS, ROUTER_WEIGHT_EXPERTS, ROUTER_WEIGHT_ROWS, ROUTER_WEIGHT_THREADS,
-    kernels,
+    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS,
+    MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM,
+    ROUTER_GEMM_BN, ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS,
+    ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, kernels,
 };
 use tensor_core::bf16;
 
@@ -330,9 +330,24 @@ fn check_moe_routing(
 
         let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(400);
         let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
-        let mut expert_output_gradient_dev = DeviceBuffer::<f32>::zeroed(stream, E * C * D)?;
+        // Poisoned, not zeroed: the dead-slot pass plus the scatter must between
+        // them rewrite every bin, so a surviving poison value fails the compare.
+        let poison: Vec<f32> = (0..E * C * D).map(|index| index as f32 + 1.0).collect();
+        let mut expert_output_gradient_dev = DeviceBuffer::from_host(stream, &poison)?;
         let mut gate_gradients_dev = DeviceBuffer::<f32>::zeroed(stream, N * K)?;
         unsafe {
+            module.moe_zero_dead_bins(
+                stream,
+                LaunchConfig {
+                    grid_dim: ((E * C) as u32, 1, 1),
+                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &counts_dev,
+                D as u32,
+                C as u32,
+                &mut expert_output_gradient_dev,
+            )?;
             module.moe_scatter_dy(
                 stream,
                 LaunchConfig {
@@ -428,6 +443,8 @@ fn check_moe_routing(
         let mut dlogits_dev = DeviceBuffer::<f32>::zeroed(stream, N * E)?;
         let mut router_dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
         let mut router_dweight_dev = DeviceBuffer::<f32>::zeroed(stream, D * E)?;
+        let mut router_dweight_partials_dev =
+            DeviceBuffer::<f32>::zeroed(stream, ROUTER_WGRAD_SPLITS * E * D)?;
         let mut serial_router_dweight_dev = DeviceBuffer::<f32>::zeroed(stream, D * E)?;
         unsafe {
             module.router_backward(
@@ -449,7 +466,11 @@ fn check_moe_routing(
             module.router_backward_input(
                 stream,
                 LaunchConfig {
-                    grid_dim: (N as u32, 1, 1),
+                    grid_dim: (
+                        D.div_ceil(ROUTER_INPUT_BN) as u32,
+                        N.div_ceil(ROUTER_INPUT_TOKENS) as u32,
+                        1,
+                    ),
                     block_dim: (ROUTER_INPUT_THREADS as u32, 1, 1),
                     shared_mem_bytes: 0,
                 },
@@ -469,30 +490,75 @@ fn check_moe_routing(
             &mut serial_router_dweight_dev,
         )?;
         unsafe {
-            module.router_backward_weight_tiled(
+            module.router_backward_weight_split(
                 stream,
                 LaunchConfig {
                     grid_dim: (
-                        D.div_ceil(ROUTER_WEIGHT_ROWS) as u32,
-                        E.div_ceil(ROUTER_WEIGHT_EXPERTS) as u32,
+                        D.div_ceil(ROUTER_WGRAD_BM) as u32,
+                        ROUTER_WGRAD_SPLITS as u32,
                         1,
                     ),
-                    block_dim: (ROUTER_WEIGHT_THREADS as u32, 1, 1),
+                    block_dim: (ROUTER_WGRAD_THREADS as u32, 1, 1),
                     shared_mem_bytes: 0,
                 },
                 &x_dev,
                 &dlogits_dev,
                 N as u32,
                 E as u32,
+                D as u32,
+                &mut router_dweight_partials_dev,
+            )?;
+        }
+        unsafe {
+            module.router_backward_weight_merge(
+                stream,
+                LaunchConfig::for_num_elems((D * E) as u32),
+                &router_dweight_partials_dev,
+                E as u32,
                 &mut router_dweight_dev,
             )?;
         }
         assert_close(
-            "tiled MoE router weight gradient vs serial GPU oracle",
+            "split MoE router weight gradient vs serial GPU oracle",
             &router_dweight_dev.to_host_vec(stream)?,
             &serial_router_dweight_dev.to_host_vec(stream)?,
             2e-6,
             2e-6,
+        );
+        // The split reduction owes its determinism to a fixed order, not to a
+        // fixed schedule: relaunching must reproduce the gradient bit for bit.
+        let mut repeat_dweight_dev = DeviceBuffer::<f32>::zeroed(stream, D * E)?;
+        unsafe {
+            module.router_backward_weight_split(
+                stream,
+                LaunchConfig {
+                    grid_dim: (
+                        D.div_ceil(ROUTER_WGRAD_BM) as u32,
+                        ROUTER_WGRAD_SPLITS as u32,
+                        1,
+                    ),
+                    block_dim: (ROUTER_WGRAD_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &x_dev,
+                &dlogits_dev,
+                N as u32,
+                E as u32,
+                D as u32,
+                &mut router_dweight_partials_dev,
+            )?;
+            module.router_backward_weight_merge(
+                stream,
+                LaunchConfig::for_num_elems((D * E) as u32),
+                &router_dweight_partials_dev,
+                E as u32,
+                &mut repeat_dweight_dev,
+            )?;
+        }
+        assert_eq!(
+            repeat_dweight_dev.to_host_vec(stream)?,
+            router_dweight_dev.to_host_vec(stream)?,
+            "split MoE router weight gradient must be bit-identical across launches"
         );
         cpu.backward(cpu_ctx, dy);
         assert_close(
@@ -513,8 +579,137 @@ fn check_moe_routing(
         );
 
         check_moe_tie_routing(stream, module)?;
+        check_moe_scatter_dy_rows(stream, module)?;
         Ok(())
     }
+}
+
+/// Exercises the backward scatter row walks at a `D` the float4 path takes and
+/// one it cannot, over a routing with a dropped pair, a partly dead expert, and
+/// an entirely unassigned expert.
+fn check_moe_scatter_dy_rows(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    check_moe_scatter_dy_case::<8>(stream, module)?;
+    check_moe_scatter_dy_case::<5>(stream, module)
+}
+
+fn check_moe_scatter_dy_case<const D: usize>(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 4;
+    const E: usize = 3;
+    const K: usize = 1;
+    const C: usize = 2;
+
+    let selected = [0u32, 0, 0, 1];
+    let gates: Vec<f32> = (0..N * K).map(|pair| 0.25 + pair as f32 * 0.5).collect();
+    let expert_output: Vec<f32> = (0..E * C * D)
+        .map(|index| index as f32 * 0.125 - 1.0)
+        .collect();
+    let dy: Vec<f32> = (0..N * D)
+        .map(|index| 1.0 - index as f32 * 0.0625)
+        .collect();
+    // Poisoned, not zeroed: the dead-slot pass plus the scatter must between
+    // them rewrite every bin, so a surviving poison value fails the compare.
+    let poison: Vec<f32> = (0..E * C * D).map(|index| index as f32 + 1.0).collect();
+
+    let selected_dev = DeviceBuffer::from_host(stream, &selected)?;
+    let gates_dev = DeviceBuffer::from_host(stream, &gates)?;
+    let expert_output_dev = DeviceBuffer::from_host(stream, &expert_output)?;
+    let dy_dev = DeviceBuffer::from_host(stream, &dy)?;
+    let mut slots_dev = DeviceBuffer::<u32>::zeroed(stream, N * K)?;
+    let mut counts_dev = DeviceBuffer::<u32>::zeroed(stream, E)?;
+    let mut gradient_dev = DeviceBuffer::from_host(stream, &poison)?;
+    let mut gate_gradients_dev = DeviceBuffer::<f32>::zeroed(stream, N * K)?;
+
+    unsafe {
+        module.moe_bin_assign_parallel(
+            stream,
+            LaunchConfig {
+                grid_dim: (E as u32, 1, 1),
+                block_dim: (MOE_ASSIGN_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &selected_dev,
+            N as u32,
+            E as u32,
+            K as u32,
+            C as u32,
+            &mut slots_dev,
+            &mut counts_dev,
+        )?;
+        module.moe_zero_dead_bins(
+            stream,
+            LaunchConfig {
+                grid_dim: ((E * C) as u32, 1, 1),
+                block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &counts_dev,
+            D as u32,
+            C as u32,
+            &mut gradient_dev,
+        )?;
+        module.moe_scatter_dy(
+            stream,
+            LaunchConfig {
+                grid_dim: ((N * K) as u32, 1, 1),
+                block_dim: (MOE_SCATTER_DY_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &expert_output_dev,
+            &dy_dev,
+            &selected_dev,
+            &gates_dev,
+            &slots_dev,
+            D as u32,
+            K as u32,
+            C as u32,
+            &mut gradient_dev,
+            &mut gate_gradients_dev,
+        )?;
+    }
+
+    let slots = slots_dev.to_host_vec(stream)?;
+    assert_eq!(
+        slots,
+        [0, 1, MOE_DROPPED_SLOT, 0],
+        "MoE scatter row shape must drop one pair and leave expert 2 empty"
+    );
+    assert_eq!(counts_dev.to_host_vec(stream)?, [3, 1, 0]);
+
+    let mut expected_gradient = vec![0.0f32; E * C * D];
+    let mut expected_gate_gradients = vec![0.0f32; N * K];
+    for pair in 0..N * K {
+        if slots[pair] == MOE_DROPPED_SLOT {
+            continue;
+        }
+        let bin_base = (selected[pair] as usize * C + slots[pair] as usize) * D;
+        let token_base = (pair / K) * D;
+        for column in 0..D {
+            expected_gradient[bin_base + column] = gates[pair] * dy[token_base + column];
+            expected_gate_gradients[pair] +=
+                expert_output[bin_base + column] * dy[token_base + column];
+        }
+    }
+    assert_close(
+        "MoE dead-slot zeroing and scatter cover every bin",
+        &gradient_dev.to_host_vec(stream)?,
+        &expected_gradient,
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "MoE gate gradients over strided rows",
+        &gate_gradients_dev.to_host_vec(stream)?,
+        &expected_gate_gradients,
+        1e-6,
+        1e-6,
+    );
+    Ok(())
 }
 
 fn check_moe_tie_routing(
@@ -1044,7 +1239,7 @@ fn check_classifier_bf16_case<const N: usize, const C: usize, const CP: usize>(
                     assert!(
                         (actual - expected).abs() <= tolerance,
                         "bf16 classifier dlogits mismatch at [{row},{col}]: \
-                     gpu={actual}, oracle={expected}, tolerance={tolerance}"
+                         gpu={actual}, oracle={expected}, tolerance={tolerance}"
                     );
                 } else {
                     assert_eq!(bits, 0, "padded dlogits column [{row},{col}] is not zero");
@@ -1133,16 +1328,27 @@ fn check_embedding(
     unsafe {
         const N: usize = 6;
         const V: usize = 9;
-        const D: usize = 5;
+        // Even, because the bf16 embedding master is stored as packed pairs.
+        const D: usize = 6;
         let tokens_usize = [2, 7, 2, 0, 7, 4];
         let tokens = tokens_usize.map(|v| v as u32);
-        let weight = CpuTensor::<f32, Rank2<V, D>>::uniform(7);
+        // The master is bf16 (#57): the reference reads the same rounded values the
+        // lookup kernel unpacks, so the forward stays an exact comparison.
+        let weight = CpuTensor::<f32, Rank2<V, D>>::uniform(7).to_bf16().to_f32();
         let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(8);
         let mut cpu = Embedding::<N, V, D>::new(weight.clone());
         let (cpu_y, cpu_ctx) = cpu.forward(tokens_usize);
         cpu.backward(cpu_ctx, dy.clone());
 
-        let weight_dev = DeviceBuffer::from_host(stream, weight.as_slice())?;
+        let packed_weight: Vec<u32> = weight
+            .as_slice()
+            .chunks_exact(2)
+            .map(|pair| {
+                bf16::from_f32(pair[0]).to_bits() as u32
+                    | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
+            })
+            .collect();
+        let weight_dev = DeviceBuffer::from_host(stream, &packed_weight)?;
         let tokens_dev = DeviceBuffer::from_host(stream, &tokens)?;
         let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
         let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;

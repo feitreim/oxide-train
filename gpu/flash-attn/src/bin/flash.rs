@@ -25,7 +25,7 @@ mod tcgen05_device;
 use host::{
     FLASH_HD, FLASH_SUBTILE_HD, FLASH_TILE, Tcgen05Flash, correction_count_len,
     create_flash_head_tma_map, device_sm_count, flash_backward_kv_config, flash_backward_q_config,
-    flash_forward_config, flash_persistent_config, flash_pipelined_config,
+    flash_forward_config, flash_persistent_config, flash_pipelined_config, function_profile,
 };
 
 /// Which forward kernel a gate or bench exercises; all three share the
@@ -772,6 +772,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flash = Tcgen05Flash::load_from_ptx(&ctx, "flash.ptx")?;
     let sm_count = device_sm_count(&ctx)?;
     println!("persistent grid: min(work items, {sm_count} SMs)");
+
+    // What ptxas gave each kernel. `.maxntid` (from `#[launch_bounds]`) is the
+    // register budget's divisor, so a stale one shows up here as a low register
+    // count and a nonzero spill frame — never in the PTX, which ptxas consumes.
+    println!("ptxas budgets (registers/thread, spill bytes, .maxntid)");
+    for (name, function) in flash.kernels() {
+        let profile = function_profile(function)?;
+        println!(
+            "  {name:<19} {:>3} regs, {:>4} spill bytes, maxntid {}",
+            profile.registers, profile.spill_bytes, profile.max_threads
+        );
+    }
 
     println!("software math parity");
     check_math(&stream, &flash)?;

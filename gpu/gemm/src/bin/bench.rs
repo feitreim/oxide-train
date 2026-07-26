@@ -8,7 +8,7 @@
 use bench_util::{time_gpu_iters, uniform_vec};
 use cuda_core::{CudaContext, DeviceBuffer};
 use gemm::{
-    BK, BM, BN, TM, TN, Tcgen05Gemm, create_bf16_tma_map, fp32, fp32_launch_config,
+    BK, BM, BN, TM, TN, Tcgen05Gemm, TmaLayout, create_bf16_tma_map, fp32, fp32_launch_config,
     tcgen05_launch_config,
 };
 use half::bf16;
@@ -88,8 +88,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let bf16_a = DeviceBuffer::from_host(&stream, &bf16_a)?;
     let bf16_b = DeviceBuffer::from_host(&stream, &bf16_b)?;
-    let a_tma = create_bf16_tma_map(&stream, &bf16_a, BF16_K, BF16_M)?;
-    let b_tma = create_bf16_tma_map(&stream, &bf16_b, BF16_K, BF16_N)?;
+    let a_tma = create_bf16_tma_map(&stream, &bf16_a, BF16_K, BF16_M, TmaLayout::KMajor)?;
+    let b_tma = create_bf16_tma_map(&stream, &bf16_b, BF16_K, BF16_N, TmaLayout::KMajor)?;
     let mut bf16_c = DeviceBuffer::<u32>::zeroed(&stream, BF16_M * BF16_N / 2)?;
     let bf16_config = tcgen05_launch_config(BF16_M, BF16_N, BF16_K);
 

@@ -52,6 +52,15 @@ pub mod optimized_kernels {
         }
     }
 
+    /// MN elements in one 128-byte-row `SWIZZLE_128B` subtile, and the bytes
+    /// one such subtile occupies over a `TC_BK`-deep stage. An MN-major
+    /// operand's 128 MN values do not fit one swizzled row (the swizzle caps a
+    /// TMA box at 128 bytes), so it arrives as two stacked subtiles and the
+    /// smem descriptor's LBO jumps between them — see `src/bin/transpose_probe.rs`.
+    const SUBTILE_MN: i32 = 64;
+    const SUBTILE_BYTES: u64 = (TC_BK * 64 * 2) as u64;
+
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn produce_stage(
         smem_a: *mut u8,
@@ -68,6 +77,7 @@ pub mod optimized_kernels {
         leader_cta: bool,
         lane_zero: bool,
         self_mask: u16,
+        transposed: bool,
     ) {
         unsafe {
             while !mbarrier_try_wait_parity(mma_bar, parity) {}
@@ -76,16 +86,46 @@ pub mod optimized_kernels {
                     mbarrier_arrive_expect_tx(tma_bar, 1, (128 * 64 * 2) * 4);
                 }
                 let aliased = ((tma_bar_mut as u32) & 0xFEFFFFF8) as *mut Barrier;
-                cp_async_bulk_tensor_2d_g2s_multicast_cg2(
-                    smem_a, a_tma, k_offset, m_offset, aliased, self_mask,
-                );
-                cp_async_bulk_tensor_2d_g2s_multicast_cg2(
-                    smem_b, b_tma, k_offset, n_offset, aliased, self_mask,
-                );
+                if transposed {
+                    // MN-major operands: the map's fast axis is MN, so the
+                    // coordinates swap and each 128-MN tile is two subtile
+                    // loads. Same transaction bytes, twice the descriptors.
+                    let sub = SUBTILE_BYTES as usize;
+                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                        smem_a, a_tma, m_offset, k_offset, aliased, self_mask,
+                    );
+                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                        smem_a.add(sub),
+                        a_tma,
+                        m_offset + SUBTILE_MN,
+                        k_offset,
+                        aliased,
+                        self_mask,
+                    );
+                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                        smem_b, b_tma, n_offset, k_offset, aliased, self_mask,
+                    );
+                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                        smem_b.add(sub),
+                        b_tma,
+                        n_offset + SUBTILE_MN,
+                        k_offset,
+                        aliased,
+                        self_mask,
+                    );
+                } else {
+                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                        smem_a, a_tma, k_offset, m_offset, aliased, self_mask,
+                    );
+                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                        smem_b, b_tma, k_offset, n_offset, aliased, self_mask,
+                    );
+                }
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn consume_stage(
         smem_a: u64,
@@ -98,18 +138,28 @@ pub mod optimized_kernels {
         accumulate_stage: bool,
         leader_cta: bool,
         lane_zero: bool,
+        transposed: bool,
     ) {
         unsafe {
             if leader_cta {
                 while !mbarrier_try_wait_parity(tma_bar, parity) {}
                 if lane_zero {
+                    // K-major: a K=16 chunk is 32 bytes along a 128-byte row,
+                    // and LBO steps the two core matrices inside it.
+                    // MN-major: a K=16 chunk is 16 rows of the subtile, and
+                    // LBO jumps to the subtile holding MN 64..128.
+                    let (chunk_step, leading_bytes) = if transposed {
+                        (16 * 128, SUBTILE_BYTES as u32)
+                    } else {
+                        (32, 16)
+                    };
                     let mut inner = 0u32;
                     while inner < 4 {
-                        let offset = (inner * 32) as u64;
+                        let offset = (inner * chunk_step) as u64;
                         tcgen05_mma_f16_cg2(
                             tmem,
-                            build_smem_descriptor(smem_a + offset, 16, 1024, 2),
-                            build_smem_descriptor(smem_b + offset, 16, 1024, 2),
+                            build_smem_descriptor(smem_a + offset, leading_bytes, 1024, 2),
+                            build_smem_descriptor(smem_b + offset, leading_bytes, 1024, 2),
                             instruction,
                             accumulate_stage || inner > 0,
                         );
@@ -136,6 +186,14 @@ pub mod optimized_kernels {
     /// every tile already has an owning cluster — so it is removed for a
     /// deterministic, deadlock-free schedule. The two-stage ACCUM buffer and its
     /// cross-cluster empty/full barriers are retained but inert (one tile each).
+    ///
+    /// `transposed` selects the operand layout. `0` is the default `C = A·Bᵀ`
+    /// over K-major `[M,K]` and `[N,K]` operands. `1` sets the instruction
+    /// descriptor's `transpose_a`/`transpose_b` bits so both operands are read
+    /// MN-major — `A` as `[K,M]` and `B` as `[K,N]`, i.e. the *native*
+    /// row-major activation and output-gradient panels of a weight gradient
+    /// `dW += Aᵀ·B`, with nothing transposed in global memory.
+    #[allow(clippy::too_many_arguments)]
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     pub unsafe fn gemm_tcgen05_bf16_optimized(
@@ -147,6 +205,7 @@ pub mod optimized_kernels {
         tiles_m: u32,
         tiles_n: u32,
         mode: u32,
+        transposed: u32,
     ) {
         unsafe {
             static mut SMEM_A0: SharedArray<u8, 16384, 128> = SharedArray::UNINIT;
@@ -217,10 +276,13 @@ pub mod optimized_kernels {
             }
             thread::sync_threads();
             let tmem = *(&raw const TMEM_ADDR as *const u32);
+            let transposed = transposed != 0;
             let instruction = Tcgen05InstructionDescriptor::builder()
                 .shape(Tcgen05MmaShape::M256_N256)
                 .element_type(Tcgen05ElementType::BF16)
                 .accumulator_type(Tcgen05AccumulatorType::F32)
+                .transpose_a(transposed)
+                .transpose_b(transposed)
                 .build()
                 .raw();
             let k_iters = k as u32 / 64;
@@ -284,6 +346,7 @@ pub mod optimized_kernels {
                                 leader_cta,
                                 lane_zero,
                                 self_mask,
+                                transposed,
                             );
                             produce_stage(
                                 &raw mut SMEM_A1 as *mut u8,
@@ -300,6 +363,7 @@ pub mod optimized_kernels {
                                 leader_cta,
                                 lane_zero,
                                 self_mask,
+                                transposed,
                             );
                             produce_stage(
                                 &raw mut SMEM_A2 as *mut u8,
@@ -316,6 +380,7 @@ pub mod optimized_kernels {
                                 leader_cta,
                                 lane_zero,
                                 self_mask,
+                                transposed,
                             );
                             produce_stage(
                                 &raw mut SMEM_A3 as *mut u8,
@@ -332,6 +397,7 @@ pub mod optimized_kernels {
                                 leader_cta,
                                 lane_zero,
                                 self_mask,
+                                transposed,
                             );
                             k_idx += 4;
                         }
@@ -384,6 +450,7 @@ pub mod optimized_kernels {
                             k_idx > 0,
                             leader_cta,
                             lane_zero,
+                            transposed,
                         );
                         consume_stage(
                             &raw const SMEM_A1 as u64,
@@ -396,6 +463,7 @@ pub mod optimized_kernels {
                             true,
                             leader_cta,
                             lane_zero,
+                            transposed,
                         );
                         consume_stage(
                             &raw const SMEM_A2 as u64,
@@ -408,6 +476,7 @@ pub mod optimized_kernels {
                             true,
                             leader_cta,
                             lane_zero,
+                            transposed,
                         );
                         consume_stage(
                             &raw const SMEM_A3 as u64,
@@ -420,6 +489,7 @@ pub mod optimized_kernels {
                             true,
                             leader_cta,
                             lane_zero,
+                            transposed,
                         );
                         k_idx += 4;
                     }

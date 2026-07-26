@@ -1,14 +1,21 @@
-//! CPU simulation of the GPU bf16 lm-head pipeline on the tiny overfit batch.
+//! CPU simulation of the GPU bf16 pipeline on the tiny overfit batch.
 //!
 //! Quantization points mirror gpu/model exactly: head input, compute
-//! weights (rounded from an fp32 master), stored logits, dlogits, dw, and dx
-//! are all bf16-rounded; every accumulation is fp32; the master update sees
-//! the bf16-rounded gradients.
+//! weights, stored logits, dlogits, dw, and dx are all bf16-rounded; every
+//! accumulation is fp32. Since #57 the *masters* are bf16 too, which is the
+//! write-back cliff this probe exists to watch: at learning-rate scale a step
+//! is regularly smaller than half a bf16 ulp of the weight it lands on.
+//!
+//! Runs the same 420 steps under both write-back roundings so the choice is
+//! made on evidence rather than by default.
 
 use nn::{
     CausalAttention, Dense, Module, Rope, SoftmaxCrossEntropy, SoftmaxCrossEntropyInput, SwiGlu,
 };
-use optim::{AdamWConfig, AdamWMoments, DenseAdamW, adamw_step};
+use optim::{
+    AdamWConfig, AdamWMoments, DenseAdamW, MasterRounding, MasterStorage, adamw_step,
+    round_to_bf16_master,
+};
 use tensor_core::{Rank2, Shape};
 use tensor_cpu::CpuTensor;
 
@@ -25,6 +32,13 @@ fn quantize<S: Shape>(tensor: &CpuTensor<f32, S>) -> CpuTensor<f32, S> {
 }
 
 fn main() {
+    for rounding in [MasterRounding::Nearest, MasterRounding::Stochastic] {
+        println!("--- bf16 master write-back: {rounding:?} ---");
+        run(rounding);
+    }
+}
+
+fn run(rounding: MasterRounding) {
     let tokens = [0, 1, 2, 3];
     let targets = [1, 2, 3, 0];
     let mut model = Dense::<N, T, VOCAB, D, H, HD, FF>::new(100);
@@ -33,8 +47,15 @@ fn main() {
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
-    let mut optimizer = DenseAdamW::new(config);
+    let mut optimizer = DenseAdamW::with_master_rounding(config, rounding);
+    // The GPU rounds every master on upload, so the probe starts on the same
+    // bf16 grid the GPU does.
+    round_to_bf16_master(&mut model.lm_head.w);
     let mut master: CpuTensor<f32, Rank2<D, VOCAB>> = model.lm_head.w.clone();
+    let head_storage = MasterStorage::Bf16 {
+        rounding,
+        parameter_id: 11,
+    };
     let mut master_moments = AdamWMoments::<Rank2<D, VOCAB>>::zeros();
     let mut step_count = 0u64;
 
@@ -119,10 +140,18 @@ fn main() {
         let dx = dx.add(&dattn_input);
         model.embedding.backward(embedding_ctx, dx);
 
-        // Optimizer: fp32 master fed the bf16-rounded head gradients; the
-        // model's own (zero-grad) lm_head is untouched because decay is zero.
+        // Optimizer: the bf16 head master fed the bf16-rounded head
+        // gradients; the model's own (zero-grad) lm_head is untouched because
+        // decay is zero.
         step_count += 1;
-        adamw_step(&mut master, &dw, &mut master_moments, config, step_count);
+        adamw_step(
+            &mut master,
+            &dw,
+            &mut master_moments,
+            config,
+            step_count,
+            head_storage,
+        );
         optimizer.update(&mut model);
     }
 }
