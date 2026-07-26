@@ -798,7 +798,7 @@ Each gated on tests; correctness before speed at every step.
        flash-attn` failed in legacy NVVM IR. It now pins the arch (matching
        `_prepare_flash_ptx`) and emits every `.ptx` it finds, not just the
        first.
-     - ✅ **7e17 kittens phases 0–2** (#61): `gpu/kittens`, the
+     - ✅ **7e17 kittens phases 0–4** (#61): `gpu/kittens`, the
        ThunderKittens-style tile library — tcgen05/sm_100a only, no arch
        dispatch — through its first two porting phases, plus the phase-0
        ptxas budget gate. The crate ships no kernels and no `#[cuda_module]`:
@@ -901,6 +901,45 @@ Each gated on tests; correctness before speed at every step.
        1.3% is ever worth reclaiming: SASS-level A/B of the fp32 drain
        (nvdisasm in-container), or a toolkit bump re-rolling the ptxas
        schedule — the gemm bench and 48-reg budget pin now track both.
+
+       **Phase 4** (2026-07-26): `kittens::pipeline` and the full forward
+       port. `pipeline::run(job, items)` is `flash_forward_persistent`'s
+       scaffold extracted verbatim — the static strided work-item loop with
+       the per-item barrier lifecycle (leader inval-then-init behind a proxy
+       fence and block sync, per-item tcgen05 fence pairing, trailing inval)
+       — behind a three-method `Job` trait (`init`/`inval`/`work`);
+       `tmem::alloc_block`/`dealloc_block` own the warp-0 TMEM lifecycle.
+       All three forward kernels now run on kittens semaphores end to end;
+       raw mbarrier math survives only in the backwards and the two probes
+       (phase 5). The port's discovery: every hand-threaded parity bit in
+       the forwards was already ring arithmetic — `warpgroup_tile`'s
+       `double_s` flag was literally `SemaphoreRing<2>` vs `SemaphoreRing<1>`
+       (`(i & 1, (i/2) & 1)` vs `(0, i & 1)`), and the persistent MMA warp's
+       `(i - 1) & 1` S wait is `SemaphoreRing::<1>::wait_recycled`. A
+       `Stream<S_BUFFERS>` struct (kernel-side, not library) bundles one
+       softmax workstream's S/O TMEM, P tile, votes/restart and five
+       barriers, shared by the pipelined kernel (one stream, S_BUFFERS = 2)
+       and the persistent pair (indexed `attach` encodes the A/B offset
+       symmetry). PTX vs base: backwards and probes byte-identical;
+       persistent net −1 instruction (and two fewer stack save/restore
+       regions); sync +7 / pipelined +6, all fall-through `bra.uni` block
+       splits plus an equivalent `tid < 32` alloc guard. ptxas re-pins:
+       pipelined 179→180, persistent 239→240 (+1 each, stable across two
+       opcode-identical formulations; a third that moved barrier init after
+       the TMEM alloc cost pipelined +3 more and was reverted — ordering is
+       load-bearing and documented at the pins). Gate fully green: parity
+       at all five forward shapes × three kernels plus three backward
+       shapes, and the bench says the +1 reg is free — pipelined **192.2
+       TFLOP/s** (187.6 at phase 3, 182.0 at main), persistent **234.9**
+       (234.7 / 230.3), sync 114.2 (flat). Honest line accounting:
+       per-kernel logic shrank but declarations grew — tcgen05.rs
+       2783→2963 (+180: Stream, the `PersistentForward` job, docs) plus 125
+       library lines (pipeline.rs 83, tmem helpers) — a one-time cost the
+       phase-5 kittens-first kernels reuse without re-paying. Local-dev
+       note: flash's lib artifact (libNVVM path) dies at darwin embed
+       before the `flash` bin's pure-PTX artifact builds, so local PTX
+       diffing uses a scratchpad bin-only crate that `#[path]`-includes
+       tcgen05.rs (session scratchpad `flashptx/`).
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on
