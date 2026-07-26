@@ -71,7 +71,10 @@ mod tests {
     #[test]
     fn the_stateless_mixer_is_the_generator_step() {
         let mut rng = SplitMix64::new(7);
-        assert_eq!(rng.next_u64(), splitmix64(7u64.wrapping_add(super::SPLITMIX64_GAMMA)));
+        assert_eq!(
+            rng.next_u64(),
+            splitmix64(7u64.wrapping_add(super::SPLITMIX64_GAMMA))
+        );
     }
 
     #[test]

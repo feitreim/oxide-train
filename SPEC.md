@@ -120,17 +120,48 @@ trait Module {
 2. **Phase 2: bf16 compute + fp32 master weights and optimizer states**
    (tcgen05 GEMMs want bf16 inputs). Loss scaling not expected to be needed
    for bf16; revisit if grads underflow.
+3. **Phase 3: bf16 masters** (#57) — the fp32 masters were phase 2's
+   gradcheck-clarity choice, not a numerical requirement. Optimizer moments,
+   gradients, activations, and every accumulator stay fp32.
 
 Phase 2 was adopted head-first (7e5), then extended to the block linears after
 the post-7e7 profile put their fp32 GEMMs at 47.3% of the step (7e9). The
 lm-head keeps packed-bf16 outputs/gradients; block linears use bf16 operands
-with fp32 store/accumulate tcgen05 epilogues so activations, gradient
-accumulation, AdamW state, and checkpoints remain fp32. Device-side bf16 is
-stored as packed pairs (`u32` = two adjacent row elements). The master-weight
-mechanism is observable: the tiny overfit gate plateaus while per-step updates
-are below one bf16 ulp of the compute weights, then escapes once the fp32
-master crosses a rounding boundary
-(`crates/optim/examples/overfit_probe.rs` reproduces this on CPU).
+with fp32 store/accumulate tcgen05 epilogues so activations and gradient
+accumulation remain fp32. Device-side bf16 is stored as packed pairs (`u32` =
+two adjacent row elements).
+
+**What is bf16 and what is not**, as of phase 3:
+
+| | dtype | why |
+|---|---|---|
+| embedding, `qkv_proj`, `o_proj`, stacked experts, `lm_head` | bf16 master | 4.39B of the 4.39B params; the compute copies were already bf16 |
+| norm weights | fp32 | `2·L+1` vectors of `D` — no memory leverage, high sensitivity |
+| router | fp32 | decision #22: rounding near a top-k boundary reassigns tokens |
+| AdamW first/second moments | fp32 | the second moment sits inside a `sqrt` in a denominator |
+| Muon momentum + Newton–Schulz | fp32 (f64 norm) | deliberately; it reads the bf16 master and widens |
+| gradients, activations, tcgen05 epilogues | fp32 | decision #20 |
+
+The write-back is the whole numerical question: `w -= lr·update` computed in
+fp32 and then rounded drops any update below half a bf16 ulp of `w`. Both
+roundings live in the same fused kernel behind `model::MASTER_ROUNDING` —
+round-to-nearest (shipped) and deterministic stochastic rounding, whose draws
+come from a splitmix64 stream keyed on `(step, parameter id, element index)`
+and never from runtime entropy, so reruns and checkpoint resumes stay
+bit-identical under either. The master-weight plateau is still observable and
+still escapes under both: the tiny overfit gate stalls while per-step updates
+are below one bf16 ulp, then escapes once a weight crosses a rounding
+boundary (`crates/optim/examples/overfit_probe.rs` reproduces this on CPU and
+now runs both roundings side by side).
+
+The CPU reference mirrors the master dtype: it keeps `f32` storage but snaps
+every bf16-master parameter onto the bf16 grid at construction
+(`optim::Bf16MasterInit`) and after each update (`optim::MasterStorage`), so
+GPU/CPU parity compares the same trajectory rather than two dtypes. Post-update
+masters are compared *on the bf16 grid* — one integer ulp, not a float
+tolerance — because a sub-ulp fp32 difference in summation order can straddle a
+rounding boundary and move the stored weight a whole ulp, and a float tolerance
+wide enough to allow that would hide real defects.
 
 CPU reference reductions accumulate in f64 so the reference never loses to
 the thing it checks.

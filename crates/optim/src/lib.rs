@@ -299,6 +299,26 @@ pub trait VisitCpuParameters {
     fn visit_cpu_parameters<V: CpuParameterVisitor>(&mut self, visitor: &mut V);
 }
 
+/// Snap every bf16-master parameter of a CPU model onto the bf16 grid.
+///
+/// The GPU rounds when it uploads a model, so a reference built from the same
+/// seed starts one rounding away unless it does this too.
+pub struct Bf16MasterInit;
+
+impl CpuParameterVisitor for Bf16MasterInit {
+    fn visit<S: Shape>(
+        &mut self,
+        _name: &'static str,
+        kind: ParameterKind,
+        parameter: &mut CpuTensor<f32, S>,
+        _gradient: &CpuTensor<f32, S>,
+    ) {
+        if kind_has_bf16_master(kind) {
+            round_to_bf16_master(parameter);
+        }
+    }
+}
+
 impl<
     const N: usize,
     const T: usize,
