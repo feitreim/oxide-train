@@ -2027,7 +2027,7 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize>
             d_activated: GpuTensor::zeros(stream)?,
             d_gate: GpuTensor::zeros(stream)?,
             d_up: GpuTensor::zeros(stream)?,
-            d_gate_up: ExpertPanel::new(stream, E, C, 2 * FF, false)?,
+            d_gate_up: ExpertPanel::new(stream, E, C, 2 * FF, aligned)?,
             d_bin_input: GpuTensor::zeros(stream)?,
             linears: ExpertLinearScratch {
                 bf16: aligned
