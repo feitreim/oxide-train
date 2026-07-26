@@ -12,6 +12,9 @@ autolib = false
 
 [dependencies]
 bench-util = { path = "../bench-util" }
+# `src/lib.rs` includes flash-attn's host.rs by #[path]; its TMA maps and
+# ptxas budget gate live in kittens/bench-util.
+kittens = { path = "../kittens", features = ["host"] }
 cuda-bindings = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }

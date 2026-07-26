@@ -9,7 +9,6 @@
 //! pure-PTX path.
 
 use std::error::Error;
-use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use cuda_core::{
@@ -203,73 +202,13 @@ pub fn flash_persistent_config(
     }
 }
 
-/// Encode a `SWIZZLE_128B` tensor map loading swizzled `[TILE, 64]` bf16
-/// subtiles from one `[T, 128]` head panel of a packed `[planes, T, 128]`
-/// staging buffer (`planes = B*H`); the kernel selects the panel via the third
-/// coordinate and the HD subtile (columns 0..64 or 64..128) via the first.
-fn encode_bf16_head_tma_map(
-    stream: &CudaStream,
-    base: u64,
-    sequence_length: usize,
-    planes: usize,
-) -> Result<DeviceBuffer<u64>, Box<dyn Error>> {
-    use cuda_core::sys::{
-        CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-        CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B, cuTensorMapEncodeTiled,
-        cudaError_enum_CUDA_SUCCESS,
-    };
-
-    assert!(sequence_length.is_multiple_of(FLASH_TILE));
-    let mut tensor_map = MaybeUninit::<cuda_core::sys::CUtensorMap>::uninit();
-    let global_dimensions = [FLASH_HD as u64, sequence_length as u64, planes as u64];
-    let global_strides = [
-        (FLASH_HD * 2) as u64,
-        (sequence_length * FLASH_HD * 2) as u64,
-    ];
-    let box_dimensions = [FLASH_SUBTILE_HD as u32, FLASH_TILE as u32, 1u32];
-    let element_strides = [1u32, 1u32, 1u32];
-    let status = unsafe {
-        cuTensorMapEncodeTiled(
-            tensor_map.as_mut_ptr(),
-            CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            3,
-            base as *mut std::ffi::c_void,
-            global_dimensions.as_ptr(),
-            global_strides.as_ptr(),
-            box_dimensions.as_ptr(),
-            element_strides.as_ptr(),
-            CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B,
-            CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-        )
-    };
-    if status != cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuTensorMapEncodeTiled(bf16 head panel) failed: {status:?}").into());
-    }
-    let tensor_map = unsafe { tensor_map.assume_init() };
-    Ok(DeviceBuffer::from_host(stream, &tensor_map.opaque)?)
-}
-
-/// Tensor map over one packed-bf16 `[planes, T, 64]` staging buffer.
-///
-/// Does not borrow the buffer: the constructor is `unsafe` and the caller
-/// promises the mapped allocation outlives every launch consuming the map.
-pub struct FlashHeadTmaMap {
-    descriptor: DeviceBuffer<u64>,
-}
-
-impl FlashHeadTmaMap {
-    pub fn as_ptr(&self) -> *const TmaDescriptor {
-        self.descriptor.cu_deviceptr() as *const TmaDescriptor
-    }
-}
+/// Tensor map over one packed-bf16 `[planes, T, 128]` staging buffer,
+/// encoded by kittens' layout-generic builder (`[FLASH_TILE, 64]` swizzled
+/// boxes, one per stacked HD subtile).
+pub type FlashHeadTmaMap = kittens::global::PanelMap;
 
 /// Build a head-panel tensor map over a packed-pair staging buffer holding
-/// `planes` panels of `[sequence_length, 64]` bf16 values.
+/// `planes` panels of `[sequence_length, 128]` bf16 values.
 ///
 /// # Safety
 ///
@@ -282,14 +221,14 @@ pub unsafe fn create_flash_head_tma_map(
     planes: usize,
 ) -> Result<FlashHeadTmaMap, Box<dyn Error>> {
     assert_eq!(buffer.len() * 2, planes * sequence_length * FLASH_HD);
-    Ok(FlashHeadTmaMap {
-        descriptor: encode_bf16_head_tma_map(
+    unsafe {
+        kittens::global::encode_bf16_panels::<FLASH_TILE, FLASH_HD>(
             stream,
             buffer.cu_deviceptr(),
             sequence_length,
             planes,
-        )?,
-    })
+        )
+    }
 }
 
 /// Raise a kernel's dynamic-shared-memory ceiling above the 48 KiB default.
@@ -309,49 +248,6 @@ fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dy
         return Err(format!("cuFuncSetAttribute(dynamic smem {bytes}) failed: {status:?}").into());
     }
     Ok(())
-}
-
-/// What ptxas actually gave a loaded kernel. `registers` is per thread and
-/// `spill_bytes` is its local-memory frame — the direct read on whether a
-/// `.maxntid` (i.e. `#[launch_bounds]`) value is squeezing the allocator, which
-/// is invisible in the PTX because ptxas runs after it.
-pub struct FunctionProfile {
-    pub registers: i32,
-    pub spill_bytes: i32,
-    pub max_threads: i32,
-}
-
-fn function_attribute(function: &CudaFunction, attribute: u32) -> Result<i32, Box<dyn Error>> {
-    use cuda_core::sys::{cuFuncGetAttribute, cudaError_enum_CUDA_SUCCESS};
-    let mut value = 0i32;
-    let status = unsafe { cuFuncGetAttribute(&mut value, attribute, function.cu_function()) };
-    if status != cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuFuncGetAttribute({attribute}) failed: {status:?}").into());
-    }
-    Ok(value)
-}
-
-/// Read a loaded kernel's register / spill / `.maxntid` facts.
-pub fn function_profile(function: &CudaFunction) -> Result<FunctionProfile, Box<dyn Error>> {
-    use cuda_core::sys::{
-        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
-        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS,
-    };
-    Ok(FunctionProfile {
-        registers: function_attribute(
-            function,
-            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS,
-        )?,
-        spill_bytes: function_attribute(
-            function,
-            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
-        )?,
-        max_threads: function_attribute(
-            function,
-            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-        )?,
-    })
 }
 
 /// The tcgen05 attention kernels, loaded from a `flash.ptx` built by

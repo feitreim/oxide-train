@@ -1,0 +1,16 @@
+[package]
+name = "kittens"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone crate: not part of the root (CPU) workspace.
+[workspace]
+
+[features]
+# Host-side TMA tensor-map builders (global.rs). Off by default so the
+# device-only surface can be `cargo check`ed without a CUDA toolkit.
+host = ["dep:cuda-core"]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51", optional = true }

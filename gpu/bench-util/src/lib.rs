@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
+use std::error::Error;
 use std::fmt;
 
-use cuda_core::{CudaEvent, CudaStream, DriverError};
+use cuda_core::{CudaEvent, CudaFunction, CudaStream, DriverError};
 
 /// Re-export: `n` uniform-random `f32`s in `[-1, 1)` from a deterministic
 /// PRNG — the *same* generator `CpuTensor::uniform` uses, so CPU/GPU parity
@@ -202,6 +203,110 @@ impl KernelProfiler for StepProfiler {
         let end = timing_event(stream)?;
         self.kernels.push(PendingKernel { name, start, end });
         Ok(output)
+    }
+}
+
+/// What ptxas actually gave a loaded kernel. `registers` is per thread and
+/// `spill_bytes` is its local-memory frame — the direct read on whether a
+/// `.maxntid` (i.e. `#[launch_bounds]`) value is squeezing the allocator,
+/// which is invisible in the PTX because ptxas runs after it.
+pub struct FunctionProfile {
+    pub registers: i32,
+    pub spill_bytes: i32,
+    pub max_threads: i32,
+}
+
+fn function_attribute(function: &CudaFunction, attribute: u32) -> Result<i32, Box<dyn Error>> {
+    use cuda_core::sys::{cuFuncGetAttribute, cudaError_enum_CUDA_SUCCESS};
+    let mut value = 0i32;
+    let status = unsafe { cuFuncGetAttribute(&mut value, attribute, function.cu_function()) };
+    if status != cudaError_enum_CUDA_SUCCESS {
+        return Err(format!("cuFuncGetAttribute({attribute}) failed: {status:?}").into());
+    }
+    Ok(value)
+}
+
+/// Read a loaded kernel's register / spill / `.maxntid` facts.
+pub fn function_profile(function: &CudaFunction) -> Result<FunctionProfile, Box<dyn Error>> {
+    use cuda_core::sys::{
+        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS,
+    };
+    Ok(FunctionProfile {
+        registers: function_attribute(
+            function,
+            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS,
+        )?,
+        spill_bytes: function_attribute(
+            function,
+            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+        )?,
+        max_threads: function_attribute(
+            function,
+            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+        )?,
+    })
+}
+
+/// A kernel's pinned ptxas ceiling — the regression gate for abstraction
+/// work (issue #61 phase 0): a refactor that costs registers or grows the
+/// local frame is a library bug, not an acceptable tax.
+pub struct KernelBudget {
+    pub name: &'static str,
+    pub max_registers: i32,
+    pub max_spill_bytes: i32,
+}
+
+/// Print every kernel's ptxas budget and fail if any pinned ceiling is
+/// exceeded. Kernels without a budget entry are print-only (pin them once a
+/// gated run has recorded their numbers); a kernel now *under* its ceiling
+/// prints a ratchet hint instead of failing.
+pub fn enforce_kernel_budgets(
+    kernels: &[(&'static str, &CudaFunction)],
+    budgets: &[KernelBudget],
+) -> Result<(), Box<dyn Error>> {
+    println!("ptxas budgets (registers/thread, spill bytes, .maxntid)");
+    let mut violations = Vec::new();
+    for (name, function) in kernels {
+        let profile = function_profile(function)?;
+        let budget = budgets.iter().find(|budget| budget.name == *name);
+        let note = match budget {
+            None => "  (unpinned)".to_string(),
+            Some(budget) => {
+                if profile.registers > budget.max_registers
+                    || profile.spill_bytes > budget.max_spill_bytes
+                {
+                    violations.push(format!(
+                        "{name}: {} regs / {} spill bytes exceeds the pinned \
+                         {} / {}",
+                        profile.registers,
+                        profile.spill_bytes,
+                        budget.max_registers,
+                        budget.max_spill_bytes
+                    ));
+                    "  ✗ over budget".to_string()
+                } else if profile.registers < budget.max_registers
+                    || profile.spill_bytes < budget.max_spill_bytes
+                {
+                    format!(
+                        "  (under the pinned {} / {} — ratchet down)",
+                        budget.max_registers, budget.max_spill_bytes
+                    )
+                } else {
+                    String::new()
+                }
+            }
+        };
+        println!(
+            "  {name:<19} {:>3} regs, {:>4} spill bytes, maxntid {}{note}",
+            profile.registers, profile.spill_bytes, profile.max_threads
+        );
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("ptxas budget regression:\n  {}", violations.join("\n  ")).into())
     }
 }
 

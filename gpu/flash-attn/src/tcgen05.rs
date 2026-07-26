@@ -76,10 +76,16 @@ use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
     cvt_f32x2_bf16x2, tcgen05_alloc, tcgen05_commit_shared_cluster,
     tcgen05_dealloc, tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync,
-    tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16,
+    tcgen05_ld_16x256b_pure, tcgen05_load_wait,
 };
 use cuda_device::tma::{TmaDescriptor, cp_async_bulk_tensor_3d_g2s};
-use cuda_device::{cuda_module, kernel, launch_bounds, ptx_asm, thread, warp};
+use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
+use kittens::ldst::stmatrix_m8n8_x2;
+use kittens::mma::{mma_ab, mma_abt};
+use kittens::reg::{RegTile, RegVec, exp2_approx, fmax, log2_approx, online_rescale};
+use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
+use kittens::sync::SemaphoreRing;
+use kittens::tmem::TmemTile;
 
 // Tile contract; `host.rs` mirrors these as FLASH_TILE / FLASH_HD (kept
 // non-pub here so SWEEP's one-definition rule never sees two copies).
@@ -94,6 +100,40 @@ use cuda_device::{cuda_module, kernel, launch_bounds, ptx_asm, thread, warp};
 // subtile.
 const TILE: usize = 64;
 const HD: usize = 128;
+
+/// One `[TILE, HD]` bf16 operand panel as a kittens tile — two stacked
+/// SWIZZLE_128B subtiles, the layout described above. Phase 1 of issue #61
+/// moves the pipelined kernel's loader warp onto these; later phases absorb
+/// the rest of the raw swizzle/barrier machinery.
+type Panel = SharedTile<Bf16, TILE, HD, Swizzle128B>;
+/// A `PIPELINE_STAGES`-deep ring of panels (the K and V streams).
+type PanelRing = SharedTileRing<Bf16, TILE, HD, Swizzle128B, PIPELINE_STAGES>;
+/// The single-subtile `[TILE, TILE]` bf16 probability tile the softmax
+/// warpgroup writes with swizzled `stmatrix` stores. Its `swizzled_chunk`
+/// folds in the tile base's absolute 128-byte row phase — the fact the
+/// per-kernel `p_phase` variables used to carry by hand.
+type PTile = SharedTile<Bf16, TILE, TILE, Swizzle128B>;
+/// 7e15's paired K-major operand: two adjacent 64-row tiles stacked into
+/// `[2·TILE, HD]`, so each of its two HD subtiles is 128 rows and the
+/// K-major MMA walk strides `TILE_BYTES` between them (Q for backward dQ,
+/// K/V for backward dK/dV).
+type PairedPanel = SharedTile<Bf16, { 2 * TILE }, HD, Swizzle128B>;
+/// The paired single-subtile `[2·TILE, TILE]` bf16 operand the backward
+/// kernels store through `write_bf16_fragment` (dS, Pᵀ, dSᵀ): 128 swizzled
+/// 128-byte rows feeding the gradient MMAs' A side.
+type PairedPTile = SharedTile<Bf16, { 2 * TILE }, TILE, Swizzle128B>;
+const _: () = assert!(Panel::BYTES == TILE_BYTES && Panel::SUBTILE_BYTES == SUBTILE_BYTES);
+const _: () = assert!(PTile::BYTES == SUBTILE_BYTES);
+const _: () = assert!(PairedPanel::SUBTILE_BYTES == TILE_BYTES);
+const _: () = assert!(PairedPTile::BYTES == 2 * SUBTILE_BYTES && PairedPTile::SUBTILES == 1);
+
+/// The `S = Q·Kᵀ` (and `dP = dY·Vᵀ`) score accumulator segment. `M128_N64`
+/// writes 128 TMEM rows; the forward kernels drain the real 64, the paired
+/// backwards all 128.
+type STmem = TmemTile<{ 2 * TILE }, TILE>;
+/// An HD-wide output/gradient accumulator segment (`O`, `dQ`, `dK`, `dV`) —
+/// two 64-column MMA bands side by side.
+type AccTmem = TmemTile<{ 2 * TILE }, HD>;
 
 /// Bytes of one full-width bf16 `[TILE, HD]` operand (two stacked subtiles).
 const TILE_BYTES: usize = TILE * HD * 2;
@@ -193,33 +233,10 @@ pub mod kernels {
     /// the recomputed probabilities live in.
     const LOG2E: f32 = 1.442_695_04;
 
-    /// Stores two packed b16 matrix fragments without routing through the
-    /// unresolved LLVM stmatrix declaration emitted by cuda-oxide b099f64.
-    #[inline(always)]
-    unsafe fn stmatrix_m8n8_x2(smem_ptr: *mut u8, r0: u32, r1: u32) {
-        unsafe {
-            ptx_asm!(
-                "{ .reg .u64 smem; cvta.to.shared.u64 smem, %0; stmatrix.sync.aligned.m8n8.x2.shared.b16 [smem], {%1, %2}; }",
-                in("l") smem_ptr as u64,
-                in("r") r0,
-                in("r") r1,
-                clobber("memory"),
-            );
-        }
-    }
-
-    /// Same encoding as gemm's operand descriptors: SWIZZLE_128B tiles with a
-    /// 16-byte leading offset and 1024-byte stride.
-    #[inline(always)]
-    fn smem_descriptor(smem_address: u64) -> u64 {
-        const LEADING_BYTES: u32 = 16;
-        const STRIDE_BYTES: u32 = 1024;
-        const SWIZZLE_128B: u8 = 2;
-        let address = (smem_address >> 4) & 0x3fff;
-        let leading = ((LEADING_BYTES >> 4) & 0x3fff) as u64;
-        let stride = ((STRIDE_BYTES >> 4) & 0x3fff) as u64;
-        address | (leading << 16) | (stride << 32) | (1u64 << 46) | ((SWIZZLE_128B as u64) << 61)
-    }
+    // The gemm-encoded operand descriptors and the chained K=16 MMA walks
+    // (score/gradient, plain and 7e15-paired) now live in kittens::shared
+    // (`operand_descriptor`) and kittens::mma (`mma_abt`/`mma_ab`) — same
+    // bits, same issue order.
 
     /// TMA one `[TILE, HD]` head-panel row range into two stacked 64-wide
     /// SWIZZLE_128B subtiles: the descriptor's box is 64 columns, so the
@@ -240,72 +257,10 @@ pub mod kernels {
         }
     }
 
-    /// NaN-free float max/min. `f32::max`/`f32::min` lower to libdevice
-    /// (`__nv_fmaxf`), which would silently force this artifact off the
-    /// pure-PTX path; comparison + select stays native. All scores here are
-    /// finite by construction (`MASKED_SCORE` is finite).
-    #[inline(always)]
-    fn fmax(a: f32, b: f32) -> f32 {
-        if a > b { a } else { b }
-    }
-
-    #[inline(always)]
-    fn fmin(a: f32, b: f32) -> f32 {
-        if a < b { a } else { b }
-    }
-
-    /// `2^x` on FMA units: round-to-nearest split via the 1.5·2²³ shift trick,
-    /// exponent-bit insertion for the integer part, and a degree-3 minimax
-    /// polynomial (max relative error 7.5e-5 on the reduced range) for the
-    /// fraction. The clamp keeps the exponent field in the normal range and
-    /// flushes `MASKED_SCORE` inputs to a harmless ~2^-125.
-    #[inline(always)]
-    fn exp2_approx(x: f32) -> f32 {
-        const SHIFT: f32 = 12582912.0; // 1.5 * 2^23
-        const C0: f32 = 0.999_928_07;
-        const C1: f32 = 0.693_260_99;
-        const C2: f32 = 0.242_611_12;
-        const C3: f32 = 0.055_171_67;
-        let x = fmin(fmax(x, -125.0), 125.0);
-        let shifted = x + SHIFT;
-        let integer = (shifted.to_bits() as i32).wrapping_sub(0x4b40_0000);
-        let fraction = x - (shifted - SHIFT);
-        let poly = C0 + fraction * (C1 + fraction * (C2 + fraction * C3));
-        f32::from_bits((poly.to_bits() as i32).wrapping_add(integer << 23) as u32)
-    }
-
-    /// `log2(x)` for positive normal `x`: exponent extraction, mantissa
-    /// renormalized to `[√½, √2]`, then the atanh series in
-    /// `t = (m-1)/(m+1)` (four terms; |error| < 5e-8 on the reduced range).
-    #[inline(always)]
-    fn log2_approx(x: f32) -> f32 {
-        const C0: f32 = 2.885_390_1;
-        const C1: f32 = 0.961_796_7;
-        const C2: f32 = 0.577_078_02;
-        const C3: f32 = 0.412_198_58;
-        let bits = x.to_bits();
-        let mut exponent = ((bits >> 23) as i32) - 127;
-        let mut mantissa = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
-        if mantissa > 1.414_213_6 {
-            mantissa *= 0.5;
-            exponent += 1;
-        }
-        let t = (mantissa - 1.0) / (mantissa + 1.0);
-        let t2 = t * t;
-        exponent as f32 + t * (C0 + t2 * (C1 + t2 * (C2 + t2 * C3)))
-    }
-
-    #[inline(always)]
-    fn quad_max(value: f32) -> f32 {
-        let value = fmax(value, warp::shuffle_xor_f32(value, 1));
-        fmax(value, warp::shuffle_xor_f32(value, 2))
-    }
-
-    #[inline(always)]
-    fn quad_sum(value: f32) -> f32 {
-        let value = value + warp::shuffle_xor_f32(value, 1);
-        value + warp::shuffle_xor_f32(value, 2)
-    }
+    // The pure-PTX-safe scalar maps (fmax/fmin/exp2_approx/log2_approx) and
+    // the quad reductions now live in kittens::reg; the swizzled stmatrix
+    // mover in kittens::ldst. Same code, same bits — see their docs for the
+    // libdevice discipline they encode.
 
     /// One key tile of register softmax, shared by the three forward
     /// kernels. `warp_id` and every row coordinate are warpgroup-local: the
@@ -313,11 +268,11 @@ pub mod kernels {
     ///
     /// Drains `S[128, 128]` from `s_tmem` twice — pass 1 for masked row
     /// maxima, pass 2 to exponentiate against the O segment's per-row max
-    /// reference `m_ref` — and stores bf16 probabilities into the two
-    /// stacked SWIZZLE_128B P subtiles via `stmatrix` (the per-row
-    /// addresses apply the 16-byte-chunk XOR the TMA swizzle would have
-    /// produced, folding in the tile base's absolute 128-byte row phase, so
-    /// the O-MMA descriptors read P exactly like a TMA-loaded operand).
+    /// reference `m_ref` — and stores bf16 probabilities into the P tile via
+    /// `stmatrix` at `PTile::swizzled_chunk` addresses (the 16-byte-chunk
+    /// XOR the TMA swizzle would have produced, absolute base phase folded
+    /// in, so the O-MMA descriptors read P exactly like a TMA-loaded
+    /// operand).
     ///
     /// Between the passes sits FA4's conditional correction, adapted to the
     /// missing `tcgen05.st`: the O TMEM segment keeps accumulating under
@@ -341,43 +296,39 @@ pub mod kernels {
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn softmax_tile(
-        s_tmem: u32,
-        o_tmem: u32,
+        s_tmem: STmem,
+        o_tmem: AccTmem,
         tile: u32,
         diagonal: bool,
         warp_id: u32,
         lane: u32,
-        p_smem: *mut u8,
-        p_phase: usize,
+        p: PTile,
         votes: *mut u32,
         vote_barrier: *const Barrier,
-        m_ref: &mut [f32; 4],
-        running_sum: &mut [f32; 4],
-        out_acc: &mut [[f32; 32]; 4],
+        m_ref: &mut RegVec<4>,
+        running_sum: &mut RegVec<4>,
+        out_acc: &mut RegTile<4, 32>,
     ) -> bool {
         unsafe {
             let quad = (lane % 4) as usize;
             let row_in_16 = (lane / 4) as usize;
 
             // Pass 1: tile row maxima (masked, base-2 domain).
-            let mut tile_max = [MASKED_SCORE; 4];
+            let mut tile_max = RegVec::<4>::splat(MASKED_SCORE);
             let mut row_block = 0u32;
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
+                    let (low, high) = s_tmem.fragment(tmem_row, column);
                     let slot_a = (row_block * 2) as usize;
                     let slot_b = slot_a + 1;
                     if diagonal {
                         let row_a = (tmem_row as usize + row_in_16) as u32;
                         let row_b = row_a + 8;
                         let col = column + 2 * quad as u32;
-                        let mut max_a = tile_max[slot_a];
+                        let mut max_a = tile_max.0[slot_a];
                         max_a = fmax(max_a, if col <= row_a { low[0] } else { MASKED_SCORE });
                         max_a =
                             fmax(max_a, if col + 1 <= row_a { low[1] } else { MASKED_SCORE });
@@ -385,8 +336,8 @@ pub mod kernels {
                             fmax(max_a, if col + 8 <= row_a { high[0] } else { MASKED_SCORE });
                         max_a =
                             fmax(max_a, if col + 9 <= row_a { high[1] } else { MASKED_SCORE });
-                        tile_max[slot_a] = max_a;
-                        let mut max_b = tile_max[slot_b];
+                        tile_max.0[slot_a] = max_a;
+                        let mut max_b = tile_max.0[slot_b];
                         max_b = fmax(max_b, if col <= row_b { low[2] } else { MASKED_SCORE });
                         max_b =
                             fmax(max_b, if col + 1 <= row_b { low[3] } else { MASKED_SCORE });
@@ -394,14 +345,14 @@ pub mod kernels {
                             fmax(max_b, if col + 8 <= row_b { high[2] } else { MASKED_SCORE });
                         max_b =
                             fmax(max_b, if col + 9 <= row_b { high[3] } else { MASKED_SCORE });
-                        tile_max[slot_b] = max_b;
+                        tile_max.0[slot_b] = max_b;
                     } else {
-                        tile_max[slot_a] = fmax(
-                            fmax(fmax(tile_max[slot_a], low[0]), fmax(low[1], high[0])),
+                        tile_max.0[slot_a] = fmax(
+                            fmax(fmax(tile_max.0[slot_a], low[0]), fmax(low[1], high[0])),
                             high[1],
                         );
-                        tile_max[slot_b] = fmax(
-                            fmax(fmax(tile_max[slot_b], low[2]), fmax(low[3], high[2])),
+                        tile_max.0[slot_b] = fmax(
+                            fmax(fmax(tile_max.0[slot_b], low[2]), fmax(low[3], high[2])),
                             high[3],
                         );
                     }
@@ -409,14 +360,8 @@ pub mod kernels {
                 }
                 row_block += 1;
             }
-            let mut row_max = [0.0f32; 4];
-            let mut exceed = false;
-            let mut slot = 0usize;
-            while slot < 4 {
-                row_max[slot] = quad_max(tile_max[slot]);
-                exceed = exceed || row_max[slot] > m_ref[slot] + CORRECTION_THRESHOLD;
-                slot += 1;
-            }
+            let row_max = tile_max.quad_max();
+            let exceed = row_max.any_exceeds(*m_ref, CORRECTION_THRESHOLD);
 
             // Collective correction vote (tile 0 always trips it: m_ref
             // still sits at MASKED_SCORE). One word per warp, one barrier
@@ -437,35 +382,22 @@ pub mod kernels {
                 if tile > 0 {
                     merge_output_tile(o_tmem, warp_id, out_acc);
                 }
-                let mut slot = 0usize;
-                while slot < 4 {
-                    let next = fmax(m_ref[slot], row_max[slot]);
-                    let factor = exp2_approx(m_ref[slot] - next);
-                    m_ref[slot] = next;
-                    running_sum[slot] *= factor;
-                    let mut value = 0usize;
-                    while value < 32 {
-                        out_acc[slot][value] *= factor;
-                        value += 1;
-                    }
-                    slot += 1;
-                }
+                online_rescale(m_ref, row_max, running_sum, out_acc);
             }
 
             // Pass 2: probabilities — re-drain S, exponentiate against the
             // segment reference, accumulate row sums, and store bf16 P
-            // through the swizzle-aware stmatrix addresses.
-            let mut tile_sum = [0.0f32; 4];
+            // through the swizzle-aware stmatrix addresses (base phase
+            // hoisted once, like the old `p_phase`).
+            let p_chunks = p.chunk_writer();
+            let mut tile_sum = RegVec::<4>::splat(0.0);
             let mut row_block = 0u32;
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
+                    let (low, high) = s_tmem.fragment(tmem_row, column);
                     let slot_a = (row_block * 2) as usize;
                     let slot_b = slot_a + 1;
                     let row_a = (tmem_row as usize + row_in_16) as u32;
@@ -480,16 +412,16 @@ pub mod kernels {
                     let s_b1 = if !diagonal || col + 1 <= row_b { low[3] } else { MASKED_SCORE };
                     let s_b8 = if !diagonal || col + 8 <= row_b { high[2] } else { MASKED_SCORE };
                     let s_b9 = if !diagonal || col + 9 <= row_b { high[3] } else { MASKED_SCORE };
-                    let p_a0 = exp2_approx(s_a0 - m_ref[slot_a]);
-                    let p_a1 = exp2_approx(s_a1 - m_ref[slot_a]);
-                    let p_a8 = exp2_approx(s_a8 - m_ref[slot_a]);
-                    let p_a9 = exp2_approx(s_a9 - m_ref[slot_a]);
-                    let p_b0 = exp2_approx(s_b0 - m_ref[slot_b]);
-                    let p_b1 = exp2_approx(s_b1 - m_ref[slot_b]);
-                    let p_b8 = exp2_approx(s_b8 - m_ref[slot_b]);
-                    let p_b9 = exp2_approx(s_b9 - m_ref[slot_b]);
-                    tile_sum[slot_a] += p_a0 + p_a1 + p_a8 + p_a9;
-                    tile_sum[slot_b] += p_b0 + p_b1 + p_b8 + p_b9;
+                    let p_a0 = exp2_approx(s_a0 - m_ref.0[slot_a]);
+                    let p_a1 = exp2_approx(s_a1 - m_ref.0[slot_a]);
+                    let p_a8 = exp2_approx(s_a8 - m_ref.0[slot_a]);
+                    let p_a9 = exp2_approx(s_a9 - m_ref.0[slot_a]);
+                    let p_b0 = exp2_approx(s_b0 - m_ref.0[slot_b]);
+                    let p_b1 = exp2_approx(s_b1 - m_ref.0[slot_b]);
+                    let p_b8 = exp2_approx(s_b8 - m_ref.0[slot_b]);
+                    let p_b9 = exp2_approx(s_b9 - m_ref.0[slot_b]);
+                    tile_sum.0[slot_a] += p_a0 + p_a1 + p_a8 + p_a9;
+                    tile_sum.0[slot_b] += p_b0 + p_b1 + p_b8 + p_b9;
 
                     // P is a single 64-wide subtile (128-byte rows), so the
                     // eight 16-byte chunks index the whole row directly.
@@ -497,17 +429,13 @@ pub mod kernels {
                     let chunk = if (8..16).contains(&lane) { chunk_low + 1 } else { chunk_low };
                     let row_low = tmem_row as usize + (lane % 8) as usize;
                     let row_high = row_low + 8;
-                    let address_low =
-                        p_smem.add(row_low * 128 + (chunk ^ ((row_low + p_phase) & 7)) * 16);
-                    let address_high =
-                        p_smem.add(row_high * 128 + (chunk ^ ((row_high + p_phase) & 7)) * 16);
                     stmatrix_m8n8_x2(
-                        address_low,
+                        p_chunks.at(row_low, chunk),
                         cvt_f32x2_bf16x2(p_a0, p_a1),
                         cvt_f32x2_bf16x2(p_a8, p_a9),
                     );
                     stmatrix_m8n8_x2(
-                        address_high,
+                        p_chunks.at(row_high, chunk),
                         cvt_f32x2_bf16x2(p_b0, p_b1),
                         cvt_f32x2_bf16x2(p_b8, p_b9),
                     );
@@ -515,11 +443,7 @@ pub mod kernels {
                 }
                 row_block += 1;
             }
-            let mut slot = 0usize;
-            while slot < 4 {
-                running_sum[slot] += quad_sum(tile_sum[slot]);
-                slot += 1;
-            }
+            running_sum.add_assign(tile_sum.quad_sum());
             correction
         }
     }
@@ -529,7 +453,7 @@ pub mod kernels {
     /// then rescales the merged accumulator to the new reference) and by
     /// the epilogue for the final segment. `warp_id` is warpgroup-local.
     #[inline(always)]
-    unsafe fn merge_output_tile(o_tmem: u32, warp_id: u32, out_acc: &mut [[f32; 32]; 4]) {
+    unsafe fn merge_output_tile(o_tmem: AccTmem, warp_id: u32, out_acc: &mut RegTile<4, 32>) {
         unsafe {
             let mut row_block = 0u32;
             while row_block < 2 {
@@ -537,21 +461,18 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 8 {
                     let column = column_block * 16;
-                    let low = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(o_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
+                    let (low, high) = o_tmem.fragment(tmem_row, column);
                     let slot_a = (row_block * 2) as usize;
                     let slot_b = slot_a + 1;
                     let base = (column_block * 4) as usize;
-                    out_acc[slot_a][base] += low[0];
-                    out_acc[slot_a][base + 1] += low[1];
-                    out_acc[slot_a][base + 2] += high[0];
-                    out_acc[slot_a][base + 3] += high[1];
-                    out_acc[slot_b][base] += low[2];
-                    out_acc[slot_b][base + 1] += low[3];
-                    out_acc[slot_b][base + 2] += high[2];
-                    out_acc[slot_b][base + 3] += high[3];
+                    out_acc.0[slot_a][base] += low[0];
+                    out_acc.0[slot_a][base + 1] += low[1];
+                    out_acc.0[slot_a][base + 2] += high[0];
+                    out_acc.0[slot_a][base + 3] += high[1];
+                    out_acc.0[slot_b][base] += low[2];
+                    out_acc.0[slot_b][base + 1] += low[3];
+                    out_acc.0[slot_b][base + 2] += high[2];
+                    out_acc.0[slot_b][base + 3] += high[3];
                     column_block += 1;
                 }
                 row_block += 1;
@@ -575,9 +496,9 @@ pub mod kernels {
         query_tile: u32,
         warp_id: u32,
         lane: u32,
-        max_ref: &[f32; 4],
-        running_sum: &[f32; 4],
-        out_acc: &[[f32; 32]; 4],
+        max_ref: &RegVec<4>,
+        running_sum: &RegVec<4>,
+        out_acc: &RegTile<4, 32>,
         output: &mut DisjointSlice<f32>,
         logsumexp: &mut DisjointSlice<f32>,
     ) {
@@ -591,24 +512,25 @@ pub mod kernels {
                     warp_id as usize * 32 + (slot / 2) * 16 + (slot % 2) * 8 + row_in_16;
                 let global_row =
                     (batch * t) as usize + query_tile as usize * TILE + local_row;
-                let inverse = 1.0 / running_sum[slot];
+                let inverse = 1.0 / running_sum.0[slot];
                 let out_base = global_row * d_model + head as usize * HD;
                 let mut column_block = 0usize;
                 while column_block < 8 {
                     let column = column_block * 16 + 2 * quad;
                     let base = column_block * 4;
-                    *output.get_unchecked_mut(out_base + column) = out_acc[slot][base] * inverse;
+                    *output.get_unchecked_mut(out_base + column) =
+                        out_acc.0[slot][base] * inverse;
                     *output.get_unchecked_mut(out_base + column + 1) =
-                        out_acc[slot][base + 1] * inverse;
+                        out_acc.0[slot][base + 1] * inverse;
                     *output.get_unchecked_mut(out_base + column + 8) =
-                        out_acc[slot][base + 2] * inverse;
+                        out_acc.0[slot][base + 2] * inverse;
                     *output.get_unchecked_mut(out_base + column + 9) =
-                        out_acc[slot][base + 3] * inverse;
+                        out_acc.0[slot][base + 3] * inverse;
                     column_block += 1;
                 }
                 if quad == 0 {
                     *logsumexp.get_unchecked_mut(global_row * h as usize + head as usize) =
-                        LN2 * (max_ref[slot] + log2_approx(running_sum[slot]));
+                        LN2 * (max_ref.0[slot] + log2_approx(running_sum.0[slot]));
                 }
                 slot += 1;
             }
@@ -623,14 +545,13 @@ pub mod kernels {
     #[inline(always)]
     unsafe fn score_mma(s_tmem: u32, q_smem: *mut u8, k_smem: *mut u8, s_instruction: u32) {
         unsafe {
-            let mut chunk = 0u64;
-            while chunk < 8 {
-                let offset = (chunk / 4) * SUBTILE_BYTES as u64 + (chunk % 4) * 32;
-                let a_descriptor = smem_descriptor(q_smem as u64 + offset);
-                let b_descriptor = smem_descriptor(k_smem as u64 + offset);
-                tcgen05_mma_f16(s_tmem, a_descriptor, b_descriptor, s_instruction, chunk > 0);
-                chunk += 1;
-            }
+            mma_abt(
+                s_tmem,
+                Panel::from_raw(q_smem),
+                Panel::from_raw(k_smem),
+                s_instruction,
+                false,
+            );
         }
     }
 
@@ -700,8 +621,8 @@ pub mod kernels {
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn backward_q_tile(
-        s_tmem: u32,
-        dp_tmem: u32,
+        s_tmem: STmem,
+        dp_tmem: STmem,
         diagonal: bool,
         warp_id: u32,
         lane: u32,
@@ -719,14 +640,8 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let s_low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let s_high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
-                    let dp_low = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let dp_high = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
+                    let (s_low, s_high) = s_tmem.fragment(tmem_row, column);
+                    let (dp_low, dp_high) = dp_tmem.fragment(tmem_row, column);
                     let row_a = tmem_row + row_in_16 as u32;
                     let row_b = row_a + 8;
                     let col = column + 2 * quad as u32;
@@ -778,8 +693,8 @@ pub mod kernels {
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn backward_kv_tile(
-        st_tmem: u32,
-        dpt_tmem: u32,
+        st_tmem: STmem,
+        dpt_tmem: STmem,
         diagonal: bool,
         warp_id: u32,
         lane: u32,
@@ -799,14 +714,8 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let s_low = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let s_high = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
-                    let dp_low = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let dp_high = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
+                    let (s_low, s_high) = st_tmem.fragment(tmem_row, column);
+                    let (dp_low, dp_high) = dpt_tmem.fragment(tmem_row, column);
                     let row_a = tmem_row + row_in_16 as u32;
                     let row_b = row_a + 8;
                     let col = column + 2 * quad as u32;
@@ -871,8 +780,8 @@ pub mod kernels {
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn backward_q_tile_paired(
-        s_tmem: u32,
-        dp_tmem: u32,
+        s_tmem: STmem,
+        dp_tmem: STmem,
         key: u32,
         tile_a: u32,
         tile_b: u32,
@@ -896,14 +805,8 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let s_low = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let s_high = tcgen05_ld_16x256b_pure(s_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
-                    let dp_low = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let dp_high = tcgen05_ld_16x256b_pure(dp_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
+                    let (s_low, s_high) = s_tmem.fragment(tmem_row, column);
+                    let (dp_low, dp_high) = dp_tmem.fragment(tmem_row, column);
                     let row_a = tmem_row + row_in_16 as u32;
                     let row_b = row_a + 8;
                     let qrow_a = row_a & 63;
@@ -970,8 +873,8 @@ pub mod kernels {
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn backward_kv_tile_paired(
-        st_tmem: u32,
-        dpt_tmem: u32,
+        st_tmem: STmem,
+        dpt_tmem: STmem,
         query: u32,
         key_a: u32,
         key_b: u32,
@@ -997,14 +900,8 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 4 {
                     let column = column_block * 16;
-                    let s_low = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let s_high = tcgen05_ld_16x256b_pure(st_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
-                    let dp_low = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column);
-                    tcgen05_load_wait();
-                    let dp_high = tcgen05_ld_16x256b_pure(dpt_tmem + (tmem_row << 16) + column + 8);
-                    tcgen05_load_wait();
+                    let (s_low, s_high) = st_tmem.fragment(tmem_row, column);
+                    let (dp_low, dp_high) = dpt_tmem.fragment(tmem_row, column);
                     let row_a = tmem_row + row_in_16 as u32;
                     let row_b = row_a + 8;
                     let krow_a = row_a & 63;
@@ -1072,24 +969,13 @@ pub mod kernels {
     #[inline(always)]
     unsafe fn grad_mma(acc_tmem: u32, a_smem: *mut u8, b_smem: *mut u8, instruction: u32, fresh: bool) {
         unsafe {
-            let mut hd = 0u64;
-            while hd < 2 {
-                let mut chunk = 0u64;
-                while chunk < 4 {
-                    let a_descriptor = smem_descriptor(a_smem as u64 + chunk * 32);
-                    let b_descriptor =
-                        smem_descriptor(b_smem as u64 + hd * SUBTILE_BYTES as u64 + chunk * 2048);
-                    tcgen05_mma_f16(
-                        acc_tmem + (hd as u32) * 64,
-                        a_descriptor,
-                        b_descriptor,
-                        instruction,
-                        chunk > 0 || !fresh,
-                    );
-                    chunk += 1;
-                }
-                hd += 1;
-            }
+            mma_ab(
+                acc_tmem,
+                PTile::from_raw(a_smem),
+                Panel::from_raw(b_smem),
+                instruction,
+                !fresh,
+            );
         }
     }
 
@@ -1107,7 +993,7 @@ pub mod kernels {
         tile: u32,
         warp_id: u32,
         lane: u32,
-        grad_acc: &[[f32; 32]; 4],
+        grad_acc: &RegTile<4, 32>,
         output: &mut DisjointSlice<f32>,
     ) {
         unsafe {
@@ -1124,10 +1010,10 @@ pub mod kernels {
                 while column_block < 8 {
                     let column = column_block * 16 + 2 * quad;
                     let base = column_block * 4;
-                    *output.get_unchecked_mut(out_base + column) = grad_acc[slot][base];
-                    *output.get_unchecked_mut(out_base + column + 1) = grad_acc[slot][base + 1];
-                    *output.get_unchecked_mut(out_base + column + 8) = grad_acc[slot][base + 2];
-                    *output.get_unchecked_mut(out_base + column + 9) = grad_acc[slot][base + 3];
+                    *output.get_unchecked_mut(out_base + column) = grad_acc.0[slot][base];
+                    *output.get_unchecked_mut(out_base + column + 1) = grad_acc.0[slot][base + 1];
+                    *output.get_unchecked_mut(out_base + column + 8) = grad_acc.0[slot][base + 2];
+                    *output.get_unchecked_mut(out_base + column + 9) = grad_acc.0[slot][base + 3];
                     column_block += 1;
                 }
                 slot += 1;
@@ -1361,8 +1247,8 @@ pub mod kernels {
             }
             thread::sync_threads();
             let tmem = *(&raw const TMEM_ADDRESS as *const u32);
-            let s_tmem = tmem;
-            let o_tmem = tmem + 256;
+            let s_tmem = STmem::from_raw(tmem);
+            let o_tmem = AccTmem::from_raw(tmem + 256);
 
             let s_instruction = Tcgen05InstructionDescriptor::builder()
                 .shape(Tcgen05MmaShape::M128_N64)
@@ -1392,18 +1278,15 @@ pub mod kernels {
             while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
             thread::sync_threads();
 
-            let mut m_ref = [MASKED_SCORE; 4];
-            let mut running_sum = [0.0f32; 4];
-            let mut out_acc = [[0.0f32; 32]; 4];
+            let mut m_ref = RegVec::<4>::splat(MASKED_SCORE);
+            let mut running_sum = RegVec::<4>::splat(0.0);
+            let mut out_acc = RegTile::<4, 32>::zero();
             let mut corrections = 0u32;
 
             // The 128B swizzle XORs *absolute* shared-address bits [9:7], not
-            // tile-relative rows. Dynamic shared memory starts just past the
-            // static barrier words, so the P tile's base row phase is
-            // nonzero; fold it into the manual stmatrix swizzle (the P
-            // subtiles are a whole number of 8-row groups apart, so one
-            // phase serves both).
-            let p_phase = (p_smem as usize >> 7) & 7;
+            // tile-relative rows; `PTile::swizzled_chunk` folds the base's
+            // row phase in.
+            let p = PTile::from_raw(p_smem);
 
             let mut tma_phase = 1u32;
             let mut mma_phase = 0u32;
@@ -1422,7 +1305,7 @@ pub mod kernels {
                 // S = Q·Kᵀ, fresh accumulation each tile.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    score_mma(s_tmem, q_smem, k_smem, s_instruction);
+                    score_mma(s_tmem.raw(), q_smem, k_smem, s_instruction);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
@@ -1436,8 +1319,7 @@ pub mod kernels {
                     key_tile == query_tile,
                     warp_id,
                     lane,
-                    p_smem,
-                    p_phase,
+                    p,
                     &raw mut VOTES as *mut u32,
                     &raw const VOTE_BARRIER,
                     &mut m_ref,
@@ -1459,7 +1341,7 @@ pub mod kernels {
                 // across the block, so the leader's copy is the vote).
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    grad_mma(o_tmem, p_smem, v_smem, o_instruction, correction);
+                    grad_mma(o_tmem.raw(), p_smem, v_smem, o_instruction, correction);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
@@ -1575,9 +1457,9 @@ pub mod kernels {
             }
             thread::sync_threads();
             let tmem = *(&raw const TMEM_ADDRESS as *const u32);
-            let s_tmem = tmem;
-            let dp_tmem = tmem + 128;
-            let dq_tmem = tmem + 256;
+            let s_tmem = STmem::from_raw(tmem);
+            let dp_tmem = STmem::from_raw(tmem + 128);
+            let dq_tmem = AccTmem::from_raw(tmem + 256);
 
             let s_instruction = Tcgen05InstructionDescriptor::builder()
                 .shape(Tcgen05MmaShape::M128_N64)
@@ -1626,7 +1508,7 @@ pub mod kernels {
             thread::sync_threads();
 
             let ds_phase = (ds_smem as usize >> 7) & 7;
-            let mut dq_acc = [[0.0f32; 32]; 4];
+            let mut dq_acc = RegTile::<4, 32>::zero();
 
             let mut tma_phase = 1u32;
             let mut mma_phase = 0u32;
@@ -1645,8 +1527,8 @@ pub mod kernels {
                 // S = [Q_A;Q_B]·Kᵀ and dP = [dY_A;dY_B]·Vᵀ, both fresh.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    score_mma_paired(s_tmem, q_smem, k_smem, s_instruction);
-                    score_mma_paired(dp_tmem, dy_smem, v_smem, s_instruction);
+                    score_mma_paired(s_tmem.raw(), q_smem, k_smem, s_instruction);
+                    score_mma_paired(dp_tmem.raw(), dy_smem, v_smem, s_instruction);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
@@ -1674,7 +1556,7 @@ pub mod kernels {
                 // dQ += dS·K, continuing the accumulator (fresh on key 0).
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    grad_mma(dq_tmem, ds_smem, k_smem, grad_instruction, key_tile == 0);
+                    grad_mma(dq_tmem.raw(), ds_smem, k_smem, grad_instruction, key_tile == 0);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
@@ -1775,10 +1657,10 @@ pub mod kernels {
             let tmem = *(&raw const TMEM_ADDRESS as *const u32);
             // Sᵀ/dPᵀ are 64-column segments; the dV/dK gradients are 128
             // columns, following at tmem+128 and tmem+256.
-            let st_tmem = tmem;
-            let dpt_tmem = tmem + 64;
-            let dv_tmem = tmem + 128;
-            let dk_tmem = tmem + 256;
+            let st_tmem = STmem::from_raw(tmem);
+            let dpt_tmem = STmem::from_raw(tmem + 64);
+            let dv_tmem = AccTmem::from_raw(tmem + 128);
+            let dk_tmem = AccTmem::from_raw(tmem + 256);
 
             let s_instruction = Tcgen05InstructionDescriptor::builder()
                 .shape(Tcgen05MmaShape::M128_N64)
@@ -1821,8 +1703,8 @@ pub mod kernels {
 
             let p_phase = (p_smem as usize >> 7) & 7;
             let ds_phase = (ds_smem as usize >> 7) & 7;
-            let mut dv_acc = [[0.0f32; 32]; 4];
-            let mut dk_acc = [[0.0f32; 32]; 4];
+            let mut dv_acc = RegTile::<4, 32>::zero();
+            let mut dk_acc = RegTile::<4, 32>::zero();
 
             let mut tma_phase = 1u32;
             let mut mma_phase = 0u32;
@@ -1853,8 +1735,8 @@ pub mod kernels {
                 // Sᵀ = [K_A;K_B]·Qᵀ and dPᵀ = [V_A;V_B]·dYᵀ, both fresh.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    score_mma_paired(st_tmem, k_smem, q_smem, s_instruction);
-                    score_mma_paired(dpt_tmem, v_smem, dy_smem, s_instruction);
+                    score_mma_paired(st_tmem.raw(), k_smem, q_smem, s_instruction);
+                    score_mma_paired(dpt_tmem.raw(), v_smem, dy_smem, s_instruction);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
@@ -1885,8 +1767,8 @@ pub mod kernels {
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
                     let fresh = query_tile == key_a;
-                    grad_mma(dv_tmem, p_smem, dy_smem, grad_instruction, fresh);
-                    grad_mma(dk_tmem, ds_smem, q_smem, grad_instruction, fresh);
+                    grad_mma(dv_tmem.raw(), p_smem, dy_smem, grad_instruction, fresh);
+                    grad_mma(dk_tmem.raw(), ds_smem, q_smem, grad_instruction, fresh);
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
@@ -1960,10 +1842,9 @@ pub mod kernels {
         tid_in_group: u32,
         warp_id: u32,
         lane: u32,
-        s_tmem: u32,
-        o_tmem: u32,
-        p_smem: *mut u8,
-        p_phase: usize,
+        s_tmem: STmem,
+        o_tmem: AccTmem,
+        p: PTile,
         votes: *mut u32,
         vote_barrier: *const Barrier,
         restart: *mut u32,
@@ -1972,9 +1853,9 @@ pub mod kernels {
         p_full: *const Barrier,
         o_full: *const Barrier,
         kv_free: *mut Barrier,
-        m_ref: &mut [f32; 4],
-        running_sum: &mut [f32; 4],
-        out_acc: &mut [[f32; 32]; 4],
+        m_ref: &mut RegVec<4>,
+        running_sum: &mut RegVec<4>,
+        out_acc: &mut RegTile<4, 32>,
         corrections: &mut u32,
     ) {
         unsafe {
@@ -1986,14 +1867,13 @@ pub mod kernels {
             while !mbarrier_try_wait_parity(s_full.add(buffer), s_parity) {}
             let correction = softmax_tile(
                 // The double-buffered S is 64 columns wide per buffer.
-                s_tmem + (buffer as u32) * 64,
+                s_tmem.columns_right((buffer as u32) * 64),
                 o_tmem,
                 i,
                 diagonal,
                 warp_id,
                 lane,
-                p_smem,
-                p_phase,
+                p,
                 votes,
                 vote_barrier,
                 m_ref,
@@ -2126,18 +2006,19 @@ pub mod kernels {
             thread::sync_threads();
             let tmem = *(&raw const TMEM_ADDRESS as *const u32);
             // Two 64-wide S buffers occupy columns 0..128; O follows at 128.
-            let o_tmem = tmem + 128;
+            let s_tmem = STmem::from_raw(tmem);
+            let o_tmem = AccTmem::from_raw(tmem + 128);
 
             if tid < TILE as u32 {
                 // Softmax / correction / epilogue warpgroup. The key loop
                 // is split so the diagonal tile is the only one paying for
                 // mask logic (the full-tile calls fold `diagonal = false`).
-                let p_phase = (p_smem as usize >> 7) & 7;
+                let p = PTile::from_raw(p_smem);
                 let votes = &raw mut VOTES as *mut u32;
                 let restart = &raw mut RESTART as *mut u32;
-                let mut m_ref = [MASKED_SCORE; 4];
-                let mut running_sum = [0.0f32; 4];
-                let mut out_acc = [[0.0f32; 32]; 4];
+                let mut m_ref = RegVec::<4>::splat(MASKED_SCORE);
+                let mut running_sum = RegVec::<4>::splat(0.0);
+                let mut out_acc = RegTile::<4, 32>::zero();
                 let mut corrections = 0u32;
                 let mut i = 0u32;
                 while i + 1 < key_tiles {
@@ -2149,10 +2030,9 @@ pub mod kernels {
                         tid,
                         warp_id,
                         lane,
-                        tmem,
+                        s_tmem,
                         o_tmem,
-                        p_smem,
-                        p_phase,
+                        p,
                         votes,
                         &raw const VOTE_BARRIER,
                         restart,
@@ -2176,10 +2056,9 @@ pub mod kernels {
                     tid,
                     warp_id,
                     lane,
-                    tmem,
+                    s_tmem,
                     o_tmem,
-                    p_smem,
-                    p_phase,
+                    p,
                     votes,
                     &raw const VOTE_BARRIER,
                     restart,
@@ -2215,28 +2094,26 @@ pub mod kernels {
                     ) = corrections;
                 }
             } else if tid == TILE as u32 {
-                // TMA load warp leader: Q once, then the K/V ring.
+                // TMA load warp leader: Q once, then the K/V ring, on kittens
+                // tiles — the ring types own the stage selection and free-slot
+                // parity, the panel type the two-subtile box issue.
+                let kv_full = SemaphoreRing::<PIPELINE_STAGES>::attach(kv_full);
+                let kv_free = SemaphoreRing::<PIPELINE_STAGES>::attach(kv_free);
+                let q = Panel::from_raw(q_smem);
+                let k = PanelRing::attach(k_ring);
+                let v = PanelRing::attach(v_ring);
                 let mut i = 0u32;
                 while i < key_tiles {
-                    let stage = (i as usize) % PIPELINE_STAGES;
-                    if i as usize >= PIPELINE_STAGES {
-                        let parity = ((i as usize / PIPELINE_STAGES - 1) & 1) as u32;
-                        while !mbarrier_try_wait_parity(kv_free.add(stage), parity) {}
-                    }
+                    kv_free.wait_recycled(i);
+                    let full = kv_full.sem(i);
                     let key_row = (i * TILE as u32) as i32;
-                    load_panel(k_ring.add(stage * TILE_BYTES), k_tma, key_row, plane, kv_full.add(stage));
-                    load_panel(v_ring.add(stage * TILE_BYTES), v_tma, key_row, plane, kv_full.add(stage));
+                    k.tile(i).tma_load(k_tma, key_row, plane, full);
+                    v.tile(i).tma_load(v_tma, key_row, plane, full);
                     if i == 0 {
-                        load_panel(
-                            q_smem,
-                            q_tma,
-                            (query_tile * TILE as u32) as i32,
-                            plane,
-                            kv_full.add(stage),
-                        );
-                        mbarrier_arrive_expect_tx(kv_full.add(stage), 1, 3 * TILE_BYTES as u32);
+                        q.tma_load(q_tma, (query_tile * TILE as u32) as i32, plane, full);
+                        full.expect_tx(3 * Panel::BYTES as u32);
                     } else {
-                        mbarrier_arrive_expect_tx(kv_full.add(stage), 1, 2 * TILE_BYTES as u32);
+                        full.expect_tx(2 * Panel::BYTES as u32);
                     }
                     i += 1;
                 }
@@ -2278,7 +2155,7 @@ pub mod kernels {
                         output_mma(
                             i - 1,
                             PIPELINE_STAGES,
-                            o_tmem,
+                            o_tmem.raw(),
                             p_smem,
                             v_ring,
                             o_instruction,
@@ -2292,7 +2169,7 @@ pub mod kernels {
                 output_mma(
                     key_tiles - 1,
                     PIPELINE_STAGES,
-                    o_tmem,
+                    o_tmem.raw(),
                     p_smem,
                     v_ring,
                     o_instruction,
@@ -2335,15 +2212,13 @@ pub mod kernels {
     #[inline(always)]
     unsafe fn score_mma_paired(s_tmem: u32, q_smem: *mut u8, k_smem: *mut u8, instruction: u32) {
         unsafe {
-            let mut chunk = 0u64;
-            while chunk < 8 {
-                let a_offset = (chunk / 4) * TILE_BYTES as u64 + (chunk % 4) * 32;
-                let b_offset = (chunk / 4) * SUBTILE_BYTES as u64 + (chunk % 4) * 32;
-                let a_descriptor = smem_descriptor(q_smem as u64 + a_offset);
-                let b_descriptor = smem_descriptor(k_smem as u64 + b_offset);
-                tcgen05_mma_f16(s_tmem, a_descriptor, b_descriptor, instruction, chunk > 0);
-                chunk += 1;
-            }
+            mma_abt(
+                s_tmem,
+                PairedPanel::from_raw(q_smem),
+                Panel::from_raw(k_smem),
+                instruction,
+                false,
+            );
         }
     }
 
@@ -2398,9 +2273,9 @@ pub mod kernels {
         tid_in_group: u32,
         warp_id: u32,
         lane: u32,
-        s_tmem: u32,
-        o_tmem: u32,
-        p_smem: *mut u8,
+        s_tmem: STmem,
+        o_tmem: AccTmem,
+        p: PTile,
         votes: *mut u32,
         vote_barrier: *const Barrier,
         restart: *mut u32,
@@ -2414,11 +2289,10 @@ pub mod kernels {
         correction_counts: &mut DisjointSlice<u32>,
     ) {
         unsafe {
-            let p_phase = (p_smem as usize >> 7) & 7;
             let key_tiles = query_tile + 1;
-            let mut m_ref = [MASKED_SCORE; 4];
-            let mut running_sum = [0.0f32; 4];
-            let mut out_acc = [[0.0f32; 32]; 4];
+            let mut m_ref = RegVec::<4>::splat(MASKED_SCORE);
+            let mut running_sum = RegVec::<4>::splat(0.0);
+            let mut out_acc = RegTile::<4, 32>::zero();
             let mut corrections = 0u32;
             let mut i = 0u32;
             while i + 1 < key_tiles {
@@ -2432,8 +2306,7 @@ pub mod kernels {
                     lane,
                     s_tmem,
                     o_tmem,
-                    p_smem,
-                    p_phase,
+                    p,
                     votes,
                     vote_barrier,
                     restart,
@@ -2459,8 +2332,7 @@ pub mod kernels {
                 lane,
                 s_tmem,
                 o_tmem,
-                p_smem,
-                p_phase,
+                p,
                 votes,
                 vote_barrier,
                 restart,
@@ -2706,9 +2578,9 @@ pub mod kernels {
                         tid,
                         warp_id,
                         lane,
-                        tmem,
-                        tmem + 128,
-                        p_a,
+                        STmem::from_raw(tmem),
+                        AccTmem::from_raw(tmem + 128),
+                        PTile::from_raw(p_a),
                         votes,
                         vote_barrier,
                         restart,
@@ -2739,9 +2611,9 @@ pub mod kernels {
                             tid - 2 * TILE as u32,
                             warp_id - (2 * TILE / 32) as u32,
                             lane,
-                            tmem + 64,
-                            tmem + 256,
-                            p_b,
+                            STmem::from_raw(tmem + 64),
+                            AccTmem::from_raw(tmem + 256),
+                            PTile::from_raw(p_b),
                             votes.add(8),
                             vote_barrier.add(1),
                             restart.add(2),
