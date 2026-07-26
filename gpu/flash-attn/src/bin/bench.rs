@@ -31,6 +31,9 @@ fn per_row_config() -> LaunchConfig {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: benchmark launch dimensions satisfy each kernel contract, and
+    // all captured buffers outlive the timed stream operations.
+    unsafe {
     assert!(HD.is_power_of_two() && HD <= flash::MAX_HEAD_DIM);
     assert_eq!(HD, flash::TILE_HD);
 
@@ -225,4 +228,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         per_row_backward_ms / tiled_backward_ms
     );
     Ok(())
+    }
 }

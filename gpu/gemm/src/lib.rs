@@ -26,15 +26,14 @@ use cuda_device::cluster;
 use cuda_device::shared::SharedArray;
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    cvt_f32x2_bf16x2, stmatrix_m8n8_x2, tcgen05_alloc, tcgen05_alloc_cg2,
-    tcgen05_commit_multicast_cg2, tcgen05_commit_shared_cluster, tcgen05_dealloc,
-    tcgen05_dealloc_cg2, tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16,
-    tcgen05_mma_f16_cg2, tcgen05_relinquish_alloc_permit_cg2,
+    cvt_f32x2_bf16x2, tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_commit_multicast_cg2,
+    tcgen05_commit_shared_cluster, tcgen05_dealloc, tcgen05_dealloc_cg2, tcgen05_ld_16x256b_pure,
+    tcgen05_load_wait, tcgen05_mma_f16, tcgen05_mma_f16_cg2, tcgen05_relinquish_alloc_permit_cg2,
 };
 use cuda_device::tma::{
     TmaDescriptor, cp_async_bulk_tensor_2d_g2s, cp_async_bulk_tensor_2d_g2s_multicast_cg2,
 };
-use cuda_device::{DisjointSlice, cluster_launch, kernel, thread, warp};
+use cuda_device::{DisjointSlice, cluster_launch, kernel, ptx_asm, thread, warp};
 use cuda_host::cuda_module;
 
 pub mod fp32;
@@ -45,6 +44,21 @@ pub use host::{
     TmaLayout, create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_tma_map,
     tcgen05_launch_config,
 };
+
+/// Stores two packed b16 matrix fragments without routing through the
+/// unresolved LLVM stmatrix declaration emitted by cuda-oxide b099f64.
+#[inline(always)]
+unsafe fn stmatrix_m8n8_x2(smem_ptr: *mut u8, r0: u32, r1: u32) {
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 smem; cvta.to.shared.u64 smem, %0; stmatrix.sync.aligned.m8n8.x2.shared.b16 [smem], {%1, %2}; }",
+            in("l") smem_ptr as u64,
+            in("r") r0,
+            in("r") r1,
+            clobber("memory"),
+        );
+    }
+}
 
 #[cuda_module]
 pub mod kernels {

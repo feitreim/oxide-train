@@ -326,7 +326,8 @@ fn add_into<S: Shape, P: KernelProfiler>(
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, name, || {
+    // SAFETY: launch dimensions come from S and all buffers have shape S.
+    profiler.measure(stream, name, || unsafe {
         kernels.add(
             stream,
             elementwise_config::<S>(),
@@ -344,7 +345,8 @@ fn fill_zero<S: Shape, P: KernelProfiler>(
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, name, || {
+    // SAFETY: launch dimensions come from S and output has shape S.
+    profiler.measure(stream, name, || unsafe {
         kernels.fill(
             stream,
             elementwise_config::<S>(),
@@ -362,7 +364,8 @@ fn sum_into<S: Shape, P: KernelProfiler>(
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, name, || {
+    // SAFETY: the reduction config and scalar output satisfy the kernel contract.
+    profiler.measure(stream, name, || unsafe {
         kernels.sum(
             stream,
             reduction_config(),
@@ -382,7 +385,8 @@ fn scale_into<S: Shape, P: KernelProfiler>(
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, name, || {
+    // SAFETY: launch dimensions come from S and both buffers have shape S.
+    profiler.measure(stream, name, || unsafe {
         kernels.scale(
             stream,
             elementwise_config::<S>(),
@@ -567,6 +571,8 @@ impl Bf16LinearWeights {
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         copy_device_region(&mut self.normal, 0, master, 0, rows * columns / 2, stream)?;
+        // SAFETY: `normal` holds the master's rows * columns packed pairs and
+        // `transposed` is the same allocation size.
         unsafe {
             kernels.transpose_bf16_pairs(
                 stream,
@@ -787,7 +793,7 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_unsafe)]
     fn forward_into<const N: usize, const D: usize, const FF: usize, P: KernelProfiler>(
         &self,
         x: &GpuTensor<f32, Rank2<N, IN>>,
@@ -803,7 +809,8 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
             && tcgen05_linear_eligible(N, IN, OUT)
         {
-            profiler.measure(stream, name, || {
+            // SAFETY: buffers and launch tiles are validated by the eligibility check.
+            profiler.measure(stream, name, || unsafe {
                 tensor.convert_f32_to_bf16_pairs(
                     stream,
                     pairs_config(N * IN / 2),
@@ -829,7 +836,7 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_unsafe)]
     fn backward_into<const N: usize, const D: usize, const FF: usize, P: KernelProfiler>(
         &mut self,
         x: &GpuTensor<f32, Rank2<N, IN>>,
@@ -846,7 +853,9 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
             && tcgen05_linear_eligible(N, IN, OUT)
         {
-            profiler.measure(stream, names[0], || {
+            // SAFETY: both quantize launches cover exactly the panels they
+            // write, and the accumulate's tiles come from the eligibility check.
+            profiler.measure(stream, names[0], || unsafe {
                 // `dW += xᵀ·dy` reads both operands MN-major straight out of
                 // their native `[N, width]` panels, so staging is a plain
                 // quantize each and no transpose runs at all. `rows` doubles as
@@ -940,7 +949,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_unsafe)]
     fn forward_into<const N: usize, const D: usize, const FF: usize, P: KernelProfiler>(
         &self,
         x: &GpuTensor<f32, Rank2<N, IN>>,
@@ -957,7 +966,8 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
             && tcgen05_linear_eligible(N, IN, width)
         {
-            profiler.measure(stream, name, || {
+            // SAFETY: buffers and launch tiles are validated by the eligibility check.
+            profiler.measure(stream, name, || unsafe {
                 tensor.convert_f32_to_bf16_pairs(
                     stream,
                     pairs_config(N * IN / 2),
@@ -994,7 +1004,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_unsafe)]
     fn backward_into<const N: usize, const D: usize, const FF: usize, P: KernelProfiler>(
         &mut self,
         x: &GpuTensor<f32, Rank2<N, IN>>,
@@ -1012,7 +1022,9 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
             && tcgen05_linear_eligible(N, IN, width)
         {
-            profiler.measure(stream, names[0], || {
+            // SAFETY: both quantize launches cover exactly the panels they
+            // write, and the accumulate's tiles come from the eligibility check.
+            profiler.measure(stream, names[0], || unsafe {
                 // See `GpuLinear::backward_into`: both weight-gradient operands
                 // are consumed MN-major from their native panels, so each is a
                 // plain quantize and nothing is transposed.
@@ -1178,6 +1190,8 @@ impl StackedBf16Weights {
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         copy_device_region(&mut self.normal, 0, master, 0, master.len(), stream)?;
+        // SAFETY: `normal` mirrors the master's packed-pair length and
+        // `transposed` is allocated to the same size.
         unsafe {
             kernels.transpose_bf16_pairs(
                 stream,
@@ -1267,19 +1281,22 @@ impl ExpertPanel {
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
-        profiler.measure(stream, name, || match self {
-            Self::Wide(values) => kernels.fill(
-                stream,
-                LaunchConfig::for_num_elems(values.len() as u32),
-                0.0,
-                values,
-            ),
-            Self::Packed(panel) => kernels.fill_u32(
-                stream,
-                LaunchConfig::for_num_elems(panel.words.len() as u32),
-                0,
-                &mut panel.words,
-            ),
+        // SAFETY: each arm launches over its own buffer's exact length.
+        profiler.measure(stream, name, || unsafe {
+            match self {
+                Self::Wide(values) => kernels.fill(
+                    stream,
+                    LaunchConfig::for_num_elems(values.len() as u32),
+                    0.0,
+                    values,
+                ),
+                Self::Packed(panel) => kernels.fill_u32(
+                    stream,
+                    LaunchConfig::for_num_elems(panel.words.len() as u32),
+                    0,
+                    &mut panel.words,
+                ),
+            }
         })
     }
 
@@ -1371,7 +1388,7 @@ impl ExpertFp32Scratch {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_unsafe)]
 fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
     input: &ExpertPanel,
     weights: &DeviceBuffer<u32>,
@@ -1412,7 +1429,9 @@ fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
         let fp32_scratch = staging
             .as_mut()
             .expect("non-aligned experts must own fp32 staging");
-        profiler.measure(stream, name, || {
+        // SAFETY: every expert's slice fits the oracle scratch, which is sized
+        // for the widest operand this call can see.
+        profiler.measure(stream, name, || unsafe {
             for expert in 0..E {
                 copy_device_region(
                     &mut fp32_scratch.a,
@@ -1456,7 +1475,7 @@ fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_unsafe)]
 fn expert_linear_backward<const E: usize, const C: usize, P: KernelProfiler>(
     input: &ExpertPanel,
     output_gradient: &ExpertPanel,
@@ -1570,7 +1589,9 @@ fn expert_linear_backward<const E: usize, const C: usize, P: KernelProfiler>(
             }
             Ok(())
         })?;
-        profiler.measure(stream, names[1], || {
+        // SAFETY: every expert's slice fits the oracle scratch, which is sized
+        // for the widest operand this call can see.
+        profiler.measure(stream, names[1], || unsafe {
             for expert in 0..E {
                 copy_device_region(
                     &mut fp32_scratch.a,
@@ -1711,7 +1732,8 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             profiler,
             "forward.experts.gate_up_gemm",
         )?;
-        profiler.measure(stream, "forward.experts.gate_up_split", || {
+        // SAFETY: expert buffers contain E * C rows at the configured widths.
+        profiler.measure(stream, "forward.experts.gate_up_split", || unsafe {
             dense.split_group2(
                 stream,
                 LaunchConfig::for_num_elems((E * C * FF) as u32),
@@ -1727,21 +1749,25 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             activated,
             ..
         } = &mut *acts;
-        profiler.measure(stream, "forward.experts.swiglu", || match activated {
-            ExpertPanel::Packed(panel) => dense.swiglu_forward_bf16(
-                stream,
-                LaunchConfig::for_num_elems((E * C * FF / 2) as u32),
-                gate.as_device_buffer(),
-                up.as_device_buffer(),
-                &mut panel.words,
-            ),
-            ExpertPanel::Wide(values) => dense.swiglu_forward(
-                stream,
-                LaunchConfig::for_num_elems((E * C * FF) as u32),
-                gate.as_device_buffer(),
-                up.as_device_buffer(),
-                values,
-            ),
+        // SAFETY: gate and up hold E * C * FF elements, and each arm launches
+        // over the element count its own output dtype packs them into.
+        profiler.measure(stream, "forward.experts.swiglu", || unsafe {
+            match activated {
+                ExpertPanel::Packed(panel) => dense.swiglu_forward_bf16(
+                    stream,
+                    LaunchConfig::for_num_elems((E * C * FF / 2) as u32),
+                    gate.as_device_buffer(),
+                    up.as_device_buffer(),
+                    &mut panel.words,
+                ),
+                ExpertPanel::Wide(values) => dense.swiglu_forward(
+                    stream,
+                    LaunchConfig::for_num_elems((E * C * FF) as u32),
+                    gate.as_device_buffer(),
+                    up.as_device_buffer(),
+                    values,
+                ),
+            }
         })?;
         expert_linear_forward::<E, C, P>(
             &acts.activated,
@@ -1816,7 +1842,8 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             ],
         )?;
         let elementwise = LaunchConfig::for_num_elems((E * C * FF) as u32);
-        profiler.measure(stream, "backward.experts.swiglu_gate", || {
+        // SAFETY: all elementwise buffers contain E * C * FF elements.
+        profiler.measure(stream, "backward.experts.swiglu_gate", || unsafe {
             dense.swiglu_backward_gate(
                 stream,
                 elementwise,
@@ -1826,7 +1853,8 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
                 scratch.d_gate.as_device_buffer_mut(),
             )
         })?;
-        profiler.measure(stream, "backward.experts.swiglu_up", || {
+        // SAFETY: all elementwise buffers contain E * C * FF elements.
+        profiler.measure(stream, "backward.experts.swiglu_up", || unsafe {
             dense.swiglu_backward_up(
                 stream,
                 elementwise,
@@ -2143,7 +2171,8 @@ impl<const D: usize> GpuRmsNorm<D> {
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
-        profiler.measure(stream, name, || {
+        // SAFETY: norm launch dimensions and Rank2 buffers agree on N * D.
+        profiler.measure(stream, name, || unsafe {
             kernels.rms_norm_forward_fast(
                 stream,
                 norm_config::<N>(),
@@ -2167,7 +2196,8 @@ impl<const D: usize> GpuRmsNorm<D> {
         profiler: &mut P,
         names: [&'static str; 2],
     ) -> Result<(), DriverError> {
-        profiler.measure(stream, names[0], || {
+        // SAFETY: norm launch dimensions and saved/output buffers agree on N * D.
+        profiler.measure(stream, names[0], || unsafe {
             kernels.rms_norm_backward_x_fast(
                 stream,
                 norm_config::<N>(),
@@ -2223,7 +2253,8 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
-        profiler.measure(stream, name, || {
+        // SAFETY: token and output shapes satisfy the embedding launch contract.
+        profiler.measure(stream, name, || unsafe {
             kernels.embedding_forward(
                 stream,
                 LaunchConfig::for_num_elems((N * D) as u32),
@@ -2350,7 +2381,8 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
-        profiler.measure(stream, name, || {
+        // SAFETY: dw contains exactly D * VP / 2 packed words.
+        profiler.measure(stream, name, || unsafe {
             kernels.fill_u32(stream, pairs_config(D * VP / 2), 0, &mut self.dw)
         })
     }
@@ -2433,23 +2465,27 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        kernels.adamw_bf16_master_packed_grad(
-            stream,
-            pairs_config(D * VP / 2),
-            &self.dw,
-            config.learning_rate,
-            config.beta1,
-            config.beta2,
-            config.epsilon,
-            config.weight_decay,
-            config.first_correction,
-            config.second_correction,
-            config.rounding,
-            config.seed,
-            self.master.as_words_mut(),
-            moments.first.as_device_buffer_mut(),
-            moments.second.as_device_buffer_mut(),
-        )
+        // SAFETY: packed gradients, packed masters, and both fp32 moments all
+        // describe the same D * VP parameter matrix, launched over its pairs.
+        unsafe {
+            kernels.adamw_bf16_master_packed_grad(
+                stream,
+                pairs_config(D * VP / 2),
+                &self.dw,
+                config.learning_rate,
+                config.beta1,
+                config.beta2,
+                config.epsilon,
+                config.weight_decay,
+                config.first_correction,
+                config.second_correction,
+                config.rounding,
+                config.seed,
+                self.master.as_words_mut(),
+                moments.first.as_device_buffer_mut(),
+                moments.second.as_device_buffer_mut(),
+            )
+        }
     }
 
     /// Refresh both compute copies from the master after an optimizer step.
@@ -3031,6 +3067,9 @@ impl GpuMuonScratch {
         tensor: &tensor_kernels::LoadedModule,
         gemm: &gemm_kernels::LoadedModule,
     ) -> Result<Vec<f32>, DriverError> {
+        // SAFETY: the copied prefix and launch dimensions are bounded by the
+        // scratch allocations validated by the constructor.
+        unsafe {
         let elements = rows * cols;
         tensor.gather_group(
             stream,
@@ -3046,6 +3085,7 @@ impl GpuMuonScratch {
         let mut values = self.x.to_host_vec(stream)?;
         values.truncate(elements);
         Ok(values)
+        }
     }
 }
 
@@ -3057,6 +3097,7 @@ impl GpuMuonScratch {
 /// For tall matrices the reference transposes, iterates, and transposes back;
 /// since `A = X^T X` and its polynomial `B` are symmetric, that whole
 /// round-trip collapses to `X = aX + X B`, so no f32 transpose kernel exists.
+#[allow(unused_unsafe)]
 fn newton_schulz_orthogonalize(
     scratch: &mut GpuMuonScratch,
     rows: usize,
@@ -3066,6 +3107,9 @@ fn newton_schulz_orthogonalize(
     tensor: &tensor_kernels::LoadedModule,
     gemm: &gemm_kernels::LoadedModule,
 ) -> Result<(), DriverError> {
+    // SAFETY: every launch is bounded by elements or gram_elements, both of
+    // which fit the preallocated Muon scratch buffers.
+    unsafe {
     assert!(steps < 100, "Newton-Schulz steps must be less than 100");
     assert!(rows > 0 && cols > 0, "Muon matrices must be non-empty");
     let elements = rows * cols;
@@ -3186,6 +3230,7 @@ fn newton_schulz_orthogonalize(
         std::mem::swap(&mut scratch.x, &mut scratch.x_next);
     }
     Ok(())
+    }
 }
 
 /// One Muon update over a `[rows, groups, cols]` parameter whose groups are
@@ -3200,6 +3245,7 @@ fn newton_schulz_orthogonalize(
 /// deliberately fp32 (SPEC §7); the bf16 master is widened on read inside the
 /// apply kernel and rounded once on write-back.
 #[allow(clippy::too_many_arguments)]
+#[allow(unused_unsafe)]
 fn muon_step_raw(
     parameter: &mut DeviceBuffer<u32>,
     gradient: &DeviceBuffer<f32>,
@@ -3215,6 +3261,9 @@ fn muon_step_raw(
     tensor: &tensor_kernels::LoadedModule,
     gemm: &gemm_kernels::LoadedModule,
 ) -> Result<(), DriverError> {
+    // SAFETY: group offsets partition the parameter matrix and all scratch
+    // launches are bounded by total or per_group.
+    unsafe {
     let total = rows * groups * cols;
     let per_group = rows * cols;
     tensor.ema_momentum(
@@ -3289,6 +3338,7 @@ fn muon_step_raw(
         seed,
         parameter,
     )
+    }
 }
 
 /// GPU-resident mixed Muon/AdamW state mirroring `optim::DenseMuon`'s
@@ -4130,7 +4180,8 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             profiler,
             "forward.qkv_proj.gemm",
         )?;
-        profiler.measure(stream, "forward.qkv_proj.split", || {
+        // SAFETY: qkv contains three contiguous N * D groups.
+        profiler.measure(stream, "forward.qkv_proj.split", || unsafe {
             dense.split_group3(
                 stream,
                 LaunchConfig::for_num_elems((N * D) as u32),
@@ -4286,7 +4337,8 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             dense,
             profiler,
         )?;
-        profiler.measure(stream, "forward.router.gather", || {
+        // SAFETY: routing indices and slots were produced for the same N/K/C shape.
+        profiler.measure(stream, "forward.router.gather", || unsafe {
             dense.moe_gather_combine(
                 stream,
                 LaunchConfig::for_num_elems((N * D) as u32),
@@ -4430,7 +4482,8 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             dense,
             profiler,
         )?;
-        profiler.measure(stream, "backward.router.gather_dx", || {
+        // SAFETY: routing indices and slots were produced for the same N/K/C shape.
+        profiler.measure(stream, "backward.router.gather_dx", || unsafe {
             dense.moe_gather_dx(
                 stream,
                 LaunchConfig::for_num_elems((N * D) as u32),
@@ -4772,7 +4825,7 @@ impl<
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_unsafe)]
     pub fn forward_profiled<P: KernelProfiler>(
         &self,
         tokens: &[usize; N],
@@ -4790,6 +4843,9 @@ impl<
     ) -> Result<(), DriverError> {
         assert!(aux_coefficient.is_finite() && aux_coefficient >= 0.0);
         assert_eq!(self.blocks.len(), L);
+        // SAFETY: workspace construction fixes every buffer to this model's
+        // const-generic shape and each helper validates its launch dimensions.
+        unsafe {
         workspace.upload_inputs(tokens, targets, stream)?;
         self.embedding.forward_into(
             &workspace.tokens,
@@ -4900,6 +4956,7 @@ impl<
             })?;
         }
         Ok(())
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4930,7 +4987,7 @@ impl<
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_unsafe)]
     pub fn backward_profiled<P: KernelProfiler>(
         &mut self,
         aux_coefficient: f32,
@@ -4946,6 +5003,9 @@ impl<
     ) -> Result<(), DriverError> {
         assert!(aux_coefficient.is_finite() && aux_coefficient >= 0.0);
         assert_eq!(self.blocks.len(), L);
+        // SAFETY: workspace construction fixes every buffer to this model's
+        // const-generic shape and each helper validates its launch dimensions.
+        unsafe {
         cross_entropy_backward_into::<N, VOCAB, VP, P>(
             &workspace.targets,
             &mut workspace.logits,
@@ -5021,6 +5081,7 @@ impl<
             profiler,
             "backward.embedding",
         )
+        }
     }
 
     pub fn zero_grad(
@@ -5143,7 +5204,7 @@ impl<
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_unsafe)]
     pub fn forward_profiled<P: KernelProfiler>(
         &self,
         tokens: &[usize; N],
@@ -5158,6 +5219,9 @@ impl<
         dense: &dense_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
+        // SAFETY: workspace construction fixes every buffer to this model's
+        // const-generic shape and each helper validates its launch dimensions.
+        unsafe {
         workspace.upload_inputs(tokens, targets, stream)?;
         self.embedding.forward_into(
             &workspace.tokens,
@@ -5346,6 +5410,7 @@ impl<
             dense,
             profiler,
         )
+        }
     }
 
     pub fn backward(
@@ -5373,7 +5438,7 @@ impl<
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_unsafe)]
     pub fn backward_profiled<P: KernelProfiler>(
         &mut self,
         workspace: &mut GpuDenseWorkspace<N, NP, T, VOCAB, VP, D, H, FF>,
@@ -5386,6 +5451,9 @@ impl<
         dense: &dense_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
+        // SAFETY: workspace construction fixes every buffer to this model's
+        // const-generic shape and each helper validates its launch dimensions.
+        unsafe {
         cross_entropy_backward_into::<N, VOCAB, VP, P>(
             &workspace.targets,
             &mut workspace.logits,
@@ -5605,6 +5673,7 @@ impl<
             profiler,
             "backward.embedding",
         )
+        }
     }
 
     pub fn zero_grad(
@@ -5664,7 +5733,8 @@ fn rope_into<
     name: &'static str,
 ) -> Result<(), DriverError> {
     if backward {
-        profiler.measure(stream, name, || {
+        // SAFETY: all buffers contain N * D elements and config matches them.
+        profiler.measure(stream, name, || unsafe {
             kernels.rope_backward(
                 stream,
                 LaunchConfig::for_num_elems((N * D) as u32),
@@ -5676,7 +5746,8 @@ fn rope_into<
             )
         })?;
     } else {
-        profiler.measure(stream, name, || {
+        // SAFETY: all buffers contain N * D elements and config matches them.
+        profiler.measure(stream, name, || unsafe {
             kernels.rope_forward(
                 stream,
                 LaunchConfig::for_num_elems((N * D) as u32),
@@ -5719,7 +5790,8 @@ fn flash_attention_forward_into<
         // Fold softmax_scale * log2(e) into Q so the kernel's softmax is
         // base-2 native; K/V quantize unscaled.
         let q_scale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
-        profiler.measure(stream, "forward.attention.stage_bf16", || {
+        // SAFETY: staged buffers match the N/T/H/HD attention layout.
+        profiler.measure(stream, "forward.attention.stage_bf16", || unsafe {
             let config = flash_device::stage_heads_config(N, H, HD);
             kernels.stage_attention_heads_bf16(
                 stream,
@@ -5765,7 +5837,8 @@ fn flash_attention_forward_into<
             )
         })
     } else if HD == flash_device::TILE_HD {
-        profiler.measure(stream, "forward.attention.flash", || {
+        // SAFETY: tiled config is selected only for its specialized head width.
+        profiler.measure(stream, "forward.attention.flash", || unsafe {
             kernels.flash_attention_forward_tiled(
                 stream,
                 flash_forward_config::<N, T, H, HD>(),
@@ -5783,7 +5856,8 @@ fn flash_attention_forward_into<
         // the per-row oracle kernels: correct for any power-of-two `HD` up to
         // `MAX_HEAD_DIM`, but serial over keys — a stopgap until the tcgen05
         // flash learns this head width.
-        profiler.measure(stream, "forward.attention.flash", || {
+        // SAFETY: per-row config covers N * H rows with HD lanes.
+        profiler.measure(stream, "forward.attention.flash", || unsafe {
             kernels.flash_attention_forward(
                 stream,
                 per_row_flash_config::<N, H, HD>(),
@@ -5832,7 +5906,8 @@ fn flash_attention_backward_into<
     flash_bf16: &Tcgen05Flash,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, "backward.attention.flash_dot", || {
+    // SAFETY: dot config and buffers agree on N, H, and HD.
+    profiler.measure(stream, "backward.attention.flash_dot", || unsafe {
         kernels.flash_attention_backward_dot(
             stream,
             flash_dot_config::<N, H, HD>(),
@@ -5847,7 +5922,8 @@ fn flash_attention_backward_into<
         // K/V/dY quantize unscaled. Re-staged because the shared scratch may
         // hold another layer's forward panels by now.
         let q_scale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
-        profiler.measure(stream, "backward.attention.stage_bf16", || {
+        // SAFETY: staged buffers match the N/T/H/HD attention layout.
+        profiler.measure(stream, "backward.attention.stage_bf16", || unsafe {
             let config = flash_device::stage_heads_config(N, H, HD);
             kernels.stage_attention_heads_bf16(
                 stream,
@@ -5919,7 +5995,8 @@ fn flash_attention_backward_into<
         })?;
         Ok(())
     } else if HD == flash_device::TILE_HD {
-        profiler.measure(stream, "backward.attention.flash_q", || {
+        // SAFETY: tiled config is selected only for its specialized head width.
+        profiler.measure(stream, "backward.attention.flash_q", || unsafe {
             kernels.flash_attention_backward_q_tiled(
                 stream,
                 flash_backward_q_config::<N, T, H, HD>(),
@@ -5934,7 +6011,8 @@ fn flash_attention_backward_into<
                 dq.as_device_buffer_mut(),
             )
         })?;
-        profiler.measure(stream, "backward.attention.flash_kv", || {
+        // SAFETY: tiled config is selected only for its specialized head width.
+        profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
             kernels.flash_attention_backward_kv_tiled(
                 stream,
                 flash_backward_kv_config::<N, T, H, HD>(),
@@ -5953,7 +6031,8 @@ fn flash_attention_backward_into<
         Ok(())
     } else {
         // Per-row oracle fallback; see the forward dispatch for the contract.
-        profiler.measure(stream, "backward.attention.flash_q", || {
+        // SAFETY: per-row config covers N * H rows with HD lanes.
+        profiler.measure(stream, "backward.attention.flash_q", || unsafe {
             kernels.flash_attention_backward_q(
                 stream,
                 per_row_flash_config::<N, H, HD>(),
@@ -5969,7 +6048,8 @@ fn flash_attention_backward_into<
                 dq.as_device_buffer_mut(),
             )
         })?;
-        profiler.measure(stream, "backward.attention.flash_kv", || {
+        // SAFETY: per-row config covers N * H rows with HD lanes.
+        profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
             kernels.flash_attention_backward_kv(
                 stream,
                 per_row_flash_config::<N, H, HD>(),
@@ -5999,7 +6079,8 @@ fn swiglu_into<const N: usize, const FF: usize, P: KernelProfiler>(
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, name, || {
+    // SAFETY: all elementwise buffers contain N * FF elements.
+    profiler.measure(stream, name, || unsafe {
         kernels.swiglu_forward(
             stream,
             LaunchConfig::for_num_elems((N * FF) as u32),
@@ -6022,7 +6103,8 @@ fn swiglu_backward_into<const N: usize, const FF: usize, P: KernelProfiler>(
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     let config = LaunchConfig::for_num_elems((N * FF) as u32);
-    profiler.measure(stream, "backward.swiglu.gate", || {
+    // SAFETY: all elementwise buffers contain N * FF elements.
+    profiler.measure(stream, "backward.swiglu.gate", || unsafe {
         kernels.swiglu_backward_gate(
             stream,
             config,
@@ -6032,7 +6114,8 @@ fn swiglu_backward_into<const N: usize, const FF: usize, P: KernelProfiler>(
             dgate.as_device_buffer_mut(),
         )
     })?;
-    profiler.measure(stream, "backward.swiglu.up", || {
+    // SAFETY: all elementwise buffers contain N * FF elements.
+    profiler.measure(stream, "backward.swiglu.up", || unsafe {
         kernels.swiglu_backward_up(
             stream,
             config,
@@ -6056,7 +6139,8 @@ fn cross_entropy_into<const N: usize, const VOCAB: usize, const VP: usize, P: Ke
     dense: &dense_kernels::LoadedModule,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, "forward.loss.fused_classifier", || {
+    // SAFETY: logits use N padded-VP rows and targets/losses use N entries.
+    profiler.measure(stream, "forward.loss.fused_classifier", || unsafe {
         dense.fused_classifier_forward_bf16(
             stream,
             classifier_config::<N>(),
@@ -6099,7 +6183,8 @@ fn cross_entropy_backward_into<
     kernels: &dense_kernels::LoadedModule,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
-    profiler.measure(stream, "backward.loss.fused_classifier", || {
+    // SAFETY: dlogits uses N padded-VP rows and targets contain N entries.
+    profiler.measure(stream, "backward.loss.fused_classifier", || unsafe {
         kernels.fused_classifier_backward_in_place_bf16(
             stream,
             classifier_config::<N>(),

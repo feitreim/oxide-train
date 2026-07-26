@@ -65,6 +65,9 @@ fn stage_on_device(
     scale: f32,
     name: &str,
 ) -> Result<DeviceBuffer<u32>, Box<dyn std::error::Error>> {
+    // SAFETY: the launch uses live buffers sized for its contract, and the
+    // subsequent host copy synchronizes the stream before either can drop.
+    unsafe {
     let mut staged = DeviceBuffer::<u32>::zeroed(stream, b * h * t * HD / 2)?;
     flash_module.stage_attention_heads_bf16(
         stream,
@@ -81,13 +84,14 @@ fn stage_on_device(
         assert_eq!(d, e, "{name} staging word {i}: device {d:#010x} vs cpu {e:#010x}");
     }
     Ok(staged)
+    }
 }
 
 /// tcgen05 forward vs both fp32 oracles at a tile-aligned shape. Inputs are
 /// quantized through the device staging kernel; the oracles run on the
 /// original fp32 values, so tolerances are the bf16-appropriate ones (the
 /// dominant term is operand quantization, per the 7e9 precedent).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_unsafe)]
 fn check_tcgen05_shape(
     stream: &CudaStream,
     flash_module: &flash::kernels::LoadedModule,
@@ -98,6 +102,9 @@ fn check_tcgen05_shape(
     t: usize,
     h: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: launch shapes match the documented kernel contracts and all
+    // buffers/TMA descriptors remain live until their stream work completes.
+    unsafe {
     let n = b * t;
     let d = h * HD;
     let q = uniform_vec(n * d, 171);
@@ -216,6 +223,7 @@ fn check_tcgen05_shape(
         assert_close("lse", &lse.to_host_vec(stream)?, &tiled_lse_host, 5.0e-3, 0.0);
     }
     Ok(())
+    }
 }
 
 /// tcgen05 backward (issue #35 phase 4) vs both fp32 oracles at a
@@ -225,7 +233,7 @@ fn check_tcgen05_shape(
 /// staged operands plus those statistics. Gradients are compared against the
 /// materialized-probability oracle at bf16-appropriate tolerances (operand
 /// quantization dominates, per the forward's 7e9/7e10 precedent).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_unsafe)]
 fn check_tcgen05_backward_shape(
     stream: &CudaStream,
     flash_module: &flash::kernels::LoadedModule,
@@ -235,6 +243,9 @@ fn check_tcgen05_backward_shape(
     t: usize,
     h: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: launch shapes match the documented kernel contracts and all
+    // buffers/TMA descriptors remain live until their stream work completes.
+    unsafe {
     let n = b * t;
     let d = h * HD;
     let q = uniform_vec(n * d, 271);
@@ -376,6 +387,7 @@ fn check_tcgen05_backward_shape(
     assert_close("dk", &dk.to_host_vec(stream)?, &expected_dk, 1.0e-2, 1.0e-2);
     assert_close("dv", &dv.to_host_vec(stream)?, &expected_dv, 1.0e-2, 1.0e-2);
     Ok(())
+    }
 }
 
 fn per_row_config(rows: usize, heads: usize) -> LaunchConfig {
@@ -410,6 +422,9 @@ fn check_shape(
     t: usize,
     h: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: launch shapes match the documented kernel contracts and every
+    // device buffer remains valid through the corresponding host readback.
+    unsafe {
     let n = b * t;
     let d = h * HD;
 
@@ -723,6 +738,7 @@ fn check_shape(
     }
     println!("  sentinel + 200-round bit-stability passed");
     Ok(())
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

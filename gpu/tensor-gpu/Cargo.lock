@@ -18,6 +18,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "bench-util"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "tensor-core",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.71.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -308,14 +316,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "nn"
-version = "0.1.0"
-dependencies = [
- "tensor-core",
- "tensor-cpu",
-]
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -344,18 +344,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "memchr",
-]
-
-[[package]]
-name = "ops"
-version = "0.1.0"
-dependencies = [
- "cuda-core",
- "cuda-device",
- "cuda-host",
- "nn",
- "tensor-core",
- "tensor-cpu",
 ]
 
 [[package]]
@@ -485,6 +473,18 @@ name = "tensor-cpu"
 version = "0.1.0"
 dependencies = [
  "tensor-core",
+]
+
+[[package]]
+name = "tensor-gpu"
+version = "0.1.0"
+dependencies = [
+ "bench-util",
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "tensor-core",
+ "tensor-cpu",
 ]
 
 [[package]]

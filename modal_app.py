@@ -19,9 +19,9 @@ from pathlib import Path
 
 import modal
 
-# Keep this tag in sync with the git deps in gpu/*/Cargo.toml: the codegen
+# Keep this revision in sync with the git deps in gpu/*/Cargo.toml: the codegen
 # backend and the device/host/core crates must come from the same revision.
-CUDA_OXIDE_REF = "v0.2.1"
+CUDA_OXIDE_REF = "b099f64c1a32869b74be99f4f88242fb68655b51"
 RUST_TOOLCHAIN = "nightly-2026-04-03"
 GIT_REPO = "https://github.com/NVlabs/cuda-oxide.git"
 TRAINER_REPO = "https://github.com/feitreim/oxide-train.git"
@@ -38,9 +38,9 @@ version = "0.1.0"
 edition = "2024"
 [workspace]
 [dependencies]
-cuda-device = {{ git = "{GIT_REPO}", tag = "{CUDA_OXIDE_REF}" }}
-cuda-host = {{ git = "{GIT_REPO}", tag = "{CUDA_OXIDE_REF}" }}
-cuda-core = {{ git = "{GIT_REPO}", tag = "{CUDA_OXIDE_REF}" }}
+cuda-device = {{ git = "{GIT_REPO}", rev = "{CUDA_OXIDE_REF}" }}
+cuda-host = {{ git = "{GIT_REPO}", rev = "{CUDA_OXIDE_REF}" }}
+cuda-core = {{ git = "{GIT_REPO}", rev = "{CUDA_OXIDE_REF}" }}
 """
 
 WARMUP_MAIN_RS = """
@@ -100,7 +100,7 @@ image = (
         "| sh -s -- -y --default-toolchain none --profile minimal",
         f"rustup toolchain install {RUST_TOOLCHAIN} --profile minimal "
         "-c rust-src -c rustc-dev -c llvm-tools",
-        f"cargo +{RUST_TOOLCHAIN} install --git {GIT_REPO} --tag {CUDA_OXIDE_REF} cargo-oxide",
+        f"cargo +{RUST_TOOLCHAIN} install --git {GIT_REPO} --rev {CUDA_OXIDE_REF} cargo-oxide",
     )
     # Build the codegen backend (slow, one time; baked into this image layer)
     # and compile a trivial kernel end-to-end to prove the toolchain works.
@@ -114,7 +114,9 @@ image = (
         f"cat > /opt/warmup/Cargo.toml <<'EOF'\n{WARMUP_CARGO_TOML}\nEOF",
         f"cat > /opt/warmup/src/main.rs <<'EOF'\n{WARMUP_MAIN_RS}\nEOF",
         "ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1",
-        "cd /opt/warmup && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs cargo oxide setup",
+        # `cargo oxide build` bootstraps and caches the backend on first use.
+        # Do not call `setup` from a standalone project: at this revision that
+        # command tries to rebuild the project itself as a backend library.
         "cd /opt/warmup && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs cargo oxide build warmup",
     )
     # Live mounts (re-read each run; edits need no image rebuild). crates/ is
@@ -150,7 +152,7 @@ def _proj(kernel: str) -> str:
     return proj
 
 
-def _prepare_gemm_ptx(root: str) -> None:
+def _prepare_gemm_ptx(root: str, oxide: list[str] | None = None) -> None:
     """Prebuild gpu/gemm and stage its pure-PTX artifact for model.
 
     model's own device artifact is NVVM IR (its kernels use libdevice
@@ -160,11 +162,11 @@ def _prepare_gemm_ptx(root: str) -> None:
     import shutil
 
     gemm = f"{root}/gpu/gemm"
-    _run(["cargo", "oxide", "build", "gemm"], cwd=gemm)
+    _run([*(oxide or ["cargo", "oxide"]), "build", "gemm"], cwd=gemm)
     shutil.copy(f"{gemm}/gemm.ptx", f"{root}/gpu/model/gemm.ptx")
 
 
-def _prepare_flash_ptx(root: str) -> None:
+def _prepare_flash_ptx(root: str, oxide: list[str] | None = None) -> None:
     """Prebuild gpu/flash-attn's binaries so the pure-PTX tcgen05 attention
     artifact (flash.ptx, emitted by the `flash` bin target) exists for the
     parity harness, and stage a copy for model's phase-3 integration.
@@ -180,7 +182,10 @@ def _prepare_flash_ptx(root: str) -> None:
     # device atomics, which legacy NVVM IR rejects; pin the Blackwell target
     # (tcgen05 requires sm_100a anyway) so they take the NVVM path that
     # `cargo oxide run` would pick on the B200.
-    _run(["cargo", "oxide", "build", "flash-attn", "--arch", "sm_100a"], cwd=flash)
+    _run(
+        [*(oxide or ["cargo", "oxide"]), "build", "flash-attn", "--arch", "sm_100a"],
+        cwd=flash,
+    )
     if not Path(flash, "flash.ptx").is_file():
         raise SystemExit(
             "gpu/flash-attn built but produced no flash.ptx: the tcgen05 "
@@ -245,12 +250,44 @@ def compare_profile(kernel: str, baseline_ref: str) -> None:
     """Build a retained git baseline and the mounted candidate, then profile
     both back-to-back in one container after each binary's equivalent warmups.
     """
+    import os
+    import re
+
     baseline_root = "/tmp/rust-trainer-baseline"
     _run(["git", "clone", "--quiet", TRAINER_REPO, baseline_root], cwd="/tmp")
     _run(["git", "checkout", "--quiet", baseline_ref], cwd=baseline_root)
 
     baseline = f"{baseline_root}/gpu/{kernel}"
     candidate = _proj(kernel)
+    baseline_manifest = Path(baseline, "Cargo.toml").read_text()
+    oxide_ref = re.search(
+        r'cuda-oxide\.git",\s*(tag|rev)\s*=\s*"([^"]+)"',
+        baseline_manifest,
+    )
+    if oxide_ref is None:
+        raise SystemExit("baseline manifest has no cuda-oxide tag/rev")
+    ref_kind, ref_value = oxide_ref.groups()
+    baseline_oxide_root = "/tmp/cargo-oxide-baseline"
+    _run(
+        [
+            "cargo",
+            "install",
+            "--git",
+            GIT_REPO,
+            f"--{ref_kind}",
+            ref_value,
+            "--root",
+            baseline_oxide_root,
+            "cargo-oxide",
+        ],
+        cwd="/tmp",
+    )
+    baseline_oxide = [
+        "env",
+        f"PATH={baseline_oxide_root}/bin:{os.environ['PATH']}",
+        "cargo",
+        "oxide",
+    ]
     if kernel == "model":
         # Historical model refs infer `src/lib.rs` as a library target even
         # though each executable includes it directly for cuda-oxide kernel
@@ -258,7 +295,7 @@ def compare_profile(kernel: str, baseline_ref: str) -> None:
         # device symbol. This build-only manifest setting keeps old source refs
         # profileable without changing their model or kernel implementation.
         manifest = Path(baseline) / "Cargo.toml"
-        contents = manifest.read_text()
+        contents = baseline_manifest
         if "autolib = false" not in contents:
             contents = contents.replace(
                 "[package]\n",
@@ -267,16 +304,15 @@ def compare_profile(kernel: str, baseline_ref: str) -> None:
             )
             manifest.write_text(contents)
         # Baselines predating the staged tcgen05 PTX simply ignore the file.
-        _prepare_gemm_ptx(baseline_root)
+        _prepare_gemm_ptx(baseline_root, baseline_oxide)
         _prepare_gemm_ptx(PROJECT_DIR)
         # Same for flash.ptx (phase-3 attention); baselines whose flash-attn
         # crate predates the flash bin target skip the baseline-side prep.
         if Path(baseline_root, "gpu/flash-attn/src/bin/flash.rs").is_file():
-            _prepare_flash_ptx(baseline_root)
+            _prepare_flash_ptx(baseline_root, baseline_oxide)
         _prepare_flash_ptx(PROJECT_DIR)
-    prime = ["cargo", "oxide", "run", kernel, "--bin", "profile"]
-    _run(prime, cwd=baseline)
-    _run(prime, cwd=candidate)
+    _run([*baseline_oxide, "run", kernel, "--bin", "profile"], cwd=baseline)
+    _run(["cargo", "oxide", "run", kernel, "--bin", "profile"], cwd=candidate)
 
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     print(f"=== baseline {baseline_ref} ===", flush=True)

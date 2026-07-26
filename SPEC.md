@@ -17,7 +17,8 @@ bindings.
 
 ## 2. Toolchain & dev environment
 
-- **cuda-oxide** (pinned `v0.2.1`, upstream stock backend) compiles `#[kernel]`
+- **cuda-oxide** (pinned upstream revision
+  `b099f64c1a32869b74be99f4f88242fb68655b51`) compiles `#[kernel]`
   Rust to PTX through a real rustc codegen backend. Kernels monomorphize like
   host Rust — const generics included — which is what makes the static-shape
   design (§3) real.
@@ -1146,6 +1147,32 @@ Each gated on tests; correctness before speed at every step.
      delta is a little under the sum of the two individual measurements
      (−55.3 vs −61.9 ms), which is the expected small overlap plus
      container-to-container spread.
+   - ✅ **cuda-oxide pinned to `b099f64`** (#56): the codegen-backend bump is a
+     toolchain change, not a kernel change, so it is measured here rather than
+     claimed to be free. **No same-container A/B exists and none can:** the
+     baseline's own `v0.2.1` CLI, reinstalled beside the new one, emits a
+     `gemm.ptx` the B200 refuses to JIT (`DriverError(218)`), which kills
+     `BASELINE_REF` across the pin boundary in both directions. What replaces it
+     is repeat measurement plus kernel-level benches that *are* comparable
+     across epochs. Candidate at the §13.9 shape (B=12 T=2048), two containers:
+     full step **576.68 / 572.73 ms**, per-span spread ≤0.71 ms on a 44 ms span
+     — the candidate is stable to 0.7%, so the pre-merge branch's 648.1 ms was
+     its own missing-merge state plus container luck, not the backend.
+     Against main's recorded 552.80 ms the residual is **+21 ms (+3.9%)**, and
+     it decomposes into one named regression and one flat remainder. Named:
+     `optimizer.experts.sync_compute` 5.52 → 7.11 ms (+29%) and
+     `optimizer.lm_head.sync_w_t` 0.242 → 0.306 (+26%) — the two spans whose
+     time is `transpose_bf16_pairs`, and the only spans anywhere in the step
+     that move by more than a few percent (≈1.7 ms of the 21; #58 deletes
+     `sync_w_t` and the redundant compute copies outright). Flat: everything
+     else sits at +3%, uniform across memory-bound AdamW and compute-bound
+     tcgen05 alike, which is the signature of container epoch rather than
+     codegen — and the kernel-level flash benches, the one measurement directly
+     comparable across the pin, confirm it: persistent forward 1.929 ms /
+     227.1 TFLOP/s against the recorded 1.937 / 226, pipelined 2.409 / 181.8
+     against 2.425 / 181, with ptxas budgets unchanged to the byte (persistent
+     206 regs / 592 spill / maxntid 192). The `transpose_bf16_pairs` cost is
+     the one thing the bump is actually on the hook for.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 
@@ -1176,3 +1203,4 @@ Each gated on tests; correctness before speed at every step.
 | 21 | MoE aux-loss coefficient is runtime config, not const | Const generics are reserved for values the compiler specializes on — `E`/`K`/`C` size buffers, bins, and launch grids; the coefficient is one scalar FMA that shapes nothing, needs a step schedule, and must be sweepable without a Modal rebuild (stable Rust also forbids f32 const generics). It flows host→kernel per step like `learning_rate` and is recorded in the checkpoint header like `AdamWConfig` |
 | 22 | MoE router is fp32 over bf16 experts | Routing is discrete: bf16 rounding near a top-k boundary doesn't perturb the output, it reassigns the token (the 7e7 bf16 two-logit tie showed how violently trajectories react to that). The router GEMM is `[N,D]×[D,E]` — skinny, off the tcgen05 tile contract, and a rounding-error share of step FLOPs — so fp32 costs nothing measurable while keeping gate weights and the aux loss in the precision gradcheck trusts |
 | 23 | bf16 masters (successor to #8) | #8's fp32 masters bought gradcheck clarity, and the price rose with the model: 16.3 GiB of the 4.39B config and half of every checkpoint, duplicating bf16 compute copies that already existed beside them. The update stays fp32 against fp32 moments — only the write-back is bf16 — so what was actually given up is sub-half-ulp accumulation across steps, and the overfit gates (the documented knife-edge sensor) converge on round-to-nearest with margin. Stochastic rounding is implemented in the same kernel behind one constant for when they stop, deterministic by construction (splitmix64 keyed on step/parameter/element, never runtime entropy) so bit-identical reruns and resumes survive either choice. Norms, the router (#22), moments, and Muon's fp32 internals stay fp32 — all cheap and all numerically load-bearing |
+| 24 | Pin cuda-oxide to immutable upstream revisions | The tcgen05 generated-intrinsics API evolves between releases; one SHA keeps the codegen backend, proc macros, device crates, lockfiles, and Modal image reproducible and unlocks `tcgen05.st` without carrying a fork |
