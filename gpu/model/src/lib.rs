@@ -1968,9 +1968,10 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
 /// them and every block in a deep model owns its own copy.
 ///
 /// `gate`/`up` stay fp32 for the SwiGLU pointwise math and `bin_output` for
-/// the gate-gradient dot product; `activated` is packed bf16 because both of
-/// its readers are tcgen05 operands (SPEC §7.1). The fp32 buffers occupy
-/// `4 * E * C * (2 * D + 2 * FF)` bytes plus `2 * E * C * FF` packed.
+/// the gate-gradient dot product; `bin_input` and `activated` are packed bf16
+/// because every reader of those two is a tcgen05 operand (SPEC §7.1). The
+/// fp32 buffers occupy `4 * E * C * (D + 2 * FF)` bytes plus
+/// `2 * E * C * (D + FF)` packed.
 pub struct GpuExpertActs<const E: usize, const C: usize, const D: usize, const FF: usize> {
     pub bin_input: ExpertPanel,
     gate: GpuTensor<f32, Rank3<E, C, FF>>,
@@ -1986,7 +1987,7 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize> GpuExpertA
         assert!(E * C * FF <= u32::MAX as usize);
         let aligned = expert_tcgen05_aligned::<C, D, FF>();
         Ok(Self {
-            bin_input: ExpertPanel::new(stream, E, C, D, false)?,
+            bin_input: ExpertPanel::new(stream, E, C, D, aligned)?,
             gate: GpuTensor::zeros(stream)?,
             up: GpuTensor::zeros(stream)?,
             activated: ExpertPanel::new(stream, E, C, FF, aligned)?,
