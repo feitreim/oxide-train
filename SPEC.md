@@ -998,6 +998,64 @@ Each gated on tests; correctness before speed at every step.
        a price an optional cleanup gets to charge. Keeping the tight
        40/180/240 pins is worth more than the 60 lines. The formulation is
        recorded here if a future toolkit bump re-rolls the schedule anyway.
+
+       **Phase 5, the kittens-first kernels** (2026-07-26): the backward pair
+       rewritten warp-specialized — the acceptance criterion's "one new kernel
+       shipped kittens-first," and the last synchronous tcgen05 kernels in the
+       repo. Target chosen by decision 17, not taste: attention is 21.2% of
+       step and the backward is ~3× the forward's time inside it, while
+       `flash_backward_q/kv_tcgen05` still ran TMA → `sync_threads` → MMA →
+       `sync_threads` → register pass → `sync_threads` → gradient MMA →
+       `sync_threads` per tile, tensor cores idle through every register pass.
+       `flash_backward_q_pipelined` and `flash_backward_kv_pipelined` run the
+       forward's three roles (TMA warp over a `BACKWARD_STAGES`-deep ring, MMA
+       warp staggering `S/dP-MMA(i)` ahead of the gradient MMA of `i-1`, and
+       the 128-thread gradient warpgroup between them) over *unchanged*
+       Design-B math — `backward_q_tile_paired` and `backward_kv_tile_paired`
+       are reused verbatim.
+       Two things the forward did not have to solve. **The streamed operand is
+       read twice**: `K(i)` feeds the score MMA immediately and `dQ-MMA(i)` a
+       full stage later, so `kv_free(i)` hangs off `dq_done(i)` rather than
+       off the score barrier — and that same wait then proves the gradient MMA
+       finished reading dS, which is what keeps dS single-buffered exactly as P
+       is in the forward (kernel B: Q and dY both, keeping Pᵀ and dSᵀ single).
+       **Kernel B's ring arithmetic is relative**: it streams query tiles
+       `key_a..T/64` from a runtime start, and a `SemaphoreRing`'s parity is a
+       *visit count*, so every index and parity runs off `step = query - key_a`
+       while data addressing keeps the absolute tile — get it wrong and exactly
+       the `key_a > 0` CTAs hang. Kernel B also re-stages `lse2`/`dot` per
+       streamed tile (its statistics index by query *column*), which the
+       synchronous kernel did behind a block sync that specialization deletes;
+       they now ride the ring, the TMA warp's 32 lanes staging two rows each
+       with a `warp::sync_mask` ordering those stores ahead of the leader's
+       `expect_tx`.
+       **Results, B200 same-container:** kernel A 2.370 → 2.135 ms (−9.9%,
+       277.3 → 307.8 TFLOP/s), kernel B 3.171 → 2.664 ms (−16.0%, 276.3 →
+       328.8), the attention backward **5.541 → 4.799 ms (−13.4%)**. Both
+       gate on `dq`/`dk`/`dv` being **bit-identical** to the kernels they
+       replace at all three shapes — a pure scheduling change must be, and a
+       5e-3 tolerance would hide a dropped or reordered tile. ptxas: kernel A
+       **53 regs** against the synchronous 52 (+1 for three warp roles, two
+       S/dP buffers and six barrier sets — the library's overhead for a whole
+       pipeline is one scalar); kernel B 60 → 72, the second gradient
+       accumulator's drain, with occupancy TMEM-pinned at one CTA/SM either
+       way (kernel B uses all 512 columns). Existing kernels byte-identical in
+       PTX and flat on the bench. The trainer switched to both and all
+       thirteen `run.sh model` gates pass, the MoE overfit landing on its
+       recorded 2.949433 → 0.000060 to the digit — which is what
+       bit-identical kernels should produce.
+       **Step-level share, candidate-side profile** at the §13.9 shape (B=12
+       T=2048, VRAM 137.8 GiB matching the #58 record): full step 567.59 ms
+       with `backward.attention.flash_q` 32.59 ms (5.74%) and `flash_kv`
+       38.44 ms (6.77%) — **71.03 ms, 12.51% of step** in the two spans this
+       work owns. This is a single-sided profile, not a §10.1 A/B: the
+       same-container baseline needs the branch pushed, so the honest
+       statement is that the *kernel* delta is measured in-container (−13.4%)
+       and these are the spans it applies to; at the bench shape's ratios that
+       implies ≈−11 ms of step (≈−1.9%), and the model's longer T=2048 should
+       favour the pipelined form further (more key tiles per CTA means the
+       prologue amortizes over a longer steady state). Worth confirming with a
+       real `BASELINE_REF` A/B before the number is quoted as fact.
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on
