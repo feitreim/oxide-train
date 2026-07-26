@@ -798,10 +798,12 @@ Each gated on tests; correctness before speed at every step.
        flash-attn` failed in legacy NVVM IR. It now pins the arch (matching
        `_prepare_flash_ptx`) and emits every `.ptx` it finds, not just the
        first.
-     - ✅ **7e17 kittens phases 0–4** (#61): `gpu/kittens`, the
+     - ✅ **7e17 kittens phases 0–5 (flash side)** (#61): `gpu/kittens`, the
        ThunderKittens-style tile library — tcgen05/sm_100a only, no arch
-       dispatch — through its first two porting phases, plus the phase-0
-       ptxas budget gate. The crate ships no kernels and no `#[cuda_module]`:
+       dispatch — with every flash-attn and gemm kernel ported onto it, plus
+       the phase-0 ptxas budget gate. Phase 5's remaining scope is
+       kittens-first NEW kernels (fused `gpu/ops`, router/scatter #54/#55,
+       the `tcgen05.st` correction warpgroup). The crate ships no kernels and no `#[cuda_module]`:
        everything is `#[inline(always)]` functions and Copy structs of
        pointers + const generics, monomorphizing into the calling crate's
        artifact, and nothing in it may touch libdevice-lowered math so it
@@ -940,6 +942,62 @@ Each gated on tests; correctness before speed at every step.
        before the `flash` bin's pure-PTX artifact builds, so local PTX
        diffing uses a scratchpad bin-only crate that `#[path]`-includes
        tcgen05.rs (session scratchpad `flashptx/`).
+
+       **Phase 5, flash side** (2026-07-26): the backward kernels and the
+       two probes ported, so no raw mbarrier, swizzle, or fragment math is
+       left anywhere in flash-attn — `cvt_f32x2_bf16x2` and
+       `stmatrix_m8n8_x2` are not even imported by the backward path. Four
+       library additions, all extracted from the working kernels: `reg`
+       gains `Fragment` (`RegTile<2, 4>` — exactly what one 16x256b drain
+       hands a thread, which is what `write_bf16_fragment`'s eight loose
+       `a0/a1/a8/a9/b0/b1/b8/b9` arguments were spelling out) and
+       `value_column` (the `{0,1,8,9}`-per-16-block offset every masking
+       and per-column-statistic site transcribed by hand); `tmem` gains
+       `fragment_tile`, the simd pair resolved into `[slot][value]` order;
+       `ldst` gains `store_fragment_bf16`, the store twin addressed by the
+       same `(row, column)` the drain used; `sync` gains `PhasedSemaphore`,
+       a semaphore owning the phase counter the `tma_phase`/`mma_phase`
+       locals were (`wait_next()` also dissolves the "starts at 1 because
+       the resident load took phase 0" subtlety); `shared` gains
+       `tma_load_at`, a box landing at a destination row — how two adjacent
+       64-row tiles stack into one 128-row paired operand. The port also
+       found ~250 lines of dead code: `backward_q_tile`/`backward_kv_tile`,
+       the unpaired Design-A register passes, have had no call sites since
+       the paired kernels landed. tcgen05.rs **2963 → 2351**.
+       Gate green: parity at five forward shapes × three kernels plus three
+       backward shapes; bench 114.0 / 192.0 / 234.7 forward and 197.7
+       backward, all at phase-4 levels. **ptxas ratcheted DOWN for the
+       first time in this series** — backward q 62→52, kv 64→60, forwards
+       unchanged at 40/180/240, local frames unchanged to the byte, forward
+       PTX byte-identical. The backwards are +9/+8 instructions, all of it
+       the fall-through `bra.uni` block splits `alloc_block`'s guard
+       introduces; against that the kv register pass gave back five
+       `or.pred`s (looped causal masking shares the `masked_all` term that
+       eight hand-written `keep_*` expressions each re-derived) and three
+       `cvta.shared`s.
+
+       **Negative result worth keeping** (same day, reverted): unifying
+       `softmax_tile`'s pass-2 P-write onto `store_fragment_bf16` — the
+       last hand-rolled fragment store in the crate — is correct and −60
+       lines, but costs the *production* forward. Two formulations were
+       measured. Filling the fragment through an indexed loop
+       (`p.0[slot][value] = ...`) does not scalarize: local frame 592→656 B
+       and +76 `st.local`/+40 `ld.local` **in the softmax inner loop** —
+       issue #61's risk 1 arriving exactly as predicted. Building it as a
+       *literal* over an `#[inline(always)]` `masked_exp2` helper fixes that
+       completely (frame back to 592, `ld/st.local` and the FMA/mul/select
+       histogram identical to the byte, 13–28 *fewer* instructions per
+       forward kernel) — but ptxas then re-rolls the schedule: pipelined
+       180→216 regs, persistent 240→236, sync 40→32, stable across two
+       runs, and the B200 bench reads persistent **231.6** TFLOP/s vs
+       234.7/234.9/234.7 in the three prior runs (−1.3%, well outside that
+       ±0.1% spread), pipelined 191.5 (flat), sync 125.9 (+10% — this
+       incidentally *undoes* phase 2's 126→115 sync dip). Reverted: the
+       forwards were already kittens-native, so the change bought lines and
+       not capability, and 1.3% on the production attention forward is not
+       a price an optional cleanup gets to charge. Keeping the tight
+       40/180/240 pins is worth more than the 60 lines. The formulation is
+       recorded here if a future toolkit bump re-rolls the schedule anyway.
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on
