@@ -1,13 +1,10 @@
 //! FA4-shaped tcgen05 attention forward (issue #35, phases 1–3) and backward
 //! (phase 4).
 //!
-//! This module compiles ONLY into `src/bin/flash.rs`, whose device artifact
-//! takes the pure-PTX path and ships as `flash.ptx`. It must never be reached
-//! from `lib.rs`: the oracle kernels there use libdevice math, which forces
-//! their artifact through libNVVM, and libNVVM rejects tcgen05 constructs.
-//! For the same reason nothing here may call `f32::exp/ln/sqrt/floor` — the
-//! softmax runs on a software `exp2` and the LSE epilogue on a software
-//! `log2`, which is also FA4's SFU-offload optimization.
+//! At cuda-oxide b099f64 this module shares a pure-PTX artifact with the
+//! libdevice-backed oracle kernels. The softmax's software `exp2` and LSE
+//! epilogue's software `log2` remain deliberate FA4 SFU-offload optimizations,
+//! not artifact-path workarounds.
 //!
 //! Kernel shape contract (the host launchers in `host.rs` enforce it):
 //! - operands are packed-bf16 staging buffers `[B*H, T, HD]`, one contiguous
@@ -1249,7 +1246,13 @@ pub mod kernels {
                 q.tma_load_at(q_tma, 0, (tile_a * TILE as u32) as i32, plane, tma.sem());
                 q.tma_load_at(q_tma, TILE, (tile_b * TILE as u32) as i32, plane, tma.sem());
                 dy.tma_load_at(dy_tma, 0, (tile_a * TILE as u32) as i32, plane, tma.sem());
-                dy.tma_load_at(dy_tma, TILE, (tile_b * TILE as u32) as i32, plane, tma.sem());
+                dy.tma_load_at(
+                    dy_tma,
+                    TILE,
+                    (tile_b * TILE as u32) as i32,
+                    plane,
+                    tma.sem(),
+                );
                 tma.sem().expect_tx(4 * TILE_BYTES as u32);
             }
             tma.wait_next();
@@ -1596,9 +1599,8 @@ pub mod kernels {
             let q = PairedPanel::from_raw(smem);
             let dy = PairedPanel::from_raw(smem.add(2 * TILE_BYTES));
             let k = PanelRingN::<BACKWARD_STAGES>::attach(smem.add(4 * TILE_BYTES));
-            let v = PanelRingN::<BACKWARD_STAGES>::attach(
-                smem.add((4 + BACKWARD_STAGES) * TILE_BYTES),
-            );
+            let v =
+                PanelRingN::<BACKWARD_STAGES>::attach(smem.add((4 + BACKWARD_STAGES) * TILE_BYTES));
             let ds = PairedPTile::from_raw(smem.add((4 + 2 * BACKWARD_STAGES) * TILE_BYTES));
 
             let tid = thread::threadIdx_x();
@@ -1861,9 +1863,8 @@ pub mod kernels {
             let k = PairedPanel::from_raw(smem);
             let v = PairedPanel::from_raw(smem.add(2 * TILE_BYTES));
             let q = PanelRingN::<BACKWARD_STAGES>::attach(smem.add(4 * TILE_BYTES));
-            let dy = PanelRingN::<BACKWARD_STAGES>::attach(
-                smem.add((4 + BACKWARD_STAGES) * TILE_BYTES),
-            );
+            let dy =
+                PanelRingN::<BACKWARD_STAGES>::attach(smem.add((4 + BACKWARD_STAGES) * TILE_BYTES));
             let p = PairedPTile::from_raw(smem.add((4 + 2 * BACKWARD_STAGES) * TILE_BYTES));
             let ds = PairedPTile::from_raw(smem.add((5 + 2 * BACKWARD_STAGES) * TILE_BYTES));
 

@@ -1,13 +1,4 @@
-//! Pure-PTX artifact binary for the tcgen05 attention kernels, plus their
-//! CPU parity self-test and a TFLOP/s bench at the profile shape.
-//!
-//! Building this target emits `flash.ptx` next to the crate manifest (the
-//! binary crate name selects the artifact stem, exactly like `gemm.ptx`).
-//! The flash-attn parity harness (`main.rs`) and later `gpu/model` load that
-//! file at runtime because their own device artifacts go through libNVVM,
-//! which rejects tcgen05 constructs. This binary's own device artifact is
-//! the pure-PTX one, so it must include only `tcgen05.rs` — never `lib.rs`,
-//! whose oracle kernels use libdevice math.
+//! Standalone tcgen05 attention parity and performance harness.
 //!
 //! Run on B200 with `./run.sh flash-attn flash`.
 
@@ -22,11 +13,12 @@ mod host;
 #[allow(dead_code)]
 mod tcgen05_device;
 
+use tcgen05_device as tcgen05;
+
 use host::{
     FLASH_HD, FLASH_SUBTILE_HD, FLASH_TILE, Tcgen05Flash, correction_count_len,
     create_flash_head_tma_map, device_sm_count, flash_backward_kv_config,
-    flash_backward_kv_pipelined_config, flash_backward_q_config,
-    flash_backward_q_pipelined_config,
+    flash_backward_kv_pipelined_config, flash_backward_q_config, flash_backward_q_pipelined_config,
     flash_forward_config, flash_persistent_config, flash_pipelined_config,
 };
 
@@ -1057,7 +1049,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
-    let flash = Tcgen05Flash::load_from_ptx(&ctx, "flash.ptx")?;
+    let flash = Tcgen05Flash::load(&ctx)?;
     let sm_count = device_sm_count(&ctx)?;
     println!("persistent grid: min(work items, {sm_count} SMs)");
 

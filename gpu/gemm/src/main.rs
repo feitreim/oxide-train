@@ -97,17 +97,24 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 /// ceiling on regression, ratchet hint on improvement. Pinned at the kittens
 /// port's gated measurement (2026-07-26, B200): 48 regs, no spill — identical
 /// to the pre-port allocation, measured the same day.
-const KERNEL_BUDGETS: [KernelBudget; 1] = [KernelBudget {
-    name: "gemm_tcgen05_bf16_optimized",
-    max_registers: 48,
-    max_spill_bytes: 0,
-}];
+const KERNEL_BUDGETS: [KernelBudget; 2] = [
+    KernelBudget {
+        name: "gemm_tcgen05_bf16_optimized",
+        max_registers: 48,
+        max_spill_bytes: 0,
+    },
+    KernelBudget {
+        name: "gemm_tcgen05_f32_optimized",
+        max_registers: 48,
+        max_spill_bytes: 0,
+    },
+];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
     let stream = context.default_stream();
-    let fp32_module = fp32::kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
-    let module = Tcgen05Gemm::load_from_ptx(&context, "gemm.ptx")?;
+    let fp32_module = fp32::kernels::load(&context)?;
+    let module = Tcgen05Gemm::load(&context)?;
     enforce_kernel_budgets(&module.kernels(), &KERNEL_BUDGETS)?;
 
     check_fp32(&stream, &fp32_module)?;

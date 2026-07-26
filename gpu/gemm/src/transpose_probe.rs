@@ -19,10 +19,11 @@
 //! is what deferred this work in #43/#50.
 //!
 //! This compiles ONLY into `src/bin/transpose_probe.rs`, whose device artifact
-//! ships as `transpose_probe.ptx` on the pure-PTX path: nothing here may call
-//! libdevice-backed math (`f32::max`, `sqrt`, ...) or libNVVM would take the
-//! artifact and reject the tcgen05 lowerings. There is no float arithmetic in
-//! the kernel at all — the MMA is the only math.
+//! ships as `transpose_probe.ptx` on the pure-PTX path. Alongside the tcgen05
+//! geometry sweep it deliberately carries libdevice-backed math and a device
+//! atomic regression probe. At cuda-oxide b099f64 those lowerings remain legal
+//! in the same pure-PTX artifact as tcgen05; losing that property must fail this
+//! harness before the model's single-artifact build can regress silently.
 //!
 //! Shape contract: `C[128, 64] = A[128, 64] · Bᵀ[64, 64]` over one `K = 64`
 //! stage (four chained `K = 16` bf16 MMAs), `M128_N64` or `M64_N64`. `N = 64`
@@ -30,6 +31,7 @@
 //! row, so a B operand fits one subtile in either layout.
 
 use cuda_device::DisjointSlice;
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32};
 use cuda_device::barrier::{
     Barrier, fence_proxy_async_shared_cta, mbarrier_arrive_expect_tx, mbarrier_init,
     mbarrier_inval, mbarrier_try_wait_parity,
@@ -59,6 +61,29 @@ const SUBTILE_ELEMENTS: i32 = 64;
 #[cuda_module]
 pub mod kernels {
     use super::*;
+
+    /// Libdevice regression gate for the unified tcgen05 artifact.
+    #[kernel]
+    pub unsafe fn libdevice_math_probe(input: &[f32], mut output: DisjointSlice<f32>) {
+        let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        if i < input.len() {
+            let value = input[i];
+            unsafe {
+                *output.as_mut_ptr().add(i) =
+                    value.sqrt() + value.exp() + value.ln() + value.max(0.5);
+            }
+        }
+    }
+
+    /// Exact contended sum: threads add the integers 1..=64 to one fp32 slot.
+    #[kernel]
+    pub unsafe fn device_atomic_probe(mut output: DisjointSlice<f32>) {
+        let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        if i < 64 {
+            let slot = unsafe { DeviceAtomicF32::from_ptr(output.as_mut_ptr()) };
+            slot.fetch_add((i + 1) as f32, AtomicOrdering::Relaxed);
+        }
+    }
 
     /// Fold a shared address into a host-packed layout word (LBO/SBO/swizzle
     /// bits, address field zero). Same encoding as `gemm::kernels`'.
