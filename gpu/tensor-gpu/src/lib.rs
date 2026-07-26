@@ -377,12 +377,13 @@ pub mod kernels {
         }
     }
 
-    /// [`convert_bf16_pairs_to_f32`] over a slice of a packed buffer: widen
-    /// `len` elements starting at element `offset` into a dense fp32 prefix of
-    /// `output`.
+    /// [`convert_bf16_pairs_to_f32`] with explicit bounds: widen `len` elements
+    /// starting at element `offset` into a dense fp32 prefix of `output`.
     ///
-    /// The bf16 masters are one stacked allocation per expert entry, so the
-    /// fp32 oracle path stages one expert at a time out of the middle of it.
+    /// Both ends of the fp32 oracle path need this rather than the whole-buffer
+    /// convert — experts read one expert out of the middle of a stacked master,
+    /// and block linears widen into staging sized for the largest of them, so
+    /// neither `input` nor `output` bounds the work on its own.
     #[kernel]
     pub fn widen_bf16_region(input: &[u32], offset: u32, len: u32, mut output: DisjointSlice<f32>) {
         let index = thread::index_1d();

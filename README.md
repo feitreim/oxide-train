@@ -21,7 +21,7 @@ B200 (Blackwell), with GPU kernels written in Rust via
   tuning constants sweep via Modal *outside* of training.
 
 Plan: Dense-style model (RMSNorm, RoPE, SwiGLU, untied embeddings) at
-~150-350M params, fp32 first then bf16 compute + fp32 master weights, AdamW
+~150-350M params, fp32 first then bf16 compute and bf16 master weights, AdamW
 then Muon, trained on English Wikipedia tokenized with tiktoken `r50k_base`
 (ids fit `u16`). MoE is next (SPEC milestone 8).
 
@@ -142,7 +142,7 @@ rewrite them.
 
 The milestone-6 trainer reads `TOK1` shards from the `rust-trainer-wiki` Modal
 volume. Upload a prepared shard once, then launch the small reference
-configuration (fp32 masters with the bf16 tcgen05 lm-head and block linears):
+configuration (bf16 masters with the bf16 tcgen05 lm-head and block linears):
 
 ```bash
 modal volume create rust-trainer-wiki

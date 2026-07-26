@@ -1,7 +1,8 @@
 //! GPU forward and backward for the single-block reference Dense. Aligned
 //! training shapes run the lm-head and block linears through bf16 tcgen05
-//! against fp32 master weights/gradients; small parity shapes retain the fp32
-//! register-tiled block-linear oracle.
+//! against bf16 master weights (#57) and fp32 gradients; small parity shapes
+//! retain the fp32 register-tiled block-linear oracle, which widens the master
+//! on the way in.
 //!
 //! Parameters, gradients, and saved activations remain GPU-resident. The
 //! implementation mirrors `nn::Dense` explicitly so residual splits and the
@@ -86,11 +87,20 @@ pub mod checkpoint;
 /// How every bf16 master commits its fp32 update (#57).
 ///
 /// One constant switches the whole model, kernels included, because both modes
-/// live in the same fused kernel. Nearest is the shipped default: the overfit
-/// gates converge on it and it costs no arithmetic. Stochastic rounding is
-/// there for when they stop — its draws come from a splitmix64 stream keyed on
-/// `(step, parameter id, element index)` and never from runtime entropy, so a
-/// rerun and a checkpoint resume reproduce the same weights either way.
+/// live in the same fused kernel. Nearest is the shipped default: every overfit
+/// gate converges on it with margin, so nothing yet demands the alternative,
+/// and it costs no arithmetic. Stochastic rounding is there for when they stop
+/// — its draws come from a splitmix64 stream keyed on `(step, parameter id,
+/// element index)` and never from runtime entropy, so a rerun and a checkpoint
+/// resume reproduce the same weights either way.
+///
+/// Flipping this also breaks the GPU/CPU master parity gates, and not because
+/// either side is wrong: the two draw independent streams (the grouped `qkv`
+/// and `gate_up` masters are one interleaved parameter on the GPU and three or
+/// two separate ones on the CPU, so no keying can align them), a single step
+/// stays within the gates' one-ulp budget, and then a near-cancelling update
+/// turns that ulp into many at the much smaller result. Adopting stochastic
+/// rounding means re-deciding what those gates compare, not just widening them.
 pub const MASTER_ROUNDING: MasterRounding = MasterRounding::Nearest;
 
 const fn master_rounding_selector() -> u32 {
