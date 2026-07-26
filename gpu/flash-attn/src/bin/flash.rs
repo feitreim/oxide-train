@@ -24,7 +24,8 @@ mod tcgen05_device;
 
 use host::{
     FLASH_HD, FLASH_SUBTILE_HD, FLASH_TILE, Tcgen05Flash, correction_count_len,
-    create_flash_head_tma_map, device_sm_count, flash_backward_kv_config, flash_backward_q_config,
+    create_flash_head_tma_map, device_sm_count, flash_backward_kv_config,
+    flash_backward_q_config, flash_backward_q_pipelined_config,
     flash_forward_config, flash_persistent_config, flash_pipelined_config,
 };
 
@@ -63,7 +64,14 @@ use host::{
 /// (looped causal masking shares the `masked_all` term eight hand-written
 /// `keep_*` expressions each re-derived) and three `cvta.shared`s. Local
 /// frames unchanged to the byte, forwards byte-identical, bench flat.
-const KERNEL_BUDGETS: [KernelBudget; 5] = [
+///
+/// `backward q pipelined` (2026-07-26) is the first kernel written
+/// kittens-first rather than ported: same Design-B math as `backward q`, the
+/// forward's three-role warp specialization instead of four block syncs per
+/// key tile. It costs **one** register over the synchronous kernel (52 → 53,
+/// same 512 B frame) — the tile library's overhead for a whole pipeline is
+/// inside the noise of a single scalar.
+const KERNEL_BUDGETS: [KernelBudget; 6] = [
     KernelBudget {
         name: "forward sync",
         max_registers: 40,
@@ -82,6 +90,14 @@ const KERNEL_BUDGETS: [KernelBudget; 5] = [
     KernelBudget {
         name: "backward q",
         max_registers: 52,
+        max_spill_bytes: 512,
+    },
+    KernelBudget {
+        // The kittens-first pipelined backward, first flight: 53 regs / 512 B
+        // frame, one register over the synchronous kernel it replaces for
+        // three warp roles, two S/dP buffers and six barrier sets.
+        name: "backward q pipelined",
+        max_registers: 53,
         max_spill_bytes: 512,
     },
     KernelBudget {
@@ -223,6 +239,32 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f
         );
     }
     println!("  {name:<9} max abs error: {max_error:.3e}");
+}
+
+/// Bit-for-bit equality between two kernels that must agree exactly — the
+/// gate for a pure scheduling change, where any drift at all is a reordered
+/// accumulation rather than a tolerable rounding difference.
+fn assert_identical(name: &str, actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    let mut mismatches = 0usize;
+    let mut worst = (0usize, 0.0f32, 0.0f32);
+    for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+        if a.to_bits() != e.to_bits() {
+            mismatches += 1;
+            if (a - e).abs() > (worst.1 - worst.2).abs() {
+                worst = (i, a, e);
+            }
+        }
+    }
+    assert!(
+        mismatches == 0,
+        "{name}: {mismatches} of {} values differ; worst at {}: {} vs {}",
+        actual.len(),
+        worst.0,
+        worst.1,
+        worst.2
+    );
+    println!("  {name:<9} bit-identical ({} values)", actual.len());
 }
 
 /// Software exp2/log2 accuracy against the host libm oracles. Gates the
@@ -624,6 +666,7 @@ fn check_backward(
     let dot_device = DeviceBuffer::from_host(stream, &dot)?;
 
     let mut dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dq_pipelined = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     unsafe {
@@ -654,8 +697,29 @@ fn check_backward(
             &mut dk,
             &mut dv,
         )?;
+        flash.backward_q_pipelined(
+            stream,
+            flash_backward_q_pipelined_config(b, t, h),
+            q_tma.as_ptr(),
+            k_tma.as_ptr(),
+            v_tma.as_ptr(),
+            dy_tma.as_ptr(),
+            &lse_device,
+            &dot_device,
+            t as u32,
+            h as u32,
+            &mut dq_pipelined,
+        )?;
     }
     println!("tcgen05 backward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]");
+    // The pipelined backward is a pure scheduling change: same per-tile math in
+    // the same key order into the same TMEM accumulator, so anything short of
+    // bit-identical means the pipeline reordered or dropped a tile.
+    assert_identical(
+        "dq pipelined vs sync",
+        &dq_pipelined.to_host_vec(stream)?,
+        &dq.to_host_vec(stream)?,
+    );
     assert_close("dq", &dq.to_host_vec(stream)?, &expected_dq, 5.0e-3, 5.0e-3);
     assert_close("dk", &dk.to_host_vec(stream)?, &expected_dk, 5.0e-3, 5.0e-3);
     assert_close("dv", &dv.to_host_vec(stream)?, &expected_dv, 5.0e-3, 5.0e-3);
@@ -757,6 +821,52 @@ fn bench(
     let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let backward_flop = visits * 5.0 * (2.0 * 128.0 * 128.0 * 64.0);
+
+    // Kernel A alone on both schedules: the direct measure of what the
+    // warp specialization bought. Per key-tile visit kernel A issues two
+    // 128x128x64 score GEMMs plus one 128x64x128 gradient GEMM.
+    let q_flop = visits * 3.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    for (name, pipelined) in [("sync", false), ("pipelined", true)] {
+        let milliseconds = time_gpu_iters(stream, 3, 20, || {
+            unsafe {
+                if pipelined {
+                    flash.backward_q_pipelined(
+                        stream,
+                        flash_backward_q_pipelined_config(b, t, h),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        dy_tma.as_ptr(),
+                        &lse_in,
+                        &dot_in,
+                        t as u32,
+                        h as u32,
+                        &mut dq,
+                    )?;
+                } else {
+                    flash.backward_q(
+                        stream,
+                        flash_backward_q_config(b, t, h),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        dy_tma.as_ptr(),
+                        &lse_in,
+                        &dot_in,
+                        t as u32,
+                        h as u32,
+                        &mut dq,
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+        println!(
+            "tcgen05 backward q {name} [{b},{t},{h},{FLASH_HD}]: {milliseconds:.3} ms, {:.1} TFLOP/s",
+            q_flop / (milliseconds * 1.0e-3) / 1.0e12
+        );
+    }
+
     let milliseconds = time_gpu_iters(stream, 3, 20, || {
         unsafe {
             flash.backward_q(
@@ -829,6 +939,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host::FLASH_BACKWARD_KV_SMEM_BYTES as usize,
         tcgen05_device::FLASH_BACKWARD_KV_SMEM,
         "host.rs and tcgen05.rs disagree on the kernel-B shared plan"
+    );
+    assert!(
+        tcgen05_device::FLASH_BACKWARD_Q_PIPELINED_SMEM
+            <= host::FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES as usize,
+        "BACKWARD_STAGES overflows the host-side shared-memory ceiling"
+    );
+    assert_eq!(
+        host::FLASH_BACKWARD_Q_PIPELINED_BLOCK_THREADS as usize,
+        tcgen05_device::FLASH_BACKWARD_Q_PIPELINED_BLOCK,
+        "host.rs and tcgen05.rs disagree on the pipelined-backward block width"
     );
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();

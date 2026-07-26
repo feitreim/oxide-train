@@ -198,6 +198,26 @@ pub const FLASH_BACKWARD_Q_SMEM: usize = 7 * TILE_BYTES;
 /// tiles (`TILE_BYTES` each). No `PHANTOM_PAD`.
 pub const FLASH_BACKWARD_KV_SMEM: usize = 8 * TILE_BYTES;
 
+/// K/V ring depth of the warp-specialized backward (SWEEP knob). Two is the
+/// floor for the same reason as `PIPELINE_STAGES`: the staggered issue order
+/// (`S/dP-MMA(i)` before `dQ-MMA(i-1)`) needs a stage of load-ahead, and the
+/// K stage of tile `i` cannot recycle until `dQ-MMA(i)` — which reads it a
+/// second time — has been observed.
+pub const BACKWARD_STAGES: usize = 3;
+const _: () = assert!(2 <= BACKWARD_STAGES && BACKWARD_STAGES <= 4);
+/// Dynamic shared plan of the PIPELINED query-parallel backward: the resident
+/// stacked Q and dY pairs (`2 * TILE_BYTES` each), the K and V rings, and the
+/// single stacked `[128, 64]` dS tile. dS stays single-buffered for the same
+/// reason P does in the forward — the warpgroup's `dq_done(i)` wait proves the
+/// gradient MMA finished reading it before tile `i+1` overwrites it.
+pub const FLASH_BACKWARD_Q_PIPELINED_SMEM: usize = (5 + 2 * BACKWARD_STAGES) * TILE_BYTES;
+/// Threads of the pipelined backward: the 128-thread gradient warpgroup (the
+/// paired `S` is 128 real rows, so it takes four warps, not the forward's two)
+/// plus the TMA-load warp and the MMA-issue warp.
+pub const FLASH_BACKWARD_Q_PIPELINED_BLOCK: usize = 2 * TILE + 64;
+/// Mirrors the `FLASH_PIPELINE_BLOCK` `.maxntid` note.
+const _: () = assert!(FLASH_BACKWARD_Q_PIPELINED_BLOCK == 192);
+
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
 /// most `2^CORRECTION_THRESHOLD`, comfortably inside bf16 range and the fp32
@@ -1513,6 +1533,273 @@ pub mod kernels {
             if is_leader {
                 tma.sem().inval();
                 mma.sem().inval();
+            }
+        }
+    }
+
+    /// Issue one tile's `dQ += dS·K` from the MMA warp: wait for the gradient
+    /// warpgroup to publish dS, chain the four K=16 MMAs across K's two HD
+    /// subtiles into the dQ segment (fresh on the first key tile, accumulating
+    /// after), and commit completion into `dq_done`. That commit is what
+    /// releases both the dS tile and the K ring stage — the K panel of tile `i`
+    /// is read twice, once as the score MMA's B operand and once here.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn gradient_mma<const STAGES: usize>(
+        i: u32,
+        ds: PairedPTile,
+        k: PanelRingN<STAGES>,
+        dq_tmem: AccTmem,
+        ds_full: Semaphore,
+        dq_done: Semaphore,
+        instruction: u32,
+    ) {
+        unsafe {
+            ds_full.wait(i & 1);
+            mma_ab(dq_tmem.raw(), ds, k.tile(i), instruction, i != 0);
+            mma::commit(dq_done);
+        }
+    }
+
+    /// Warp-specialized pipelined query-parallel backward (issue #61 phase 5:
+    /// the first kernel written kittens-first). Launch with
+    /// `host::flash_backward_q_pipelined_config`: grid `(T/128, H, B)`,
+    /// `FLASH_BACKWARD_Q_PIPELINED_BLOCK` threads,
+    /// `host::FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES` dynamic shared bytes.
+    /// Identical operand, statistic, and output contract to
+    /// `flash_backward_q_tcgen05` — same PAIRED Design-B math, same causal
+    /// masking, same fragment map — with the synchronous kernel's four
+    /// block-wide `sync_threads` per key tile replaced by the forward's
+    /// three-role warp specialization:
+    ///
+    /// - warp 4's leader streams TMA: the resident Q/dY pairs once (charged
+    ///   onto the first K/V stage), then the K/V ring running `BACKWARD_STAGES`
+    ///   tiles ahead;
+    /// - warp 5's leader issues MMAs, staggered exactly like the forward so
+    ///   `S/dP-MMA(i)` reaches the tensor core before `dQ-MMA(i-1)`: while the
+    ///   warpgroup forms `dS(i)`, the core is already producing `S(i+1)`;
+    /// - warps 0–3 are the gradient warpgroup: wait `s_full`, run
+    ///   `backward_q_tile_paired`, release `s_free`, publish `ds_full`, wait
+    ///   `dq_done`, recycle the K/V stage. The dQ accumulator lives in TMEM
+    ///   for the whole key stream and is drained once at the end, so unlike
+    ///   the forward there is no per-tile correction to fuse in here.
+    ///
+    /// Where the synchronous kernel exposed every stage — TMA, then MMA, then
+    /// the register pass, then the gradient MMA, each behind its own block
+    /// sync — this overlaps all four. The parity argument is the forward's:
+    /// every barrier's completions lead their waiter by at most one phase,
+    /// because each producer's next completion transitively requires the
+    /// previous consumer wait.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(192, 1)]
+    pub unsafe fn flash_backward_q_pipelined(
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &[f32],
+        dot: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        mut dq: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
+            static mut KV_FULL: SharedArray<u64, BACKWARD_STAGES, 8> = SharedArray::UNINIT;
+            static mut KV_FREE: SharedArray<u64, BACKWARD_STAGES, 8> = SharedArray::UNINIT;
+            static mut S_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
+            static mut S_FREE: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
+            static mut DS_FULL: Barrier = Barrier::UNINIT;
+            static mut DQ_DONE: Barrier = Barrier::UNINIT;
+            static mut LSE2: SharedArray<f32, 128> = SharedArray::UNINIT;
+            static mut DOTS: SharedArray<f32, 128> = SharedArray::UNINIT;
+
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let q = PairedPanel::from_raw(smem);
+            let dy = PairedPanel::from_raw(smem.add(2 * TILE_BYTES));
+            let k = PanelRingN::<BACKWARD_STAGES>::attach(smem.add(4 * TILE_BYTES));
+            let v = PanelRingN::<BACKWARD_STAGES>::attach(
+                smem.add((4 + BACKWARD_STAGES) * TILE_BYTES),
+            );
+            let ds = PairedPTile::from_raw(smem.add((4 + 2 * BACKWARD_STAGES) * TILE_BYTES));
+
+            let tid = thread::threadIdx_x();
+            if thread::blockDim_x() as usize != FLASH_BACKWARD_Q_PIPELINED_BLOCK {
+                return;
+            }
+            let warp_id = warp::warp_id();
+            let lane = warp::lane_id();
+            let group = 2 * TILE as u32;
+
+            let pair = thread::blockIdx_x();
+            let head = thread::blockIdx_y();
+            let batch = thread::blockIdx_z();
+            let t = sequence_length;
+            let h = heads;
+            let plane = (batch * h + head) as i32;
+            let tile_a = pair * 2;
+            let tile_b = tile_a + 1;
+            let key_tiles = tile_b + 1;
+
+            let kv_full =
+                SemaphoreRing::<BACKWARD_STAGES>::attach(&raw mut KV_FULL as *mut Barrier);
+            let kv_free =
+                SemaphoreRing::<BACKWARD_STAGES>::attach(&raw mut KV_FREE as *mut Barrier);
+            let s_full = SemaphoreRing::<2>::attach(&raw mut S_FULL as *mut Barrier);
+            let s_free = SemaphoreRing::<2>::attach(&raw mut S_FREE as *mut Barrier);
+            let ds_full = Semaphore::attach(&raw mut DS_FULL);
+            let dq_done = Semaphore::attach(&raw mut DQ_DONE);
+
+            // Barrier init precedes the TMEM allocation (the validated
+            // ordering — see the ptxas pins in flash.rs).
+            if tid == 0 {
+                kv_full.init_all(1);
+                kv_free.init_all(1);
+                s_full.init_all(1);
+                s_free.init_all(group);
+                ds_full.init(group);
+                dq_done.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            // The pair's 128 contiguous query rows' base-2 LSE and softmax dot,
+            // staged while every warp is still running the prologue together —
+            // after the split there is no block-wide sync left to hide behind.
+            if tid < group {
+                let query_row = (batch * t) as usize + tile_a as usize * TILE + tid as usize;
+                let stat_index = query_row * h as usize + head as usize;
+                (*(&raw mut LSE2 as *mut f32).add(tid as usize)) = logsumexp[stat_index] * LOG2E;
+                (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
+            }
+            thread::sync_threads();
+
+            // Two 64-wide S buffers at columns 0..128, two dP buffers at
+            // 128..256, the 128-column dQ accumulator at 256.
+            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
+            let s_tmem = STmem::from_raw(tmem);
+            let dp_tmem = STmem::from_raw(tmem + 128);
+            let dq_tmem = AccTmem::from_raw(tmem + 256);
+
+            if tid < group {
+                // Gradient warpgroup.
+                let mut i = 0u32;
+                while i < key_tiles {
+                    s_full.wait(i);
+                    backward_q_tile_paired(
+                        s_tmem.columns_right((i & 1) * 64),
+                        dp_tmem.columns_right((i & 1) * 64),
+                        i,
+                        tile_a,
+                        tile_b,
+                        warp_id,
+                        lane,
+                        &raw const LSE2 as *const f32,
+                        &raw const DOTS as *const f32,
+                        ds,
+                    );
+                    // dS is fenced into the async proxy before it is published;
+                    // both S buffers are drained, so the score MMA may reuse
+                    // this one.
+                    fence_proxy_async_shared_cta();
+                    s_free.sem(i).arrive();
+                    ds_full.arrive();
+                    dq_done.wait(i & 1);
+                    if tid == 0 {
+                        kv_free.sem(i).arrive();
+                    }
+                    i += 1;
+                }
+                let mut dq_acc = RegTile::<4, 32>::zero();
+                merge_output_tile(dq_tmem, warp_id, &mut dq_acc);
+                // The pair's rows are contiguous, so the block's base tile is
+                // `tile_a` and the warp-derived local row (0..127) lands
+                // correctly.
+                store_grad_tile(batch, t, h, head, tile_a, warp_id, lane, &dq_acc, &mut dq);
+            } else if tid == group {
+                // TMA load warp leader. Q/dY ride the first stage's expected
+                // bytes exactly like the forward's Q does.
+                let mut i = 0u32;
+                while i < key_tiles {
+                    kv_free.wait_recycled(i);
+                    let full = kv_full.sem(i);
+                    let key_row = (i * TILE as u32) as i32;
+                    k.tile(i).tma_load(k_tma, key_row, plane, full);
+                    v.tile(i).tma_load(v_tma, key_row, plane, full);
+                    if i == 0 {
+                        let row_a = (tile_a * TILE as u32) as i32;
+                        let row_b = (tile_b * TILE as u32) as i32;
+                        q.tma_load_at(q_tma, 0, row_a, plane, full);
+                        q.tma_load_at(q_tma, TILE, row_b, plane, full);
+                        dy.tma_load_at(dy_tma, 0, row_a, plane, full);
+                        dy.tma_load_at(dy_tma, TILE, row_b, plane, full);
+                        full.expect_tx((2 * Panel::BYTES + 2 * PairedPanel::BYTES) as u32);
+                    } else {
+                        full.expect_tx(2 * Panel::BYTES as u32);
+                    }
+                    i += 1;
+                }
+            } else if tid == group + 32 {
+                // MMA warp leader.
+                let s_instruction = Tcgen05InstructionDescriptor::builder()
+                    .shape(Tcgen05MmaShape::M128_N64)
+                    .element_type(Tcgen05ElementType::BF16)
+                    .accumulator_type(Tcgen05AccumulatorType::F32)
+                    .build()
+                    .raw();
+                let grad_instruction = Tcgen05InstructionDescriptor::builder()
+                    .shape(Tcgen05MmaShape::M128_N64)
+                    .element_type(Tcgen05ElementType::BF16)
+                    .accumulator_type(Tcgen05AccumulatorType::F32)
+                    .transpose_b(true)
+                    .build()
+                    .raw();
+                tcgen05_fence_after_thread_sync();
+                let mut i = 0u32;
+                while i < key_tiles {
+                    kv_full.wait(i);
+                    s_free.wait_recycled(i);
+                    let buffer = (i & 1) * 64;
+                    mma_abt(
+                        s_tmem.columns_right(buffer).raw(),
+                        q,
+                        k.tile(i),
+                        s_instruction,
+                        false,
+                    );
+                    mma_abt(
+                        dp_tmem.columns_right(buffer).raw(),
+                        dy,
+                        v.tile(i),
+                        s_instruction,
+                        false,
+                    );
+                    mma::commit(s_full.sem(i));
+                    if i > 0 {
+                        gradient_mma(i - 1, ds, k, dq_tmem, ds_full, dq_done, grad_instruction);
+                    }
+                    i += 1;
+                }
+                gradient_mma(
+                    key_tiles - 1,
+                    ds,
+                    k,
+                    dq_tmem,
+                    ds_full,
+                    dq_done,
+                    grad_instruction,
+                );
+            }
+
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
+            dealloc_block(tmem, 512);
+            if tid == 0 {
+                kv_full.inval_all();
+                kv_free.inval_all();
+                s_full.inval_all();
+                s_free.inval_all();
+                ds_full.inval();
+                dq_done.inval();
             }
         }
     }

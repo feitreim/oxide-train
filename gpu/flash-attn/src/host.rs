@@ -47,6 +47,17 @@ pub const FLASH_BACKWARD_Q_SMEM_BYTES: u32 = (7 * TILE_BYTES) as u32;
 /// B): resident stacked `[K_A;K_B]`/`[V_A;V_B]`, streamed Q/dY panels, and the
 /// stacked Pᵀ and dSᵀ tiles. No `PHANTOM_PAD`. Mirrors `FLASH_BACKWARD_KV_SMEM`.
 pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = (8 * TILE_BYTES) as u32;
+/// Dynamic shared allocation for the PIPELINED query-parallel backward: the
+/// resident Q/dY pairs, K/V rings sized for the deepest supported
+/// `BACKWARD_STAGES` (4), and the single stacked dS tile. As with the
+/// pipelined forward, the ceiling is allocated so stage sweeps are a one-const
+/// edit and the flash bin asserts the kernel's actual plan fits. Mirrors
+/// `FLASH_BACKWARD_Q_PIPELINED_SMEM` in `tcgen05.rs`.
+pub const FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES: u32 = ((5 + 2 * 4) * TILE_BYTES) as u32;
+/// Threads of the pipelined backward: the 128-thread gradient warpgroup plus
+/// the TMA-load and MMA-issue warps. Mirrors
+/// `FLASH_BACKWARD_Q_PIPELINED_BLOCK`.
+pub const FLASH_BACKWARD_Q_PIPELINED_BLOCK_THREADS: u32 = (2 * FLASH_TILE + 64) as u32;
 /// Dynamic shared allocation for the pipelined forward: Q + K/V rings sized
 /// for the deepest supported `PIPELINE_STAGES` (4) + the P subtile.
 /// The kernel's actual plan (`FLASH_PIPELINE_SMEM`, a function of the swept
@@ -132,6 +143,21 @@ pub fn flash_backward_kv_config(
         heads,
         FLASH_BACKWARD_KV_SMEM_BYTES,
     )
+}
+
+/// Launch for the warp-specialized pipelined query-parallel backward: same
+/// grid as kernel A, the wider block, the ring-sized shared allocation.
+pub fn flash_backward_q_pipelined_config(
+    batches: usize,
+    sequence_length: usize,
+    heads: usize,
+) -> LaunchConfig {
+    let base = flash_backward_q_config(batches, sequence_length, heads);
+    LaunchConfig {
+        grid_dim: base.grid_dim,
+        block_dim: (FLASH_BACKWARD_Q_PIPELINED_BLOCK_THREADS, 1, 1),
+        shared_mem_bytes: FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES,
+    }
 }
 
 /// Launch for the warp-specialized pipelined forward: same grid, the wider
@@ -259,6 +285,7 @@ pub struct Tcgen05Flash {
     forward_pipelined: CudaFunction,
     forward_persistent: CudaFunction,
     backward_q: CudaFunction,
+    backward_q_pipelined: CudaFunction,
     backward_kv: CudaFunction,
     transpose_probe: CudaFunction,
     swizzle_probe: CudaFunction,
@@ -280,12 +307,17 @@ impl Tcgen05Flash {
         let forward_pipelined = module.load_function("flash_forward_pipelined")?;
         let forward_persistent = module.load_function("flash_forward_persistent")?;
         let backward_q = module.load_function("flash_backward_q_tcgen05")?;
+        let backward_q_pipelined = module.load_function("flash_backward_q_pipelined")?;
         let backward_kv = module.load_function("flash_backward_kv_tcgen05")?;
         let transpose_probe = module.load_function("transpose_b_probe")?;
         opt_in_dynamic_smem(&forward, FLASH_DYNAMIC_SMEM_BYTES)?;
         opt_in_dynamic_smem(&forward_pipelined, FLASH_PIPELINE_SMEM_BYTES)?;
         opt_in_dynamic_smem(&forward_persistent, FLASH_PERSISTENT_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_q, FLASH_BACKWARD_Q_SMEM_BYTES)?;
+        opt_in_dynamic_smem(
+            &backward_q_pipelined,
+            FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES,
+        )?;
         opt_in_dynamic_smem(&backward_kv, FLASH_BACKWARD_KV_SMEM_BYTES)?;
         opt_in_dynamic_smem(&transpose_probe, PROBE_DYNAMIC_SMEM_BYTES)?;
         Ok(Self {
@@ -293,6 +325,7 @@ impl Tcgen05Flash {
             forward_pipelined,
             forward_persistent,
             backward_q,
+            backward_q_pipelined,
             backward_kv,
             transpose_probe,
             swizzle_probe: module.load_function("swizzle_probe")?,
@@ -311,12 +344,13 @@ impl Tcgen05Flash {
 
     /// The launched kernels paired with their names, for reporting what ptxas
     /// gave each one.
-    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 5] {
+    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 6] {
         [
             ("forward sync", &self.forward),
             ("forward pipelined", &self.forward_pipelined),
             ("forward persistent", &self.forward_persistent),
             ("backward q", &self.backward_q),
+            ("backward q pipelined", &self.backward_q_pipelined),
             ("backward kv", &self.backward_kv),
         ]
     }
@@ -466,6 +500,80 @@ impl Tcgen05Flash {
         heads: u32,
         dq: &mut DeviceBuffer<f32>,
     ) -> Result<(), DriverError> {
+        unsafe {
+            self.launch_backward_q(
+                &self.backward_q,
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                logsumexp,
+                dot,
+                sequence_length,
+                heads,
+                dq,
+            )
+        }
+    }
+
+    /// The warp-specialized pipelined query-parallel backward: identical
+    /// contract to [`Self::backward_q`], launched with
+    /// `flash_backward_q_pipelined_config`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::backward_q`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn backward_q_pipelined(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &DeviceBuffer<f32>,
+        dot: &DeviceBuffer<f32>,
+        sequence_length: u32,
+        heads: u32,
+        dq: &mut DeviceBuffer<f32>,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            self.launch_backward_q(
+                &self.backward_q_pipelined,
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                logsumexp,
+                dot,
+                sequence_length,
+                heads,
+                dq,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_backward_q(
+        &self,
+        function: &CudaFunction,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &DeviceBuffer<f32>,
+        dot: &DeviceBuffer<f32>,
+        sequence_length: u32,
+        heads: u32,
+        dq: &mut DeviceBuffer<f32>,
+    ) -> Result<(), DriverError> {
         let mut q_tma = q_tma;
         let mut k_tma = k_tma;
         let mut v_tma = v_tma;
@@ -487,7 +595,7 @@ impl Tcgen05Flash {
         cuda_host::push_kernel_device_slice(&mut args, &mut dq_ptr, &mut dq_len);
         unsafe {
             cuda_core::launch_kernel_on_stream(
-                &self.backward_q,
+                function,
                 config.grid_dim,
                 config.block_dim,
                 config.shared_mem_bytes,
