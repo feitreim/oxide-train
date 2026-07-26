@@ -1147,6 +1147,32 @@ Each gated on tests; correctness before speed at every step.
      delta is a little under the sum of the two individual measurements
      (−55.3 vs −61.9 ms), which is the expected small overlap plus
      container-to-container spread.
+   - ✅ **cuda-oxide pinned to `b099f64`** (#56): the codegen-backend bump is a
+     toolchain change, not a kernel change, so it is measured here rather than
+     claimed to be free. **No same-container A/B exists and none can:** the
+     baseline's own `v0.2.1` CLI, reinstalled beside the new one, emits a
+     `gemm.ptx` the B200 refuses to JIT (`DriverError(218)`), which kills
+     `BASELINE_REF` across the pin boundary in both directions. What replaces it
+     is repeat measurement plus kernel-level benches that *are* comparable
+     across epochs. Candidate at the §13.9 shape (B=12 T=2048), two containers:
+     full step **576.68 / 572.73 ms**, per-span spread ≤0.71 ms on a 44 ms span
+     — the candidate is stable to 0.7%, so the pre-merge branch's 648.1 ms was
+     its own missing-merge state plus container luck, not the backend.
+     Against main's recorded 552.80 ms the residual is **+21 ms (+3.9%)**, and
+     it decomposes into one named regression and one flat remainder. Named:
+     `optimizer.experts.sync_compute` 5.52 → 7.11 ms (+29%) and
+     `optimizer.lm_head.sync_w_t` 0.242 → 0.306 (+26%) — the two spans whose
+     time is `transpose_bf16_pairs`, and the only spans anywhere in the step
+     that move by more than a few percent (≈1.7 ms of the 21; #58 deletes
+     `sync_w_t` and the redundant compute copies outright). Flat: everything
+     else sits at +3%, uniform across memory-bound AdamW and compute-bound
+     tcgen05 alike, which is the signature of container epoch rather than
+     codegen — and the kernel-level flash benches, the one measurement directly
+     comparable across the pin, confirm it: persistent forward 1.929 ms /
+     227.1 TFLOP/s against the recorded 1.937 / 226, pipelined 2.409 / 181.8
+     against 2.425 / 181, with ptxas budgets unchanged to the byte (persistent
+     206 regs / 592 spill / maxntid 192). The `transpose_bf16_pairs` cost is
+     the one thing the bump is actually on the hook for.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 
