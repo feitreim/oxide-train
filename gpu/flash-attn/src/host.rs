@@ -9,7 +9,6 @@
 //! pure-PTX path.
 
 use std::error::Error;
-use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use cuda_core::{
@@ -48,6 +47,25 @@ pub const FLASH_BACKWARD_Q_SMEM_BYTES: u32 = (7 * TILE_BYTES) as u32;
 /// B): resident stacked `[K_A;K_B]`/`[V_A;V_B]`, streamed Q/dY panels, and the
 /// stacked Pᵀ and dSᵀ tiles. No `PHANTOM_PAD`. Mirrors `FLASH_BACKWARD_KV_SMEM`.
 pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = (8 * TILE_BYTES) as u32;
+/// Dynamic shared allocation for the PIPELINED query-parallel backward: the
+/// resident Q/dY pairs, K/V rings sized for the deepest supported
+/// `BACKWARD_STAGES` (4), and the single stacked dS tile. As with the
+/// pipelined forward, the ceiling is allocated so stage sweeps are a one-const
+/// edit and the flash bin asserts the kernel's actual plan fits. Mirrors
+/// `FLASH_BACKWARD_Q_PIPELINED_SMEM` in `tcgen05.rs`.
+pub const FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES: u32 = ((5 + 2 * 4) * TILE_BYTES) as u32;
+/// Threads of the pipelined backward: the 128-thread gradient warpgroup plus
+/// the TMA-load and MMA-issue warps. Mirrors
+/// `FLASH_BACKWARD_Q_PIPELINED_BLOCK`.
+pub const FLASH_BACKWARD_Q_PIPELINED_BLOCK_THREADS: u32 = (2 * FLASH_TILE + 64) as u32;
+/// Dynamic shared allocation for the PIPELINED key-parallel backward: the
+/// resident K/V pairs, Q/dY rings sized for the deepest supported
+/// `BACKWARD_STAGES` (4), and the stacked Pᵀ and dSᵀ tiles. Mirrors
+/// `FLASH_BACKWARD_KV_PIPELINED_SMEM` in `tcgen05.rs`.
+pub const FLASH_BACKWARD_KV_PIPELINED_SMEM_BYTES: u32 = ((6 + 2 * 4) * TILE_BYTES) as u32;
+/// Threads of the pipelined key-parallel backward. Mirrors
+/// `FLASH_BACKWARD_KV_PIPELINED_BLOCK`.
+pub const FLASH_BACKWARD_KV_PIPELINED_BLOCK_THREADS: u32 = (2 * FLASH_TILE + 64) as u32;
 /// Dynamic shared allocation for the pipelined forward: Q + K/V rings sized
 /// for the deepest supported `PIPELINE_STAGES` (4) + the P subtile.
 /// The kernel's actual plan (`FLASH_PIPELINE_SMEM`, a function of the swept
@@ -135,6 +153,35 @@ pub fn flash_backward_kv_config(
     )
 }
 
+/// Launch for the warp-specialized pipelined query-parallel backward: same
+/// grid as kernel A, the wider block, the ring-sized shared allocation.
+pub fn flash_backward_q_pipelined_config(
+    batches: usize,
+    sequence_length: usize,
+    heads: usize,
+) -> LaunchConfig {
+    let base = flash_backward_q_config(batches, sequence_length, heads);
+    LaunchConfig {
+        grid_dim: base.grid_dim,
+        block_dim: (FLASH_BACKWARD_Q_PIPELINED_BLOCK_THREADS, 1, 1),
+        shared_mem_bytes: FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES,
+    }
+}
+
+/// Launch for the warp-specialized pipelined key-parallel backward.
+pub fn flash_backward_kv_pipelined_config(
+    batches: usize,
+    sequence_length: usize,
+    heads: usize,
+) -> LaunchConfig {
+    let base = flash_backward_kv_config(batches, sequence_length, heads);
+    LaunchConfig {
+        grid_dim: base.grid_dim,
+        block_dim: (FLASH_BACKWARD_KV_PIPELINED_BLOCK_THREADS, 1, 1),
+        shared_mem_bytes: FLASH_BACKWARD_KV_PIPELINED_SMEM_BYTES,
+    }
+}
+
 /// Launch for the warp-specialized pipelined forward: same grid, the wider
 /// block, the ring-sized dynamic shared allocation.
 pub fn flash_pipelined_config(
@@ -203,73 +250,13 @@ pub fn flash_persistent_config(
     }
 }
 
-/// Encode a `SWIZZLE_128B` tensor map loading swizzled `[TILE, 64]` bf16
-/// subtiles from one `[T, 128]` head panel of a packed `[planes, T, 128]`
-/// staging buffer (`planes = B*H`); the kernel selects the panel via the third
-/// coordinate and the HD subtile (columns 0..64 or 64..128) via the first.
-fn encode_bf16_head_tma_map(
-    stream: &CudaStream,
-    base: u64,
-    sequence_length: usize,
-    planes: usize,
-) -> Result<DeviceBuffer<u64>, Box<dyn Error>> {
-    use cuda_core::sys::{
-        CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-        CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B, cuTensorMapEncodeTiled,
-        cudaError_enum_CUDA_SUCCESS,
-    };
-
-    assert!(sequence_length.is_multiple_of(FLASH_TILE));
-    let mut tensor_map = MaybeUninit::<cuda_core::sys::CUtensorMap>::uninit();
-    let global_dimensions = [FLASH_HD as u64, sequence_length as u64, planes as u64];
-    let global_strides = [
-        (FLASH_HD * 2) as u64,
-        (sequence_length * FLASH_HD * 2) as u64,
-    ];
-    let box_dimensions = [FLASH_SUBTILE_HD as u32, FLASH_TILE as u32, 1u32];
-    let element_strides = [1u32, 1u32, 1u32];
-    let status = unsafe {
-        cuTensorMapEncodeTiled(
-            tensor_map.as_mut_ptr(),
-            CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            3,
-            base as *mut std::ffi::c_void,
-            global_dimensions.as_ptr(),
-            global_strides.as_ptr(),
-            box_dimensions.as_ptr(),
-            element_strides.as_ptr(),
-            CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B,
-            CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-        )
-    };
-    if status != cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuTensorMapEncodeTiled(bf16 head panel) failed: {status:?}").into());
-    }
-    let tensor_map = unsafe { tensor_map.assume_init() };
-    Ok(DeviceBuffer::from_host(stream, &tensor_map.opaque)?)
-}
-
-/// Tensor map over one packed-bf16 `[planes, T, 64]` staging buffer.
-///
-/// Does not borrow the buffer: the constructor is `unsafe` and the caller
-/// promises the mapped allocation outlives every launch consuming the map.
-pub struct FlashHeadTmaMap {
-    descriptor: DeviceBuffer<u64>,
-}
-
-impl FlashHeadTmaMap {
-    pub fn as_ptr(&self) -> *const TmaDescriptor {
-        self.descriptor.cu_deviceptr() as *const TmaDescriptor
-    }
-}
+/// Tensor map over one packed-bf16 `[planes, T, 128]` staging buffer,
+/// encoded by kittens' layout-generic builder (`[FLASH_TILE, 64]` swizzled
+/// boxes, one per stacked HD subtile).
+pub type FlashHeadTmaMap = kittens::global::PanelMap;
 
 /// Build a head-panel tensor map over a packed-pair staging buffer holding
-/// `planes` panels of `[sequence_length, 64]` bf16 values.
+/// `planes` panels of `[sequence_length, 128]` bf16 values.
 ///
 /// # Safety
 ///
@@ -282,14 +269,14 @@ pub unsafe fn create_flash_head_tma_map(
     planes: usize,
 ) -> Result<FlashHeadTmaMap, Box<dyn Error>> {
     assert_eq!(buffer.len() * 2, planes * sequence_length * FLASH_HD);
-    Ok(FlashHeadTmaMap {
-        descriptor: encode_bf16_head_tma_map(
+    unsafe {
+        kittens::global::encode_bf16_panels::<FLASH_TILE, FLASH_HD>(
             stream,
             buffer.cu_deviceptr(),
             sequence_length,
             planes,
-        )?,
-    })
+        )
+    }
 }
 
 /// Raise a kernel's dynamic-shared-memory ceiling above the 48 KiB default.
@@ -311,49 +298,6 @@ fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dy
     Ok(())
 }
 
-/// What ptxas actually gave a loaded kernel. `registers` is per thread and
-/// `spill_bytes` is its local-memory frame — the direct read on whether a
-/// `.maxntid` (i.e. `#[launch_bounds]`) value is squeezing the allocator, which
-/// is invisible in the PTX because ptxas runs after it.
-pub struct FunctionProfile {
-    pub registers: i32,
-    pub spill_bytes: i32,
-    pub max_threads: i32,
-}
-
-fn function_attribute(function: &CudaFunction, attribute: u32) -> Result<i32, Box<dyn Error>> {
-    use cuda_core::sys::{cuFuncGetAttribute, cudaError_enum_CUDA_SUCCESS};
-    let mut value = 0i32;
-    let status = unsafe { cuFuncGetAttribute(&mut value, attribute, function.cu_function()) };
-    if status != cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuFuncGetAttribute({attribute}) failed: {status:?}").into());
-    }
-    Ok(value)
-}
-
-/// Read a loaded kernel's register / spill / `.maxntid` facts.
-pub fn function_profile(function: &CudaFunction) -> Result<FunctionProfile, Box<dyn Error>> {
-    use cuda_core::sys::{
-        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
-        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS,
-    };
-    Ok(FunctionProfile {
-        registers: function_attribute(
-            function,
-            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS,
-        )?,
-        spill_bytes: function_attribute(
-            function,
-            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
-        )?,
-        max_threads: function_attribute(
-            function,
-            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-        )?,
-    })
-}
-
 /// The tcgen05 attention kernels, loaded from a `flash.ptx` built by
 /// `src/bin/flash.rs` rather than from the calling binary's embedded
 /// artifact. The launchers mirror the `#[cuda_module]`-generated
@@ -363,7 +307,9 @@ pub struct Tcgen05Flash {
     forward_pipelined: CudaFunction,
     forward_persistent: CudaFunction,
     backward_q: CudaFunction,
+    backward_q_pipelined: CudaFunction,
     backward_kv: CudaFunction,
+    backward_kv_pipelined: CudaFunction,
     transpose_probe: CudaFunction,
     swizzle_probe: CudaFunction,
     exp2: CudaFunction,
@@ -384,20 +330,32 @@ impl Tcgen05Flash {
         let forward_pipelined = module.load_function("flash_forward_pipelined")?;
         let forward_persistent = module.load_function("flash_forward_persistent")?;
         let backward_q = module.load_function("flash_backward_q_tcgen05")?;
+        let backward_q_pipelined = module.load_function("flash_backward_q_pipelined")?;
         let backward_kv = module.load_function("flash_backward_kv_tcgen05")?;
+        let backward_kv_pipelined = module.load_function("flash_backward_kv_pipelined")?;
         let transpose_probe = module.load_function("transpose_b_probe")?;
         opt_in_dynamic_smem(&forward, FLASH_DYNAMIC_SMEM_BYTES)?;
         opt_in_dynamic_smem(&forward_pipelined, FLASH_PIPELINE_SMEM_BYTES)?;
         opt_in_dynamic_smem(&forward_persistent, FLASH_PERSISTENT_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_q, FLASH_BACKWARD_Q_SMEM_BYTES)?;
+        opt_in_dynamic_smem(
+            &backward_q_pipelined,
+            FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES,
+        )?;
         opt_in_dynamic_smem(&backward_kv, FLASH_BACKWARD_KV_SMEM_BYTES)?;
+        opt_in_dynamic_smem(
+            &backward_kv_pipelined,
+            FLASH_BACKWARD_KV_PIPELINED_SMEM_BYTES,
+        )?;
         opt_in_dynamic_smem(&transpose_probe, PROBE_DYNAMIC_SMEM_BYTES)?;
         Ok(Self {
             forward,
             forward_pipelined,
             forward_persistent,
             backward_q,
+            backward_q_pipelined,
             backward_kv,
+            backward_kv_pipelined,
             transpose_probe,
             swizzle_probe: module.load_function("swizzle_probe")?,
             exp2: module.load_function("software_exp2")?,
@@ -415,13 +373,15 @@ impl Tcgen05Flash {
 
     /// The launched kernels paired with their names, for reporting what ptxas
     /// gave each one.
-    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 5] {
+    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 7] {
         [
             ("forward sync", &self.forward),
             ("forward pipelined", &self.forward_pipelined),
             ("forward persistent", &self.forward_persistent),
             ("backward q", &self.backward_q),
+            ("backward q pipelined", &self.backward_q_pipelined),
             ("backward kv", &self.backward_kv),
+            ("backward kv pipelined", &self.backward_kv_pipelined),
         ]
     }
 
@@ -570,6 +530,80 @@ impl Tcgen05Flash {
         heads: u32,
         dq: &mut DeviceBuffer<f32>,
     ) -> Result<(), DriverError> {
+        unsafe {
+            self.launch_backward_q(
+                &self.backward_q,
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                logsumexp,
+                dot,
+                sequence_length,
+                heads,
+                dq,
+            )
+        }
+    }
+
+    /// The warp-specialized pipelined query-parallel backward: identical
+    /// contract to [`Self::backward_q`], launched with
+    /// `flash_backward_q_pipelined_config`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::backward_q`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn backward_q_pipelined(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &DeviceBuffer<f32>,
+        dot: &DeviceBuffer<f32>,
+        sequence_length: u32,
+        heads: u32,
+        dq: &mut DeviceBuffer<f32>,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            self.launch_backward_q(
+                &self.backward_q_pipelined,
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                logsumexp,
+                dot,
+                sequence_length,
+                heads,
+                dq,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_backward_q(
+        &self,
+        function: &CudaFunction,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &DeviceBuffer<f32>,
+        dot: &DeviceBuffer<f32>,
+        sequence_length: u32,
+        heads: u32,
+        dq: &mut DeviceBuffer<f32>,
+    ) -> Result<(), DriverError> {
         let mut q_tma = q_tma;
         let mut k_tma = k_tma;
         let mut v_tma = v_tma;
@@ -591,7 +625,7 @@ impl Tcgen05Flash {
         cuda_host::push_kernel_device_slice(&mut args, &mut dq_ptr, &mut dq_len);
         unsafe {
             cuda_core::launch_kernel_on_stream(
-                &self.backward_q,
+                function,
                 config.grid_dim,
                 config.block_dim,
                 config.shared_mem_bytes,
@@ -612,6 +646,84 @@ impl Tcgen05Flash {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn backward_kv(
         &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &DeviceBuffer<f32>,
+        dot: &DeviceBuffer<f32>,
+        sequence_length: u32,
+        heads: u32,
+        dk: &mut DeviceBuffer<f32>,
+        dv: &mut DeviceBuffer<f32>,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            self.launch_backward_kv(
+                &self.backward_kv,
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                logsumexp,
+                dot,
+                sequence_length,
+                heads,
+                dk,
+                dv,
+            )
+        }
+    }
+
+    /// The warp-specialized pipelined key-parallel backward: identical
+    /// contract to [`Self::backward_kv`], launched with
+    /// `flash_backward_kv_pipelined_config`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::backward_kv`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn backward_kv_pipelined(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &DeviceBuffer<f32>,
+        dot: &DeviceBuffer<f32>,
+        sequence_length: u32,
+        heads: u32,
+        dk: &mut DeviceBuffer<f32>,
+        dv: &mut DeviceBuffer<f32>,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            self.launch_backward_kv(
+                &self.backward_kv_pipelined,
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                logsumexp,
+                dot,
+                sequence_length,
+                heads,
+                dk,
+                dv,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_backward_kv(
+        &self,
+        function: &CudaFunction,
         stream: &CudaStream,
         config: LaunchConfig,
         q_tma: *const TmaDescriptor,
@@ -648,7 +760,7 @@ impl Tcgen05Flash {
         cuda_host::push_kernel_device_slice(&mut args, &mut dv_ptr, &mut dv_len);
         unsafe {
             cuda_core::launch_kernel_on_stream(
-                &self.backward_kv,
+                function,
                 config.grid_dim,
                 config.block_dim,
                 config.shared_mem_bytes,

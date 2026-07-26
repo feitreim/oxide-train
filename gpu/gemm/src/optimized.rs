@@ -9,20 +9,6 @@ pub mod optimized_kernels {
     use super::*;
 
     #[inline(always)]
-    fn build_smem_descriptor(
-        address: u64,
-        leading_bytes: u32,
-        stride_bytes: u32,
-        swizzle: u8,
-    ) -> u64 {
-        ((address >> 4) & 0x3fff)
-            | ((((leading_bytes >> 4) & 0x3fff) as u64) << 16)
-            | ((((stride_bytes >> 4) & 0x3fff) as u64) << 32)
-            | (1u64 << 46)
-            | ((swizzle as u64) << 61)
-    }
-
-    #[inline(always)]
     unsafe fn store_output_pair(
         output: *mut u32,
         packed_index: usize,
@@ -52,22 +38,13 @@ pub mod optimized_kernels {
         }
     }
 
-    /// MN elements in one 128-byte-row `SWIZZLE_128B` subtile, and the bytes
-    /// one such subtile occupies over a `TC_BK`-deep stage. An MN-major
-    /// operand's 128 MN values do not fit one swizzled row (the swizzle caps a
-    /// TMA box at 128 bytes), so it arrives as two stacked subtiles and the
-    /// smem descriptor's LBO jumps between them — see `src/bin/transpose_probe.rs`.
-    const SUBTILE_MN: i32 = 64;
-    const SUBTILE_BYTES: u64 = (TC_BK * 64 * 2) as u64;
-
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn produce_stage(
         smem_a: *mut u8,
         smem_b: *mut u8,
-        tma_bar: *const Barrier,
-        tma_bar_mut: *mut Barrier,
-        mma_bar: *const Barrier,
+        tma_sem: Semaphore,
+        mma_sem: Semaphore,
         parity: u32,
         k_offset: i32,
         m_offset: i32,
@@ -80,46 +57,25 @@ pub mod optimized_kernels {
         transposed: bool,
     ) {
         unsafe {
-            while !mbarrier_try_wait_parity(mma_bar, parity) {}
+            mma_sem.wait(parity);
             if lane_zero {
                 if leader_cta {
-                    mbarrier_arrive_expect_tx(tma_bar, 1, (128 * 64 * 2) * 4);
+                    tma_sem.expect_tx((128 * 64 * 2) * 4);
                 }
-                let aliased = ((tma_bar_mut as u32) & 0xFEFFFFF8) as *mut Barrier;
+                let multicast = tma_sem.multicast_alias();
                 if transposed {
                     // MN-major operands: the map's fast axis is MN, so the
-                    // coordinates swap and each 128-MN tile is two subtile
-                    // loads. Same transaction bytes, twice the descriptors.
-                    let sub = SUBTILE_BYTES as usize;
-                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
-                        smem_a, a_tma, m_offset, k_offset, aliased, self_mask,
-                    );
-                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
-                        smem_a.add(sub),
-                        a_tma,
-                        m_offset + SUBTILE_MN,
-                        k_offset,
-                        aliased,
-                        self_mask,
-                    );
-                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
-                        smem_b, b_tma, n_offset, k_offset, aliased, self_mask,
-                    );
-                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
-                        smem_b.add(sub),
-                        b_tma,
-                        n_offset + SUBTILE_MN,
-                        k_offset,
-                        aliased,
-                        self_mask,
-                    );
+                    // coordinates swap and each 128-MN stage is one box per
+                    // stacked subtile. Same transaction bytes, twice the boxes.
+                    let a = MnStage::from_raw(smem_a);
+                    let b = MnStage::from_raw(smem_b);
+                    a.tma_load_2d_multicast_cg2(a_tma, m_offset, k_offset, multicast, self_mask);
+                    b.tma_load_2d_multicast_cg2(b_tma, n_offset, k_offset, multicast, self_mask);
                 } else {
-                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
-                        smem_a, a_tma, k_offset, m_offset, aliased, self_mask,
-                    );
-                    cp_async_bulk_tensor_2d_g2s_multicast_cg2(
-                        smem_b, b_tma, k_offset, n_offset, aliased, self_mask,
-                    );
+                    let a = KStage::from_raw(smem_a);
+                    let b = KStage::from_raw(smem_b);
+                    a.tma_load_2d_multicast_cg2(a_tma, k_offset, m_offset, multicast, self_mask);
+                    b.tma_load_2d_multicast_cg2(b_tma, k_offset, n_offset, multicast, self_mask);
                 }
             }
         }
@@ -128,10 +84,10 @@ pub mod optimized_kernels {
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn consume_stage(
-        smem_a: u64,
-        smem_b: u64,
-        tma_bar: *const Barrier,
-        mma_bar: *mut Barrier,
+        smem_a: *mut u8,
+        smem_b: *mut u8,
+        tma_sem: Semaphore,
+        mma_sem: Semaphore,
         parity: u32,
         tmem: u32,
         instruction: u32,
@@ -142,34 +98,30 @@ pub mod optimized_kernels {
     ) {
         unsafe {
             if leader_cta {
-                while !mbarrier_try_wait_parity(tma_bar, parity) {}
+                tma_sem.wait(parity);
                 if lane_zero {
-                    // K-major: a K=16 chunk is 32 bytes along a 128-byte row,
-                    // and LBO steps the two core matrices inside it.
-                    // MN-major: a K=16 chunk is 16 rows of the subtile, and
-                    // LBO jumps to the subtile holding MN 64..128.
-                    let (chunk_step, leading_bytes) = if transposed {
-                        (16 * 128, SUBTILE_BYTES as u32)
+                    // The walk is value-level so both layouts share one issue
+                    // loop — a select, not a duplicated MMA chain (the
+                    // hand-written kernel's schedule, kept deliberately).
+                    let (a, b) = if transposed {
+                        (
+                            MnStage::from_raw(smem_a).mn_walk(),
+                            MnStage::from_raw(smem_b).mn_walk(),
+                        )
                     } else {
-                        (32, 16)
+                        (
+                            KStage::from_raw(smem_a).k_walk(),
+                            KStage::from_raw(smem_b).k_walk(),
+                        )
                     };
-                    let mut inner = 0u32;
-                    while inner < 4 {
-                        let offset = (inner * chunk_step) as u64;
-                        tcgen05_mma_f16_cg2(
-                            tmem,
-                            build_smem_descriptor(smem_a + offset, leading_bytes, 1024, 2),
-                            build_smem_descriptor(smem_b + offset, leading_bytes, 1024, 2),
-                            instruction,
-                            accumulate_stage || inner > 0,
-                        );
-                        inner += 1;
-                    }
-                    tcgen05_commit_multicast_cg2(mma_bar as *mut u64, 0b11);
+                    mma::mma_walk_cg2::<4>(tmem, a, b, instruction, accumulate_stage);
+                    mma::commit_multicast_cg2(mma_sem, CTA_MASK_PAIR);
                 }
             }
         }
     }
+
+    const CTA_MASK_PAIR: u16 = 0b11;
 
     /// B200 GEMM: cta_group::2 pair-UMMA + four-stage TMA pipeline.
     ///
@@ -220,23 +172,14 @@ pub mod optimized_kernels {
             static mut TMEM_ADDR: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
             static mut TILE_INFO: SharedArray<u32, 4, 4> = SharedArray::UNINIT;
 
-            static mut TMA_BAR0: Barrier = Barrier::UNINIT;
-            static mut TMA_BAR1: Barrier = Barrier::UNINIT;
-            static mut TMA_BAR2: Barrier = Barrier::UNINIT;
-            static mut TMA_BAR3: Barrier = Barrier::UNINIT;
-            static mut MMA_BAR0: Barrier = Barrier::UNINIT;
-            static mut MMA_BAR1: Barrier = Barrier::UNINIT;
-            static mut MMA_BAR2: Barrier = Barrier::UNINIT;
-            static mut MMA_BAR3: Barrier = Barrier::UNINIT;
-            static mut ACCUM_FULL0: Barrier = Barrier::UNINIT;
-            static mut ACCUM_FULL1: Barrier = Barrier::UNINIT;
-            static mut ACCUM_EMPTY0: Barrier = Barrier::UNINIT;
-            static mut ACCUM_EMPTY1: Barrier = Barrier::UNINIT;
+            static mut TMA_BARS: SharedArray<u64, 4, 8> = SharedArray::UNINIT;
+            static mut MMA_BARS: SharedArray<u64, 4, 8> = SharedArray::UNINIT;
+            static mut ACCUM_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
+            static mut ACCUM_EMPTY: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
             static mut TILE_READY: Barrier = Barrier::UNINIT;
 
             const TMA_WARP: u32 = 4;
             const MMA_WARP: u32 = 5;
-            const CTA_MASK_PAIR: u16 = 0b11;
 
             let tid = thread::threadIdx_x();
             let warp_id = warp::warp_id();
@@ -245,29 +188,29 @@ pub mod optimized_kernels {
             let leader_cta = rank == 0;
             let self_mask = 1u16 << rank;
 
+            let tma_ring = SemaphoreRing::<4>::attach(&raw mut TMA_BARS as *mut Barrier);
+            let mma_ring = SemaphoreRing::<4>::attach(&raw mut MMA_BARS as *mut Barrier);
+            let accum_full = SemaphoreRing::<2>::attach(&raw mut ACCUM_FULL as *mut Barrier);
+            let accum_empty = SemaphoreRing::<2>::attach(&raw mut ACCUM_EMPTY as *mut Barrier);
+            let tile_ready = Semaphore::attach(&raw mut TILE_READY);
+
             if tid == 0 {
-                mbarrier_init(&raw mut TMA_BAR0, 1);
-                mbarrier_init(&raw mut TMA_BAR1, 1);
-                mbarrier_init(&raw mut TMA_BAR2, 1);
-                mbarrier_init(&raw mut TMA_BAR3, 1);
-                mbarrier_init(&raw mut MMA_BAR0, 1);
-                mbarrier_init(&raw mut MMA_BAR1, 1);
-                mbarrier_init(&raw mut MMA_BAR2, 1);
-                mbarrier_init(&raw mut MMA_BAR3, 1);
-                mbarrier_init(&raw mut ACCUM_FULL0, 1);
-                mbarrier_init(&raw mut ACCUM_FULL1, 1);
-                mbarrier_init(&raw mut ACCUM_EMPTY0, 256);
-                mbarrier_init(&raw mut ACCUM_EMPTY1, 256);
-                mbarrier_init(&raw mut TILE_READY, 1);
+                tma_ring.init_all(1);
+                mma_ring.init_all(1);
+                accum_full.init_all(1);
+                accum_empty.init_all(256);
+                tile_ready.init(1);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
 
+            // Pre-arrive every MMA barrier once so the producer's first ring
+            // cycle finds its virgin slots "released" at parity 0.
             if tid == 0 {
-                mbarrier_arrive(&raw const MMA_BAR0);
-                mbarrier_arrive(&raw const MMA_BAR1);
-                mbarrier_arrive(&raw const MMA_BAR2);
-                mbarrier_arrive(&raw const MMA_BAR3);
+                mma_ring.sem(0).arrive();
+                mma_ring.sem(1).arrive();
+                mma_ring.sem(2).arrive();
+                mma_ring.sem(3).arrive();
             }
             thread::sync_threads();
 
@@ -323,7 +266,7 @@ pub mod optimized_kernels {
                             *(&raw mut TILE_INFO as *mut u32).add(0) = tile_m;
                             *(&raw mut TILE_INFO as *mut u32).add(1) = tile_n;
                             *(&raw mut TILE_INFO as *mut u32).add(2) = 1;
-                            mbarrier_arrive(&raw const TILE_READY);
+                            tile_ready.arrive();
                         }
 
                         let m_offset = (tile_m * 256 + rank * 128) as i32;
@@ -334,9 +277,8 @@ pub mod optimized_kernels {
                             produce_stage(
                                 &raw mut SMEM_A0 as *mut u8,
                                 &raw mut SMEM_B0 as *mut u8,
-                                &raw const TMA_BAR0,
-                                &raw mut TMA_BAR0,
-                                &raw const MMA_BAR0,
+                                tma_ring.sem(0),
+                                mma_ring.sem(0),
                                 parity,
                                 (k_idx * 64) as i32,
                                 m_offset,
@@ -351,9 +293,8 @@ pub mod optimized_kernels {
                             produce_stage(
                                 &raw mut SMEM_A1 as *mut u8,
                                 &raw mut SMEM_B1 as *mut u8,
-                                &raw const TMA_BAR1,
-                                &raw mut TMA_BAR1,
-                                &raw const MMA_BAR1,
+                                tma_ring.sem(1),
+                                mma_ring.sem(1),
                                 parity,
                                 ((k_idx + 1) * 64) as i32,
                                 m_offset,
@@ -368,9 +309,8 @@ pub mod optimized_kernels {
                             produce_stage(
                                 &raw mut SMEM_A2 as *mut u8,
                                 &raw mut SMEM_B2 as *mut u8,
-                                &raw const TMA_BAR2,
-                                &raw mut TMA_BAR2,
-                                &raw const MMA_BAR2,
+                                tma_ring.sem(2),
+                                mma_ring.sem(2),
                                 parity,
                                 ((k_idx + 2) * 64) as i32,
                                 m_offset,
@@ -385,9 +325,8 @@ pub mod optimized_kernels {
                             produce_stage(
                                 &raw mut SMEM_A3 as *mut u8,
                                 &raw mut SMEM_B3 as *mut u8,
-                                &raw const TMA_BAR3,
-                                &raw mut TMA_BAR3,
-                                &raw const MMA_BAR3,
+                                tma_ring.sem(3),
+                                mma_ring.sem(3),
                                 parity,
                                 ((k_idx + 3) * 64) as i32,
                                 m_offset,
@@ -408,7 +347,7 @@ pub mod optimized_kernels {
                     // MMA and epilogue warps drain and exit.
                     if lane_zero {
                         *(&raw mut TILE_INFO as *mut u32).add(2) = 0;
-                        mbarrier_arrive(&raw const TILE_READY);
+                        tile_ready.arrive();
                     }
                 }
             }
@@ -418,7 +357,7 @@ pub mod optimized_kernels {
                 let mut tile_iter = 0u32;
                 let mut tile_parity = 0u32;
                 loop {
-                    while !mbarrier_try_wait_parity(&raw const TILE_READY, tile_parity) {}
+                    tile_ready.wait(tile_parity);
                     tile_parity ^= 1;
                     if *(&raw const TILE_INFO as *const u32).add(2) == 0 {
                         break;
@@ -427,23 +366,27 @@ pub mod optimized_kernels {
                     let accum_stage = tile_iter & 1;
                     let tmem_offset = accum_stage * 256;
                     if leader_cta && tile_iter >= 2 {
+                        // Branch-selected literal stages keep the barrier
+                        // addresses compile-time immediates, exactly like the
+                        // hand-written kernel — a ring-computed address here
+                        // perturbs the ptxas schedule.
                         let parity = ((tile_iter - 2) / 2) & 1;
                         let empty = if accum_stage == 0 {
-                            &raw const ACCUM_EMPTY0
+                            accum_empty.sem(0)
                         } else {
-                            &raw const ACCUM_EMPTY1
+                            accum_empty.sem(1)
                         };
-                        while !mbarrier_try_wait_parity(empty, parity) {}
+                        empty.wait(parity);
                     }
 
                     let mut k_idx = 0u32;
                     while k_idx < k_iters {
                         let parity = ((tile_iter * k_iters + k_idx) >> 2) & 1;
                         consume_stage(
-                            &raw const SMEM_A0 as u64,
-                            &raw const SMEM_B0 as u64,
-                            &raw const TMA_BAR0,
-                            &raw mut MMA_BAR0,
+                            &raw mut SMEM_A0 as *mut u8,
+                            &raw mut SMEM_B0 as *mut u8,
+                            tma_ring.sem(0),
+                            mma_ring.sem(0),
                             parity,
                             tmem + tmem_offset,
                             instruction,
@@ -453,10 +396,10 @@ pub mod optimized_kernels {
                             transposed,
                         );
                         consume_stage(
-                            &raw const SMEM_A1 as u64,
-                            &raw const SMEM_B1 as u64,
-                            &raw const TMA_BAR1,
-                            &raw mut MMA_BAR1,
+                            &raw mut SMEM_A1 as *mut u8,
+                            &raw mut SMEM_B1 as *mut u8,
+                            tma_ring.sem(1),
+                            mma_ring.sem(1),
                             parity,
                             tmem + tmem_offset,
                             instruction,
@@ -466,10 +409,10 @@ pub mod optimized_kernels {
                             transposed,
                         );
                         consume_stage(
-                            &raw const SMEM_A2 as u64,
-                            &raw const SMEM_B2 as u64,
-                            &raw const TMA_BAR2,
-                            &raw mut MMA_BAR2,
+                            &raw mut SMEM_A2 as *mut u8,
+                            &raw mut SMEM_B2 as *mut u8,
+                            tma_ring.sem(2),
+                            mma_ring.sem(2),
                             parity,
                             tmem + tmem_offset,
                             instruction,
@@ -479,10 +422,10 @@ pub mod optimized_kernels {
                             transposed,
                         );
                         consume_stage(
-                            &raw const SMEM_A3 as u64,
-                            &raw const SMEM_B3 as u64,
-                            &raw const TMA_BAR3,
-                            &raw mut MMA_BAR3,
+                            &raw mut SMEM_A3 as *mut u8,
+                            &raw mut SMEM_B3 as *mut u8,
+                            tma_ring.sem(3),
+                            mma_ring.sem(3),
                             parity,
                             tmem + tmem_offset,
                             instruction,
@@ -495,11 +438,11 @@ pub mod optimized_kernels {
                     }
                     if leader_cta && lane_zero {
                         let full = if accum_stage == 0 {
-                            &raw mut ACCUM_FULL0
+                            accum_full.sem(0)
                         } else {
-                            &raw mut ACCUM_FULL1
+                            accum_full.sem(1)
                         };
-                        tcgen05_commit_multicast_cg2(full as *mut u64, CTA_MASK_PAIR);
+                        mma::commit_multicast_cg2(full, CTA_MASK_PAIR);
                     }
                     tile_iter += 1;
                 }
@@ -507,10 +450,13 @@ pub mod optimized_kernels {
             }
 
             if warp_id < 4 {
+                let accumulator = TmemTile::<128, 256>::from_raw(tmem);
                 let mut tile_iter = 0u32;
                 let mut tile_parity = 0u32;
-                let leader_empty0 = cluster::map_shared_rank(&raw const ACCUM_EMPTY0, 0) as u64;
-                let leader_empty1 = cluster::map_shared_rank(&raw const ACCUM_EMPTY1, 0) as u64;
+                let leader_empty0 =
+                    cluster::map_shared_rank(accum_empty.sem(0).raw() as *const Barrier, 0) as u64;
+                let leader_empty1 =
+                    cluster::map_shared_rank(accum_empty.sem(1).raw() as *const Barrier, 0) as u64;
                 let warp_row = (warp_id * 32) as usize;
                 let row_in_8 = (lane_id % 8) as usize;
                 let matrix_offset = if (8..16).contains(&lane_id) {
@@ -520,7 +466,7 @@ pub mod optimized_kernels {
                 };
 
                 loop {
-                    while !mbarrier_try_wait_parity(&raw const TILE_READY, tile_parity) {}
+                    tile_ready.wait(tile_parity);
                     tile_parity ^= 1;
                     if *(&raw const TILE_INFO as *const u32).add(2) == 0 {
                         break;
@@ -528,14 +474,14 @@ pub mod optimized_kernels {
                     let tile_m = *(&raw const TILE_INFO as *const u32);
                     let tile_n = *(&raw const TILE_INFO as *const u32).add(1);
                     let accum_stage = tile_iter & 1;
-                    let tmem_offset = accum_stage * 256;
+                    let stage_acc = accumulator.columns_right(accum_stage * 256);
                     let full_parity = (tile_iter / 2) & 1;
                     let full = if accum_stage == 0 {
-                        &raw const ACCUM_FULL0
+                        accum_full.sem(0)
                     } else {
-                        &raw const ACCUM_FULL1
+                        accum_full.sem(1)
                     };
-                    while !mbarrier_try_wait_parity(full, full_parity) {}
+                    full.wait(full_parity);
 
                     let mut row_block = 0u32;
                     while row_block < 2 {
@@ -543,21 +489,7 @@ pub mod optimized_kernels {
                         let mut column_block = 0u32;
                         while column_block < 16 {
                             let column = (column_block * 16) as usize;
-                            let low = tcgen05_ld_16x256b_pure(
-                                tmem
-                                    + tmem_offset
-                                    + (tmem_row << 16)
-                                    + column as u32,
-                            );
-                            tcgen05_load_wait();
-                            let high = tcgen05_ld_16x256b_pure(
-                                tmem
-                                    + tmem_offset
-                                    + (tmem_row << 16)
-                                    + column as u32
-                                    + 8,
-                            );
-                            tcgen05_load_wait();
+                            let (low, high) = stage_acc.fragment(tmem_row, column as u32);
 
                             let out_row =
                                 warp_row + row_block as usize * 16 + row_in_8;
@@ -608,9 +540,9 @@ pub mod optimized_kernels {
 
                     if leader_cta {
                         if accum_stage == 0 {
-                            mbarrier_arrive(&raw const ACCUM_EMPTY0);
+                            accum_empty.sem(0).arrive();
                         } else {
-                            mbarrier_arrive(&raw const ACCUM_EMPTY1);
+                            accum_empty.sem(1).arrive();
                         }
                     } else if accum_stage == 0 {
                         mbarrier_arrive_cluster(leader_empty0);
@@ -626,19 +558,11 @@ pub mod optimized_kernels {
                 tcgen05_dealloc_cg2(tmem, 512);
             }
             if tid == 0 {
-                mbarrier_inval(&raw mut TMA_BAR0);
-                mbarrier_inval(&raw mut TMA_BAR1);
-                mbarrier_inval(&raw mut TMA_BAR2);
-                mbarrier_inval(&raw mut TMA_BAR3);
-                mbarrier_inval(&raw mut MMA_BAR0);
-                mbarrier_inval(&raw mut MMA_BAR1);
-                mbarrier_inval(&raw mut MMA_BAR2);
-                mbarrier_inval(&raw mut MMA_BAR3);
-                mbarrier_inval(&raw mut ACCUM_FULL0);
-                mbarrier_inval(&raw mut ACCUM_FULL1);
-                mbarrier_inval(&raw mut ACCUM_EMPTY0);
-                mbarrier_inval(&raw mut ACCUM_EMPTY1);
-                mbarrier_inval(&raw mut TILE_READY);
+                tma_ring.inval_all();
+                mma_ring.inval_all();
+                accum_full.inval_all();
+                accum_empty.inval_all();
+                tile_ready.inval();
             }
         }
     }

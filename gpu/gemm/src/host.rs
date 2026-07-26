@@ -301,6 +301,11 @@ impl Tcgen05Gemm {
         })
     }
 
+    /// The loaded kernels, named for `bench_util::enforce_kernel_budgets`.
+    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 1] {
+        [("gemm_tcgen05_bf16_optimized", &self.optimized)]
+    }
+
     /// Blackwell bf16 `C = A B^T`; see the kernel for the full contract.
     ///
     /// # Safety

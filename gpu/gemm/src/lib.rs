@@ -18,23 +18,22 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use cuda_device::barrier::{
-    Barrier, fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_cluster,
-    mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_inval, mbarrier_try_wait_parity,
-};
+use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta, mbarrier_arrive_cluster};
 use cuda_device::cluster;
 use cuda_device::shared::SharedArray;
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    cvt_f32x2_bf16x2, tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_commit_multicast_cg2,
-    tcgen05_commit_shared_cluster, tcgen05_dealloc, tcgen05_dealloc_cg2, tcgen05_ld_16x256b_pure,
-    tcgen05_load_wait, tcgen05_mma_f16, tcgen05_mma_f16_cg2, tcgen05_relinquish_alloc_permit_cg2,
+    cvt_f32x2_bf16x2, tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_dealloc, tcgen05_dealloc_cg2,
+    tcgen05_relinquish_alloc_permit_cg2,
 };
-use cuda_device::tma::{
-    TmaDescriptor, cp_async_bulk_tensor_2d_g2s, cp_async_bulk_tensor_2d_g2s_multicast_cg2,
-};
-use cuda_device::{DisjointSlice, cluster_launch, kernel, ptx_asm, thread, warp};
+use cuda_device::tma::TmaDescriptor;
+use cuda_device::{DisjointSlice, cluster_launch, kernel, thread, warp};
 use cuda_host::cuda_module;
+use kittens::ldst::stmatrix_m8n8_x2;
+use kittens::mma;
+use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+use kittens::sync::{Semaphore, SemaphoreRing};
+use kittens::tmem::TmemTile;
 
 pub mod fp32;
 pub use fp32::{BK, BM, BN, TM, TN, launch_config as fp32_launch_config};
@@ -45,37 +44,17 @@ pub use host::{
     tcgen05_launch_config,
 };
 
-/// Stores two packed b16 matrix fragments without routing through the
-/// unresolved LLVM stmatrix declaration emitted by cuda-oxide b099f64.
-#[inline(always)]
-unsafe fn stmatrix_m8n8_x2(smem_ptr: *mut u8, r0: u32, r1: u32) {
-    unsafe {
-        ptx_asm!(
-            "{ .reg .u64 smem; cvta.to.shared.u64 smem, %0; stmatrix.sync.aligned.m8n8.x2.shared.b16 [smem], {%1, %2}; }",
-            in("l") smem_ptr as u64,
-            in("r") r0,
-            in("r") r1,
-            clobber("memory"),
-        );
-    }
-}
+/// A `[TC_TILE, TC_BK]` K-major bf16 operand stage: one swizzle subtile,
+/// four chained K=16 MMA chunks.
+type KStage = SharedTile<Bf16, TC_TILE, TC_BK, Swizzle128B>;
+
+/// The same stage bytes read MN-major (`transpose_a`/`transpose_b` set):
+/// `[TC_BK, TC_TILE]` as two stacked 64-wide subtiles, K along the rows.
+type MnStage = SharedTile<Bf16, TC_BK, TC_TILE, Swizzle128B>;
 
 #[cuda_module]
 pub mod kernels {
     use super::*;
-
-    #[inline(always)]
-    fn smem_descriptor(
-        smem_address: u64,
-        leading_bytes: u32,
-        stride_bytes: u32,
-        swizzle: u8,
-    ) -> u64 {
-        let address = (smem_address >> 4) & 0x3fff;
-        let leading = ((leading_bytes >> 4) & 0x3fff) as u64;
-        let stride = ((stride_bytes >> 4) & 0x3fff) as u64;
-        address | (leading << 16) | (stride << 32) | (1u64 << 46) | ((swizzle as u64) << 61)
-    }
 
     #[inline(always)]
     pub(super) fn bf16_to_f32(bits: u16) -> f32 {
@@ -117,9 +96,6 @@ pub mod kernels {
             static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
 
             const TILE_BYTES: u32 = (TC_TILE * TC_BK * 2) as u32;
-            const LEADING_BYTES: u32 = 16;
-            const STRIDE_BYTES: u32 = 1024;
-            const SWIZZLE_128B: u8 = 2;
 
             let tid = thread::threadIdx_x();
             let warp_id = warp::warp_id();
@@ -128,9 +104,14 @@ pub mod kernels {
             let tile_m = thread::blockIdx_x();
             let tile_n = thread::blockIdx_y();
 
+            let tma_sem = Semaphore::attach(&raw mut TMA_BARRIER);
+            let mma_sem = Semaphore::attach(&raw mut MMA_BARRIER);
+            let a_tile = KStage::from_raw(&raw mut SMEM_A as *mut u8);
+            let b_tile = KStage::from_raw(&raw mut SMEM_B as *mut u8);
+
             if is_leader {
-                mbarrier_init(&raw mut TMA_BARRIER, 1);
-                mbarrier_init(&raw mut MMA_BARRIER, 1);
+                tma_sem.init(1);
+                mma_sem.init(1);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
@@ -139,7 +120,8 @@ pub mod kernels {
                 tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
             }
             thread::sync_threads();
-            let tmem_address = *(&raw const TMEM_ADDRESS as *const u32);
+            let accumulator =
+                TmemTile::<TC_TILE, TC_TILE>::from_raw(*(&raw const TMEM_ADDRESS as *const u32));
 
             let instruction = Tcgen05InstructionDescriptor::builder()
                 .shape(Tcgen05MmaShape::M128_N128)
@@ -153,59 +135,22 @@ pub mod kernels {
                 let phase = k_tile & 1;
                 if is_leader {
                     let k_offset = (k_tile * TC_BK as u32) as i32;
-                    cp_async_bulk_tensor_2d_g2s(
-                        &raw mut SMEM_A as *mut u8,
-                        a_tma,
-                        k_offset,
-                        (tile_m * TC_TILE as u32) as i32,
-                        &raw mut TMA_BARRIER,
-                    );
-                    cp_async_bulk_tensor_2d_g2s(
-                        &raw mut SMEM_B as *mut u8,
-                        b_tma,
-                        k_offset,
-                        (tile_n * TC_TILE as u32) as i32,
-                        &raw mut TMA_BARRIER,
-                    );
-                    mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, TILE_BYTES * 2);
+                    a_tile.tma_load_2d(a_tma, k_offset, (tile_m * TC_TILE as u32) as i32, tma_sem);
+                    b_tile.tma_load_2d(b_tma, k_offset, (tile_n * TC_TILE as u32) as i32, tma_sem);
+                    tma_sem.expect_tx(TILE_BYTES * 2);
                 }
 
-                while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, phase) {}
+                tma_sem.wait(phase);
                 thread::sync_threads();
 
                 if is_leader {
-                    let a_base = &raw const SMEM_A as u64;
-                    let b_base = &raw const SMEM_B as u64;
-                    let mut mma = 0u32;
-                    while mma < 4 {
-                        let byte_offset = (mma * 32) as u64;
-                        let a_descriptor = smem_descriptor(
-                            a_base + byte_offset,
-                            LEADING_BYTES,
-                            STRIDE_BYTES,
-                            SWIZZLE_128B,
-                        );
-                        let b_descriptor = smem_descriptor(
-                            b_base + byte_offset,
-                            LEADING_BYTES,
-                            STRIDE_BYTES,
-                            SWIZZLE_128B,
-                        );
-                        // PTX names this the 16-bit floating-point MMA family;
-                        // the instruction descriptor selects bf16 inputs.
-                        tcgen05_mma_f16(
-                            tmem_address,
-                            a_descriptor,
-                            b_descriptor,
-                            instruction,
-                            k_tile > 0 || mma > 0,
-                        );
-                        mma += 1;
-                    }
-                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                    // PTX names this the 16-bit floating-point MMA family;
+                    // the instruction descriptor selects bf16 inputs.
+                    mma::mma_abt(accumulator.raw(), a_tile, b_tile, instruction, k_tile > 0);
+                    mma::commit(mma_sem);
                 }
 
-                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, phase) {}
+                mma_sem.wait(phase);
                 thread::sync_threads();
                 k_tile += 1;
             }
@@ -221,13 +166,7 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 8 {
                     let column = (column_block * 16) as usize;
-                    let low =
-                        tcgen05_ld_16x256b_pure(tmem_address + (tmem_row << 16) + column as u32);
-                    tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(
-                        tmem_address + (tmem_row << 16) + column as u32 + 8,
-                    );
-                    tcgen05_load_wait();
+                    let (low, high) = accumulator.fragment(tmem_row, column as u32);
 
                     let output_row = warp_row_base + row_block as usize * 16 + row_in_matrix;
                     let output_address = (&raw mut SMEM_OUT as *mut u8)
@@ -273,11 +212,11 @@ pub mod kernels {
 
             thread::sync_threads();
             if warp_id == 0 {
-                tcgen05_dealloc(tmem_address, 512);
+                tcgen05_dealloc(accumulator.raw(), 512);
             }
             if is_leader {
-                mbarrier_inval(&raw mut TMA_BARRIER);
-                mbarrier_inval(&raw mut MMA_BARRIER);
+                tma_sem.inval();
+                mma_sem.inval();
             }
         }
     }
@@ -304,9 +243,6 @@ pub mod kernels {
             static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
 
             const TILE_BYTES: u32 = (TC_TILE * TC_BK * 2) as u32;
-            const LEADING_BYTES: u32 = 16;
-            const STRIDE_BYTES: u32 = 1024;
-            const SWIZZLE_128B: u8 = 2;
 
             let tid = thread::threadIdx_x();
             let warp_id = warp::warp_id();
@@ -315,9 +251,14 @@ pub mod kernels {
             let tile_m = thread::blockIdx_x();
             let tile_n = thread::blockIdx_y();
 
+            let tma_sem = Semaphore::attach(&raw mut TMA_BARRIER);
+            let mma_sem = Semaphore::attach(&raw mut MMA_BARRIER);
+            let a_tile = KStage::from_raw(&raw mut SMEM_A as *mut u8);
+            let b_tile = KStage::from_raw(&raw mut SMEM_B as *mut u8);
+
             if is_leader {
-                mbarrier_init(&raw mut TMA_BARRIER, 1);
-                mbarrier_init(&raw mut MMA_BARRIER, 1);
+                tma_sem.init(1);
+                mma_sem.init(1);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
@@ -326,7 +267,8 @@ pub mod kernels {
                 tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
             }
             thread::sync_threads();
-            let tmem_address = *(&raw const TMEM_ADDRESS as *const u32);
+            let accumulator =
+                TmemTile::<TC_TILE, TC_TILE>::from_raw(*(&raw const TMEM_ADDRESS as *const u32));
 
             let instruction = Tcgen05InstructionDescriptor::builder()
                 .shape(Tcgen05MmaShape::M128_N128)
@@ -340,57 +282,20 @@ pub mod kernels {
                 let phase = k_tile & 1;
                 if is_leader {
                     let k_offset = (k_tile * TC_BK as u32) as i32;
-                    cp_async_bulk_tensor_2d_g2s(
-                        &raw mut SMEM_A as *mut u8,
-                        a_tma,
-                        k_offset,
-                        (tile_m * TC_TILE as u32) as i32,
-                        &raw mut TMA_BARRIER,
-                    );
-                    cp_async_bulk_tensor_2d_g2s(
-                        &raw mut SMEM_B as *mut u8,
-                        b_tma,
-                        k_offset,
-                        (tile_n * TC_TILE as u32) as i32,
-                        &raw mut TMA_BARRIER,
-                    );
-                    mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, TILE_BYTES * 2);
+                    a_tile.tma_load_2d(a_tma, k_offset, (tile_m * TC_TILE as u32) as i32, tma_sem);
+                    b_tile.tma_load_2d(b_tma, k_offset, (tile_n * TC_TILE as u32) as i32, tma_sem);
+                    tma_sem.expect_tx(TILE_BYTES * 2);
                 }
 
-                while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, phase) {}
+                tma_sem.wait(phase);
                 thread::sync_threads();
 
                 if is_leader {
-                    let a_base = &raw const SMEM_A as u64;
-                    let b_base = &raw const SMEM_B as u64;
-                    let mut mma = 0u32;
-                    while mma < 4 {
-                        let byte_offset = (mma * 32) as u64;
-                        let a_descriptor = smem_descriptor(
-                            a_base + byte_offset,
-                            LEADING_BYTES,
-                            STRIDE_BYTES,
-                            SWIZZLE_128B,
-                        );
-                        let b_descriptor = smem_descriptor(
-                            b_base + byte_offset,
-                            LEADING_BYTES,
-                            STRIDE_BYTES,
-                            SWIZZLE_128B,
-                        );
-                        tcgen05_mma_f16(
-                            tmem_address,
-                            a_descriptor,
-                            b_descriptor,
-                            instruction,
-                            k_tile > 0 || mma > 0,
-                        );
-                        mma += 1;
-                    }
-                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                    mma::mma_abt(accumulator.raw(), a_tile, b_tile, instruction, k_tile > 0);
+                    mma::commit(mma_sem);
                 }
 
-                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, phase) {}
+                mma_sem.wait(phase);
                 thread::sync_threads();
                 k_tile += 1;
             }
@@ -408,13 +313,7 @@ pub mod kernels {
                 let mut column_block = 0u32;
                 while column_block < 8 {
                     let column = (column_block * 16) as usize;
-                    let low =
-                        tcgen05_ld_16x256b_pure(tmem_address + (tmem_row << 16) + column as u32);
-                    tcgen05_load_wait();
-                    let high = tcgen05_ld_16x256b_pure(
-                        tmem_address + (tmem_row << 16) + column as u32 + 8,
-                    );
-                    tcgen05_load_wait();
+                    let (low, high) = accumulator.fragment(tmem_row, column as u32);
 
                     let output_row = warp_row_base + row_block as usize * 16 + row_in_matrix;
                     let output_address = (&raw mut SMEM_OUT as *mut u8)
@@ -464,11 +363,11 @@ pub mod kernels {
 
             thread::sync_threads();
             if warp_id == 0 {
-                tcgen05_dealloc(tmem_address, 512);
+                tcgen05_dealloc(accumulator.raw(), 512);
             }
             if is_leader {
-                mbarrier_inval(&raw mut TMA_BARRIER);
-                mbarrier_inval(&raw mut MMA_BARRIER);
+                tma_sem.inval();
+                mma_sem.inval();
             }
         }
     }

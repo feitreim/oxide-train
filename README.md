@@ -9,8 +9,7 @@ on wikipedia, going for max MFU on a single GPU, then going to expand to 8xB200.
 right now model size is sitting around 4billion total 1billion active
 parameters.
 
-
-
+Also includes a thunderkittens style abstraction for writing kernels that are fast and easy to write and understand.
 
 
 ## CPU-side development (local)

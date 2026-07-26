@@ -798,6 +798,272 @@ Each gated on tests; correctness before speed at every step.
        flash-attn` failed in legacy NVVM IR. It now pins the arch (matching
        `_prepare_flash_ptx`) and emits every `.ptx` it finds, not just the
        first.
+     - ✅ **7e17 kittens phases 0–5 (flash side)** (#61): `gpu/kittens`, the
+       ThunderKittens-style tile library — tcgen05/sm_100a only, no arch
+       dispatch — with every flash-attn and gemm kernel ported onto it, plus
+       the phase-0 ptxas budget gate. Phase 5's remaining scope is
+       kittens-first NEW kernels (fused `gpu/ops`, router/scatter #54/#55,
+       the `tcgen05.st` correction warpgroup). The crate ships no kernels and no `#[cuda_module]`:
+       everything is `#[inline(always)]` functions and Copy structs of
+       pointers + const generics, monomorphizing into the calling crate's
+       artifact, and nothing in it may touch libdevice-lowered math so it
+       stays linkable into pure-PTX artifacts like `flash.ptx`. Phase 0:
+       `bench_util::enforce_kernel_budgets` turns 7e16's printed ptxas table
+       into a regression gate (`KernelBudget` pins per kernel, hard error
+       past a pin, ratchet hint under it); all five flash kernels pinned.
+       Phase 1 (`shared`/`global`/`sync`): `SharedTile<E, R, C, S>` owns the
+       64-wide-subtile stacking, TMA box loads, SWIZZLE_128B chunk addresses
+       with the absolute base phase folded in, and the gemm-encoded operand
+       descriptors; `SemaphoreRing<N>` owns mbarrier phase-parity (including
+       the recycled-stage wait the loader warp hand-rolled);
+       `global::encode_bf16_panels` generalizes the host-side
+       `cuTensorMapEncodeTiled` call. The `flash_forward_pipelined` loader
+       warp rewrote onto these types — bit-identical: 224 regs/592 B
+       unchanged on first flight, parity green, bench at recorded levels.
+       Phase 2 (`reg`/`ldst`): `RegVec<N>`/`RegTile<S,V>` with the quad
+       shuffle reductions, the software `exp2`/`log2` (bit-exact copies;
+       hardware `ex2.approx` is exposed separately as `exp2_hw`, a measured
+       change not a refactor), and the fused `online_rescale`; `softmax_tile`
+       and the output/gradient drains ported. **The one surprise:** ptxas
+       allocates by instruction order, and the port — instruction-identical
+       by normalized PTX diff vs main for every kernel, local frames
+       unchanged to the byte — moved the persistent forward 206→238 regs
+       while dropping the pipelined 224→219. Two reformulation attempts
+       (206→212→238) established the sensitivity runs through scheduling,
+       not work, so the call went to measurement: occupancy is TMEM-pinned
+       at one CTA/SM regardless (238×192 threads ≈ 45.7K of the 64K register
+       file), and the B200 bench came back **233.5–234.7 TFLOP/s persistent
+       / 186.6–186.8 pipelined** vs 230.3 / 182.0 recorded at main, parity
+       green on every gate shape both directions. Pins re-set to the
+       measured allocation (238/219) rather than fighting the allocator's
+       ordering luck — "same SASS" holds at the instruction level, which is
+       the level the library controls. Local-dev fallout worth keeping: the
+       whole diff loop ran without a GPU (scratch harness bins that include
+       only `tcgen05.rs` emit `flash.ptx` locally via `cargo oxide build
+       --arch sm_100a` with redist `cuda.h` for `CUDA_TOOLKIT_PATH`), which
+       is what caught the identical-instructions fact two failed Modal gate
+       runs couldn't show.
+       **Phase 3, flash side** (`mma`/`tmem`, same day): `mma_abt`/`mma_ab`
+       are the two chained K=16 walk shapes the flash kernels proved out
+       (K-major `A·Bᵀ` with per-operand subtile strides — covering 7e15's
+       paired-A case — and the `transpose_b` band walk), extracted per
+       decision 15 rather than designed; gemm's `_cg2`/MN-major walks wait
+       for that port to be their working variant. `TmemTile` owns
+       `base + (row << 16) + column` addressing and the 16x256b
+       fragment-pair drain. Flash's `smem_descriptor` + three walk helpers
+       became one-call shims, eleven hand-written drain pairs became
+       `fragment()` calls, and TMEM segments are typed at definition
+       (`STmem`/`AccTmem`, `.raw()` only at the MMA-issue boundary). The
+       allocator moved again — sync 48→40, pipelined 219→**179** (−40),
+       persistent 238→239 — on an equal-or-smaller instruction stream,
+       frames unchanged. Bench: persistent **234.7** TFLOP/s, pipelined
+       **187.6**, backward 198.2 — all at or above main; the sync oracle
+       dipped 126→115 TFLOP/s with its 8-reg drop, tolerated as a
+       non-production reference. Kernel-crate net: −91 lines against a
+       1,326-line reusable library. Backward-kernel fragment writers stay
+       raw; phases 4 (`pipeline`) and 5 remain.
+       **Phase 3, gemm side** (2026-07-26): both gemm `#[cuda_module]`s
+       rewrote onto kittens, completing phase 3. Library additions, per
+       decision 15 extracted from the working kernel: 2d/multicast TMA tile
+       loads (`tma_load_2d[_multicast_cg2]` walking one box per subtile with
+       the leading coordinate lifted, which covers both the K-major
+       single-box and MN-major two-box cases; `Semaphore::multicast_alias`
+       owns the `& 0xFEFF_FFF8` cluster-alias idiom), and the cg2 MMA walk
+       — where the right abstraction turned out to be *value-level*:
+       `OperandWalk` erases K-major (LBO 16, 32-byte chunk step) vs MN-major
+       (LBO = `SUBTILE_BYTES`, 16-row chunk step) into runtime values
+       because gemm selects the layout by its `transposed` launch parameter,
+       and a typed two-arm branch (tried first) duplicated the MMA chain —
+       +59 instructions, ptxas 48→80 regs. The barrier statics merged into
+       `SemaphoreRing` storage with *literal* stage selection at per-tile
+       sites (branch over `sem(0)`/`sem(1)`), keeping every mbarrier address
+       a compile-time immediate like the hand-written kernel. ptxas budget
+       gate extended to gemm (`Tcgen05Gemm::kernels()`, pins in main.rs):
+       **48 regs / 0 spill, identical to the pre-port allocation** (measured
+       same-day both sides — the first time gemm's allocation was recorded).
+       Parity green in four gated runs, including the MN-major
+       weight-gradient gate. **Open regression, decision pending:** 4096³
+       bench holds packed store/accumulate at base levels (1102–1126 /
+       537–545 vs base 1103–1118 / 550–552 TFLOP/s) but f32-store reads
+       978–999 vs base's 1044–1054 (−6%) and f32-accum 506–517 vs 531–532
+       (−3%), stable across four samples and three source formulations. The
+       investigation eliminated every source-visible cause: allocation is
+       identical (48/0/maxntid 1024), the per-iteration drain/store loops
+       are instruction-identical, and the surviving epilogue PTX diff is 13
+       lines of per-tile scalar placement (LLVM block-layout choices, not
+       expressible from source). Mode-0 store is unaffected, so the cost
+       sits in how ptxas schedules the fp32-wide drain against residual PTX
+       placement — below source-level control. Decision (Finn): keep the
+       port and measure end-to-end. §10.1 BASELINE_REF=main profile, two
+       passes each side in one container: **572.4 → 579.9 ms mean full step
+       (+1.3%)**, attribution matching the micro-bench exactly — the
+       fp32-epilogue GEMM rows absorb it (forward experts gate_up 29.0→31.1
+       ms, down 13.3→14.0, backward experts rows +0.5–1.2 each) while
+       packed-mode lm_head rows are flat (6.36→6.27). Follow-ups if the
+       1.3% is ever worth reclaiming: SASS-level A/B of the fp32 drain
+       (nvdisasm in-container), or a toolkit bump re-rolling the ptxas
+       schedule — the gemm bench and 48-reg budget pin now track both.
+
+       **Phase 4** (2026-07-26): `kittens::pipeline` and the full forward
+       port. `pipeline::run(job, items)` is `flash_forward_persistent`'s
+       scaffold extracted verbatim — the static strided work-item loop with
+       the per-item barrier lifecycle (leader inval-then-init behind a proxy
+       fence and block sync, per-item tcgen05 fence pairing, trailing inval)
+       — behind a three-method `Job` trait (`init`/`inval`/`work`);
+       `tmem::alloc_block`/`dealloc_block` own the warp-0 TMEM lifecycle.
+       All three forward kernels now run on kittens semaphores end to end;
+       raw mbarrier math survives only in the backwards and the two probes
+       (phase 5). The port's discovery: every hand-threaded parity bit in
+       the forwards was already ring arithmetic — `warpgroup_tile`'s
+       `double_s` flag was literally `SemaphoreRing<2>` vs `SemaphoreRing<1>`
+       (`(i & 1, (i/2) & 1)` vs `(0, i & 1)`), and the persistent MMA warp's
+       `(i - 1) & 1` S wait is `SemaphoreRing::<1>::wait_recycled`. A
+       `Stream<S_BUFFERS>` struct (kernel-side, not library) bundles one
+       softmax workstream's S/O TMEM, P tile, votes/restart and five
+       barriers, shared by the pipelined kernel (one stream, S_BUFFERS = 2)
+       and the persistent pair (indexed `attach` encodes the A/B offset
+       symmetry). PTX vs base: backwards and probes byte-identical;
+       persistent net −1 instruction (and two fewer stack save/restore
+       regions); sync +7 / pipelined +6, all fall-through `bra.uni` block
+       splits plus an equivalent `tid < 32` alloc guard. ptxas re-pins:
+       pipelined 179→180, persistent 239→240 (+1 each, stable across two
+       opcode-identical formulations; a third that moved barrier init after
+       the TMEM alloc cost pipelined +3 more and was reverted — ordering is
+       load-bearing and documented at the pins). Gate fully green: parity
+       at all five forward shapes × three kernels plus three backward
+       shapes, and the bench says the +1 reg is free — pipelined **192.2
+       TFLOP/s** (187.6 at phase 3, 182.0 at main), persistent **234.9**
+       (234.7 / 230.3), sync 114.2 (flat). Honest line accounting:
+       per-kernel logic shrank but declarations grew — tcgen05.rs
+       2783→2963 (+180: Stream, the `PersistentForward` job, docs) plus 125
+       library lines (pipeline.rs 83, tmem helpers) — a one-time cost the
+       phase-5 kittens-first kernels reuse without re-paying. Local-dev
+       note: flash's lib artifact (libNVVM path) dies at darwin embed
+       before the `flash` bin's pure-PTX artifact builds, so local PTX
+       diffing uses a scratchpad bin-only crate that `#[path]`-includes
+       tcgen05.rs (session scratchpad `flashptx/`).
+
+       **Phase 5, flash side** (2026-07-26): the backward kernels and the
+       two probes ported, so no raw mbarrier, swizzle, or fragment math is
+       left anywhere in flash-attn — `cvt_f32x2_bf16x2` and
+       `stmatrix_m8n8_x2` are not even imported by the backward path. Four
+       library additions, all extracted from the working kernels: `reg`
+       gains `Fragment` (`RegTile<2, 4>` — exactly what one 16x256b drain
+       hands a thread, which is what `write_bf16_fragment`'s eight loose
+       `a0/a1/a8/a9/b0/b1/b8/b9` arguments were spelling out) and
+       `value_column` (the `{0,1,8,9}`-per-16-block offset every masking
+       and per-column-statistic site transcribed by hand); `tmem` gains
+       `fragment_tile`, the simd pair resolved into `[slot][value]` order;
+       `ldst` gains `store_fragment_bf16`, the store twin addressed by the
+       same `(row, column)` the drain used; `sync` gains `PhasedSemaphore`,
+       a semaphore owning the phase counter the `tma_phase`/`mma_phase`
+       locals were (`wait_next()` also dissolves the "starts at 1 because
+       the resident load took phase 0" subtlety); `shared` gains
+       `tma_load_at`, a box landing at a destination row — how two adjacent
+       64-row tiles stack into one 128-row paired operand. The port also
+       found ~250 lines of dead code: `backward_q_tile`/`backward_kv_tile`,
+       the unpaired Design-A register passes, have had no call sites since
+       the paired kernels landed. tcgen05.rs **2963 → 2351**.
+       Gate green: parity at five forward shapes × three kernels plus three
+       backward shapes; bench 114.0 / 192.0 / 234.7 forward and 197.7
+       backward, all at phase-4 levels. **ptxas ratcheted DOWN for the
+       first time in this series** — backward q 62→52, kv 64→60, forwards
+       unchanged at 40/180/240, local frames unchanged to the byte, forward
+       PTX byte-identical. The backwards are +9/+8 instructions, all of it
+       the fall-through `bra.uni` block splits `alloc_block`'s guard
+       introduces; against that the kv register pass gave back five
+       `or.pred`s (looped causal masking shares the `masked_all` term that
+       eight hand-written `keep_*` expressions each re-derived) and three
+       `cvta.shared`s.
+
+       **The unified P-store** (same day): `softmax_tile`'s pass-2 write moved
+       onto `store_fragment_bf16` too, so the library is now the *only*
+       fragment-store path in the crate — `cvt_f32x2_bf16x2` and
+       `stmatrix_m8n8_x2` are no longer imported by `tcgen05.rs` at all.
+       Two formulations were measured and the difference between them is the
+       phase's sharpest lesson. Filling the fragment through an indexed loop
+       (`p.0[slot][value] = ...`) does **not** scalarize: local frame 592→656 B
+       and +76 `st.local`/+40 `ld.local` **inside the softmax inner loop** —
+       issue #61's risk 1 arriving exactly as predicted, and invisible in the
+       Rust. Building it as a *literal* over an `#[inline(always)]`
+       `masked_exp2` helper hands SROA constant indices and the tile
+       evaporates: frame back to 592, `ld/st.local` and the FMA/mul/select
+       histogram identical to the byte, and 13–28 *fewer* instructions per
+       forward kernel. Pass 1 (the row-max drain) stays hand-written on
+       purpose: its `diagonal`/else split reduces the four values as a TREE
+       off the diagonal, which a uniform masked loop would flatten into a
+       4-deep dependent `fmax` chain — a latency change, not a scheduling one.
+       **Cost, and the call:** ptxas re-rolls the schedule against the change —
+       sync 40→32, pipelined 180→216, persistent 240→236, reproducible to the
+       register across two runs — and the B200 bench reads persistent
+       **231.6 / 231.8** TFLOP/s against 234.7 / 234.9 / 234.7 in the three
+       prior runs, i.e. a reproducible ≈1.3%, alongside pipelined 191.5 (flat)
+       and sync **125.8–125.9** (+10%, which incidentally undoes phase 2's
+       126→115 sync dip). Occupancy is untouched (TMEM pins 1 CTA/SM;
+       216×128 threads ≈ 27.6K of the 64K register file), forward parity is
+       identical to the digit at every gate shape, and the backwards are
+       unaffected. Decision (Finn): the 3 TFLOP/s is inside what he is willing
+       to pay for one fragment-store path; adopted, pins re-set to the measured
+       allocation. If it is ever worth reclaiming, the lever is the schedule,
+       not the source — the instruction stream is strictly smaller.
+
+       **Phase 5, the kittens-first kernels** (2026-07-26): the backward pair
+       rewritten warp-specialized — the acceptance criterion's "one new kernel
+       shipped kittens-first," and the last synchronous tcgen05 kernels in the
+       repo. Target chosen by decision 17, not taste: attention is 21.2% of
+       step and the backward is ~3× the forward's time inside it, while
+       `flash_backward_q/kv_tcgen05` still ran TMA → `sync_threads` → MMA →
+       `sync_threads` → register pass → `sync_threads` → gradient MMA →
+       `sync_threads` per tile, tensor cores idle through every register pass.
+       `flash_backward_q_pipelined` and `flash_backward_kv_pipelined` run the
+       forward's three roles (TMA warp over a `BACKWARD_STAGES`-deep ring, MMA
+       warp staggering `S/dP-MMA(i)` ahead of the gradient MMA of `i-1`, and
+       the 128-thread gradient warpgroup between them) over *unchanged*
+       Design-B math — `backward_q_tile_paired` and `backward_kv_tile_paired`
+       are reused verbatim.
+       Two things the forward did not have to solve. **The streamed operand is
+       read twice**: `K(i)` feeds the score MMA immediately and `dQ-MMA(i)` a
+       full stage later, so `kv_free(i)` hangs off `dq_done(i)` rather than
+       off the score barrier — and that same wait then proves the gradient MMA
+       finished reading dS, which is what keeps dS single-buffered exactly as P
+       is in the forward (kernel B: Q and dY both, keeping Pᵀ and dSᵀ single).
+       **Kernel B's ring arithmetic is relative**: it streams query tiles
+       `key_a..T/64` from a runtime start, and a `SemaphoreRing`'s parity is a
+       *visit count*, so every index and parity runs off `step = query - key_a`
+       while data addressing keeps the absolute tile — get it wrong and exactly
+       the `key_a > 0` CTAs hang. Kernel B also re-stages `lse2`/`dot` per
+       streamed tile (its statistics index by query *column*), which the
+       synchronous kernel did behind a block sync that specialization deletes;
+       they now ride the ring, the TMA warp's 32 lanes staging two rows each
+       with a `warp::sync_mask` ordering those stores ahead of the leader's
+       `expect_tx`.
+       **Results, B200 same-container:** kernel A 2.370 → 2.135 ms (−9.9%,
+       277.3 → 307.8 TFLOP/s), kernel B 3.171 → 2.664 ms (−16.0%, 276.3 →
+       328.8), the attention backward **5.541 → 4.799 ms (−13.4%)**. Both
+       gate on `dq`/`dk`/`dv` being **bit-identical** to the kernels they
+       replace at all three shapes — a pure scheduling change must be, and a
+       5e-3 tolerance would hide a dropped or reordered tile. ptxas: kernel A
+       **53 regs** against the synchronous 52 (+1 for three warp roles, two
+       S/dP buffers and six barrier sets — the library's overhead for a whole
+       pipeline is one scalar); kernel B 60 → 72, the second gradient
+       accumulator's drain, with occupancy TMEM-pinned at one CTA/SM either
+       way (kernel B uses all 512 columns). Existing kernels byte-identical in
+       PTX and flat on the bench. The trainer switched to both and all
+       thirteen `run.sh model` gates pass, the MoE overfit landing on its
+       recorded 2.949433 → 0.000060 to the digit — which is what
+       bit-identical kernels should produce.
+       **Step-level share, candidate-side profile** at the §13.9 shape (B=12
+       T=2048, VRAM 137.8 GiB matching the #58 record): full step 567.59 ms
+       with `backward.attention.flash_q` 32.59 ms (5.74%) and `flash_kv`
+       38.44 ms (6.77%) — **71.03 ms, 12.51% of step** in the two spans this
+       work owns. This is a single-sided profile, not a §10.1 A/B: the
+       same-container baseline needs the branch pushed, so the honest
+       statement is that the *kernel* delta is measured in-container (−13.4%)
+       and these are the spans it applies to; at the bench shape's ratios that
+       implies ≈−11 ms of step (≈−1.9%), and the model's longer T=2048 should
+       favour the pipelined form further (more key tiles per CTA means the
+       prologue amortizes over a longer steady state). Worth confirming with a
+       real `BASELINE_REF` A/B before the number is quoted as fact.
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on

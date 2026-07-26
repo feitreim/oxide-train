@@ -5968,9 +5968,9 @@ fn flash_attention_backward_into<
             )
         })?;
         profiler.measure(stream, "backward.attention.flash_q", || unsafe {
-            flash_bf16.backward_q(
+            flash_bf16.backward_q_pipelined(
                 stream,
-                flash_host::flash_backward_q_config(N / T, T, H),
+                flash_host::flash_backward_q_pipelined_config(N / T, T, H),
                 scratch.q_tma.as_ptr(),
                 scratch.k_tma.as_ptr(),
                 scratch.v_tma.as_ptr(),
@@ -5983,9 +5983,9 @@ fn flash_attention_backward_into<
             )
         })?;
         profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
-            flash_bf16.backward_kv(
+            flash_bf16.backward_kv_pipelined(
                 stream,
-                flash_host::flash_backward_kv_config(N / T, T, H),
+                flash_host::flash_backward_kv_pipelined_config(N / T, T, H),
                 scratch.q_tma.as_ptr(),
                 scratch.k_tma.as_ptr(),
                 scratch.v_tma.as_ptr(),

@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use bench_util::{time_gpu_iters, uniform_vec};
+use bench_util::{KernelBudget, enforce_kernel_budgets, time_gpu_iters, uniform_vec};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
 #[path = "../host.rs"]
@@ -24,9 +24,113 @@ mod tcgen05_device;
 
 use host::{
     FLASH_HD, FLASH_SUBTILE_HD, FLASH_TILE, Tcgen05Flash, correction_count_len,
-    create_flash_head_tma_map, device_sm_count, flash_backward_kv_config, flash_backward_q_config,
-    flash_forward_config, flash_persistent_config, flash_pipelined_config, function_profile,
+    create_flash_head_tma_map, device_sm_count, flash_backward_kv_config,
+    flash_backward_kv_pipelined_config, flash_backward_q_config,
+    flash_backward_q_pipelined_config,
+    flash_forward_config, flash_persistent_config, flash_pipelined_config,
 };
+
+/// Pinned ptxas ceilings (issue #61 phase 0): the B200-measured budgets from
+/// SPEC 13.7e16 (forwards; 592 B is a fixed local frame, not a spill) and the
+/// 2026-07-25 phase-1 gate run (backwards). Any tile-library port that pushes
+/// a kernel past its pin is a library bug; ratchet a pin down when a run
+/// reports lower numbers.
+///
+/// Phase-2/3 re-pins (2026-07-26): the kittens ports leave every kernel's
+/// instruction stream equal-or-smaller (normalized PTX diff vs main; local
+/// frames unchanged to the byte), but ptxas allocates by schedule, and the
+/// counts moved with each formulation: persistent 206→238→239, pipelined
+/// 224→219→179, sync 48→40. Occupancy is TMEM-pinned at one CTA/SM
+/// throughout, and the bench holds or improves where it matters —
+/// persistent 234.7 TFLOP/s / pipelined 187.6 (vs 230.3 / 182.0 at main);
+/// the sync oracle dipped 126→115 with its 8-reg drop, tolerated because
+/// it is a correctness reference, not a production path. The pins track
+/// the measured allocation rather than fighting ordering sensitivity.
+///
+/// Phase-4 re-pins (2026-07-26): the pipeline.rs port (forward kernels
+/// fully on kittens semaphores/streams, persistent scaffold extracted to
+/// `pipeline::run`) lands at pipelined 180 / persistent 240 — +1 each with
+/// opcode-identical-or-smaller PTX (persistent net −1 instruction), stable
+/// across two formulations; a third formulation that reordered barrier
+/// init after the TMEM alloc cost pipelined +3 more and was reverted, so
+/// the init-before-alloc ordering is deliberate. Sync stays 40, backwards
+/// untouched. No occupancy boundary anywhere near (TMEM pins 1 CTA/SM).
+///
+/// Phase-5 re-pins (2026-07-26): the backward/probe port (`Fragment` drains
+/// and swizzled stores, `PhasedSemaphore`, `tma_load_at`, `alloc_block`)
+/// ratchets backward q 62→52 and kv 64→60 — the first port in this series
+/// where the allocator gave registers back. PTX is +9/+8 instructions, all
+/// of it the fall-through `bra.uni` block splits `alloc_block`'s guard
+/// introduces; against that the kv register pass lost five `or.pred`s
+/// (looped causal masking shares the `masked_all` term eight hand-written
+/// `keep_*` expressions each re-derived) and three `cvta.shared`s. Local
+/// frames unchanged to the byte, forwards byte-identical, bench flat.
+///
+/// Forward re-pins for the unified P-store (2026-07-26): `softmax_tile`'s
+/// pass-2 write moved onto `store_fragment_bf16`, making the library the only
+/// fragment-store path in the crate. Statically the change is strictly
+/// cleaner — local frames unchanged at 592 B, `ld/st.local` and the
+/// FMA/mul/select histogram identical to the byte, 13–28 *fewer* instructions
+/// per forward kernel (the fragment is built as a literal over an
+/// `#[inline(always)]` `masked_exp2`; filling it through an indexed loop
+/// instead does NOT scalarize, and puts 64 B of frame and 76 `st.local` into
+/// the softmax inner loop — issue #61's risk 1, worth remembering). ptxas
+/// re-rolls the schedule against it: sync 40→32, pipelined 180→216,
+/// persistent 240→236, reproducible across runs. Occupancy is unaffected
+/// (TMEM pins 1 CTA/SM; 216×128 threads ≈ 27.6K of the 64K register file).
+///
+/// `backward q pipelined` (2026-07-26) is the first kernel written
+/// kittens-first rather than ported: same Design-B math as `backward q`, the
+/// forward's three-role warp specialization instead of four block syncs per
+/// key tile. It costs **one** register over the synchronous kernel (52 → 53,
+/// same 512 B frame) — the tile library's overhead for a whole pipeline is
+/// inside the noise of a single scalar.
+const KERNEL_BUDGETS: [KernelBudget; 7] = [
+    KernelBudget {
+        name: "forward sync",
+        max_registers: 32,
+        max_spill_bytes: 592,
+    },
+    KernelBudget {
+        name: "forward pipelined",
+        max_registers: 216,
+        max_spill_bytes: 592,
+    },
+    KernelBudget {
+        name: "forward persistent",
+        max_registers: 236,
+        max_spill_bytes: 592,
+    },
+    KernelBudget {
+        name: "backward q",
+        max_registers: 52,
+        max_spill_bytes: 512,
+    },
+    KernelBudget {
+        // The kittens-first pipelined backward, first flight: 53 regs / 512 B
+        // frame, one register over the synchronous kernel it replaces for
+        // three warp roles, two S/dP buffers and six barrier sets.
+        name: "backward q pipelined",
+        max_registers: 53,
+        max_spill_bytes: 512,
+    },
+    KernelBudget {
+        name: "backward kv",
+        max_registers: 60,
+        max_spill_bytes: 1024,
+    },
+    KernelBudget {
+        // Kernel B's pipelined form, first flight: 72 regs / 1024 B frame.
+        // The +12 over the synchronous kernel (against kernel A's +1) is the
+        // second gradient accumulator's drain — two `RegTile<4, 32>`s live
+        // through the epilogue instead of one. Occupancy is TMEM-pinned at
+        // one CTA/SM (this kernel uses all 512 columns), so it buys nothing
+        // to fight.
+        name: "backward kv pipelined",
+        max_registers: 72,
+        max_spill_bytes: 1024,
+    },
+];
 
 /// Which forward kernel a gate or bench exercises; all three share the
 /// operand and output contract, so everything downstream of the launch is
@@ -162,6 +266,32 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f
     println!("  {name:<9} max abs error: {max_error:.3e}");
 }
 
+/// Bit-for-bit equality between two kernels that must agree exactly — the
+/// gate for a pure scheduling change, where any drift at all is a reordered
+/// accumulation rather than a tolerable rounding difference.
+fn assert_identical(name: &str, actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    let mut mismatches = 0usize;
+    let mut worst = (0usize, 0.0f32, 0.0f32);
+    for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+        if a.to_bits() != e.to_bits() {
+            mismatches += 1;
+            if (a - e).abs() > (worst.1 - worst.2).abs() {
+                worst = (i, a, e);
+            }
+        }
+    }
+    assert!(
+        mismatches == 0,
+        "{name}: {mismatches} of {} values differ; worst at {}: {} vs {}",
+        actual.len(),
+        worst.0,
+        worst.1,
+        worst.2
+    );
+    println!("  {name:<9} bit-identical ({} values)", actual.len());
+}
+
 /// Software exp2/log2 accuracy against the host libm oracles. Gates the
 /// polynomial paths standalone before any attention math depends on them.
 fn check_math(
@@ -184,7 +314,10 @@ fn check_math(
         let reference = (x as f64).exp2();
         if x <= -125.0 {
             // Clamped flush region: anything at subnormal scale is "zero".
-            assert!(a >= 0.0 && (a as f64) < 1.0e-35, "exp2({x}) flush failed: {a}");
+            assert!(
+                a >= 0.0 && (a as f64) < 1.0e-35,
+                "exp2({x}) flush failed: {a}"
+            );
             continue;
         }
         let rel = ((a as f64) - reference).abs() / reference;
@@ -387,8 +520,7 @@ fn check_forward(
     for kernel in FORWARDS {
         let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
         let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-        let mut corrections =
-            DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
+        let mut corrections = DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
         unsafe {
             kernel.launch(
                 flash,
@@ -559,8 +691,11 @@ fn check_backward(
     let dot_device = DeviceBuffer::from_host(stream, &dot)?;
 
     let mut dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dq_pipelined = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dk_pipelined = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dv_pipelined = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     unsafe {
         flash.backward_q(
             stream,
@@ -589,9 +724,52 @@ fn check_backward(
             &mut dk,
             &mut dv,
         )?;
+        flash.backward_q_pipelined(
+            stream,
+            flash_backward_q_pipelined_config(b, t, h),
+            q_tma.as_ptr(),
+            k_tma.as_ptr(),
+            v_tma.as_ptr(),
+            dy_tma.as_ptr(),
+            &lse_device,
+            &dot_device,
+            t as u32,
+            h as u32,
+            &mut dq_pipelined,
+        )?;
+        flash.backward_kv_pipelined(
+            stream,
+            flash_backward_kv_pipelined_config(b, t, h),
+            q_tma.as_ptr(),
+            k_tma.as_ptr(),
+            v_tma.as_ptr(),
+            dy_tma.as_ptr(),
+            &lse_device,
+            &dot_device,
+            t as u32,
+            h as u32,
+            &mut dk_pipelined,
+            &mut dv_pipelined,
+        )?;
     }
-    println!(
-        "tcgen05 backward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]"
+    println!("tcgen05 backward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]");
+    // The pipelined backward is a pure scheduling change: same per-tile math in
+    // the same key order into the same TMEM accumulator, so anything short of
+    // bit-identical means the pipeline reordered or dropped a tile.
+    assert_identical(
+        "dq pipelined vs sync",
+        &dq_pipelined.to_host_vec(stream)?,
+        &dq.to_host_vec(stream)?,
+    );
+    assert_identical(
+        "dk pipelined vs sync",
+        &dk_pipelined.to_host_vec(stream)?,
+        &dk.to_host_vec(stream)?,
+    );
+    assert_identical(
+        "dv pipelined vs sync",
+        &dv_pipelined.to_host_vec(stream)?,
+        &dv.to_host_vec(stream)?,
     );
     assert_close("dq", &dq.to_host_vec(stream)?, &expected_dq, 5.0e-3, 5.0e-3);
     assert_close("dk", &dk.to_host_vec(stream)?, &expected_dk, 5.0e-3, 5.0e-3);
@@ -694,6 +872,96 @@ fn bench(
     let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let backward_flop = visits * 5.0 * (2.0 * 128.0 * 128.0 * 64.0);
+
+    // Kernel A alone on both schedules: the direct measure of what the
+    // warp specialization bought. Per key-tile visit kernel A issues two
+    // 128x128x64 score GEMMs plus one 128x64x128 gradient GEMM.
+    let q_flop = visits * 3.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    // Kernel B issues two score GEMMs plus two gradient GEMMs per visit.
+    let kv_flop = visits * 4.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    for (name, pipelined) in [("sync", false), ("pipelined", true)] {
+        let milliseconds = time_gpu_iters(stream, 3, 20, || {
+            unsafe {
+                if pipelined {
+                    flash.backward_kv_pipelined(
+                        stream,
+                        flash_backward_kv_pipelined_config(b, t, h),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        dy_tma.as_ptr(),
+                        &lse_in,
+                        &dot_in,
+                        t as u32,
+                        h as u32,
+                        &mut dk,
+                        &mut dv,
+                    )?;
+                } else {
+                    flash.backward_kv(
+                        stream,
+                        flash_backward_kv_config(b, t, h),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        dy_tma.as_ptr(),
+                        &lse_in,
+                        &dot_in,
+                        t as u32,
+                        h as u32,
+                        &mut dk,
+                        &mut dv,
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+        println!(
+            "tcgen05 backward kv {name} [{b},{t},{h},{FLASH_HD}]: {milliseconds:.3} ms, {:.1} TFLOP/s",
+            kv_flop / (milliseconds * 1.0e-3) / 1.0e12
+        );
+    }
+    for (name, pipelined) in [("sync", false), ("pipelined", true)] {
+        let milliseconds = time_gpu_iters(stream, 3, 20, || {
+            unsafe {
+                if pipelined {
+                    flash.backward_q_pipelined(
+                        stream,
+                        flash_backward_q_pipelined_config(b, t, h),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        dy_tma.as_ptr(),
+                        &lse_in,
+                        &dot_in,
+                        t as u32,
+                        h as u32,
+                        &mut dq,
+                    )?;
+                } else {
+                    flash.backward_q(
+                        stream,
+                        flash_backward_q_config(b, t, h),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        dy_tma.as_ptr(),
+                        &lse_in,
+                        &dot_in,
+                        t as u32,
+                        h as u32,
+                        &mut dq,
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+        println!(
+            "tcgen05 backward q {name} [{b},{t},{h},{FLASH_HD}]: {milliseconds:.3} ms, {:.1} TFLOP/s",
+            q_flop / (milliseconds * 1.0e-3) / 1.0e12
+        );
+    }
+
     let milliseconds = time_gpu_iters(stream, 3, 20, || {
         unsafe {
             flash.backward_q(
@@ -767,23 +1035,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcgen05_device::FLASH_BACKWARD_KV_SMEM,
         "host.rs and tcgen05.rs disagree on the kernel-B shared plan"
     );
+    assert!(
+        tcgen05_device::FLASH_BACKWARD_Q_PIPELINED_SMEM
+            <= host::FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES as usize,
+        "BACKWARD_STAGES overflows the host-side shared-memory ceiling"
+    );
+    assert_eq!(
+        host::FLASH_BACKWARD_Q_PIPELINED_BLOCK_THREADS as usize,
+        tcgen05_device::FLASH_BACKWARD_Q_PIPELINED_BLOCK,
+        "host.rs and tcgen05.rs disagree on the pipelined-backward block width"
+    );
+    assert!(
+        tcgen05_device::FLASH_BACKWARD_KV_PIPELINED_SMEM
+            <= host::FLASH_BACKWARD_KV_PIPELINED_SMEM_BYTES as usize,
+        "BACKWARD_STAGES overflows the kernel-B host-side shared-memory ceiling"
+    );
+    assert_eq!(
+        host::FLASH_BACKWARD_KV_PIPELINED_BLOCK_THREADS as usize,
+        tcgen05_device::FLASH_BACKWARD_KV_PIPELINED_BLOCK,
+        "host.rs and tcgen05.rs disagree on the pipelined kernel-B block width"
+    );
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let flash = Tcgen05Flash::load_from_ptx(&ctx, "flash.ptx")?;
     let sm_count = device_sm_count(&ctx)?;
     println!("persistent grid: min(work items, {sm_count} SMs)");
 
-    // What ptxas gave each kernel. `.maxntid` (from `#[launch_bounds]`) is the
-    // register budget's divisor, so a stale one shows up here as a low register
-    // count and a nonzero spill frame — never in the PTX, which ptxas consumes.
-    println!("ptxas budgets (registers/thread, spill bytes, .maxntid)");
-    for (name, function) in flash.kernels() {
-        let profile = function_profile(function)?;
-        println!(
-            "  {name:<19} {:>3} regs, {:>4} spill bytes, maxntid {}",
-            profile.registers, profile.spill_bytes, profile.max_threads
-        );
-    }
+    // What ptxas gave each kernel, gated against the pinned ceilings.
+    // `.maxntid` (from `#[launch_bounds]`) is the register budget's divisor,
+    // so a stale one shows up here as a low register count and a nonzero
+    // spill frame — never in the PTX, which ptxas consumes.
+    enforce_kernel_budgets(&flash.kernels(), &KERNEL_BUDGETS)?;
 
     println!("software math parity");
     check_math(&stream, &flash)?;
