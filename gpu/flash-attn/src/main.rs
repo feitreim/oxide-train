@@ -8,9 +8,8 @@
 //!
 //! Tile-aligned shapes additionally gate the tcgen05 forward (issue #35)
 //! against both fp32 oracles at bf16-appropriate tolerances, after checking
-//! the device staging kernel bit-exactly against a CPU mirror. Those checks
-//! load `flash.ptx`, so `src/bin/flash.rs` must be built first (modal_app.py
-//! prepares it, mirroring the model's `gemm.ptx` staging).
+//! the device staging kernel bit-exactly against a CPU mirror. The fp32 and
+//! tcgen05 kernels load from one embedded pure-PTX artifact.
 
 use bench_util::uniform_vec;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
@@ -68,22 +67,25 @@ fn stage_on_device(
     // SAFETY: the launch uses live buffers sized for its contract, and the
     // subsequent host copy synchronizes the stream before either can drop.
     unsafe {
-    let mut staged = DeviceBuffer::<u32>::zeroed(stream, b * h * t * HD / 2)?;
-    flash_module.stage_attention_heads_bf16(
-        stream,
-        flash::stage_heads_config(b * t, h, HD),
-        input,
-        t as u32,
-        h as u32,
-        scale,
-        &mut staged,
-    )?;
-    let device_words = staged.to_host_vec(stream)?;
-    let host_words = stage_heads(host_input, b, t, h, scale);
-    for (i, (&d, &e)) in device_words.iter().zip(&host_words).enumerate() {
-        assert_eq!(d, e, "{name} staging word {i}: device {d:#010x} vs cpu {e:#010x}");
-    }
-    Ok(staged)
+        let mut staged = DeviceBuffer::<u32>::zeroed(stream, b * h * t * HD / 2)?;
+        flash_module.stage_attention_heads_bf16(
+            stream,
+            flash::stage_heads_config(b * t, h, HD),
+            input,
+            t as u32,
+            h as u32,
+            scale,
+            &mut staged,
+        )?;
+        let device_words = staged.to_host_vec(stream)?;
+        let host_words = stage_heads(host_input, b, t, h, scale);
+        for (i, (&d, &e)) in device_words.iter().zip(&host_words).enumerate() {
+            assert_eq!(
+                d, e,
+                "{name} staging word {i}: device {d:#010x} vs cpu {e:#010x}"
+            );
+        }
+        Ok(staged)
     }
 }
 
@@ -105,124 +107,130 @@ fn check_tcgen05_shape(
     // SAFETY: launch shapes match the documented kernel contracts and all
     // buffers/TMA descriptors remain live until their stream work completes.
     unsafe {
-    let n = b * t;
-    let d = h * HD;
-    let q = uniform_vec(n * d, 171);
-    let k = uniform_vec(n * d, 172);
-    let v = uniform_vec(n * d, 173);
-    let q_device = DeviceBuffer::from_host(stream, &q)?;
-    let k_device = DeviceBuffer::from_host(stream, &k)?;
-    let v_device = DeviceBuffer::from_host(stream, &v)?;
+        let n = b * t;
+        let d = h * HD;
+        let q = uniform_vec(n * d, 171);
+        let k = uniform_vec(n * d, 172);
+        let v = uniform_vec(n * d, 173);
+        let q_device = DeviceBuffer::from_host(stream, &q)?;
+        let k_device = DeviceBuffer::from_host(stream, &k)?;
+        let v_device = DeviceBuffer::from_host(stream, &v)?;
 
-    let q_scale = LOG2_E / (HD as f32).sqrt();
-    let q_staged = stage_on_device(stream, flash_module, &q_device, &q, b, t, h, q_scale, "q")?;
-    let k_staged = stage_on_device(stream, flash_module, &k_device, &k, b, t, h, 1.0, "k")?;
-    let v_staged = stage_on_device(stream, flash_module, &v_device, &v, b, t, h, 1.0, "v")?;
+        let q_scale = LOG2_E / (HD as f32).sqrt();
+        let q_staged = stage_on_device(stream, flash_module, &q_device, &q, b, t, h, q_scale, "q")?;
+        let k_staged = stage_on_device(stream, flash_module, &k_device, &k, b, t, h, 1.0, "k")?;
+        let v_staged = stage_on_device(stream, flash_module, &v_device, &v, b, t, h, 1.0, "v")?;
 
-    // Tier 1 oracle: materialized probabilities from ops.
-    let mut probabilities = DeviceBuffer::<f32>::zeroed(stream, n * h * t)?;
-    let mut naive_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    naive_module.attention_probabilities(
-        stream,
-        LaunchConfig::for_num_elems((n * h * t) as u32),
-        &q_device,
-        &k_device,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut probabilities,
-    )?;
-    naive_module.attention_output(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &probabilities,
-        &v_device,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut naive_y,
-    )?;
+        // Tier 1 oracle: materialized probabilities from ops.
+        let mut probabilities = DeviceBuffer::<f32>::zeroed(stream, n * h * t)?;
+        let mut naive_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        naive_module.attention_probabilities(
+            stream,
+            LaunchConfig::for_num_elems((n * h * t) as u32),
+            &q_device,
+            &k_device,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut probabilities,
+        )?;
+        naive_module.attention_output(
+            stream,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &probabilities,
+            &v_device,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut naive_y,
+        )?;
 
-    // Tier 2 oracle: the fp32 tiled forward and its log-sum-exp.
-    let mut tiled_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut tiled_lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-    flash_module.flash_attention_forward_tiled(
-        stream,
-        flash::tiled_forward_config(b, t, h, HD),
-        &q_device,
-        &k_device,
-        &v_device,
-        t as u32,
-        h as u32,
-        &mut tiled_y,
-        &mut tiled_lse,
-    )?;
+        // Tier 2 oracle: the fp32 tiled forward and its log-sum-exp.
+        let mut tiled_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut tiled_lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        flash_module.flash_attention_forward_tiled(
+            stream,
+            flash::tiled_forward_config(b, t, h, HD),
+            &q_device,
+            &k_device,
+            &v_device,
+            t as u32,
+            h as u32,
+            &mut tiled_y,
+            &mut tiled_lse,
+        )?;
 
-    let q_tma = unsafe { create_flash_head_tma_map(stream, &q_staged, t, b * h)? };
-    let k_tma = unsafe { create_flash_head_tma_map(stream, &k_staged, t, b * h)? };
-    let v_tma = unsafe { create_flash_head_tma_map(stream, &v_staged, t, b * h)? };
-    let naive_y_host = naive_y.to_host_vec(stream)?;
-    let tiled_y_host = tiled_y.to_host_vec(stream)?;
-    let tiled_lse_host = tiled_lse.to_host_vec(stream)?;
-    // All forwards run the same math over the same staged operands; gating
-    // each against the oracles makes a pipelined/persistent failure a
-    // scheduling bug by construction whenever the sync kernel still passes.
-    for name in ["sync", "pipelined", "persistent"] {
-        let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-        let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-        let mut corrections =
-            DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
-        unsafe {
-            match name {
-                "pipelined" => tcgen05.forward_pipelined(
-                    stream,
-                    flash_pipelined_config(b, t, h),
-                    q_tma.as_ptr(),
-                    k_tma.as_ptr(),
-                    v_tma.as_ptr(),
-                    t as u32,
-                    h as u32,
-                    &mut y,
-                    &mut lse,
-                    &mut corrections,
-                )?,
-                "persistent" => tcgen05.forward_persistent(
-                    stream,
-                    flash_persistent_config(b, t, h, sm_count),
-                    q_tma.as_ptr(),
-                    k_tma.as_ptr(),
-                    v_tma.as_ptr(),
-                    t as u32,
-                    h as u32,
-                    b as u32,
-                    &mut y,
-                    &mut lse,
-                    &mut corrections,
-                )?,
-                _ => tcgen05.forward(
-                    stream,
-                    flash_forward_config(b, t, h),
-                    q_tma.as_ptr(),
-                    k_tma.as_ptr(),
-                    v_tma.as_ptr(),
-                    t as u32,
-                    h as u32,
-                    &mut y,
-                    &mut lse,
-                    &mut corrections,
-                )?,
+        let q_tma = unsafe { create_flash_head_tma_map(stream, &q_staged, t, b * h)? };
+        let k_tma = unsafe { create_flash_head_tma_map(stream, &k_staged, t, b * h)? };
+        let v_tma = unsafe { create_flash_head_tma_map(stream, &v_staged, t, b * h)? };
+        let naive_y_host = naive_y.to_host_vec(stream)?;
+        let tiled_y_host = tiled_y.to_host_vec(stream)?;
+        let tiled_lse_host = tiled_lse.to_host_vec(stream)?;
+        // All forwards run the same math over the same staged operands; gating
+        // each against the oracles makes a pipelined/persistent failure a
+        // scheduling bug by construction whenever the sync kernel still passes.
+        for name in ["sync", "pipelined", "persistent"] {
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+            let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+            let mut corrections =
+                DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
+            unsafe {
+                match name {
+                    "pipelined" => tcgen05.forward_pipelined(
+                        stream,
+                        flash_pipelined_config(b, t, h),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        t as u32,
+                        h as u32,
+                        &mut y,
+                        &mut lse,
+                        &mut corrections,
+                    )?,
+                    "persistent" => tcgen05.forward_persistent(
+                        stream,
+                        flash_persistent_config(b, t, h, sm_count),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        t as u32,
+                        h as u32,
+                        b as u32,
+                        &mut y,
+                        &mut lse,
+                        &mut corrections,
+                    )?,
+                    _ => tcgen05.forward(
+                        stream,
+                        flash_forward_config(b, t, h),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        t as u32,
+                        h as u32,
+                        &mut y,
+                        &mut lse,
+                        &mut corrections,
+                    )?,
+                }
             }
-        }
 
-        println!("tcgen05 {name} parity against both oracles [{b},{t},{h},{HD}]");
-        // Measured maxima vs the fp32 oracles: y 2.4e-3, lse 8.9e-4 (T up
-        // to 1024) — dominated by bf16 operand quantization; ~4x headroom.
-        let y_host = y.to_host_vec(stream)?;
-        assert_close("y/naive", &y_host, &naive_y_host, 1.0e-2, 1.0e-2);
-        assert_close("y/tiled", &y_host, &tiled_y_host, 1.0e-2, 1.0e-2);
-        assert_close("lse", &lse.to_host_vec(stream)?, &tiled_lse_host, 5.0e-3, 0.0);
-    }
-    Ok(())
+            println!("tcgen05 {name} parity against both oracles [{b},{t},{h},{HD}]");
+            // Measured maxima vs the fp32 oracles: y 2.4e-3, lse 8.9e-4 (T up
+            // to 1024) — dominated by bf16 operand quantization; ~4x headroom.
+            let y_host = y.to_host_vec(stream)?;
+            assert_close("y/naive", &y_host, &naive_y_host, 1.0e-2, 1.0e-2);
+            assert_close("y/tiled", &y_host, &tiled_y_host, 1.0e-2, 1.0e-2);
+            assert_close(
+                "lse",
+                &lse.to_host_vec(stream)?,
+                &tiled_lse_host,
+                5.0e-3,
+                0.0,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -246,147 +254,147 @@ fn check_tcgen05_backward_shape(
     // SAFETY: launch shapes match the documented kernel contracts and all
     // buffers/TMA descriptors remain live until their stream work completes.
     unsafe {
-    let n = b * t;
-    let d = h * HD;
-    let q = uniform_vec(n * d, 271);
-    let k = uniform_vec(n * d, 272);
-    let v = uniform_vec(n * d, 273);
-    let dy = uniform_vec(n * d, 274);
-    let q_device = DeviceBuffer::from_host(stream, &q)?;
-    let k_device = DeviceBuffer::from_host(stream, &k)?;
-    let v_device = DeviceBuffer::from_host(stream, &v)?;
-    let dy_device = DeviceBuffer::from_host(stream, &dy)?;
+        let n = b * t;
+        let d = h * HD;
+        let q = uniform_vec(n * d, 271);
+        let k = uniform_vec(n * d, 272);
+        let v = uniform_vec(n * d, 273);
+        let dy = uniform_vec(n * d, 274);
+        let q_device = DeviceBuffer::from_host(stream, &q)?;
+        let k_device = DeviceBuffer::from_host(stream, &k)?;
+        let v_device = DeviceBuffer::from_host(stream, &v)?;
+        let dy_device = DeviceBuffer::from_host(stream, &dy)?;
 
-    let q_scale = LOG2_E / (HD as f32).sqrt();
-    let q_staged = stage_on_device(stream, flash_module, &q_device, &q, b, t, h, q_scale, "q")?;
-    let k_staged = stage_on_device(stream, flash_module, &k_device, &k, b, t, h, 1.0, "k")?;
-    let v_staged = stage_on_device(stream, flash_module, &v_device, &v, b, t, h, 1.0, "v")?;
-    let dy_staged = stage_on_device(stream, flash_module, &dy_device, &dy, b, t, h, 1.0, "dy")?;
+        let q_scale = LOG2_E / (HD as f32).sqrt();
+        let q_staged = stage_on_device(stream, flash_module, &q_device, &q, b, t, h, q_scale, "q")?;
+        let k_staged = stage_on_device(stream, flash_module, &k_device, &k, b, t, h, 1.0, "k")?;
+        let v_staged = stage_on_device(stream, flash_module, &v_device, &v, b, t, h, 1.0, "v")?;
+        let dy_staged = stage_on_device(stream, flash_module, &dy_device, &dy, b, t, h, 1.0, "dy")?;
 
-    // Tier-1 oracle: materialized-probability backward from ops.
-    let mut probabilities = DeviceBuffer::<f32>::zeroed(stream, n * h * t)?;
-    naive_module.attention_probabilities(
-        stream,
-        LaunchConfig::for_num_elems((n * h * t) as u32),
-        &q_device,
-        &k_device,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut probabilities,
-    )?;
-    let mut expected_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut expected_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut expected_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    naive_module.attention_backward_q(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &q_device,
-        &k_device,
-        &v_device,
-        &probabilities,
-        &dy_device,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_dq,
-    )?;
-    naive_module.attention_backward_k(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &q_device,
-        &v_device,
-        &probabilities,
-        &dy_device,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_dk,
-    )?;
-    naive_module.attention_backward_v(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &probabilities,
-        &dy_device,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_dv,
-    )?;
-    let expected_dq = expected_dq.to_host_vec(stream)?;
-    let expected_dk = expected_dk.to_host_vec(stream)?;
-    let expected_dv = expected_dv.to_host_vec(stream)?;
-
-    // Model data flow: tcgen05 forward y/LSE, then fp32 backward_dot over y.
-    let q_tma = unsafe { create_flash_head_tma_map(stream, &q_staged, t, b * h)? };
-    let k_tma = unsafe { create_flash_head_tma_map(stream, &k_staged, t, b * h)? };
-    let v_tma = unsafe { create_flash_head_tma_map(stream, &v_staged, t, b * h)? };
-    let dy_tma = unsafe { create_flash_head_tma_map(stream, &dy_staged, t, b * h)? };
-    let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-    let mut corrections = DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
-    unsafe {
-        tcgen05.forward(
+        // Tier-1 oracle: materialized-probability backward from ops.
+        let mut probabilities = DeviceBuffer::<f32>::zeroed(stream, n * h * t)?;
+        naive_module.attention_probabilities(
             stream,
-            flash_forward_config(b, t, h),
-            q_tma.as_ptr(),
-            k_tma.as_ptr(),
-            v_tma.as_ptr(),
+            LaunchConfig::for_num_elems((n * h * t) as u32),
+            &q_device,
+            &k_device,
             t as u32,
             h as u32,
-            &mut y,
-            &mut lse,
-            &mut corrections,
+            HD as u32,
+            &mut probabilities,
         )?;
-    }
-    let mut dot = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-    flash_module.flash_attention_backward_dot(
-        stream,
-        flash::dot_config(n, h, HD),
-        &dy_device,
-        &y,
-        HD as u32,
-        &mut dot,
-    )?;
-
-    let mut dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    unsafe {
-        tcgen05.backward_q(
+        let mut expected_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut expected_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut expected_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        naive_module.attention_backward_q(
             stream,
-            flash_backward_q_config(b, t, h),
-            q_tma.as_ptr(),
-            k_tma.as_ptr(),
-            v_tma.as_ptr(),
-            dy_tma.as_ptr(),
-            &lse,
-            &dot,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &q_device,
+            &k_device,
+            &v_device,
+            &probabilities,
+            &dy_device,
             t as u32,
             h as u32,
-            &mut dq,
+            HD as u32,
+            &mut expected_dq,
         )?;
-        tcgen05.backward_kv(
+        naive_module.attention_backward_k(
             stream,
-            flash_backward_kv_config(b, t, h),
-            q_tma.as_ptr(),
-            k_tma.as_ptr(),
-            v_tma.as_ptr(),
-            dy_tma.as_ptr(),
-            &lse,
-            &dot,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &q_device,
+            &v_device,
+            &probabilities,
+            &dy_device,
             t as u32,
             h as u32,
-            &mut dk,
-            &mut dv,
+            HD as u32,
+            &mut expected_dk,
         )?;
-    }
+        naive_module.attention_backward_v(
+            stream,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &probabilities,
+            &dy_device,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut expected_dv,
+        )?;
+        let expected_dq = expected_dq.to_host_vec(stream)?;
+        let expected_dk = expected_dk.to_host_vec(stream)?;
+        let expected_dv = expected_dv.to_host_vec(stream)?;
 
-    println!("tcgen05 backward parity against ops oracle [{b},{t},{h},{HD}]");
-    assert_close("dq", &dq.to_host_vec(stream)?, &expected_dq, 1.0e-2, 1.0e-2);
-    assert_close("dk", &dk.to_host_vec(stream)?, &expected_dk, 1.0e-2, 1.0e-2);
-    assert_close("dv", &dv.to_host_vec(stream)?, &expected_dv, 1.0e-2, 1.0e-2);
-    Ok(())
+        // Model data flow: tcgen05 forward y/LSE, then fp32 backward_dot over y.
+        let q_tma = unsafe { create_flash_head_tma_map(stream, &q_staged, t, b * h)? };
+        let k_tma = unsafe { create_flash_head_tma_map(stream, &k_staged, t, b * h)? };
+        let v_tma = unsafe { create_flash_head_tma_map(stream, &v_staged, t, b * h)? };
+        let dy_tma = unsafe { create_flash_head_tma_map(stream, &dy_staged, t, b * h)? };
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        let mut corrections = DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
+        unsafe {
+            tcgen05.forward(
+                stream,
+                flash_forward_config(b, t, h),
+                q_tma.as_ptr(),
+                k_tma.as_ptr(),
+                v_tma.as_ptr(),
+                t as u32,
+                h as u32,
+                &mut y,
+                &mut lse,
+                &mut corrections,
+            )?;
+        }
+        let mut dot = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        flash_module.flash_attention_backward_dot(
+            stream,
+            flash::dot_config(n, h, HD),
+            &dy_device,
+            &y,
+            HD as u32,
+            &mut dot,
+        )?;
+
+        let mut dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        unsafe {
+            tcgen05.backward_q(
+                stream,
+                flash_backward_q_config(b, t, h),
+                q_tma.as_ptr(),
+                k_tma.as_ptr(),
+                v_tma.as_ptr(),
+                dy_tma.as_ptr(),
+                &lse,
+                &dot,
+                t as u32,
+                h as u32,
+                &mut dq,
+            )?;
+            tcgen05.backward_kv(
+                stream,
+                flash_backward_kv_config(b, t, h),
+                q_tma.as_ptr(),
+                k_tma.as_ptr(),
+                v_tma.as_ptr(),
+                dy_tma.as_ptr(),
+                &lse,
+                &dot,
+                t as u32,
+                h as u32,
+                &mut dk,
+                &mut dv,
+            )?;
+        }
+
+        println!("tcgen05 backward parity against ops oracle [{b},{t},{h},{HD}]");
+        assert_close("dq", &dq.to_host_vec(stream)?, &expected_dq, 1.0e-2, 1.0e-2);
+        assert_close("dk", &dk.to_host_vec(stream)?, &expected_dk, 1.0e-2, 1.0e-2);
+        assert_close("dv", &dv.to_host_vec(stream)?, &expected_dv, 1.0e-2, 1.0e-2);
+        Ok(())
     }
 }
 
@@ -425,252 +433,157 @@ fn check_shape(
     // SAFETY: launch shapes match the documented kernel contracts and every
     // device buffer remains valid through the corresponding host readback.
     unsafe {
-    let n = b * t;
-    let d = h * HD;
+        let n = b * t;
+        let d = h * HD;
 
-    let q = DeviceBuffer::from_host(stream, &uniform_vec(n * d, 71))?;
-    let k = DeviceBuffer::from_host(stream, &uniform_vec(n * d, 72))?;
-    let v = DeviceBuffer::from_host(stream, &uniform_vec(n * d, 73))?;
-    let dy = DeviceBuffer::from_host(stream, &uniform_vec(n * d, 74))?;
+        let q = DeviceBuffer::from_host(stream, &uniform_vec(n * d, 71))?;
+        let k = DeviceBuffer::from_host(stream, &uniform_vec(n * d, 72))?;
+        let v = DeviceBuffer::from_host(stream, &uniform_vec(n * d, 73))?;
+        let dy = DeviceBuffer::from_host(stream, &uniform_vec(n * d, 74))?;
 
-    let mut probabilities = DeviceBuffer::<f32>::zeroed(stream, n * h * t)?;
-    let mut expected_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut expected_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut expected_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut expected_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    naive_module.attention_probabilities(
-        stream,
-        LaunchConfig::for_num_elems((n * h * t) as u32),
-        &q,
-        &k,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut probabilities,
-    )?;
-    naive_module.attention_output(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &probabilities,
-        &v,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_y,
-    )?;
-    naive_module.attention_backward_q(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &q,
-        &k,
-        &v,
-        &probabilities,
-        &dy,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_dq,
-    )?;
-    naive_module.attention_backward_k(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &q,
-        &v,
-        &probabilities,
-        &dy,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_dk,
-    )?;
-    naive_module.attention_backward_v(
-        stream,
-        LaunchConfig::for_num_elems((n * d) as u32),
-        &probabilities,
-        &dy,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut expected_dv,
-    )?;
-    let expected_y = expected_y.to_host_vec(stream)?;
-    let expected_dq = expected_dq.to_host_vec(stream)?;
-    let expected_dk = expected_dk.to_host_vec(stream)?;
-    let expected_dv = expected_dv.to_host_vec(stream)?;
+        let mut probabilities = DeviceBuffer::<f32>::zeroed(stream, n * h * t)?;
+        let mut expected_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut expected_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut expected_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut expected_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        naive_module.attention_probabilities(
+            stream,
+            LaunchConfig::for_num_elems((n * h * t) as u32),
+            &q,
+            &k,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut probabilities,
+        )?;
+        naive_module.attention_output(
+            stream,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &probabilities,
+            &v,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut expected_y,
+        )?;
+        naive_module.attention_backward_q(
+            stream,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &q,
+            &k,
+            &v,
+            &probabilities,
+            &dy,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut expected_dq,
+        )?;
+        naive_module.attention_backward_k(
+            stream,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &q,
+            &v,
+            &probabilities,
+            &dy,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut expected_dk,
+        )?;
+        naive_module.attention_backward_v(
+            stream,
+            LaunchConfig::for_num_elems((n * d) as u32),
+            &probabilities,
+            &dy,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut expected_dv,
+        )?;
+        let expected_y = expected_y.to_host_vec(stream)?;
+        let expected_dq = expected_dq.to_host_vec(stream)?;
+        let expected_dk = expected_dk.to_host_vec(stream)?;
+        let expected_dv = expected_dv.to_host_vec(stream)?;
 
-    let mut actual_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut logsumexp = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-    let mut actual_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut actual_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut actual_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut actual_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut logsumexp = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        let mut actual_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut actual_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut actual_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
 
-    println!("per-row flash parity against ops [{b},{t},{h},{HD}]");
-    flash_module.flash_attention_forward(
-        stream,
-        per_row_config(n, h),
-        &q,
-        &k,
-        &v,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut actual_y,
-        &mut logsumexp,
-    )?;
-    flash_module.flash_attention_backward_q(
-        stream,
-        per_row_config(n, h),
-        &q,
-        &k,
-        &v,
-        &actual_y,
-        &dy,
-        &logsumexp,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut actual_dq,
-    )?;
-    flash_module.flash_attention_backward_kv(
-        stream,
-        per_row_config(n, h),
-        &q,
-        &k,
-        &v,
-        &actual_y,
-        &dy,
-        &logsumexp,
-        t as u32,
-        h as u32,
-        HD as u32,
-        &mut actual_dk,
-        &mut actual_dv,
-    )?;
-    assert_close("y", &actual_y.to_host_vec(stream)?, &expected_y, 5e-5, 5e-5);
-    assert_close(
-        "dq",
-        &actual_dq.to_host_vec(stream)?,
-        &expected_dq,
-        1e-4,
-        1e-4,
-    );
-    assert_close(
-        "dk",
-        &actual_dk.to_host_vec(stream)?,
-        &expected_dk,
-        1e-4,
-        1e-4,
-    );
-    assert_close(
-        "dv",
-        &actual_dv.to_host_vec(stream)?,
-        &expected_dv,
-        1e-4,
-        1e-4,
-    );
+        println!("per-row flash parity against ops [{b},{t},{h},{HD}]");
+        flash_module.flash_attention_forward(
+            stream,
+            per_row_config(n, h),
+            &q,
+            &k,
+            &v,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut actual_y,
+            &mut logsumexp,
+        )?;
+        flash_module.flash_attention_backward_q(
+            stream,
+            per_row_config(n, h),
+            &q,
+            &k,
+            &v,
+            &actual_y,
+            &dy,
+            &logsumexp,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut actual_dq,
+        )?;
+        flash_module.flash_attention_backward_kv(
+            stream,
+            per_row_config(n, h),
+            &q,
+            &k,
+            &v,
+            &actual_y,
+            &dy,
+            &logsumexp,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut actual_dk,
+            &mut actual_dv,
+        )?;
+        assert_close("y", &actual_y.to_host_vec(stream)?, &expected_y, 5e-5, 5e-5);
+        assert_close(
+            "dq",
+            &actual_dq.to_host_vec(stream)?,
+            &expected_dq,
+            1e-4,
+            1e-4,
+        );
+        assert_close(
+            "dk",
+            &actual_dk.to_host_vec(stream)?,
+            &expected_dk,
+            1e-4,
+            1e-4,
+        );
+        assert_close(
+            "dv",
+            &actual_dv.to_host_vec(stream)?,
+            &expected_dv,
+            1e-4,
+            1e-4,
+        );
 
-    println!("tiled flash parity against ops [{b},{t},{h},{HD}]");
-    let mut tiled_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut tiled_logsumexp = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-    let mut softmax_dot = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-    let mut tiled_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut tiled_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let mut tiled_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    flash_module.flash_attention_forward_tiled(
-        stream,
-        flash::tiled_forward_config(b, t, h, HD),
-        &q,
-        &k,
-        &v,
-        t as u32,
-        h as u32,
-        &mut tiled_y,
-        &mut tiled_logsumexp,
-    )?;
-    flash_module.flash_attention_backward_dot(
-        stream,
-        flash::dot_config(n, h, HD),
-        &dy,
-        &tiled_y,
-        HD as u32,
-        &mut softmax_dot,
-    )?;
-    flash_module.flash_attention_backward_q_tiled(
-        stream,
-        flash::tiled_backward_q_config(b, t, h, HD),
-        &q,
-        &k,
-        &v,
-        &dy,
-        &tiled_logsumexp,
-        &softmax_dot,
-        t as u32,
-        h as u32,
-        &mut tiled_dq,
-    )?;
-    flash_module.flash_attention_backward_kv_tiled(
-        stream,
-        flash::tiled_backward_kv_config(b, t, h, HD),
-        &q,
-        &k,
-        &v,
-        &dy,
-        &tiled_logsumexp,
-        &softmax_dot,
-        t as u32,
-        h as u32,
-        &mut tiled_dk,
-        &mut tiled_dv,
-    )?;
-    assert_close("y", &tiled_y.to_host_vec(stream)?, &expected_y, 5e-5, 5e-5);
-    assert_close(
-        "lse",
-        &tiled_logsumexp.to_host_vec(stream)?,
-        &logsumexp.to_host_vec(stream)?,
-        5e-5,
-        5e-5,
-    );
-    assert_close(
-        "dq",
-        &tiled_dq.to_host_vec(stream)?,
-        &expected_dq,
-        1e-4,
-        1e-4,
-    );
-    assert_close(
-        "dk",
-        &tiled_dk.to_host_vec(stream)?,
-        &expected_dk,
-        1e-4,
-        1e-4,
-    );
-    assert_close(
-        "dv",
-        &tiled_dv.to_host_vec(stream)?,
-        &expected_dv,
-        1e-4,
-        1e-4,
-    );
-
-    // DIAGNOSTIC: training reuses gradient scratch buffers, so any output
-    // element the tiled kernels skip writing leaks stale data. Seed every
-    // output with a sentinel and rerun; a surviving sentinel means a
-    // write-coverage gap. Then loop for bit-stability to expose races.
-    let first_y = tiled_y.to_host_vec(stream)?;
-    let first_lse = tiled_logsumexp.to_host_vec(stream)?;
-    let first_dot = softmax_dot.to_host_vec(stream)?;
-    let first_dq = tiled_dq.to_host_vec(stream)?;
-    let first_dk = tiled_dk.to_host_vec(stream)?;
-    let first_dv = tiled_dv.to_host_vec(stream)?;
-    let sentinel_y = vec![1.0e30f32; n * d];
-    let sentinel_h = vec![1.0e30f32; n * h];
-    for round in 0..200 {
-        let mut tiled_y = DeviceBuffer::from_host(stream, &sentinel_y)?;
-        let mut tiled_logsumexp = DeviceBuffer::from_host(stream, &sentinel_h)?;
-        let mut softmax_dot = DeviceBuffer::from_host(stream, &sentinel_h)?;
-        let mut tiled_dq = DeviceBuffer::from_host(stream, &sentinel_y)?;
-        let mut tiled_dk = DeviceBuffer::from_host(stream, &sentinel_y)?;
-        let mut tiled_dv = DeviceBuffer::from_host(stream, &sentinel_y)?;
+        println!("tiled flash parity against ops [{b},{t},{h},{HD}]");
+        let mut tiled_y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut tiled_logsumexp = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        let mut softmax_dot = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        let mut tiled_dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut tiled_dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut tiled_dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
         flash_module.flash_attention_forward_tiled(
             stream,
             flash::tiled_forward_config(b, t, h, HD),
@@ -717,27 +630,122 @@ fn check_shape(
             &mut tiled_dk,
             &mut tiled_dv,
         )?;
-        for (name, buffer, first) in [
-            ("y", &tiled_y, &first_y),
-            ("lse", &tiled_logsumexp, &first_lse),
-            ("dot", &softmax_dot, &first_dot),
-            ("dq", &tiled_dq, &first_dq),
-            ("dk", &tiled_dk, &first_dk),
-            ("dv", &tiled_dv, &first_dv),
-        ] {
-            let values = buffer.to_host_vec(stream)?;
-            for (i, (&a, &b)) in values.iter().zip(first).enumerate() {
-                assert!(
-                    a.to_bits() == b.to_bits(),
-                    "{name} unstable at [{b},{t},{h}] round {round} index {i}: \
+        assert_close("y", &tiled_y.to_host_vec(stream)?, &expected_y, 5e-5, 5e-5);
+        assert_close(
+            "lse",
+            &tiled_logsumexp.to_host_vec(stream)?,
+            &logsumexp.to_host_vec(stream)?,
+            5e-5,
+            5e-5,
+        );
+        assert_close(
+            "dq",
+            &tiled_dq.to_host_vec(stream)?,
+            &expected_dq,
+            1e-4,
+            1e-4,
+        );
+        assert_close(
+            "dk",
+            &tiled_dk.to_host_vec(stream)?,
+            &expected_dk,
+            1e-4,
+            1e-4,
+        );
+        assert_close(
+            "dv",
+            &tiled_dv.to_host_vec(stream)?,
+            &expected_dv,
+            1e-4,
+            1e-4,
+        );
+
+        // DIAGNOSTIC: training reuses gradient scratch buffers, so any output
+        // element the tiled kernels skip writing leaks stale data. Seed every
+        // output with a sentinel and rerun; a surviving sentinel means a
+        // write-coverage gap. Then loop for bit-stability to expose races.
+        let first_y = tiled_y.to_host_vec(stream)?;
+        let first_lse = tiled_logsumexp.to_host_vec(stream)?;
+        let first_dot = softmax_dot.to_host_vec(stream)?;
+        let first_dq = tiled_dq.to_host_vec(stream)?;
+        let first_dk = tiled_dk.to_host_vec(stream)?;
+        let first_dv = tiled_dv.to_host_vec(stream)?;
+        let sentinel_y = vec![1.0e30f32; n * d];
+        let sentinel_h = vec![1.0e30f32; n * h];
+        for round in 0..200 {
+            let mut tiled_y = DeviceBuffer::from_host(stream, &sentinel_y)?;
+            let mut tiled_logsumexp = DeviceBuffer::from_host(stream, &sentinel_h)?;
+            let mut softmax_dot = DeviceBuffer::from_host(stream, &sentinel_h)?;
+            let mut tiled_dq = DeviceBuffer::from_host(stream, &sentinel_y)?;
+            let mut tiled_dk = DeviceBuffer::from_host(stream, &sentinel_y)?;
+            let mut tiled_dv = DeviceBuffer::from_host(stream, &sentinel_y)?;
+            flash_module.flash_attention_forward_tiled(
+                stream,
+                flash::tiled_forward_config(b, t, h, HD),
+                &q,
+                &k,
+                &v,
+                t as u32,
+                h as u32,
+                &mut tiled_y,
+                &mut tiled_logsumexp,
+            )?;
+            flash_module.flash_attention_backward_dot(
+                stream,
+                flash::dot_config(n, h, HD),
+                &dy,
+                &tiled_y,
+                HD as u32,
+                &mut softmax_dot,
+            )?;
+            flash_module.flash_attention_backward_q_tiled(
+                stream,
+                flash::tiled_backward_q_config(b, t, h, HD),
+                &q,
+                &k,
+                &v,
+                &dy,
+                &tiled_logsumexp,
+                &softmax_dot,
+                t as u32,
+                h as u32,
+                &mut tiled_dq,
+            )?;
+            flash_module.flash_attention_backward_kv_tiled(
+                stream,
+                flash::tiled_backward_kv_config(b, t, h, HD),
+                &q,
+                &k,
+                &v,
+                &dy,
+                &tiled_logsumexp,
+                &softmax_dot,
+                t as u32,
+                h as u32,
+                &mut tiled_dk,
+                &mut tiled_dv,
+            )?;
+            for (name, buffer, first) in [
+                ("y", &tiled_y, &first_y),
+                ("lse", &tiled_logsumexp, &first_lse),
+                ("dot", &softmax_dot, &first_dot),
+                ("dq", &tiled_dq, &first_dq),
+                ("dk", &tiled_dk, &first_dk),
+                ("dv", &tiled_dv, &first_dv),
+            ] {
+                let values = buffer.to_host_vec(stream)?;
+                for (i, (&a, &b)) in values.iter().zip(first).enumerate() {
+                    assert!(
+                        a.to_bits() == b.to_bits(),
+                        "{name} unstable at [{b},{t},{h}] round {round} index {i}: \
                      {a:e} (bits {:#x}) vs first {b:e} — sentinel leak or race",
-                    a.to_bits(),
-                );
+                        a.to_bits(),
+                    );
+                }
             }
         }
-    }
-    println!("  sentinel + 200-round bit-stability passed");
-    Ok(())
+        println!("  sentinel + 200-round bit-stability passed");
+        Ok(())
     }
 }
 
@@ -754,11 +762,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_shape(&stream, &flash_module, &naive_module, 1, 4, 2)?;
     println!("✓ per-row and tiled parity passed on both shapes");
 
-    let tcgen05 = Tcgen05Flash::load_from_ptx(&ctx, "flash.ptx")?;
+    let tcgen05 = Tcgen05Flash::load(&ctx)?;
     let sm_count = device_sm_count(&ctx)?;
-    check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, sm_count, 1, 128, 2)?;
-    check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, sm_count, 2, 256, 3)?;
-    check_tcgen05_shape(&stream, &flash_module, &naive_module, &tcgen05, sm_count, 1, 1024, 4)?;
+    check_tcgen05_shape(
+        &stream,
+        &flash_module,
+        &naive_module,
+        &tcgen05,
+        sm_count,
+        1,
+        128,
+        2,
+    )?;
+    check_tcgen05_shape(
+        &stream,
+        &flash_module,
+        &naive_module,
+        &tcgen05,
+        sm_count,
+        2,
+        256,
+        3,
+    )?;
+    check_tcgen05_shape(
+        &stream,
+        &flash_module,
+        &naive_module,
+        &tcgen05,
+        sm_count,
+        1,
+        1024,
+        4,
+    )?;
     println!("✓ tcgen05 forward parity passed on tile-aligned shapes");
     check_tcgen05_backward_shape(&stream, &flash_module, &naive_module, &tcgen05, 1, 128, 2)?;
     check_tcgen05_backward_shape(&stream, &flash_module, &naive_module, &tcgen05, 2, 256, 3)?;

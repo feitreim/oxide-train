@@ -13,10 +13,9 @@
 //! for the abstraction unless ptxas says otherwise (the bench-util budget
 //! gate is the enforcement mechanism: same SASS, fewer lines).
 //!
-//! Pure-PTX discipline: nothing in this crate may call libdevice-lowered
-//! math (`f32::exp/ln/sqrt/floor/max/min`) — kittens code must be linkable
-//! into pure-PTX artifacts like flash-attn's `flash.ptx`, which libNVVM
-//! would reject for its tcgen05 constructs.
+//! Libdevice math is legal beside tcgen05 in the same pure-PTX artifact at
+//! cuda-oxide b099f64. Software approximations remain where their lowering is
+//! a measured kernel optimization rather than an artifact-path workaround.
 //!
 pub mod global;
 pub mod ldst;

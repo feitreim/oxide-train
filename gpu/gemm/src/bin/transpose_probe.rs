@@ -591,6 +591,58 @@ fn main() -> Result<(), Box<dyn Error>> {
     let context = CudaContext::new(0)?;
     let stream = context.default_stream();
     let module = kernels::from_module(context.load_module_from_file("transpose_probe.ptx")?)?;
+    let math_input: Vec<f32> = (1..=256).map(|i| i as f32 / 64.0).collect();
+    let math_expected: Vec<f32> = math_input
+        .iter()
+        .map(|&value| value.sqrt() + value.exp() + value.ln() + value.max(0.5))
+        .collect();
+    let math_input = DeviceBuffer::from_host(&stream, &math_input)?;
+    let mut math_output = DeviceBuffer::<f32>::zeroed(&stream, math_expected.len())?;
+    unsafe {
+        module.libdevice_math_probe(
+            &stream,
+            LaunchConfig::for_num_elems(math_expected.len() as u32),
+            &math_input,
+            &mut math_output,
+        )
+    }?;
+    let math_actual = math_output.to_host_vec(&stream)?;
+    let max_math_error = math_actual
+        .iter()
+        .zip(&math_expected)
+        .map(|(&actual, &expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    if max_math_error > 1e-5 {
+        return Err(format!(
+            "libdevice math failed in the tcgen05 artifact: max abs error {max_math_error:.3e}"
+        )
+        .into());
+    }
+    println!(
+        "✓ libdevice math shares the pure-PTX tcgen05 artifact (max abs error {max_math_error:.3e})"
+    );
+
+    let mut atomic_output = DeviceBuffer::<f32>::zeroed(&stream, 1)?;
+    unsafe {
+        module.device_atomic_probe(
+            &stream,
+            LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (64, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &mut atomic_output,
+        )
+    }?;
+    let atomic_sum = atomic_output.to_host_vec(&stream)?[0];
+    if atomic_sum != 2080.0 {
+        return Err(format!(
+            "device atomics failed in the tcgen05 artifact: got {atomic_sum}, expected 2080"
+        )
+        .into());
+    }
+    println!("✓ device atomics share the pure-PTX tcgen05 artifact (sum 2080/2080)\n");
+
     let config = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (128, 1, 1),

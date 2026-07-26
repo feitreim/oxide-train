@@ -215,11 +215,6 @@ def run_kernel(
 ) -> None:
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     proj = _proj(kernel)
-    if kernel == "model":
-        _prepare_gemm_ptx(PROJECT_DIR)
-        _prepare_flash_ptx(PROJECT_DIR)
-    if kernel == "flash-attn":
-        _prepare_flash_ptx(PROJECT_DIR)
     cmd = ["cargo", "oxide", "run", kernel]
     if bin:
         cmd += ["--bin", bin]
@@ -303,14 +298,18 @@ def compare_profile(kernel: str, baseline_ref: str) -> None:
                 1,
             )
             manifest.write_text(contents)
-        # Baselines predating the staged tcgen05 PTX simply ignore the file.
-        _prepare_gemm_ptx(baseline_root, baseline_oxide)
-        _prepare_gemm_ptx(PROJECT_DIR)
-        # Same for flash.ptx (phase-3 attention); baselines whose flash-attn
-        # crate predates the flash bin target skip the baseline-side prep.
-        if Path(baseline_root, "gpu/flash-attn/src/bin/flash.rs").is_file():
+        # Preserve the staged artifacts only for historical refs that load
+        # them. The current candidate always uses one embedded artifact.
+        baseline_source = "\n".join(
+            source.read_text() for source in Path(baseline, "src").rglob("*.rs")
+        )
+        if '"gemm.ptx"' in baseline_source:
+            _prepare_gemm_ptx(baseline_root, baseline_oxide)
+        if (
+            '"flash.ptx"' in baseline_source
+            and Path(baseline_root, "gpu/flash-attn/src/bin/flash.rs").is_file()
+        ):
             _prepare_flash_ptx(baseline_root, baseline_oxide)
-        _prepare_flash_ptx(PROJECT_DIR)
     _run([*baseline_oxide, "run", kernel, "--bin", "profile"], cwd=baseline)
     _run(["cargo", "oxide", "run", kernel, "--bin", "profile"], cwd=candidate)
 
@@ -356,9 +355,7 @@ def run_sweep(kernel: str, configs: str) -> None:
             source.write_text(src)
         print(f"=== config {cfg} ===", flush=True)
         if kernel == "flash-attn":
-            # The tuning consts live in the pure-PTX device module, so the
-            # flash.ptx artifact must be rebuilt per config; the flash bin
-            # is the correctness gate and the bench in one.
+            # The standalone flash binary is its correctness gate and bench.
             commands = [["cargo", "oxide", "run", kernel, "--bin", "flash"]]
         else:
             commands = [
@@ -367,8 +364,6 @@ def run_sweep(kernel: str, configs: str) -> None:
             ]
         for cmd in commands:
             try:
-                if kernel == "flash-attn":
-                    _prepare_flash_ptx(PROJECT_DIR)
                 _run(cmd, cwd=proj)
             except (subprocess.CalledProcessError, SystemExit) as e:
                 print(f"config failed: {e}", flush=True)

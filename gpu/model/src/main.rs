@@ -1528,8 +1528,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
     let tensor = model::tensor_kernels::load(&ctx)?;
     let gemm = model::gemm_kernels::load(&ctx)?;
-    let gemm_bf16 = model::Tcgen05Gemm::load_from_ptx(&ctx, "gemm.ptx")?;
-    let flash_bf16 = model::Tcgen05Flash::load_from_ptx(&ctx, "flash.ptx")?;
+    let gemm_bf16 = model::Tcgen05Gemm::load(&ctx)?;
+    let flash_bf16 = model::Tcgen05Flash::load(&ctx)?;
     let flash = model::flash_kernels::load(&ctx)?;
     let dense = model::dense_kernels::load(&ctx)?;
 

@@ -27,8 +27,8 @@ fn tflops(m: usize, n: usize, k: usize, milliseconds: f64) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
     let stream = context.default_stream();
-    let fp32_module = fp32::kernels::from_module(context.load_module_from_file("gemm.ptx")?)?;
-    let module = Tcgen05Gemm::load_from_ptx(&context, "gemm.ptx")?;
+    let fp32_module = fp32::kernels::load(&context)?;
+    let module = Tcgen05Gemm::load(&context)?;
 
     let fp32_a = DeviceBuffer::from_host(&stream, &uniform_vec(FP32_M * FP32_K, 11))?;
     let fp32_b = DeviceBuffer::from_host(&stream, &uniform_vec(FP32_K * FP32_N, 12))?;

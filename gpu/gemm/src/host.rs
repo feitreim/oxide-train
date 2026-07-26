@@ -1,20 +1,11 @@
-//! Host-side tcgen05 support: tile contracts, TMA tensor maps, and raw
-//! launchers for the bf16 GEMM kernels.
-//!
-//! This file deliberately contains no `#[cuda_module]`. Binaries whose own
-//! device artifact must stay free of tcgen05 lowerings (gpu/model: its
-//! libdevice math forces the artifact through libNVVM, which rejects tcgen05
-//! constructs) include only this module and load the kernels from a
-//! `gemm.ptx` built separately by this crate, which takes the pure-PTX path.
+//! Host-side tcgen05 support: tile contracts, TMA tensor maps, and ergonomic
+//! adapters over cuda-oxide's generated typed launchers.
 
 use std::error::Error;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
 
-use cuda_core::{
-    CudaContext, CudaFunction, CudaModule, CudaStream, DeviceBuffer, DriverError, LaunchConfig,
-};
+use cuda_core::{CudaContext, CudaFunction, CudaStream, DeviceBuffer, DriverError, LaunchConfig};
 use cuda_device::tma::TmaDescriptor;
 
 /// TMA panel edge and packed-storage alignment.
@@ -276,34 +267,36 @@ pub unsafe fn create_bf16_pairs_tma_map_region(
     })
 }
 
-/// The optimized tcgen05 bf16 GEMM, loaded from a `gemm.ptx` built by this
-/// crate rather than from the calling binary's embedded artifact.
-///
-/// The launchers mirror the `#[cuda_module]`-generated marshalling exactly:
-/// TMA descriptor pointers and dimensions as scalars, the packed output as a
-/// `(pointer, length)` device-slice pair.
+/// The optimized tcgen05 bf16 GEMM loaded from the calling binary's single
+/// embedded device artifact.
 pub struct Tcgen05Gemm {
+    generated: super::optimized_kernels::LoadedModule,
     optimized: CudaFunction,
-    _module: Arc<CudaModule>,
+    optimized_f32: CudaFunction,
 }
 
 impl Tcgen05Gemm {
-    pub fn load_from_ptx(ctx: &Arc<CudaContext>, path: &str) -> Result<Self, Box<dyn Error>> {
-        let module = ctx.load_module_from_file(path).map_err(|error| {
-            format!(
-                "loading {path} failed ({error:?}); build gpu/gemm first so its \
-                 pure-PTX artifact exists (run.sh does this for model)"
-            )
-        })?;
+    pub fn load(ctx: &std::sync::Arc<CudaContext>) -> Result<Self, Box<dyn Error>> {
+        let generated = super::optimized_kernels::load(ctx)?;
+        let optimized = generated
+            .as_cuda_module()
+            .load_function("gemm_tcgen05_bf16_optimized")?;
+        let optimized_f32 = generated
+            .as_cuda_module()
+            .load_function("gemm_tcgen05_f32_optimized")?;
         Ok(Self {
-            optimized: module.load_function("gemm_tcgen05_bf16_optimized")?,
-            _module: module,
+            generated,
+            optimized,
+            optimized_f32,
         })
     }
 
     /// The loaded kernels, named for `bench_util::enforce_kernel_budgets`.
-    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 1] {
-        [("gemm_tcgen05_bf16_optimized", &self.optimized)]
+    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 2] {
+        [
+            ("gemm_tcgen05_bf16_optimized", &self.optimized),
+            ("gemm_tcgen05_f32_optimized", &self.optimized_f32),
+        ]
     }
 
     /// Blackwell bf16 `C = A B^T`; see the kernel for the full contract.
@@ -326,7 +319,7 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05(
-                &self.optimized,
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -358,7 +351,7 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05(
-                &self.optimized,
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -392,7 +385,7 @@ impl Tcgen05Gemm {
         let output_elements = output.len();
         unsafe {
             launch_tcgen05_f32(
-                &self.optimized,
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -430,7 +423,7 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05_f32(
-                &self.optimized,
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -465,7 +458,7 @@ impl Tcgen05Gemm {
         let output_elements = output.len();
         unsafe {
             launch_tcgen05_f32(
-                &self.optimized,
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -502,7 +495,7 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05_f32(
-                &self.optimized,
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -539,7 +532,7 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05(
-                &self.optimized,
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -579,7 +572,7 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05_f32(
-                &self.optimized,
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -630,15 +623,15 @@ impl Tcgen05Gemm {
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_tcgen05(
-    function: &CudaFunction,
+    module: &super::optimized_kernels::LoadedModule,
     stream: &CudaStream,
     config: LaunchConfig,
-    mut a_tma: *const TmaDescriptor,
-    mut b_tma: *const TmaDescriptor,
+    a_tma: *const TmaDescriptor,
+    b_tma: *const TmaDescriptor,
     output: &mut DeviceBuffer<u32>,
-    mut n: u32,
-    mut k: u32,
-    mut mode: u32,
+    n: u32,
+    k: u32,
+    mode: u32,
     layout: TmaLayout,
 ) -> Result<(), DriverError> {
     let m = output
@@ -646,83 +639,57 @@ unsafe fn launch_tcgen05(
         .checked_mul(2)
         .expect("tcgen05 packed output size overflow")
         / n as usize;
-    let mut tiles_m = (m / TC_M_TILE) as u32;
-    let mut tiles_n = (n as usize / TC_TILE) as u32;
-    let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
-    cuda_host::push_kernel_scalar(&mut args, &mut a_tma);
-    cuda_host::push_kernel_scalar(&mut args, &mut b_tma);
-    let (mut output_ptr, mut output_len) = cuda_host::writable_device_buffer_arg(output);
-    cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
-    cuda_host::push_kernel_scalar(&mut args, &mut n);
-    cuda_host::push_kernel_scalar(&mut args, &mut k);
-    cuda_host::push_kernel_scalar(&mut args, &mut tiles_m);
-    cuda_host::push_kernel_scalar(&mut args, &mut tiles_n);
-    cuda_host::push_kernel_scalar(&mut args, &mut mode);
-    let mut transposed = u32::from(layout == TmaLayout::MnMajor);
-    cuda_host::push_kernel_scalar(&mut args, &mut transposed);
     unsafe {
-        cuda_core::launch_kernel_ex_on_stream(
-            function,
-            config.grid_dim,
-            config.block_dim,
-            config.shared_mem_bytes,
-            (2, 1, 1),
+        module.gemm_tcgen05_bf16_optimized(
             stream,
-            &mut args,
+            config,
+            a_tma,
+            b_tma,
+            output,
+            n as i32,
+            k as i32,
+            (m / TC_M_TILE) as u32,
+            (n as usize / TC_TILE) as u32,
+            mode,
+            u32::from(layout == TmaLayout::MnMajor),
         )
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_tcgen05_f32(
-    function: &CudaFunction,
+    module: &super::optimized_kernels::LoadedModule,
     stream: &CudaStream,
     config: LaunchConfig,
-    mut a_tma: *const TmaDescriptor,
-    mut b_tma: *const TmaDescriptor,
+    a_tma: *const TmaDescriptor,
+    b_tma: *const TmaDescriptor,
     output: &mut DeviceBuffer<f32>,
     output_offset: usize,
     output_elements: usize,
-    mut n: u32,
-    mut k: u32,
-    mut mode: u32,
+    n: u32,
+    k: u32,
+    mode: u32,
     layout: TmaLayout,
 ) -> Result<(), DriverError> {
     let output_end = output_offset
         .checked_add(output_elements)
         .expect("tcgen05 fp32 output region overflow");
     assert!(output_end <= output.len());
-    let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
-    cuda_host::push_kernel_scalar(&mut args, &mut a_tma);
-    cuda_host::push_kernel_scalar(&mut args, &mut b_tma);
-    let byte_offset = output_offset
-        .checked_mul(std::mem::size_of::<f32>())
-        .expect("tcgen05 fp32 output byte offset overflow");
-    let mut output_ptr = output
-        .cu_deviceptr()
-        .checked_add(byte_offset as u64)
-        .expect("tcgen05 fp32 output device pointer overflow");
-    let mut output_len = output_elements as u64;
     let m = output_elements / n as usize;
-    let mut tiles_m = (m / TC_M_TILE) as u32;
-    let mut tiles_n = (n as usize / TC_TILE) as u32;
-    cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
-    cuda_host::push_kernel_scalar(&mut args, &mut n);
-    cuda_host::push_kernel_scalar(&mut args, &mut k);
-    cuda_host::push_kernel_scalar(&mut args, &mut tiles_m);
-    cuda_host::push_kernel_scalar(&mut args, &mut tiles_n);
-    cuda_host::push_kernel_scalar(&mut args, &mut mode);
-    let mut transposed = u32::from(layout == TmaLayout::MnMajor);
-    cuda_host::push_kernel_scalar(&mut args, &mut transposed);
     unsafe {
-        cuda_core::launch_kernel_ex_on_stream(
-            function,
-            config.grid_dim,
-            config.block_dim,
-            config.shared_mem_bytes,
-            (2, 1, 1),
+        module.gemm_tcgen05_f32_optimized(
             stream,
-            &mut args,
+            config,
+            a_tma,
+            b_tma,
+            output,
+            output_offset,
+            n as i32,
+            k as i32,
+            (m / TC_M_TILE) as u32,
+            (n as usize / TC_TILE) as u32,
+            mode,
+            u32::from(layout == TmaLayout::MnMajor),
         )
     }
 }

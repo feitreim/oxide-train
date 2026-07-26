@@ -146,12 +146,11 @@ pub mod optimized_kernels {
     /// row-major activation and output-gradient panels of a weight gradient
     /// `dW += Aᵀ·B`, with nothing transposed in global memory.
     #[allow(clippy::too_many_arguments)]
-    #[kernel]
-    #[cluster_launch(2, 1, 1)]
-    pub unsafe fn gemm_tcgen05_bf16_optimized(
+    #[inline(always)]
+    unsafe fn gemm_tcgen05_bf16_optimized_impl(
         a_tma: *const TmaDescriptor,
         b_tma: *const TmaDescriptor,
-        mut output: DisjointSlice<u32>,
+        output: *mut u32,
         n: i32,
         k: i32,
         tiles_m: u32,
@@ -525,11 +524,11 @@ pub mod optimized_kernels {
                         let packed = (SMEM_OUT[smem] as u64)
                             | ((SMEM_OUT[smem + 1] as u64) << 32);
                         if mode == 0 {
-                            *(output.as_mut_ptr().add(global) as *mut u64) = packed;
+                            *(output.add(global) as *mut u64) = packed;
                         } else {
-                            store_output_pair(output.as_mut_ptr(), global, packed as u32, mode);
+                            store_output_pair(output, global, packed as u32, mode);
                             store_output_pair(
-                                output.as_mut_ptr(),
+                                output,
                                 global + 1,
                                 (packed >> 32) as u32,
                                 mode,
@@ -564,6 +563,68 @@ pub mod optimized_kernels {
                 accum_empty.inval_all();
                 tile_ready.inval();
             }
+        }
+    }
+
+    /// Typed packed-bf16 entry point for overwrite/accumulate modes.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    pub unsafe fn gemm_tcgen05_bf16_optimized(
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        mut output: DisjointSlice<u32>,
+        n: i32,
+        k: i32,
+        tiles_m: u32,
+        tiles_n: u32,
+        mode: u32,
+        transposed: u32,
+    ) {
+        unsafe {
+            gemm_tcgen05_bf16_optimized_impl(
+                a_tma,
+                b_tma,
+                output.as_mut_ptr(),
+                n,
+                k,
+                tiles_m,
+                tiles_n,
+                mode,
+                transposed,
+            )
+        }
+    }
+
+    /// Typed fp32 entry point. `output_offset` selects one matrix in a stacked
+    /// allocation without host-side pointer marshalling.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    pub unsafe fn gemm_tcgen05_f32_optimized(
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        mut output: DisjointSlice<f32>,
+        output_offset: usize,
+        n: i32,
+        k: i32,
+        tiles_m: u32,
+        tiles_n: u32,
+        mode: u32,
+        transposed: u32,
+    ) {
+        unsafe {
+            gemm_tcgen05_bf16_optimized_impl(
+                a_tma,
+                b_tma,
+                output.as_mut_ptr().add(output_offset) as *mut u32,
+                n,
+                k,
+                tiles_m,
+                tiles_n,
+                mode,
+                transposed,
+            )
         }
     }
 }

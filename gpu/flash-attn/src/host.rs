@@ -1,19 +1,10 @@
 //! Host-side support for the tcgen05 attention kernels: staging-buffer TMA
-//! maps, launch configs, and raw launchers for the kernels in `flash.ptx`.
-//!
-//! This file deliberately contains no `#[cuda_module]` (the gemm `host.rs`
-//! pattern). Binaries whose own device artifact must stay free of tcgen05
-//! lowerings — `main.rs` here (libdevice oracle kernels) and later
-//! `gpu/model` — include only this module and load the kernels from a
-//! `flash.ptx` built separately by `src/bin/flash.rs`, which takes the
-//! pure-PTX path.
+//! maps, launch configs, and ergonomic adapters over generated typed launchers.
 
 use std::error::Error;
 use std::sync::Arc;
 
-use cuda_core::{
-    CudaContext, CudaFunction, CudaModule, CudaStream, DeviceBuffer, DriverError, LaunchConfig,
-};
+use cuda_core::{CudaContext, CudaFunction, CudaStream, DeviceBuffer, DriverError, LaunchConfig};
 use cuda_device::tma::TmaDescriptor;
 
 /// Query/key tile edge: `T` must be a multiple of this to use the tcgen05
@@ -298,11 +289,10 @@ fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dy
     Ok(())
 }
 
-/// The tcgen05 attention kernels, loaded from a `flash.ptx` built by
-/// `src/bin/flash.rs` rather than from the calling binary's embedded
-/// artifact. The launchers mirror the `#[cuda_module]`-generated
-/// marshalling exactly.
+/// The tcgen05 attention kernels loaded from the calling binary's single
+/// embedded device artifact.
 pub struct Tcgen05Flash {
+    generated: super::tcgen05::kernels::LoadedModule,
     forward: CudaFunction,
     forward_pipelined: CudaFunction,
     forward_persistent: CudaFunction,
@@ -310,22 +300,13 @@ pub struct Tcgen05Flash {
     backward_q_pipelined: CudaFunction,
     backward_kv: CudaFunction,
     backward_kv_pipelined: CudaFunction,
-    transpose_probe: CudaFunction,
-    swizzle_probe: CudaFunction,
-    exp2: CudaFunction,
-    log2: CudaFunction,
     sm_count: usize,
-    _module: Arc<CudaModule>,
 }
 
 impl Tcgen05Flash {
-    pub fn load_from_ptx(ctx: &Arc<CudaContext>, path: &str) -> Result<Self, Box<dyn Error>> {
-        let module = ctx.load_module_from_file(path).map_err(|error| {
-            format!(
-                "loading {path} failed ({error:?}); build gpu/flash-attn's `flash` \
-                 binary first so its pure-PTX artifact exists"
-            )
-        })?;
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<Self, Box<dyn Error>> {
+        let generated = super::tcgen05::kernels::load(ctx)?;
+        let module = generated.as_cuda_module().clone();
         let forward = module.load_function("flash_forward_tcgen05")?;
         let forward_pipelined = module.load_function("flash_forward_pipelined")?;
         let forward_persistent = module.load_function("flash_forward_persistent")?;
@@ -338,10 +319,7 @@ impl Tcgen05Flash {
         opt_in_dynamic_smem(&forward_pipelined, FLASH_PIPELINE_SMEM_BYTES)?;
         opt_in_dynamic_smem(&forward_persistent, FLASH_PERSISTENT_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_q, FLASH_BACKWARD_Q_SMEM_BYTES)?;
-        opt_in_dynamic_smem(
-            &backward_q_pipelined,
-            FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES,
-        )?;
+        opt_in_dynamic_smem(&backward_q_pipelined, FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_kv, FLASH_BACKWARD_KV_SMEM_BYTES)?;
         opt_in_dynamic_smem(
             &backward_kv_pipelined,
@@ -349,6 +327,7 @@ impl Tcgen05Flash {
         )?;
         opt_in_dynamic_smem(&transpose_probe, PROBE_DYNAMIC_SMEM_BYTES)?;
         Ok(Self {
+            generated,
             forward,
             forward_pipelined,
             forward_persistent,
@@ -356,12 +335,7 @@ impl Tcgen05Flash {
             backward_q_pipelined,
             backward_kv,
             backward_kv_pipelined,
-            transpose_probe,
-            swizzle_probe: module.load_function("swizzle_probe")?,
-            exp2: module.load_function("software_exp2")?,
-            log2: module.load_function("software_log2")?,
             sm_count: device_sm_count(ctx)?,
-            _module: module,
         })
     }
 
@@ -409,8 +383,7 @@ impl Tcgen05Flash {
         correction_counts: &mut DeviceBuffer<u32>,
     ) -> Result<(), DriverError> {
         unsafe {
-            self.launch_forward(
-                &self.forward,
+            self.generated.flash_forward_tcgen05(
                 stream,
                 config,
                 q_tma,
@@ -418,7 +391,6 @@ impl Tcgen05Flash {
                 v_tma,
                 sequence_length,
                 heads,
-                None,
                 output,
                 logsumexp,
                 correction_counts,
@@ -447,8 +419,7 @@ impl Tcgen05Flash {
         correction_counts: &mut DeviceBuffer<u32>,
     ) -> Result<(), DriverError> {
         unsafe {
-            self.launch_forward(
-                &self.forward_pipelined,
+            self.generated.flash_forward_pipelined(
                 stream,
                 config,
                 q_tma,
@@ -456,7 +427,6 @@ impl Tcgen05Flash {
                 v_tma,
                 sequence_length,
                 heads,
-                None,
                 output,
                 logsumexp,
                 correction_counts,
@@ -488,8 +458,7 @@ impl Tcgen05Flash {
         correction_counts: &mut DeviceBuffer<u32>,
     ) -> Result<(), DriverError> {
         unsafe {
-            self.launch_forward(
-                &self.forward_persistent,
+            self.generated.flash_forward_persistent(
                 stream,
                 config,
                 q_tma,
@@ -497,7 +466,7 @@ impl Tcgen05Flash {
                 v_tma,
                 sequence_length,
                 heads,
-                Some(batches),
+                batches,
                 output,
                 logsumexp,
                 correction_counts,
@@ -531,8 +500,7 @@ impl Tcgen05Flash {
         dq: &mut DeviceBuffer<f32>,
     ) -> Result<(), DriverError> {
         unsafe {
-            self.launch_backward_q(
-                &self.backward_q,
+            self.generated.flash_backward_q_tcgen05(
                 stream,
                 config,
                 q_tma,
@@ -571,8 +539,7 @@ impl Tcgen05Flash {
         dq: &mut DeviceBuffer<f32>,
     ) -> Result<(), DriverError> {
         unsafe {
-            self.launch_backward_q(
-                &self.backward_q_pipelined,
+            self.generated.flash_backward_q_pipelined(
                 stream,
                 config,
                 q_tma,
@@ -584,53 +551,6 @@ impl Tcgen05Flash {
                 sequence_length,
                 heads,
                 dq,
-            )
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn launch_backward_q(
-        &self,
-        function: &CudaFunction,
-        stream: &CudaStream,
-        config: LaunchConfig,
-        q_tma: *const TmaDescriptor,
-        k_tma: *const TmaDescriptor,
-        v_tma: *const TmaDescriptor,
-        dy_tma: *const TmaDescriptor,
-        logsumexp: &DeviceBuffer<f32>,
-        dot: &DeviceBuffer<f32>,
-        sequence_length: u32,
-        heads: u32,
-        dq: &mut DeviceBuffer<f32>,
-    ) -> Result<(), DriverError> {
-        let mut q_tma = q_tma;
-        let mut k_tma = k_tma;
-        let mut v_tma = v_tma;
-        let mut dy_tma = dy_tma;
-        let mut sequence_length = sequence_length;
-        let mut heads = heads;
-        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
-        cuda_host::push_kernel_scalar(&mut args, &mut q_tma);
-        cuda_host::push_kernel_scalar(&mut args, &mut k_tma);
-        cuda_host::push_kernel_scalar(&mut args, &mut v_tma);
-        cuda_host::push_kernel_scalar(&mut args, &mut dy_tma);
-        let (mut lse_ptr, mut lse_len) = cuda_host::read_only_device_buffer_arg(logsumexp);
-        cuda_host::push_kernel_device_slice(&mut args, &mut lse_ptr, &mut lse_len);
-        let (mut dot_ptr, mut dot_len) = cuda_host::read_only_device_buffer_arg(dot);
-        cuda_host::push_kernel_device_slice(&mut args, &mut dot_ptr, &mut dot_len);
-        cuda_host::push_kernel_scalar(&mut args, &mut sequence_length);
-        cuda_host::push_kernel_scalar(&mut args, &mut heads);
-        let (mut dq_ptr, mut dq_len) = cuda_host::writable_device_buffer_arg(dq);
-        cuda_host::push_kernel_device_slice(&mut args, &mut dq_ptr, &mut dq_len);
-        unsafe {
-            cuda_core::launch_kernel_on_stream(
-                function,
-                config.grid_dim,
-                config.block_dim,
-                config.shared_mem_bytes,
-                stream,
-                &mut args,
             )
         }
     }
@@ -660,8 +580,7 @@ impl Tcgen05Flash {
         dv: &mut DeviceBuffer<f32>,
     ) -> Result<(), DriverError> {
         unsafe {
-            self.launch_backward_kv(
-                &self.backward_kv,
+            self.generated.flash_backward_kv_tcgen05(
                 stream,
                 config,
                 q_tma,
@@ -702,8 +621,7 @@ impl Tcgen05Flash {
         dv: &mut DeviceBuffer<f32>,
     ) -> Result<(), DriverError> {
         unsafe {
-            self.launch_backward_kv(
-                &self.backward_kv_pipelined,
+            self.generated.flash_backward_kv_pipelined(
                 stream,
                 config,
                 q_tma,
@@ -716,106 +634,6 @@ impl Tcgen05Flash {
                 heads,
                 dk,
                 dv,
-            )
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn launch_backward_kv(
-        &self,
-        function: &CudaFunction,
-        stream: &CudaStream,
-        config: LaunchConfig,
-        q_tma: *const TmaDescriptor,
-        k_tma: *const TmaDescriptor,
-        v_tma: *const TmaDescriptor,
-        dy_tma: *const TmaDescriptor,
-        logsumexp: &DeviceBuffer<f32>,
-        dot: &DeviceBuffer<f32>,
-        sequence_length: u32,
-        heads: u32,
-        dk: &mut DeviceBuffer<f32>,
-        dv: &mut DeviceBuffer<f32>,
-    ) -> Result<(), DriverError> {
-        let mut q_tma = q_tma;
-        let mut k_tma = k_tma;
-        let mut v_tma = v_tma;
-        let mut dy_tma = dy_tma;
-        let mut sequence_length = sequence_length;
-        let mut heads = heads;
-        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
-        cuda_host::push_kernel_scalar(&mut args, &mut q_tma);
-        cuda_host::push_kernel_scalar(&mut args, &mut k_tma);
-        cuda_host::push_kernel_scalar(&mut args, &mut v_tma);
-        cuda_host::push_kernel_scalar(&mut args, &mut dy_tma);
-        let (mut lse_ptr, mut lse_len) = cuda_host::read_only_device_buffer_arg(logsumexp);
-        cuda_host::push_kernel_device_slice(&mut args, &mut lse_ptr, &mut lse_len);
-        let (mut dot_ptr, mut dot_len) = cuda_host::read_only_device_buffer_arg(dot);
-        cuda_host::push_kernel_device_slice(&mut args, &mut dot_ptr, &mut dot_len);
-        cuda_host::push_kernel_scalar(&mut args, &mut sequence_length);
-        cuda_host::push_kernel_scalar(&mut args, &mut heads);
-        let (mut dk_ptr, mut dk_len) = cuda_host::writable_device_buffer_arg(dk);
-        cuda_host::push_kernel_device_slice(&mut args, &mut dk_ptr, &mut dk_len);
-        let (mut dv_ptr, mut dv_len) = cuda_host::writable_device_buffer_arg(dv);
-        cuda_host::push_kernel_device_slice(&mut args, &mut dv_ptr, &mut dv_len);
-        unsafe {
-            cuda_core::launch_kernel_on_stream(
-                function,
-                config.grid_dim,
-                config.block_dim,
-                config.shared_mem_bytes,
-                stream,
-                &mut args,
-            )
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn launch_forward(
-        &self,
-        function: &CudaFunction,
-        stream: &CudaStream,
-        config: LaunchConfig,
-        q_tma: *const TmaDescriptor,
-        k_tma: *const TmaDescriptor,
-        v_tma: *const TmaDescriptor,
-        sequence_length: u32,
-        heads: u32,
-        batches: Option<u32>,
-        output: &mut DeviceBuffer<f32>,
-        logsumexp: &mut DeviceBuffer<f32>,
-        correction_counts: &mut DeviceBuffer<u32>,
-    ) -> Result<(), DriverError> {
-        let mut q_tma = q_tma;
-        let mut k_tma = k_tma;
-        let mut v_tma = v_tma;
-        let mut sequence_length = sequence_length;
-        let mut heads = heads;
-        let mut batches = batches;
-        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
-        cuda_host::push_kernel_scalar(&mut args, &mut q_tma);
-        cuda_host::push_kernel_scalar(&mut args, &mut k_tma);
-        cuda_host::push_kernel_scalar(&mut args, &mut v_tma);
-        cuda_host::push_kernel_scalar(&mut args, &mut sequence_length);
-        cuda_host::push_kernel_scalar(&mut args, &mut heads);
-        if let Some(batches) = batches.as_mut() {
-            cuda_host::push_kernel_scalar(&mut args, batches);
-        }
-        let (mut output_ptr, mut output_len) = cuda_host::writable_device_buffer_arg(output);
-        cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
-        let (mut lse_ptr, mut lse_len) = cuda_host::writable_device_buffer_arg(logsumexp);
-        cuda_host::push_kernel_device_slice(&mut args, &mut lse_ptr, &mut lse_len);
-        let (mut counts_ptr, mut counts_len) =
-            cuda_host::writable_device_buffer_arg(correction_counts);
-        cuda_host::push_kernel_device_slice(&mut args, &mut counts_ptr, &mut counts_len);
-        unsafe {
-            cuda_core::launch_kernel_on_stream(
-                function,
-                config.grid_dim,
-                config.block_dim,
-                config.shared_mem_bytes,
-                stream,
-                &mut args,
             )
         }
     }
@@ -835,21 +653,17 @@ impl Tcgen05Flash {
         b_tma: *const TmaDescriptor,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<(), DriverError> {
-        let mut a_tma = a_tma;
-        let mut b_tma = b_tma;
-        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
-        cuda_host::push_kernel_scalar(&mut args, &mut a_tma);
-        cuda_host::push_kernel_scalar(&mut args, &mut b_tma);
-        let (mut output_ptr, mut output_len) = cuda_host::writable_device_buffer_arg(output);
-        cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
         unsafe {
-            cuda_core::launch_kernel_on_stream(
-                &self.transpose_probe,
-                (1, 1, 1),
-                (FLASH_TILE as u32, 1, 1),
-                PROBE_DYNAMIC_SMEM_BYTES,
+            self.generated.transpose_b_probe(
                 stream,
-                &mut args,
+                LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (FLASH_TILE as u32, 1, 1),
+                    shared_mem_bytes: PROBE_DYNAMIC_SMEM_BYTES,
+                },
+                a_tma,
+                b_tma,
+                output,
             )
         }
     }
@@ -866,19 +680,16 @@ impl Tcgen05Flash {
         src_tma: *const TmaDescriptor,
         output: &mut DeviceBuffer<u32>,
     ) -> Result<(), DriverError> {
-        let mut src_tma = src_tma;
-        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
-        cuda_host::push_kernel_scalar(&mut args, &mut src_tma);
-        let (mut output_ptr, mut output_len) = cuda_host::writable_device_buffer_arg(output);
-        cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
         unsafe {
-            cuda_core::launch_kernel_on_stream(
-                &self.swizzle_probe,
-                (1, 1, 1),
-                (FLASH_TILE as u32, 1, 1),
-                (FLASH_TILE * FLASH_HD * 2) as u32,
+            self.generated.swizzle_probe(
                 stream,
-                &mut args,
+                LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (FLASH_TILE as u32, 1, 1),
+                    shared_mem_bytes: (FLASH_TILE * FLASH_HD * 2) as u32,
+                },
+                src_tma,
+                output,
             )
         }
     }
@@ -890,7 +701,15 @@ impl Tcgen05Flash {
         input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<(), DriverError> {
-        self.launch_elementwise(&self.exp2, stream, input, output)
+        assert_eq!(input.len(), output.len());
+        unsafe {
+            self.generated.software_exp2(
+                stream,
+                LaunchConfig::for_num_elems(output.len() as u32),
+                input,
+                output,
+            )
+        }
     }
 
     /// Elementwise software-`log2` accuracy oracle.
@@ -900,31 +719,13 @@ impl Tcgen05Flash {
         input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<(), DriverError> {
-        self.launch_elementwise(&self.log2, stream, input, output)
-    }
-
-    fn launch_elementwise(
-        &self,
-        function: &CudaFunction,
-        stream: &CudaStream,
-        input: &DeviceBuffer<f32>,
-        output: &mut DeviceBuffer<f32>,
-    ) -> Result<(), DriverError> {
         assert_eq!(input.len(), output.len());
-        let config = LaunchConfig::for_num_elems(output.len() as u32);
-        let mut args: Vec<*mut std::ffi::c_void> = Vec::new();
-        let (mut input_ptr, mut input_len) = cuda_host::read_only_device_buffer_arg(input);
-        cuda_host::push_kernel_device_slice(&mut args, &mut input_ptr, &mut input_len);
-        let (mut output_ptr, mut output_len) = cuda_host::writable_device_buffer_arg(output);
-        cuda_host::push_kernel_device_slice(&mut args, &mut output_ptr, &mut output_len);
         unsafe {
-            cuda_core::launch_kernel_on_stream(
-                function,
-                config.grid_dim,
-                config.block_dim,
-                config.shared_mem_bytes,
+            self.generated.software_log2(
                 stream,
-                &mut args,
+                LaunchConfig::for_num_elems(output.len() as u32),
+                input,
+                output,
             )
         }
     }

@@ -1,5 +1,5 @@
 //! Register vectors/tiles over the tcgen05 16x256b fragment map, plus the
-//! pure-PTX-safe scalar maps they compose with.
+//! scalar maps they compose with.
 //!
 //! The fragment ownership contract every type here assumes (base-LDTM
 //! 16x256b, the only drain shape the validated kernels use): within each
@@ -10,9 +10,7 @@
 //! offsets `{0, 1, 8, 9}`. Row statistics live once per owned row,
 //! replicated across the 4 lanes of a quad by shuffle reductions.
 //!
-//! Scalar-map discipline: `f32::max/min/exp/ln/sqrt/floor` lower to libdevice
-//! and would silently force an artifact off the pure-PTX path, so everything
-//! here is comparison+select or explicit bit math. `exp2` exists twice —
+//! `exp2` exists twice —
 //! [`exp2_approx`] (the FMA polynomial, bit-identical to what the flash
 //! kernels shipped with) and [`exp2_hw`] (one `ex2.approx` SFU instruction,
 //! also pure-PTX-safe post-#56). Ports that must hold "same SASS" keep the
@@ -20,9 +18,8 @@
 
 use cuda_device::warp;
 
-/// NaN-free float max: comparison + select stays native PTX where
-/// `f32::max` lowers to libdevice `__nv_fmaxf`. Callers guarantee finite
-/// inputs (the kernels' masked sentinel is finite).
+/// NaN-free float max. The comparison-select lowering is retained for its
+/// established SASS; libdevice-backed `f32::max` is now artifact-safe.
 #[inline(always)]
 pub fn fmax(a: f32, b: f32) -> f32 {
     if a > b { a } else { b }

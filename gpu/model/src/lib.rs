@@ -38,41 +38,35 @@ use tensor_core::{Rank1, Rank2, Rank3, Rank4, Shape, rng::stream_seed};
 // includes this file as a module, which in turn includes each canonical kernel
 // source here instead of copying definitions or relying on dependency PTX.
 //
-// The tcgen05 GEMM kernels are the one exception: this binary's kernels use
-// libdevice math (`exp`/`ln`/`sqrt`), which forces its device artifact
-// through libNVVM, and libNVVM rejects tcgen05 lowerings. Only gpu/gemm's
-// host-side support is included here; the kernels themselves load at runtime
-// from the pure-PTX `gemm.ptx` that `cargo oxide build gemm` produces
-// (modal_app.py prebuilds it for model runs).
+// At cuda-oxide b099f64, libdevice calls and tcgen05 lowerings coexist on the
+// pure-PTX path. The canonical GEMM and flash modules are therefore included
+// in this binary and loaded from the same embedded artifact as every other
+// model kernel.
 #[path = "../../ops/src/lib.rs"]
 mod dense_device;
 #[path = "../../flash-attn/src/lib.rs"]
 mod flash_device;
-#[path = "../../flash-attn/src/host.rs"]
-#[allow(dead_code)]
-mod flash_host;
-#[path = "../../gemm/src/fp32.rs"]
+#[path = "../../gemm/src/lib.rs"]
+#[allow(unused_imports)]
 mod gemm_device;
-#[path = "../../gemm/src/host.rs"]
-#[allow(dead_code)]
-mod gemm_host;
 #[path = "../../tensor-gpu/src/lib.rs"]
 #[allow(dead_code)]
 pub mod tensor_device;
 
 pub use dense_device::kernels as dense_kernels;
+pub use flash_device::host::Tcgen05Flash;
 pub use flash_device::kernels as flash_kernels;
-pub use flash_host::Tcgen05Flash;
-pub use gemm_device::kernels as gemm_kernels;
-pub use gemm_host::Tcgen05Gemm;
+pub use gemm_device::fp32::kernels as gemm_kernels;
+pub use gemm_device::host::Tcgen05Gemm;
 pub use tensor_device::kernels as tensor_kernels;
 
-use flash_host::{
+use flash_device::host as flash_host;
+use flash_device::host::{
     FLASH_HD, FLASH_TILE, FlashHeadTmaMap, correction_count_len, create_flash_head_tma_map,
     flash_persistent_config,
 };
-use gemm_device::launch_config as fp32_launch_config;
-use gemm_host::{
+use gemm_device::fp32_launch_config;
+use gemm_device::host::{
     Bf16PairsTmaMap, TC_K_PIPELINE, TC_M_TILE, TC_N_TILE, TC_TILE, TmaLayout,
     create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_pairs_tma_map_region,
     tcgen05_launch_config,
@@ -783,7 +777,13 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         let w = GpuBf16Tensor::from_f32_host(stream, layer.w.as_slice())?;
         let compute = if IN.is_multiple_of(TC_TILE) && OUT.is_multiple_of(TC_TILE) {
             let values = layer.w.as_slice();
-            Some(Bf16LinearWeights::new(stream, w.as_words(), values, IN, OUT)?)
+            Some(Bf16LinearWeights::new(
+                stream,
+                w.as_words(),
+                values,
+                IN,
+                OUT,
+            )?)
         } else {
             None
         };
@@ -3075,21 +3075,21 @@ impl GpuMuonScratch {
         // SAFETY: the copied prefix and launch dimensions are bounded by the
         // scratch allocations validated by the constructor.
         unsafe {
-        let elements = rows * cols;
-        tensor.gather_group(
-            stream,
-            pairs_config(elements),
-            input,
-            1,
-            0,
-            cols as u32,
-            elements as u32,
-            &mut self.x,
-        )?;
-        newton_schulz_orthogonalize(self, rows, cols, steps, stream, tensor, gemm)?;
-        let mut values = self.x.to_host_vec(stream)?;
-        values.truncate(elements);
-        Ok(values)
+            let elements = rows * cols;
+            tensor.gather_group(
+                stream,
+                pairs_config(elements),
+                input,
+                1,
+                0,
+                cols as u32,
+                elements as u32,
+                &mut self.x,
+            )?;
+            newton_schulz_orthogonalize(self, rows, cols, steps, stream, tensor, gemm)?;
+            let mut values = self.x.to_host_vec(stream)?;
+            values.truncate(elements);
+            Ok(values)
         }
     }
 }
@@ -3115,126 +3115,126 @@ fn newton_schulz_orthogonalize(
     // SAFETY: every launch is bounded by elements or gram_elements, both of
     // which fit the preallocated Muon scratch buffers.
     unsafe {
-    assert!(steps < 100, "Newton-Schulz steps must be less than 100");
-    assert!(rows > 0 && cols > 0, "Muon matrices must be non-empty");
-    let elements = rows * cols;
-    let gram_side = rows.min(cols);
-    let gram_elements = gram_side * gram_side;
+        assert!(steps < 100, "Newton-Schulz steps must be less than 100");
+        assert!(rows > 0 && cols > 0, "Muon matrices must be non-empty");
+        let elements = rows * cols;
+        let gram_side = rows.min(cols);
+        let gram_elements = gram_side * gram_side;
 
-    tensor.sum_squares(
-        stream,
-        reduction_config(),
-        &scratch.x,
-        elements as u32,
-        &mut scratch.sum_squares,
-    )?;
-    tensor.scale_by_inv_norm(
-        stream,
-        pairs_config(elements),
-        &scratch.x,
-        &scratch.sum_squares,
-        NEWTON_SCHULZ_EPSILON,
-        elements as u32,
-        &mut scratch.x_next,
-    )?;
-    std::mem::swap(&mut scratch.x, &mut scratch.x_next);
-
-    for _ in 0..steps {
-        if rows <= cols {
-            // A = X X^T
-            unsafe {
-                gemm.register_gemm_nt_store(
-                    stream,
-                    fp32_launch_config(rows, rows),
-                    rows,
-                    rows,
-                    cols,
-                    &scratch.x,
-                    &scratch.x,
-                    &mut scratch.gram,
-                )?;
-            }
-        } else {
-            // A = X^T X; the fp32 family has no TN store, so zero + accumulate.
-            tensor.fill(stream, pairs_config(gram_elements), 0.0, &mut scratch.gram)?;
-            unsafe {
-                gemm.register_gemm_tn_accumulate(
-                    stream,
-                    fp32_launch_config(gram_side, gram_side),
-                    gram_side,
-                    gram_side,
-                    rows,
-                    &scratch.x,
-                    &scratch.x,
-                    &mut scratch.gram,
-                )?;
-            }
-        }
-        unsafe {
-            gemm.register_gemm_store(
-                stream,
-                fp32_launch_config(gram_side, gram_side),
-                gram_side,
-                gram_side,
-                gram_side,
-                &scratch.gram,
-                &scratch.gram,
-                &mut scratch.gram_squared,
-            )?;
-        }
-        // B = b A + c A^2
-        tensor.scaled_sum(
+        tensor.sum_squares(
             stream,
-            pairs_config(gram_elements),
-            NEWTON_SCHULZ_B,
-            &scratch.gram,
-            NEWTON_SCHULZ_C,
-            &scratch.gram_squared,
-            gram_elements as u32,
-            &mut scratch.polynomial,
+            reduction_config(),
+            &scratch.x,
+            elements as u32,
+            &mut scratch.sum_squares,
         )?;
-        if rows <= cols {
-            // X = a X + B X
-            unsafe {
-                gemm.register_gemm_store(
-                    stream,
-                    fp32_launch_config(rows, cols),
-                    rows,
-                    cols,
-                    rows,
-                    &scratch.polynomial,
-                    &scratch.x,
-                    &mut scratch.product,
-                )?;
-            }
-        } else {
-            // X = a X + X B
-            unsafe {
-                gemm.register_gemm_store(
-                    stream,
-                    fp32_launch_config(rows, cols),
-                    rows,
-                    cols,
-                    cols,
-                    &scratch.x,
-                    &scratch.polynomial,
-                    &mut scratch.product,
-                )?;
-            }
-        }
-        tensor.scaled_sum(
+        tensor.scale_by_inv_norm(
             stream,
             pairs_config(elements),
-            NEWTON_SCHULZ_A,
             &scratch.x,
-            1.0,
-            &scratch.product,
+            &scratch.sum_squares,
+            NEWTON_SCHULZ_EPSILON,
             elements as u32,
             &mut scratch.x_next,
         )?;
         std::mem::swap(&mut scratch.x, &mut scratch.x_next);
-    }
-    Ok(())
+
+        for _ in 0..steps {
+            if rows <= cols {
+                // A = X X^T
+                unsafe {
+                    gemm.register_gemm_nt_store(
+                        stream,
+                        fp32_launch_config(rows, rows),
+                        rows,
+                        rows,
+                        cols,
+                        &scratch.x,
+                        &scratch.x,
+                        &mut scratch.gram,
+                    )?;
+                }
+            } else {
+                // A = X^T X; the fp32 family has no TN store, so zero + accumulate.
+                tensor.fill(stream, pairs_config(gram_elements), 0.0, &mut scratch.gram)?;
+                unsafe {
+                    gemm.register_gemm_tn_accumulate(
+                        stream,
+                        fp32_launch_config(gram_side, gram_side),
+                        gram_side,
+                        gram_side,
+                        rows,
+                        &scratch.x,
+                        &scratch.x,
+                        &mut scratch.gram,
+                    )?;
+                }
+            }
+            unsafe {
+                gemm.register_gemm_store(
+                    stream,
+                    fp32_launch_config(gram_side, gram_side),
+                    gram_side,
+                    gram_side,
+                    gram_side,
+                    &scratch.gram,
+                    &scratch.gram,
+                    &mut scratch.gram_squared,
+                )?;
+            }
+            // B = b A + c A^2
+            tensor.scaled_sum(
+                stream,
+                pairs_config(gram_elements),
+                NEWTON_SCHULZ_B,
+                &scratch.gram,
+                NEWTON_SCHULZ_C,
+                &scratch.gram_squared,
+                gram_elements as u32,
+                &mut scratch.polynomial,
+            )?;
+            if rows <= cols {
+                // X = a X + B X
+                unsafe {
+                    gemm.register_gemm_store(
+                        stream,
+                        fp32_launch_config(rows, cols),
+                        rows,
+                        cols,
+                        rows,
+                        &scratch.polynomial,
+                        &scratch.x,
+                        &mut scratch.product,
+                    )?;
+                }
+            } else {
+                // X = a X + X B
+                unsafe {
+                    gemm.register_gemm_store(
+                        stream,
+                        fp32_launch_config(rows, cols),
+                        rows,
+                        cols,
+                        cols,
+                        &scratch.x,
+                        &scratch.polynomial,
+                        &mut scratch.product,
+                    )?;
+                }
+            }
+            tensor.scaled_sum(
+                stream,
+                pairs_config(elements),
+                NEWTON_SCHULZ_A,
+                &scratch.x,
+                1.0,
+                &scratch.product,
+                elements as u32,
+                &mut scratch.x_next,
+            )?;
+            std::mem::swap(&mut scratch.x, &mut scratch.x_next);
+        }
+        Ok(())
     }
 }
 
@@ -3269,80 +3269,80 @@ fn muon_step_raw(
     // SAFETY: group offsets partition the parameter matrix and all scratch
     // launches are bounded by total or per_group.
     unsafe {
-    let total = rows * groups * cols;
-    let per_group = rows * cols;
-    tensor.ema_momentum(
-        stream,
-        pairs_config(total),
-        gradient,
-        config.momentum,
-        momentum,
-    )?;
-    let (gradient_weight, momentum_weight) = if config.nesterov {
-        (1.0 - config.momentum, config.momentum)
-    } else {
-        (0.0, 1.0)
-    };
-    tensor.scaled_sum(
-        stream,
-        pairs_config(total),
-        gradient_weight,
-        gradient,
-        momentum_weight,
-        momentum,
-        total as u32,
-        &mut scratch.update,
-    )?;
+        let total = rows * groups * cols;
+        let per_group = rows * cols;
+        tensor.ema_momentum(
+            stream,
+            pairs_config(total),
+            gradient,
+            config.momentum,
+            momentum,
+        )?;
+        let (gradient_weight, momentum_weight) = if config.nesterov {
+            (1.0 - config.momentum, config.momentum)
+        } else {
+            (0.0, 1.0)
+        };
+        tensor.scaled_sum(
+            stream,
+            pairs_config(total),
+            gradient_weight,
+            gradient,
+            momentum_weight,
+            momentum,
+            total as u32,
+            &mut scratch.update,
+        )?;
 
-    let aspect_ratio_scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
-    let decay = 1.0 - config.learning_rate * config.weight_decay;
-    let update_scale = config.learning_rate * aspect_ratio_scale;
-    for group in 0..groups {
-        tensor.gather_group(
-            stream,
-            pairs_config(per_group),
-            &scratch.update,
-            groups as u32,
-            group as u32,
-            cols as u32,
-            per_group as u32,
-            &mut scratch.x,
-        )?;
-        newton_schulz_orthogonalize(
-            scratch,
-            rows,
-            cols,
-            config.newton_schulz_steps,
-            stream,
-            tensor,
-            gemm,
-        )?;
-        // Group `g`'s slots of `update` are read only by group `g`'s gather
-        // above, so writing the orthogonalized result back over them leaves
-        // every later group's input intact.
-        unsafe {
-            tensor.scatter_group(
+        let aspect_ratio_scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
+        let decay = 1.0 - config.learning_rate * config.weight_decay;
+        let update_scale = config.learning_rate * aspect_ratio_scale;
+        for group in 0..groups {
+            tensor.gather_group(
                 stream,
                 pairs_config(per_group),
-                &scratch.x,
+                &scratch.update,
                 groups as u32,
                 group as u32,
                 cols as u32,
                 per_group as u32,
-                &mut scratch.update,
+                &mut scratch.x,
             )?;
+            newton_schulz_orthogonalize(
+                scratch,
+                rows,
+                cols,
+                config.newton_schulz_steps,
+                stream,
+                tensor,
+                gemm,
+            )?;
+            // Group `g`'s slots of `update` are read only by group `g`'s gather
+            // above, so writing the orthogonalized result back over them leaves
+            // every later group's input intact.
+            unsafe {
+                tensor.scatter_group(
+                    stream,
+                    pairs_config(per_group),
+                    &scratch.x,
+                    groups as u32,
+                    group as u32,
+                    cols as u32,
+                    per_group as u32,
+                    &mut scratch.update,
+                )?;
+            }
         }
-    }
-    tensor.muon_apply_bf16(
-        stream,
-        pairs_config(total / 2),
-        &scratch.update,
-        decay,
-        update_scale,
-        rounding,
-        seed,
-        parameter,
-    )
+        tensor.muon_apply_bf16(
+            stream,
+            pairs_config(total / 2),
+            &scratch.update,
+            decay,
+            update_scale,
+            rounding,
+            seed,
+            parameter,
+        )
     }
 }
 
@@ -4851,116 +4851,116 @@ impl<
         // SAFETY: workspace construction fixes every buffer to this model's
         // const-generic shape and each helper validates its launch dimensions.
         unsafe {
-        workspace.upload_inputs(tokens, targets, stream)?;
-        self.embedding.forward_into(
-            &workspace.tokens,
-            &mut workspace.block_acts[0].input,
-            stream,
-            dense,
-            profiler,
-            "forward.embedding",
-        )?;
-        for (index, block) in self.blocks.iter().enumerate() {
-            let (current, rest) = workspace.block_acts[index..]
-                .split_first_mut()
-                .expect("one activation set per block");
-            let output = match rest.first_mut() {
-                Some(next) => &mut next.input,
-                None => &mut workspace.final_input,
-            };
-            block.forward_profiled::<N, T, H, HD, K, C, P>(
-                current,
-                output,
-                &mut workspace.block_scratch,
-                &mut workspace.linear_scratch,
-                workspace.flash_scratch.as_mut(),
+            workspace.upload_inputs(tokens, targets, stream)?;
+            self.embedding.forward_into(
+                &workspace.tokens,
+                &mut workspace.block_acts[0].input,
+                stream,
+                dense,
+                profiler,
+                "forward.embedding",
+            )?;
+            for (index, block) in self.blocks.iter().enumerate() {
+                let (current, rest) = workspace.block_acts[index..]
+                    .split_first_mut()
+                    .expect("one activation set per block");
+                let output = match rest.first_mut() {
+                    Some(next) => &mut next.input,
+                    None => &mut workspace.final_input,
+                };
+                block.forward_profiled::<N, T, H, HD, K, C, P>(
+                    current,
+                    output,
+                    &mut workspace.block_scratch,
+                    &mut workspace.linear_scratch,
+                    workspace.flash_scratch.as_mut(),
+                    stream,
+                    tensor,
+                    gemm,
+                    gemm_bf16,
+                    flash,
+                    flash_bf16,
+                    dense,
+                    profiler,
+                )?;
+            }
+            self.final_norm.forward_into(
+                &workspace.final_input,
+                &mut workspace.final_normalized,
+                stream,
+                dense,
+                profiler,
+                "forward.final_norm",
+            )?;
+            // Rows N..NP of head_input were zeroed at allocation and the convert
+            // stops at the fp32 input's length, so they stay zero.
+            profiler.measure(stream, "forward.lm_head.quantize", || {
+                tensor.convert_f32_to_bf16_pairs(
+                    stream,
+                    pairs_config(N * D / 2),
+                    workspace.final_normalized.as_device_buffer(),
+                    &mut workspace.head_input,
+                )
+            })?;
+            self.lm_head.forward_into::<NP, P>(
+                &workspace.head_input_tma,
+                &mut workspace.logits,
+                stream,
+                gemm_bf16,
+                profiler,
+                "forward.lm_head.gemm",
+            )?;
+            cross_entropy_into::<N, VOCAB, VP, P>(
+                &workspace.logits,
+                &workspace.targets,
+                &mut workspace.losses,
+                &mut workspace.loss_sum,
+                &mut workspace.loss,
                 stream,
                 tensor,
-                gemm,
-                gemm_bf16,
-                flash,
-                flash_bf16,
                 dense,
                 profiler,
             )?;
-        }
-        self.final_norm.forward_into(
-            &workspace.final_input,
-            &mut workspace.final_normalized,
-            stream,
-            dense,
-            profiler,
-            "forward.final_norm",
-        )?;
-        // Rows N..NP of head_input were zeroed at allocation and the convert
-        // stops at the fp32 input's length, so they stay zero.
-        profiler.measure(stream, "forward.lm_head.quantize", || {
-            tensor.convert_f32_to_bf16_pairs(
-                stream,
-                pairs_config(N * D / 2),
-                workspace.final_normalized.as_device_buffer(),
-                &mut workspace.head_input,
-            )
-        })?;
-        self.lm_head.forward_into::<NP, P>(
-            &workspace.head_input_tma,
-            &mut workspace.logits,
-            stream,
-            gemm_bf16,
-            profiler,
-            "forward.lm_head.gemm",
-        )?;
-        cross_entropy_into::<N, VOCAB, VP, P>(
-            &workspace.logits,
-            &workspace.targets,
-            &mut workspace.losses,
-            &mut workspace.loss_sum,
-            &mut workspace.loss,
-            stream,
-            tensor,
-            dense,
-            profiler,
-        )?;
-        for acts in &workspace.block_acts {
-            fill_zero(
-                &mut workspace.block_scratch.probability_sums,
-                stream,
-                tensor,
-                profiler,
-                "forward.router.zero_probability_sums",
-            )?;
-            profiler.measure(stream, "forward.router.aux_probability_sums", || unsafe {
-                dense.moe_probability_sums(
+            for acts in &workspace.block_acts {
+                fill_zero(
+                    &mut workspace.block_scratch.probability_sums,
                     stream,
-                    LaunchConfig {
-                        grid_dim: (E as u32, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    acts.routing.probabilities.as_device_buffer(),
-                    N as u32,
-                    E as u32,
-                    workspace
-                        .block_scratch
-                        .probability_sums
-                        .as_device_buffer_mut(),
-                )
-            })?;
-            profiler.measure(stream, "forward.router.aux_loss", || unsafe {
-                dense.moe_aux_loss(
-                    stream,
-                    LaunchConfig::for_num_elems(1),
-                    workspace.block_scratch.probability_sums.as_device_buffer(),
-                    acts.routing.assignment_counts.as_device_buffer(),
-                    N as u32,
-                    E as u32,
-                    K as u32,
-                    aux_coefficient,
-                    workspace.loss.as_device_buffer_mut(),
-                )
-            })?;
-        }
-        Ok(())
+                    tensor,
+                    profiler,
+                    "forward.router.zero_probability_sums",
+                )?;
+                profiler.measure(stream, "forward.router.aux_probability_sums", || unsafe {
+                    dense.moe_probability_sums(
+                        stream,
+                        LaunchConfig {
+                            grid_dim: (E as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        acts.routing.probabilities.as_device_buffer(),
+                        N as u32,
+                        E as u32,
+                        workspace
+                            .block_scratch
+                            .probability_sums
+                            .as_device_buffer_mut(),
+                    )
+                })?;
+                profiler.measure(stream, "forward.router.aux_loss", || unsafe {
+                    dense.moe_aux_loss(
+                        stream,
+                        LaunchConfig::for_num_elems(1),
+                        workspace.block_scratch.probability_sums.as_device_buffer(),
+                        acts.routing.assignment_counts.as_device_buffer(),
+                        N as u32,
+                        E as u32,
+                        K as u32,
+                        aux_coefficient,
+                        workspace.loss.as_device_buffer_mut(),
+                    )
+                })?;
+            }
+            Ok(())
         }
     }
 
@@ -5011,81 +5011,81 @@ impl<
         // SAFETY: workspace construction fixes every buffer to this model's
         // const-generic shape and each helper validates its launch dimensions.
         unsafe {
-        cross_entropy_backward_into::<N, VOCAB, VP, P>(
-            &workspace.targets,
-            &mut workspace.logits,
-            stream,
-            dense,
-            profiler,
-        )?;
-        // Rows N..NP of head_input and logits hold zeros (forward computed
-        // them from the zero-padded head input and the classifier backward
-        // skips them), so the MN-major operands feed exact zeros into the
-        // weight GEMM's padded reduction slice.
-        self.lm_head.backward_weight::<NP, P>(
-            &workspace.head_input_mn_tma,
-            &workspace.logits_mn_tma,
-            stream,
-            gemm_bf16,
-            profiler,
-            "backward.lm_head.weight_gemm",
-        )?;
-        self.lm_head.backward_input::<NP, P>(
-            &workspace.logits_tma,
-            &mut workspace.d_head_input,
-            stream,
-            gemm_bf16,
-            profiler,
-            "backward.lm_head.input_gemm",
-        )?;
-        profiler.measure(stream, "backward.lm_head.dequantize", || {
-            tensor.convert_bf16_pairs_to_f32(
+            cross_entropy_backward_into::<N, VOCAB, VP, P>(
+                &workspace.targets,
+                &mut workspace.logits,
                 stream,
-                elementwise_config::<Rank2<N, D>>(),
-                &workspace.d_head_input,
-                workspace.block_scratch.d_model_0.as_device_buffer_mut(),
-            )
-        })?;
-        self.final_norm.backward_into(
-            &workspace.final_input,
-            &workspace.block_scratch.d_model_0,
-            &mut workspace.block_scratch.d_model_1,
-            &mut workspace.block_scratch.norm_backward_inv,
-            stream,
-            dense,
-            profiler,
-            ["backward.final_norm.input", "backward.final_norm.weight"],
-        )?;
-        for (block, acts) in self
-            .blocks
-            .iter_mut()
-            .zip(workspace.block_acts.iter())
-            .rev()
-        {
-            block.backward_profiled::<N, T, H, HD, K, C, P>(
-                aux_coefficient,
-                acts,
-                &mut workspace.block_scratch,
-                &mut workspace.linear_scratch,
-                workspace.flash_scratch.as_mut(),
-                stream,
-                tensor,
-                gemm,
-                gemm_bf16,
-                flash,
-                flash_bf16,
                 dense,
                 profiler,
             )?;
-        }
-        self.embedding.backward(
-            &workspace.tokens,
-            &workspace.block_scratch.d_model_1,
-            stream,
-            dense,
-            profiler,
-            "backward.embedding",
-        )
+            // Rows N..NP of head_input and logits hold zeros (forward computed
+            // them from the zero-padded head input and the classifier backward
+            // skips them), so the MN-major operands feed exact zeros into the
+            // weight GEMM's padded reduction slice.
+            self.lm_head.backward_weight::<NP, P>(
+                &workspace.head_input_mn_tma,
+                &workspace.logits_mn_tma,
+                stream,
+                gemm_bf16,
+                profiler,
+                "backward.lm_head.weight_gemm",
+            )?;
+            self.lm_head.backward_input::<NP, P>(
+                &workspace.logits_tma,
+                &mut workspace.d_head_input,
+                stream,
+                gemm_bf16,
+                profiler,
+                "backward.lm_head.input_gemm",
+            )?;
+            profiler.measure(stream, "backward.lm_head.dequantize", || {
+                tensor.convert_bf16_pairs_to_f32(
+                    stream,
+                    elementwise_config::<Rank2<N, D>>(),
+                    &workspace.d_head_input,
+                    workspace.block_scratch.d_model_0.as_device_buffer_mut(),
+                )
+            })?;
+            self.final_norm.backward_into(
+                &workspace.final_input,
+                &workspace.block_scratch.d_model_0,
+                &mut workspace.block_scratch.d_model_1,
+                &mut workspace.block_scratch.norm_backward_inv,
+                stream,
+                dense,
+                profiler,
+                ["backward.final_norm.input", "backward.final_norm.weight"],
+            )?;
+            for (block, acts) in self
+                .blocks
+                .iter_mut()
+                .zip(workspace.block_acts.iter())
+                .rev()
+            {
+                block.backward_profiled::<N, T, H, HD, K, C, P>(
+                    aux_coefficient,
+                    acts,
+                    &mut workspace.block_scratch,
+                    &mut workspace.linear_scratch,
+                    workspace.flash_scratch.as_mut(),
+                    stream,
+                    tensor,
+                    gemm,
+                    gemm_bf16,
+                    flash,
+                    flash_bf16,
+                    dense,
+                    profiler,
+                )?;
+            }
+            self.embedding.backward(
+                &workspace.tokens,
+                &workspace.block_scratch.d_model_1,
+                stream,
+                dense,
+                profiler,
+                "backward.embedding",
+            )
         }
     }
 
@@ -5227,194 +5227,194 @@ impl<
         // SAFETY: workspace construction fixes every buffer to this model's
         // const-generic shape and each helper validates its launch dimensions.
         unsafe {
-        workspace.upload_inputs(tokens, targets, stream)?;
-        self.embedding.forward_into(
-            &workspace.tokens,
-            &mut workspace.attention_input,
-            stream,
-            dense,
-            profiler,
-            "forward.embedding",
-        )?;
-        self.attention_norm.forward_into(
-            &workspace.attention_input,
-            &mut workspace.attention_normalized,
-            stream,
-            dense,
-            profiler,
-            "forward.attention_norm",
-        )?;
-        self.qkv_proj.forward_into(
-            &workspace.attention_normalized,
-            &mut workspace.qkv,
-            stream,
-            tensor,
-            gemm,
-            gemm_bf16,
-            &mut workspace.linear_scratch,
-            profiler,
-            "forward.qkv_proj.gemm",
-        )?;
-        profiler.measure(stream, "forward.qkv_proj.split", || {
-            dense.split_group3(
+            workspace.upload_inputs(tokens, targets, stream)?;
+            self.embedding.forward_into(
+                &workspace.tokens,
+                &mut workspace.attention_input,
                 stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                workspace.qkv.as_device_buffer(),
-                D as u32,
-                workspace.q.as_device_buffer_mut(),
-                workspace.k.as_device_buffer_mut(),
-                workspace.v.as_device_buffer_mut(),
-            )
-        })?;
-        rope_into::<N, T, D, H, HD, P>(
-            &workspace.q,
-            &mut workspace.d_model_0,
-            false,
-            stream,
-            dense,
-            profiler,
-            "forward.q_rope",
-        )?;
-        std::mem::swap(&mut workspace.q, &mut workspace.d_model_0);
-        rope_into::<N, T, D, H, HD, P>(
-            &workspace.k,
-            &mut workspace.d_model_0,
-            false,
-            stream,
-            dense,
-            profiler,
-            "forward.k_rope",
-        )?;
-        std::mem::swap(&mut workspace.k, &mut workspace.d_model_0);
-        flash_attention_forward_into::<N, T, D, H, HD, P>(
-            &workspace.q,
-            &workspace.k,
-            &workspace.v,
-            &mut workspace.attended,
-            &mut workspace.attention_logsumexp,
-            workspace.flash_scratch.as_mut(),
-            stream,
-            flash,
-            flash_bf16,
-            profiler,
-        )?;
-        self.o_proj.forward_into(
-            &workspace.attended,
-            &mut workspace.projection_output,
-            stream,
-            tensor,
-            gemm,
-            gemm_bf16,
-            &mut workspace.linear_scratch,
-            profiler,
-            "forward.o_proj.gemm",
-        )?;
-        add_into(
-            &workspace.attention_input,
-            &workspace.projection_output,
-            &mut workspace.ffn_input,
-            stream,
-            tensor,
-            profiler,
-            "forward.attention_residual",
-        )?;
+                dense,
+                profiler,
+                "forward.embedding",
+            )?;
+            self.attention_norm.forward_into(
+                &workspace.attention_input,
+                &mut workspace.attention_normalized,
+                stream,
+                dense,
+                profiler,
+                "forward.attention_norm",
+            )?;
+            self.qkv_proj.forward_into(
+                &workspace.attention_normalized,
+                &mut workspace.qkv,
+                stream,
+                tensor,
+                gemm,
+                gemm_bf16,
+                &mut workspace.linear_scratch,
+                profiler,
+                "forward.qkv_proj.gemm",
+            )?;
+            profiler.measure(stream, "forward.qkv_proj.split", || {
+                dense.split_group3(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    workspace.qkv.as_device_buffer(),
+                    D as u32,
+                    workspace.q.as_device_buffer_mut(),
+                    workspace.k.as_device_buffer_mut(),
+                    workspace.v.as_device_buffer_mut(),
+                )
+            })?;
+            rope_into::<N, T, D, H, HD, P>(
+                &workspace.q,
+                &mut workspace.d_model_0,
+                false,
+                stream,
+                dense,
+                profiler,
+                "forward.q_rope",
+            )?;
+            std::mem::swap(&mut workspace.q, &mut workspace.d_model_0);
+            rope_into::<N, T, D, H, HD, P>(
+                &workspace.k,
+                &mut workspace.d_model_0,
+                false,
+                stream,
+                dense,
+                profiler,
+                "forward.k_rope",
+            )?;
+            std::mem::swap(&mut workspace.k, &mut workspace.d_model_0);
+            flash_attention_forward_into::<N, T, D, H, HD, P>(
+                &workspace.q,
+                &workspace.k,
+                &workspace.v,
+                &mut workspace.attended,
+                &mut workspace.attention_logsumexp,
+                workspace.flash_scratch.as_mut(),
+                stream,
+                flash,
+                flash_bf16,
+                profiler,
+            )?;
+            self.o_proj.forward_into(
+                &workspace.attended,
+                &mut workspace.projection_output,
+                stream,
+                tensor,
+                gemm,
+                gemm_bf16,
+                &mut workspace.linear_scratch,
+                profiler,
+                "forward.o_proj.gemm",
+            )?;
+            add_into(
+                &workspace.attention_input,
+                &workspace.projection_output,
+                &mut workspace.ffn_input,
+                stream,
+                tensor,
+                profiler,
+                "forward.attention_residual",
+            )?;
 
-        self.ffn_norm.forward_into(
-            &workspace.ffn_input,
-            &mut workspace.ffn_normalized,
-            stream,
-            dense,
-            profiler,
-            "forward.ffn_norm",
-        )?;
-        self.gate_up_proj.forward_into(
-            &workspace.ffn_normalized,
-            &mut workspace.gate_up,
-            stream,
-            tensor,
-            gemm,
-            gemm_bf16,
-            &mut workspace.linear_scratch,
-            profiler,
-            "forward.gate_up_proj.gemm",
-        )?;
-        profiler.measure(stream, "forward.gate_up_proj.split", || {
-            dense.split_group2(
+            self.ffn_norm.forward_into(
+                &workspace.ffn_input,
+                &mut workspace.ffn_normalized,
                 stream,
-                LaunchConfig::for_num_elems((N * FF) as u32),
-                workspace.gate_up.as_device_buffer(),
-                FF as u32,
-                workspace.gate.as_device_buffer_mut(),
-                workspace.up.as_device_buffer_mut(),
-            )
-        })?;
-        swiglu_into(
-            &workspace.gate,
-            &workspace.up,
-            &mut workspace.activated,
-            stream,
-            dense,
-            profiler,
-            "forward.swiglu",
-        )?;
-        self.down_proj.forward_into(
-            &workspace.activated,
-            &mut workspace.projection_output,
-            stream,
-            tensor,
-            gemm,
-            gemm_bf16,
-            &mut workspace.linear_scratch,
-            profiler,
-            "forward.down_proj.gemm",
-        )?;
-        add_into(
-            &workspace.ffn_input,
-            &workspace.projection_output,
-            &mut workspace.final_input,
-            stream,
-            tensor,
-            profiler,
-            "forward.ffn_residual",
-        )?;
+                dense,
+                profiler,
+                "forward.ffn_norm",
+            )?;
+            self.gate_up_proj.forward_into(
+                &workspace.ffn_normalized,
+                &mut workspace.gate_up,
+                stream,
+                tensor,
+                gemm,
+                gemm_bf16,
+                &mut workspace.linear_scratch,
+                profiler,
+                "forward.gate_up_proj.gemm",
+            )?;
+            profiler.measure(stream, "forward.gate_up_proj.split", || {
+                dense.split_group2(
+                    stream,
+                    LaunchConfig::for_num_elems((N * FF) as u32),
+                    workspace.gate_up.as_device_buffer(),
+                    FF as u32,
+                    workspace.gate.as_device_buffer_mut(),
+                    workspace.up.as_device_buffer_mut(),
+                )
+            })?;
+            swiglu_into(
+                &workspace.gate,
+                &workspace.up,
+                &mut workspace.activated,
+                stream,
+                dense,
+                profiler,
+                "forward.swiglu",
+            )?;
+            self.down_proj.forward_into(
+                &workspace.activated,
+                &mut workspace.projection_output,
+                stream,
+                tensor,
+                gemm,
+                gemm_bf16,
+                &mut workspace.linear_scratch,
+                profiler,
+                "forward.down_proj.gemm",
+            )?;
+            add_into(
+                &workspace.ffn_input,
+                &workspace.projection_output,
+                &mut workspace.final_input,
+                stream,
+                tensor,
+                profiler,
+                "forward.ffn_residual",
+            )?;
 
-        self.final_norm.forward_into(
-            &workspace.final_input,
-            &mut workspace.final_normalized,
-            stream,
-            dense,
-            profiler,
-            "forward.final_norm",
-        )?;
-        // Rows N..NP of head_input were zeroed at allocation and the convert
-        // stops at the fp32 input's length, so they stay zero.
-        profiler.measure(stream, "forward.lm_head.quantize", || {
-            tensor.convert_f32_to_bf16_pairs(
+            self.final_norm.forward_into(
+                &workspace.final_input,
+                &mut workspace.final_normalized,
                 stream,
-                pairs_config(N * D / 2),
-                workspace.final_normalized.as_device_buffer(),
-                &mut workspace.head_input,
+                dense,
+                profiler,
+                "forward.final_norm",
+            )?;
+            // Rows N..NP of head_input were zeroed at allocation and the convert
+            // stops at the fp32 input's length, so they stay zero.
+            profiler.measure(stream, "forward.lm_head.quantize", || {
+                tensor.convert_f32_to_bf16_pairs(
+                    stream,
+                    pairs_config(N * D / 2),
+                    workspace.final_normalized.as_device_buffer(),
+                    &mut workspace.head_input,
+                )
+            })?;
+            self.lm_head.forward_into::<NP, P>(
+                &workspace.head_input_tma,
+                &mut workspace.logits,
+                stream,
+                gemm_bf16,
+                profiler,
+                "forward.lm_head.gemm",
+            )?;
+            cross_entropy_into::<N, VOCAB, VP, P>(
+                &workspace.logits,
+                &workspace.targets,
+                &mut workspace.losses,
+                &mut workspace.loss_sum,
+                &mut workspace.loss,
+                stream,
+                tensor,
+                dense,
+                profiler,
             )
-        })?;
-        self.lm_head.forward_into::<NP, P>(
-            &workspace.head_input_tma,
-            &mut workspace.logits,
-            stream,
-            gemm_bf16,
-            profiler,
-            "forward.lm_head.gemm",
-        )?;
-        cross_entropy_into::<N, VOCAB, VP, P>(
-            &workspace.logits,
-            &workspace.targets,
-            &mut workspace.losses,
-            &mut workspace.loss_sum,
-            &mut workspace.loss,
-            stream,
-            tensor,
-            dense,
-            profiler,
-        )
         }
     }
 
@@ -5459,225 +5459,225 @@ impl<
         // SAFETY: workspace construction fixes every buffer to this model's
         // const-generic shape and each helper validates its launch dimensions.
         unsafe {
-        cross_entropy_backward_into::<N, VOCAB, VP, P>(
-            &workspace.targets,
-            &mut workspace.logits,
-            stream,
-            dense,
-            profiler,
-        )?;
-        // Rows N..NP of head_input and logits hold zeros (forward computed
-        // them from the zero-padded head input and the classifier backward
-        // skips them), so the MN-major operands feed exact zeros into the
-        // weight GEMM's padded reduction slice.
-        self.lm_head.backward_weight::<NP, P>(
-            &workspace.head_input_mn_tma,
-            &workspace.logits_mn_tma,
-            stream,
-            gemm_bf16,
-            profiler,
-            "backward.lm_head.weight_gemm",
-        )?;
-        self.lm_head.backward_input::<NP, P>(
-            &workspace.logits_tma,
-            &mut workspace.d_head_input,
-            stream,
-            gemm_bf16,
-            profiler,
-            "backward.lm_head.input_gemm",
-        )?;
-        profiler.measure(stream, "backward.lm_head.dequantize", || {
-            tensor.convert_bf16_pairs_to_f32(
+            cross_entropy_backward_into::<N, VOCAB, VP, P>(
+                &workspace.targets,
+                &mut workspace.logits,
                 stream,
-                elementwise_config::<Rank2<N, D>>(),
-                &workspace.d_head_input,
-                workspace.d_model_0.as_device_buffer_mut(),
-            )
-        })?;
-        self.final_norm.backward_into(
-            &workspace.final_input,
-            &workspace.d_model_0,
-            &mut workspace.d_model_1,
-            &mut workspace.norm_backward_inv,
-            stream,
-            dense,
-            profiler,
-            ["backward.final_norm.input", "backward.final_norm.weight"],
-        )?;
+                dense,
+                profiler,
+            )?;
+            // Rows N..NP of head_input and logits hold zeros (forward computed
+            // them from the zero-padded head input and the classifier backward
+            // skips them), so the MN-major operands feed exact zeros into the
+            // weight GEMM's padded reduction slice.
+            self.lm_head.backward_weight::<NP, P>(
+                &workspace.head_input_mn_tma,
+                &workspace.logits_mn_tma,
+                stream,
+                gemm_bf16,
+                profiler,
+                "backward.lm_head.weight_gemm",
+            )?;
+            self.lm_head.backward_input::<NP, P>(
+                &workspace.logits_tma,
+                &mut workspace.d_head_input,
+                stream,
+                gemm_bf16,
+                profiler,
+                "backward.lm_head.input_gemm",
+            )?;
+            profiler.measure(stream, "backward.lm_head.dequantize", || {
+                tensor.convert_bf16_pairs_to_f32(
+                    stream,
+                    elementwise_config::<Rank2<N, D>>(),
+                    &workspace.d_head_input,
+                    workspace.d_model_0.as_device_buffer_mut(),
+                )
+            })?;
+            self.final_norm.backward_into(
+                &workspace.final_input,
+                &workspace.d_model_0,
+                &mut workspace.d_model_1,
+                &mut workspace.norm_backward_inv,
+                stream,
+                dense,
+                profiler,
+                ["backward.final_norm.input", "backward.final_norm.weight"],
+            )?;
 
-        self.down_proj.backward_into(
-            &workspace.activated,
-            &workspace.d_model_1,
-            &mut workspace.d_ff_0,
-            stream,
-            tensor,
-            gemm,
-            gemm_bf16,
-            &mut workspace.linear_scratch,
-            profiler,
-            [
-                "backward.down_proj.weight_gemm",
-                "backward.down_proj.input_gemm",
-            ],
-        )?;
-        swiglu_backward_into(
-            &workspace.gate,
-            &workspace.up,
-            &workspace.d_ff_0,
-            &mut workspace.d_ff_1,
-            &mut workspace.d_ff_2,
-            stream,
-            dense,
-            profiler,
-        )?;
-        profiler.measure(stream, "backward.gate_up_proj.join", || unsafe {
-            dense.join_group2(
+            self.down_proj.backward_into(
+                &workspace.activated,
+                &workspace.d_model_1,
+                &mut workspace.d_ff_0,
                 stream,
-                LaunchConfig::for_num_elems((N * FF) as u32),
-                workspace.d_ff_1.as_device_buffer(),
-                workspace.d_ff_2.as_device_buffer(),
-                FF as u32,
-                workspace.gate_up.as_device_buffer_mut(),
-            )
-        })?;
-        self.gate_up_proj.backward_into(
-            &workspace.ffn_normalized,
-            &workspace.gate_up,
-            &mut workspace.d_model_3,
-            stream,
-            tensor,
-            gemm,
-            gemm_bf16,
-            &mut workspace.linear_scratch,
-            profiler,
-            [
-                "backward.gate_up_proj.weight_gemm",
-                "backward.gate_up_proj.input_gemm",
-            ],
-        )?;
-        self.ffn_norm.backward_into(
-            &workspace.ffn_input,
-            &workspace.d_model_3,
-            &mut workspace.d_model_0,
-            &mut workspace.norm_backward_inv,
-            stream,
-            dense,
-            profiler,
-            ["backward.ffn_norm.input", "backward.ffn_norm.weight"],
-        )?;
-        add_into(
-            &workspace.d_model_1,
-            &workspace.d_model_0,
-            &mut workspace.d_model_2,
-            stream,
-            tensor,
-            profiler,
-            "backward.ffn_residual",
-        )?;
+                tensor,
+                gemm,
+                gemm_bf16,
+                &mut workspace.linear_scratch,
+                profiler,
+                [
+                    "backward.down_proj.weight_gemm",
+                    "backward.down_proj.input_gemm",
+                ],
+            )?;
+            swiglu_backward_into(
+                &workspace.gate,
+                &workspace.up,
+                &workspace.d_ff_0,
+                &mut workspace.d_ff_1,
+                &mut workspace.d_ff_2,
+                stream,
+                dense,
+                profiler,
+            )?;
+            profiler.measure(stream, "backward.gate_up_proj.join", || unsafe {
+                dense.join_group2(
+                    stream,
+                    LaunchConfig::for_num_elems((N * FF) as u32),
+                    workspace.d_ff_1.as_device_buffer(),
+                    workspace.d_ff_2.as_device_buffer(),
+                    FF as u32,
+                    workspace.gate_up.as_device_buffer_mut(),
+                )
+            })?;
+            self.gate_up_proj.backward_into(
+                &workspace.ffn_normalized,
+                &workspace.gate_up,
+                &mut workspace.d_model_3,
+                stream,
+                tensor,
+                gemm,
+                gemm_bf16,
+                &mut workspace.linear_scratch,
+                profiler,
+                [
+                    "backward.gate_up_proj.weight_gemm",
+                    "backward.gate_up_proj.input_gemm",
+                ],
+            )?;
+            self.ffn_norm.backward_into(
+                &workspace.ffn_input,
+                &workspace.d_model_3,
+                &mut workspace.d_model_0,
+                &mut workspace.norm_backward_inv,
+                stream,
+                dense,
+                profiler,
+                ["backward.ffn_norm.input", "backward.ffn_norm.weight"],
+            )?;
+            add_into(
+                &workspace.d_model_1,
+                &workspace.d_model_0,
+                &mut workspace.d_model_2,
+                stream,
+                tensor,
+                profiler,
+                "backward.ffn_residual",
+            )?;
 
-        self.o_proj.backward_into(
-            &workspace.attended,
-            &workspace.d_model_2,
-            &mut workspace.d_model_0,
-            stream,
-            tensor,
-            gemm,
-            gemm_bf16,
-            &mut workspace.linear_scratch,
-            profiler,
-            ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
-        )?;
-        flash_attention_backward_into::<N, T, D, H, HD, P>(
-            &workspace.q,
-            &workspace.k,
-            &workspace.v,
-            &workspace.attended,
-            &workspace.attention_logsumexp,
-            &mut workspace.attention_dot,
-            &workspace.d_model_0,
-            &mut workspace.d_model_1,
-            &mut workspace.d_model_3,
-            &mut workspace.d_model_4,
-            workspace.flash_scratch.as_mut(),
-            stream,
-            flash,
-            flash_bf16,
-            profiler,
-        )?;
-        rope_into::<N, T, D, H, HD, P>(
-            &workspace.d_model_1,
-            &mut workspace.d_model_0,
-            true,
-            stream,
-            dense,
-            profiler,
-            "backward.q_rope",
-        )?;
-        rope_into::<N, T, D, H, HD, P>(
-            &workspace.d_model_3,
-            &mut workspace.d_model_1,
-            true,
-            stream,
-            dense,
-            profiler,
-            "backward.k_rope",
-        )?;
-        profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
-            dense.join_group3(
+            self.o_proj.backward_into(
+                &workspace.attended,
+                &workspace.d_model_2,
+                &mut workspace.d_model_0,
                 stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                workspace.d_model_0.as_device_buffer(),
-                workspace.d_model_1.as_device_buffer(),
-                workspace.d_model_4.as_device_buffer(),
-                D as u32,
-                workspace.qkv.as_device_buffer_mut(),
+                tensor,
+                gemm,
+                gemm_bf16,
+                &mut workspace.linear_scratch,
+                profiler,
+                ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
+            )?;
+            flash_attention_backward_into::<N, T, D, H, HD, P>(
+                &workspace.q,
+                &workspace.k,
+                &workspace.v,
+                &workspace.attended,
+                &workspace.attention_logsumexp,
+                &mut workspace.attention_dot,
+                &workspace.d_model_0,
+                &mut workspace.d_model_1,
+                &mut workspace.d_model_3,
+                &mut workspace.d_model_4,
+                workspace.flash_scratch.as_mut(),
+                stream,
+                flash,
+                flash_bf16,
+                profiler,
+            )?;
+            rope_into::<N, T, D, H, HD, P>(
+                &workspace.d_model_1,
+                &mut workspace.d_model_0,
+                true,
+                stream,
+                dense,
+                profiler,
+                "backward.q_rope",
+            )?;
+            rope_into::<N, T, D, H, HD, P>(
+                &workspace.d_model_3,
+                &mut workspace.d_model_1,
+                true,
+                stream,
+                dense,
+                profiler,
+                "backward.k_rope",
+            )?;
+            profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
+                dense.join_group3(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    workspace.d_model_0.as_device_buffer(),
+                    workspace.d_model_1.as_device_buffer(),
+                    workspace.d_model_4.as_device_buffer(),
+                    D as u32,
+                    workspace.qkv.as_device_buffer_mut(),
+                )
+            })?;
+            self.qkv_proj.backward_into(
+                &workspace.attention_normalized,
+                &workspace.qkv,
+                &mut workspace.d_model_3,
+                stream,
+                tensor,
+                gemm,
+                gemm_bf16,
+                &mut workspace.linear_scratch,
+                profiler,
+                [
+                    "backward.qkv_proj.weight_gemm",
+                    "backward.qkv_proj.input_gemm",
+                ],
+            )?;
+            self.attention_norm.backward_into(
+                &workspace.attention_input,
+                &workspace.d_model_3,
+                &mut workspace.d_model_0,
+                &mut workspace.norm_backward_inv,
+                stream,
+                dense,
+                profiler,
+                [
+                    "backward.attention_norm.input",
+                    "backward.attention_norm.weight",
+                ],
+            )?;
+            add_into(
+                &workspace.d_model_2,
+                &workspace.d_model_0,
+                &mut workspace.d_model_1,
+                stream,
+                tensor,
+                profiler,
+                "backward.attention_residual",
+            )?;
+            self.embedding.backward(
+                &workspace.tokens,
+                &workspace.d_model_1,
+                stream,
+                dense,
+                profiler,
+                "backward.embedding",
             )
-        })?;
-        self.qkv_proj.backward_into(
-            &workspace.attention_normalized,
-            &workspace.qkv,
-            &mut workspace.d_model_3,
-            stream,
-            tensor,
-            gemm,
-            gemm_bf16,
-            &mut workspace.linear_scratch,
-            profiler,
-            [
-                "backward.qkv_proj.weight_gemm",
-                "backward.qkv_proj.input_gemm",
-            ],
-        )?;
-        self.attention_norm.backward_into(
-            &workspace.attention_input,
-            &workspace.d_model_3,
-            &mut workspace.d_model_0,
-            &mut workspace.norm_backward_inv,
-            stream,
-            dense,
-            profiler,
-            [
-                "backward.attention_norm.input",
-                "backward.attention_norm.weight",
-            ],
-        )?;
-        add_into(
-            &workspace.d_model_2,
-            &workspace.d_model_0,
-            &mut workspace.d_model_1,
-            stream,
-            tensor,
-            profiler,
-            "backward.attention_residual",
-        )?;
-        self.embedding.backward(
-            &workspace.tokens,
-            &workspace.d_model_1,
-            stream,
-            dense,
-            profiler,
-            "backward.embedding",
-        )
         }
     }
 
