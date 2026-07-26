@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, DriverError, LaunchConfig};
 use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread};
-use tensor_core::{Element, Rank1, Rank2, Shape, Tensor};
+use tensor_core::{Element, Rank1, Rank2, Shape, Tensor, bf16};
 use tensor_cpu::CpuTensor;
 
 /// GEMM tile edge and launch block dimensions. This is intentionally public so
@@ -16,6 +16,10 @@ use tensor_cpu::CpuTensor;
 pub const TILE: usize = 16;
 /// Threads in the single-block reduction kernels. Must remain a power of two.
 pub const REDUCE_THREADS: usize = 256;
+/// `rounding` selector for the fused bf16-master kernels: round to nearest even.
+pub const MASTER_ROUNDING_NEAREST: u32 = 0;
+/// `rounding` selector for the fused bf16-master kernels: stochastic rounding.
+pub const MASTER_ROUNDING_STOCHASTIC: u32 = 1;
 const TILE_ELEMENTS: usize = TILE * TILE;
 /// Square element-tile edge of the packed-bf16 transpose kernel. Both matrix
 /// dimensions must be multiples of this.
@@ -226,20 +230,17 @@ pub mod kernels {
         }
     }
 
-    /// Muon's fused parameter update for one group of a `[rows, groups,
-    /// width]` parameter: `p = decay * p - scale * update`, where `update` is
-    /// the dense `[rows, width]` orthogonalized matrix and `len` is
+    /// Write a dense `[rows, width]` matrix back into group `group` of a
+    /// `[rows, groups, width]` buffer. Inverse of [`gather_group`]; `len` is
     /// `rows * width`.
     #[kernel]
-    pub unsafe fn muon_apply_group(
-        update: &[f32],
-        decay: f32,
-        scale: f32,
+    pub unsafe fn scatter_group(
+        input: &[f32],
         groups: u32,
         group: u32,
         width: u32,
         len: u32,
-        mut parameter: DisjointSlice<f32>,
+        mut out: DisjointSlice<f32>,
     ) {
         let i = thread::index_1d().get();
         if i >= len as usize {
@@ -251,9 +252,44 @@ pub mod kernels {
         // SAFETY: distinct `i` map to distinct `target` for a fixed `group`,
         // and the caller launches one group at a time.
         unsafe {
-            let slot = parameter.get_unchecked_mut(target);
-            *slot = decay * *slot - scale * update[i];
+            *out.get_unchecked_mut(target) = input[i];
         }
+    }
+
+    /// Muon's fused decay-and-apply over a packed-bf16 master:
+    /// `p = decay * p - scale * update`, one thread per element pair.
+    ///
+    /// Runs over the whole `[rows, groups, width]` parameter at once, against
+    /// an `update` buffer each group has already scattered its orthogonalized
+    /// result into. Per-group application is not an option here: `width` may be
+    /// odd, so a packed word can straddle two groups and two group launches
+    /// would race for it.
+    #[kernel]
+    pub fn muon_apply_bf16(
+        update: &[f32],
+        decay: f32,
+        scale: f32,
+        rounding: u32,
+        seed: u64,
+        mut parameter: DisjointSlice<u32>,
+    ) {
+        let index = thread::index_1d();
+        let pair = index.get();
+        let Some(word) = parameter.get_mut(index) else {
+            return;
+        };
+        let stored = *word;
+
+        let mut packed = 0u32;
+        let mut half = 0;
+        while half < 2 {
+            let element = 2 * pair + half;
+            let weight = bf16_bits_to_f32((stored >> (16 * half)) as u16);
+            let updated = decay * weight - scale * update[element];
+            packed |= (round_master(updated, rounding, seed, element) as u32) << (16 * half);
+            half += 1;
+        }
+        *word = packed;
     }
 
     #[inline(always)]
@@ -266,6 +302,38 @@ pub mod kernels {
         let bits = value.to_bits();
         let round = 0x7fffu32 + ((bits >> 16) & 1);
         (bits.wrapping_add(round) >> 16) as u16
+    }
+
+    /// splitmix64's mixing round, ported verbatim from
+    /// `tensor_core::rng::splitmix64`. cuda-oxide collects device functions per
+    /// artifact, so device code cannot call across crates; that function is the
+    /// definition this one must match.
+    #[inline(always)]
+    fn splitmix64(state: u64) -> u64 {
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Round one updated master weight to bf16.
+    ///
+    /// `rounding` is [`MASTER_ROUNDING_NEAREST`] or
+    /// [`MASTER_ROUNDING_STOCHASTIC`]. Stochastic adds a uniform draw to the
+    /// mantissa bits bf16 discards before truncating, so the probability of
+    /// rounding up equals the discarded fraction and updates below one ulp
+    /// survive in expectation. The draw comes from `seed` — the host's
+    /// `tensor_core::rng::stream_seed(step, parameter_id)` — mixed with the
+    /// element index, never from runtime entropy, so a rerun and a resume
+    /// reproduce the same weights bit for bit.
+    #[inline(always)]
+    fn round_master(value: f32, rounding: u32, seed: u64, element: usize) -> u16 {
+        if rounding == MASTER_ROUNDING_NEAREST {
+            f32_to_bf16_bits(value)
+        } else {
+            let draw = (splitmix64(seed.wrapping_add(element as u64)) >> 32) as u32;
+            (value.to_bits().wrapping_add(draw & 0xffff) >> 16) as u16
+        }
     }
 
     /// [`fill`] for packed storage, used to zero packed-bf16 gradients.
@@ -305,6 +373,28 @@ pub mod kernels {
         if let Some(slot) = output.get_mut(index) {
             let word = input[i / 2];
             let bits = (if i % 2 == 0 { word } else { word >> 16 }) as u16;
+            *slot = bf16_bits_to_f32(bits);
+        }
+    }
+
+    /// [`convert_bf16_pairs_to_f32`] with explicit bounds: widen `len` elements
+    /// starting at element `offset` into a dense fp32 prefix of `output`.
+    ///
+    /// Both ends of the fp32 oracle path need this rather than the whole-buffer
+    /// convert — experts read one expert out of the middle of a stacked master,
+    /// and block linears widen into staging sized for the largest of them, so
+    /// neither `input` nor `output` bounds the work on its own.
+    #[kernel]
+    pub fn widen_bf16_region(input: &[u32], offset: u32, len: u32, mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i >= len as usize {
+            return;
+        }
+        if let Some(slot) = output.get_mut(index) {
+            let element = offset as usize + i;
+            let word = input[element / 2];
+            let bits = (if element % 2 == 0 { word } else { word >> 16 }) as u16;
             *slot = bf16_bits_to_f32(bits);
         }
     }
@@ -501,13 +591,64 @@ pub mod kernels {
         }
     }
 
-    /// Fused decoupled AdamW over an fp32 master parameter with a packed-bf16
-    /// gradient and compute copy: one thread owns one pair.
+    /// Fused decoupled AdamW over a packed-bf16 master with an fp32 gradient:
+    /// one thread owns one pair.
     ///
-    /// Moment and master updates match [`adamw`] exactly; the compute copy is
-    /// the rounded shadow of the updated master.
+    /// Moments stay fp32 and the whole update is computed in fp32 — bf16 only
+    /// ever appears at the write-back, where [`round_master`] decides how the
+    /// discarded mantissa bits are handled. Beside that rounding the arithmetic
+    /// is [`adamw`] exactly.
     #[kernel]
-    pub fn adamw_master_bf16(
+    pub fn adamw_bf16_master(
+        gradient: &[f32],
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+        first_correction: f32,
+        second_correction: f32,
+        rounding: u32,
+        seed: u64,
+        mut master: DisjointSlice<u32>,
+        mut first: DisjointSlice<f32>,
+        mut second: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let pair = index.get();
+        let Some(word) = master.get_mut(index) else {
+            return;
+        };
+        let stored = *word;
+
+        let mut packed = 0u32;
+        let mut half = 0;
+        while half < 2 {
+            let element = 2 * pair + half;
+            let g = gradient[element];
+            let mut weight = bf16_bits_to_f32((stored >> (16 * half)) as u16);
+            // SAFETY: this thread exclusively owns elements 2*pair and
+            // 2*pair+1 of every per-element buffer.
+            unsafe {
+                let first = first.get_unchecked_mut(element);
+                let second = second.get_unchecked_mut(element);
+                *first = beta1 * *first + (1.0 - beta1) * g;
+                *second = beta2 * *second + (1.0 - beta2) * g * g;
+                let first_hat = *first * first_correction;
+                let second_hat = *second * second_correction;
+                let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * weight;
+                weight -= learning_rate * update;
+            }
+            packed |= (round_master(weight, rounding, seed, element) as u32) << (16 * half);
+            half += 1;
+        }
+        *word = packed;
+    }
+
+    /// [`adamw_bf16_master`] for the lm-head, whose weight gradient is produced
+    /// in packed bf16 straight out of the tcgen05 accumulate epilogue.
+    #[kernel]
+    pub fn adamw_bf16_master_packed_grad(
         gradient: &[u32],
         learning_rate: f32,
         beta1: f32,
@@ -516,16 +657,18 @@ pub mod kernels {
         weight_decay: f32,
         first_correction: f32,
         second_correction: f32,
-        mut master: DisjointSlice<f32>,
+        rounding: u32,
+        seed: u64,
+        mut master: DisjointSlice<u32>,
         mut first: DisjointSlice<f32>,
         mut second: DisjointSlice<f32>,
-        mut compute: DisjointSlice<u32>,
     ) {
         let index = thread::index_1d();
         let pair = index.get();
-        let Some(word) = compute.get_mut(index) else {
+        let Some(word) = master.get_mut(index) else {
             return;
         };
+        let stored = *word;
         let gradient = gradient[pair];
 
         let mut packed = 0u32;
@@ -533,20 +676,20 @@ pub mod kernels {
         while half < 2 {
             let element = 2 * pair + half;
             let g = bf16_bits_to_f32((gradient >> (16 * half)) as u16);
+            let mut weight = bf16_bits_to_f32((stored >> (16 * half)) as u16);
             // SAFETY: this thread exclusively owns elements 2*pair and
             // 2*pair+1 of every per-element buffer.
             unsafe {
                 let first = first.get_unchecked_mut(element);
                 let second = second.get_unchecked_mut(element);
-                let master = master.get_unchecked_mut(element);
                 *first = beta1 * *first + (1.0 - beta1) * g;
                 *second = beta2 * *second + (1.0 - beta2) * g * g;
                 let first_hat = *first * first_correction;
                 let second_hat = *second * second_correction;
-                let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * *master;
-                *master -= learning_rate * update;
-                packed |= (f32_to_bf16_bits(*master) as u32) << (16 * half);
+                let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * weight;
+                weight -= learning_rate * update;
             }
+            packed |= (round_master(weight, rounding, seed, element) as u32) << (16 * half);
             half += 1;
         }
         *word = packed;
@@ -806,7 +949,163 @@ pub struct GpuTensor<E: Element, S: Shape> {
     _shape: PhantomData<S>,
 }
 
+/// Pack fp32 values into the device's packed-bf16 pair layout (one `u32` per
+/// two adjacent row elements), rounding to nearest even.
+pub fn pack_bf16_pairs(values: &[f32]) -> Vec<u32> {
+    assert!(values.len().is_multiple_of(2), "packed bf16 needs pairs");
+    values
+        .chunks_exact(2)
+        .map(|pair| {
+            bf16::from_f32(pair[0]).to_bits() as u32
+                | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
+        })
+        .collect()
+}
+
+/// Inverse of [`pack_bf16_pairs`].
+pub fn unpack_bf16_pairs(words: &[u32]) -> Vec<f32> {
+    let mut values = Vec::with_capacity(2 * words.len());
+    for &word in words {
+        values.push(bf16::from_bits(word as u16).to_f32());
+        values.push(bf16::from_bits((word >> 16) as u16).to_f32());
+    }
+    values
+}
+
+/// Owning, contiguous bf16 master weights in the device's packed-pair layout.
+///
+/// Masters moved from fp32 to bf16 in #57 (SPEC §7, decision #8 successor):
+/// the update is still computed in fp32 against fp32 moments, and bf16 appears
+/// only at the write-back. Storage is packed `u32` words rather than a bf16
+/// element buffer because that is the layout every compute copy, TMA
+/// descriptor, and tcgen05 operand in the tree already speaks.
+///
+/// Deliberately carries no arithmetic: the fused optimizer kernels widen,
+/// compute, and round in one pass, and the non-tcgen05 oracle paths widen into
+/// scratch.
+pub struct GpuBf16Tensor<S: Shape> {
+    words: DeviceBuffer<u32>,
+    _shape: PhantomData<S>,
+}
+
+impl<S: Shape> Tensor for GpuBf16Tensor<S> {
+    type Elem = tensor_core::bf16;
+    type Shape = S;
+}
+
+impl<S: Shape> GpuBf16Tensor<S> {
+    pub const LEN: usize = S::NUM_ELEMENTS;
+    /// Packed words backing the tensor. Every master dimension is even, so the
+    /// element count always is too.
+    pub const WORDS: usize = {
+        assert!(S::NUM_ELEMENTS.is_multiple_of(2));
+        S::NUM_ELEMENTS / 2
+    };
+
+    pub fn zeros(stream: &CudaStream) -> Result<Self, DriverError> {
+        Ok(Self {
+            words: DeviceBuffer::zeroed(stream, Self::WORDS)?,
+            _shape: PhantomData,
+        })
+    }
+
+    /// Round fp32 host values to bf16 and upload them.
+    pub fn from_f32_host(stream: &CudaStream, values: &[f32]) -> Result<Self, DriverError> {
+        assert_eq!(values.len(), Self::LEN, "slice length != shape volume");
+        Ok(Self {
+            words: DeviceBuffer::from_host(stream, &pack_bf16_pairs(values))?,
+            _shape: PhantomData,
+        })
+    }
+
+    /// Download and widen. Every value is exactly bf16-representable.
+    pub fn to_f32_host(&self, stream: &CudaStream) -> Result<Vec<f32>, DriverError> {
+        Ok(unpack_bf16_pairs(&self.words.to_host_vec(stream)?))
+    }
+
+    pub fn as_words(&self) -> &DeviceBuffer<u32> {
+        &self.words
+    }
+
+    pub fn as_words_mut(&mut self) -> &mut DeviceBuffer<u32> {
+        &mut self.words
+    }
+
+    /// Widen the whole master into an fp32 buffer, for the register-tiled
+    /// oracle GEMMs that read fp32 operands.
+    ///
+    /// `out` may be longer than the master — it is shared staging sized for the
+    /// largest parameter that uses it — so this goes through the explicitly
+    /// length-bounded region kernel rather than the whole-buffer one.
+    pub fn widen_into(
+        &self,
+        out: &mut DeviceBuffer<f32>,
+        stream: &CudaStream,
+        module: &kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        assert!(out.len() >= Self::LEN);
+        module.widen_bf16_region(
+            stream,
+            pairs_config(Self::LEN),
+            &self.words,
+            0,
+            Self::LEN as u32,
+            out,
+        )
+    }
+
+    /// One fused AdamW step: fp32 gradient and moments in, one rounded bf16
+    /// write-back out. `seed` is `tensor_core::rng::stream_seed(step, id)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adamw_step(
+        &mut self,
+        gradient: &GpuTensor<f32, S>,
+        moments: &mut GpuAdamWMoments<S>,
+        config: MasterAdamW,
+        stream: &CudaStream,
+        module: &kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        module.adamw_bf16_master(
+            stream,
+            pairs_config(Self::WORDS),
+            gradient.as_device_buffer(),
+            config.learning_rate,
+            config.beta1,
+            config.beta2,
+            config.epsilon,
+            config.weight_decay,
+            config.first_correction,
+            config.second_correction,
+            config.rounding,
+            config.seed,
+            &mut self.words,
+            moments.first.as_device_buffer_mut(),
+            moments.second.as_device_buffer_mut(),
+        )
+    }
+}
+
+/// Everything the fused bf16-master AdamW kernels need beyond the buffers.
+///
+/// Bundled because the write-back adds a rounding mode and a noise seed to an
+/// already long argument list, and every call site sets them the same way.
+#[derive(Clone, Copy, Debug)]
+pub struct MasterAdamW {
+    pub learning_rate: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub epsilon: f32,
+    pub weight_decay: f32,
+    pub first_correction: f32,
+    pub second_correction: f32,
+    pub rounding: u32,
+    pub seed: u64,
+}
+
 /// GPU-resident first and second AdamW moments for one parameter tensor.
+///
+/// Both stay fp32 even beside a bf16 master: the second moment sits inside a
+/// square root in the denominator, where bf16 is not safe.
 pub struct GpuAdamWMoments<S: Shape> {
     pub first: GpuTensor<f32, S>,
     pub second: GpuTensor<f32, S>,
@@ -891,6 +1190,12 @@ fn reduction_config() -> LaunchConfig {
         block_dim: (REDUCE_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
+}
+
+/// One thread per packed-bf16 word (or per element of any flat buffer).
+pub fn pairs_config(elements: usize) -> LaunchConfig {
+    assert!(elements <= u32::MAX as usize);
+    LaunchConfig::for_num_elems(elements as u32)
 }
 
 /// Validate dimensions and build the packed-bf16 transpose launch.

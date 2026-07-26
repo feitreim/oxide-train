@@ -1292,16 +1292,27 @@ fn check_embedding(
 ) -> Result<(), Box<dyn std::error::Error>> {
     const N: usize = 6;
     const V: usize = 9;
-    const D: usize = 5;
+    // Even, because the bf16 embedding master is stored as packed pairs.
+    const D: usize = 6;
     let tokens_usize = [2, 7, 2, 0, 7, 4];
     let tokens = tokens_usize.map(|v| v as u32);
-    let weight = CpuTensor::<f32, Rank2<V, D>>::uniform(7);
+    // The master is bf16 (#57): the reference reads the same rounded values the
+    // lookup kernel unpacks, so the forward stays an exact comparison.
+    let weight = CpuTensor::<f32, Rank2<V, D>>::uniform(7).to_bf16().to_f32();
     let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(8);
     let mut cpu = Embedding::<N, V, D>::new(weight.clone());
     let (cpu_y, cpu_ctx) = cpu.forward(tokens_usize);
     cpu.backward(cpu_ctx, dy.clone());
 
-    let weight_dev = DeviceBuffer::from_host(stream, weight.as_slice())?;
+    let packed_weight: Vec<u32> = weight
+        .as_slice()
+        .chunks_exact(2)
+        .map(|pair| {
+            bf16::from_f32(pair[0]).to_bits() as u32
+                | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
+        })
+        .collect();
+    let weight_dev = DeviceBuffer::from_host(stream, &packed_weight)?;
     let tokens_dev = DeviceBuffer::from_host(stream, &tokens)?;
     let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;

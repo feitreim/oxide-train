@@ -650,14 +650,18 @@ pub mod kernels {
     }
 
     #[kernel]
-    pub fn embedding_forward(weight: &[f32], tokens: &[u32], dim: u32, mut y: DisjointSlice<f32>) {
+    pub fn embedding_forward(weight: &[u32], tokens: &[u32], dim: u32, mut y: DisjointSlice<f32>) {
         let index = thread::index_1d();
         let i = index.get();
         if let Some(slot) = y.get_mut(index) {
             let d = dim as usize;
             let row = i / d;
             let col = i % d;
-            *slot = weight[tokens[row] as usize * d + col];
+            // The embedding master is bf16 (#57), stored as packed pairs.
+            let element = tokens[row] as usize * d + col;
+            let word = weight[element / 2];
+            let bits = (if element % 2 == 0 { word } else { word >> 16 }) as u16;
+            *slot = f32::from_bits((bits as u32) << 16);
         }
     }
 

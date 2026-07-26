@@ -2,6 +2,20 @@
 
 pub use half::bf16;
 
+/// Round `value` to bf16 by adding a uniform 16-bit draw to the mantissa bits
+/// bf16 discards, then truncating.
+///
+/// The probability of rounding up equals the discarded fraction, so an update
+/// smaller than a bf16 ulp survives in expectation instead of vanishing the
+/// way `bf16::from_f32`'s round-to-nearest drops it. `entropy` must come from
+/// a deterministic stream (`rng::stream_draw`), never runtime randomness: a
+/// rerun and a checkpoint resume have to reproduce the same weights bit for
+/// bit. The GPU optimizer kernels re-implement this expression verbatim in
+/// device code, which cannot call across crates.
+pub fn bf16_stochastic(value: f32, entropy: u32) -> bf16 {
+    bf16::from_bits((value.to_bits().wrapping_add(entropy & 0xffff) >> 16) as u16)
+}
+
 /// Runtime dtype tag, mostly for debug output and shard-file headers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DType {

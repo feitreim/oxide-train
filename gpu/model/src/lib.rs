@@ -1,7 +1,8 @@
 //! GPU forward and backward for the single-block reference Dense. Aligned
 //! training shapes run the lm-head and block linears through bf16 tcgen05
-//! against fp32 master weights/gradients; small parity shapes retain the fp32
-//! register-tiled block-linear oracle.
+//! against bf16 master weights (#57) and fp32 gradients; small parity shapes
+//! retain the fp32 register-tiled block-linear oracle, which widens the master
+//! on the way in.
 //!
 //! Parameters, gradients, and saved activations remain GPU-resident. The
 //! implementation mirrors `nn::Dense` explicitly so residual splits and the
@@ -23,13 +24,15 @@
 use std::error::Error;
 
 use bench_util::{KernelProfiler, NoopProfiler};
-use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, DriverError, LaunchConfig, PinnedHostBuffer};
+use cuda_core::{
+    CudaEvent, CudaStream, DeviceBuffer, DeviceCopy, DriverError, LaunchConfig, PinnedHostBuffer,
+};
 use nn::{Dense, MoeBlock, MoeDense};
 use optim::{
-    AdamWConfig, AuxLossSchedule, MuonConfig, NEWTON_SCHULZ_A, NEWTON_SCHULZ_B, NEWTON_SCHULZ_C,
-    NEWTON_SCHULZ_EPSILON,
+    AdamWConfig, AuxLossSchedule, MasterRounding, MuonConfig, NEWTON_SCHULZ_A, NEWTON_SCHULZ_B,
+    NEWTON_SCHULZ_C, NEWTON_SCHULZ_EPSILON,
 };
-use tensor_core::{Rank1, Rank2, Rank3, Rank4, Shape, bf16};
+use tensor_core::{Rank1, Rank2, Rank3, Rank4, Shape, rng::stream_seed};
 
 // cuda-oxide collects kernels from the selected binary target. The binary
 // includes this file as a module, which in turn includes each canonical kernel
@@ -74,9 +77,82 @@ use gemm_host::{
     create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_pairs_tma_map_region,
     tcgen05_launch_config,
 };
-use tensor_device::{GpuAdamWMoments, GpuMuonMomentum, GpuTensor, transpose_pairs_config};
+use tensor_device::{
+    GpuAdamWMoments, GpuBf16Tensor, GpuMuonMomentum, GpuTensor, MASTER_ROUNDING_NEAREST,
+    MASTER_ROUNDING_STOCHASTIC, MasterAdamW, pack_bf16_pairs, transpose_pairs_config,
+};
 
 pub mod checkpoint;
+
+/// How every bf16 master commits its fp32 update (#57).
+///
+/// One constant switches the whole model, kernels included, because both modes
+/// live in the same fused kernel. Nearest is the shipped default: every overfit
+/// gate converges on it with margin, so nothing yet demands the alternative,
+/// and it costs no arithmetic. Stochastic rounding is there for when they stop
+/// — its draws come from a splitmix64 stream keyed on `(step, parameter id,
+/// element index)` and never from runtime entropy, so a rerun and a checkpoint
+/// resume reproduce the same weights either way.
+///
+/// Flipping this also breaks the GPU/CPU master parity gates, and not because
+/// either side is wrong: the two draw independent streams (the grouped `qkv`
+/// and `gate_up` masters are one interleaved parameter on the GPU and three or
+/// two separate ones on the CPU, so no keying can align them), a single step
+/// stays within the gates' one-ulp budget, and then a near-cancelling update
+/// turns that ulp into many at the much smaller result. Adopting stochastic
+/// rounding means re-deciding what those gates compare, not just widening them.
+pub const MASTER_ROUNDING: MasterRounding = MasterRounding::Nearest;
+
+const fn master_rounding_selector() -> u32 {
+    match MASTER_ROUNDING {
+        MasterRounding::Nearest => MASTER_ROUNDING_NEAREST,
+        MasterRounding::Stochastic => MASTER_ROUNDING_STOCHASTIC,
+    }
+}
+
+/// Bundle the AdamW hyperparameters, this step's bias corrections, and the
+/// write-back's deterministic noise seed for one parameter.
+fn master_adamw(
+    config: AdamWConfig,
+    weight_decay: f32,
+    corrections: (f32, f32),
+    step: u64,
+    parameter_id: u64,
+) -> MasterAdamW {
+    MasterAdamW {
+        learning_rate: config.learning_rate,
+        beta1: config.beta1,
+        beta2: config.beta2,
+        epsilon: config.epsilon,
+        weight_decay,
+        first_correction: corrections.0,
+        second_correction: corrections.1,
+        rounding: master_rounding_selector(),
+        seed: stream_seed(step, parameter_id),
+    }
+}
+
+/// Stable ids for the deterministic write-back noise stream.
+///
+/// The values are structural — a parameter's slot in the model, not its
+/// allocation order — so they survive a checkpoint resume unchanged.
+mod parameter_id {
+    pub const EMBEDDING: u64 = 0;
+    pub const LM_HEAD: u64 = 1;
+    pub const QKV_PROJ: u64 = 2;
+    pub const O_PROJ: u64 = 3;
+    pub const GATE_UP_PROJ: u64 = 4;
+    pub const DOWN_PROJ: u64 = 5;
+    pub const EXPERT_GATE_UP: u64 = 6;
+    pub const EXPERT_DOWN: u64 = 7;
+    /// Ids of block-local parameters are offset by the block index times this,
+    /// which is comfortably larger than the per-block id space above.
+    pub const PER_BLOCK: u64 = 16;
+
+    pub const fn in_block(block: usize, slot: u64) -> u64 {
+        PER_BLOCK * (block as u64 + 1) + slot
+    }
+}
 
 fn elementwise_config<S: Shape>() -> LaunchConfig {
     assert!(S::NUM_ELEMENTS <= u32::MAX as usize);
@@ -317,9 +393,14 @@ fn scale_into<S: Shape, P: KernelProfiler>(
     })
 }
 
+/// `output = lhs · rhs` where `rhs` is a `[K, N]` weight shadow.
+///
+/// The weight operand is an unshaped buffer because it is the widened view of
+/// a bf16 master, not a tensor in its own right; its extent is checked by the
+/// caller's const generics.
 fn gemm_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
     lhs: &GpuTensor<f32, Rank2<M, K>>,
-    rhs: &GpuTensor<f32, Rank2<K, N>>,
+    rhs: &DeviceBuffer<f32>,
     output: &mut GpuTensor<f32, Rank2<M, N>>,
     stream: &CudaStream,
     kernels: &gemm_kernels::LoadedModule,
@@ -334,7 +415,7 @@ fn gemm_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
             N,
             K,
             lhs.as_device_buffer(),
-            rhs.as_device_buffer(),
+            rhs,
             output.as_device_buffer_mut(),
         )
     })
@@ -363,9 +444,10 @@ fn gemm_tn_accumulate_into<const M: usize, const K: usize, const N: usize, P: Ke
     })
 }
 
+/// `output = lhs · rhsᵀ`; see [`gemm_into`] for why `rhs` is unshaped.
 fn gemm_nt_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
     lhs: &GpuTensor<f32, Rank2<M, K>>,
-    rhs: &GpuTensor<f32, Rank2<N, K>>,
+    rhs: &DeviceBuffer<f32>,
     output: &mut GpuTensor<f32, Rank2<M, N>>,
     stream: &CudaStream,
     kernels: &gemm_kernels::LoadedModule,
@@ -380,16 +462,16 @@ fn gemm_nt_into<const M: usize, const K: usize, const N: usize, P: KernelProfile
             N,
             K,
             lhs.as_device_buffer(),
-            rhs.as_device_buffer(),
+            rhs,
             output.as_device_buffer_mut(),
         )
     })
 }
 
-fn copy_device_region(
-    destination: &mut DeviceBuffer<f32>,
+fn copy_device_region<E: DeviceCopy>(
+    destination: &mut DeviceBuffer<E>,
     destination_offset: usize,
-    source: &DeviceBuffer<f32>,
+    source: &DeviceBuffer<E>,
     source_offset: usize,
     elements: usize,
     stream: &CudaStream,
@@ -403,13 +485,13 @@ fn copy_device_region(
     assert!(destination_end <= destination.len());
     assert!(source_end <= source.len());
     let bytes = elements
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(std::mem::size_of::<E>())
         .expect("device copy byte count overflow");
     let destination_bytes = destination_offset
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(std::mem::size_of::<E>())
         .expect("device copy destination byte offset overflow");
     let source_bytes = source_offset
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(std::mem::size_of::<E>())
         .expect("device copy source byte offset overflow");
     let destination = destination
         .cu_deviceptr()
@@ -420,10 +502,17 @@ fn copy_device_region(
         .checked_add(source_bytes as u64)
         .expect("device copy source pointer overflow");
     // SAFETY: the checked element ranges above are within their allocations.
-    // Expert staging always copies between distinct allocations.
+    // Expert staging and master/compute refreshes always copy between distinct
+    // allocations.
     unsafe { cuda_core::memory::memcpy_dtod_async(destination, source, bytes, stream.cu_stream()) }
 }
 
+/// Packed-bf16 compute copies of one linear's bf16 master, in the two layouts
+/// the tcgen05 `C = A B^T` form needs as a K-contiguous `B` operand.
+///
+/// `normal` is byte-identical to the master since #57 made both bf16; it stays
+/// a separate allocation only because the TMA descriptors are bound to fixed
+/// device addresses, which #58 rebinds onto the master itself.
 struct Bf16LinearWeights {
     normal: DeviceBuffer<u32>,
     transposed: DeviceBuffer<u32>,
@@ -439,22 +528,14 @@ impl Bf16LinearWeights {
         columns: usize,
     ) -> Result<Self, Box<dyn Error>> {
         assert_eq!(values.len(), rows * columns);
-        let pack = |low: f32, high: f32| {
-            bf16::from_f32(low).to_bits() as u32 | ((bf16::from_f32(high).to_bits() as u32) << 16)
-        };
-        let packed: Vec<u32> = values
-            .chunks_exact(2)
-            .map(|pair| pack(pair[0], pair[1]))
-            .collect();
-        let mut packed_t = vec![0u32; rows * columns / 2];
-        for column in 0..columns {
-            for pair in 0..rows / 2 {
-                packed_t[column * rows / 2 + pair] = pack(
-                    values[2 * pair * columns + column],
-                    values[(2 * pair + 1) * columns + column],
-                );
+        let packed = pack_bf16_pairs(values);
+        let mut transposed_values = vec![0.0f32; rows * columns];
+        for row in 0..rows {
+            for column in 0..columns {
+                transposed_values[column * rows + row] = values[row * columns + column];
             }
         }
+        let packed_t = pack_bf16_pairs(&transposed_values);
         let normal = DeviceBuffer::from_host(stream, &packed)?;
         let transposed = DeviceBuffer::from_host(stream, &packed_t)?;
         // SAFETY: both allocations live beside their maps and are never
@@ -473,20 +554,19 @@ impl Bf16LinearWeights {
         })
     }
 
+    /// Refresh both copies from the master the optimizer just wrote.
+    ///
+    /// Master and `normal` are the same dtype and layout, so this is a device
+    /// copy rather than a quantize; only the transpose does real work.
     fn sync_from_master(
         &mut self,
-        master: &DeviceBuffer<f32>,
+        master: &DeviceBuffer<u32>,
         rows: usize,
         columns: usize,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        kernels.convert_f32_to_bf16_pairs(
-            stream,
-            pairs_config(rows * columns / 2),
-            master,
-            &mut self.normal,
-        )?;
+        copy_device_region(&mut self.normal, 0, master, 0, rows * columns / 2, stream)?;
         unsafe {
             kernels.transpose_bf16_pairs(
                 stream,
@@ -572,6 +652,58 @@ impl<const N: usize, const D: usize, const FF: usize> Bf16LinearScratch<N, D, FF
     }
 }
 
+/// Operand staging shared by every block linear.
+///
+/// `bf16` holds the packed tcgen05 panels; `oracle_weights` is the fp32 buffer
+/// the register-tiled fallback needs, because the masters are bf16 (#57) and
+/// that GEMM family reads fp32. Which one a given call uses depends on the
+/// token count as well as the weight shape, so both can be live in one model —
+/// and `oracle_weights` is skipped entirely when no linear can reach the
+/// fallback, which is the case for every real training shape.
+struct LinearScratch<const N: usize, const D: usize, const FF: usize> {
+    bf16: Option<Bf16LinearScratch<N, D, FF>>,
+    oracle_weights: Option<DeviceBuffer<f32>>,
+}
+
+impl<const N: usize, const D: usize, const FF: usize> LinearScratch<N, D, FF> {
+    /// `widths` are the `(input, output)` shapes of the linears this scratch
+    /// serves; `oracle_weights` is sized for the largest and allocated only if
+    /// one of them can miss the tcgen05 contract.
+    fn new(stream: &CudaStream, widths: &[(usize, usize)]) -> Result<Self, Box<dyn Error>> {
+        let bf16 =
+            if N.is_multiple_of(TC_TILE) && D.is_multiple_of(TC_TILE) && FF.is_multiple_of(TC_TILE)
+            {
+                Some(Bf16LinearScratch::new(stream)?)
+            } else {
+                None
+            };
+        let all_tcgen05 = bf16.is_some()
+            && widths
+                .iter()
+                .all(|&(input, output)| tcgen05_linear_eligible(N, input, output));
+        let oracle_weights = if all_tcgen05 {
+            None
+        } else {
+            let elements = widths
+                .iter()
+                .map(|&(input, output)| input * output)
+                .max()
+                .expect("a block has at least one linear");
+            Some(DeviceBuffer::zeroed(stream, elements)?)
+        };
+        Ok(Self {
+            bf16,
+            oracle_weights,
+        })
+    }
+
+    fn oracle_weights(&mut self) -> &mut DeviceBuffer<f32> {
+        self.oracle_weights
+            .as_mut()
+            .expect("the fp32 oracle path needs its widened weight staging")
+    }
+}
+
 fn tcgen05_linear_eligible(m: usize, k: usize, n: usize) -> bool {
     m.is_multiple_of(TC_M_TILE) && k.is_multiple_of(TC_K_PIPELINE) && n.is_multiple_of(TC_N_TILE)
 }
@@ -633,7 +765,7 @@ impl<const N: usize, const T: usize, const D: usize, const H: usize>
 }
 
 pub struct GpuLinear<const IN: usize, const OUT: usize> {
-    pub w: GpuTensor<f32, Rank2<IN, OUT>>,
+    pub w: GpuBf16Tensor<Rank2<IN, OUT>>,
     pub dw: GpuTensor<f32, Rank2<IN, OUT>>,
     compute: Option<Bf16LinearWeights>,
 }
@@ -649,7 +781,7 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
             None
         };
         Ok(Self {
-            w: GpuTensor::from_cpu(stream, &layer.w)?,
+            w: GpuBf16Tensor::from_f32_host(stream, layer.w.as_slice())?,
             dw: GpuTensor::zeros(stream)?,
             compute,
         })
@@ -664,11 +796,11 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
-        scratch: Option<&mut Bf16LinearScratch<N, D, FF>>,
+        scratch: &mut LinearScratch<N, D, FF>,
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
-        if let (Some(compute), Some(scratch)) = (&self.compute, scratch)
+        if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
             && tcgen05_linear_eligible(N, IN, OUT)
         {
             profiler.measure(stream, name, || {
@@ -676,13 +808,13 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                     stream,
                     pairs_config(N * IN / 2),
                     x.as_device_buffer(),
-                    &mut scratch.rows,
+                    &mut staging.rows,
                 )?;
                 unsafe {
                     tcgen05.f32_store(
                         stream,
                         tcgen05_launch_config(N, OUT, IN),
-                        scratch.row_maps.get::<D, FF>(IN).as_ptr(),
+                        staging.row_maps.get::<D, FF>(IN).as_ptr(),
                         compute.transposed_tma.as_ptr(),
                         output.as_device_buffer_mut(),
                         OUT as u32,
@@ -691,7 +823,9 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                 }
             })
         } else {
-            gemm_into(x, &self.w, output, stream, fp32, profiler, name)
+            let weights = scratch.oracle_weights();
+            self.w.widen_into(weights, stream, tensor)?;
+            gemm_into(x, weights, output, stream, fp32, profiler, name)
         }
     }
 
@@ -705,11 +839,11 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
-        scratch: Option<&mut Bf16LinearScratch<N, D, FF>>,
+        scratch: &mut LinearScratch<N, D, FF>,
         profiler: &mut P,
         names: [&'static str; 2],
     ) -> Result<(), DriverError> {
-        if let (Some(compute), Some(scratch)) = (&self.compute, scratch)
+        if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
             && tcgen05_linear_eligible(N, IN, OUT)
         {
             profiler.measure(stream, names[0], || {
@@ -721,34 +855,34 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                     stream,
                     pairs_config(N * IN / 2),
                     x.as_device_buffer(),
-                    &mut scratch.lhs,
+                    &mut staging.lhs,
                 )?;
                 tensor.convert_f32_to_bf16_pairs(
                     stream,
                     pairs_config(N * OUT / 2),
                     dy.as_device_buffer(),
-                    &mut scratch.rows,
+                    &mut staging.rows,
                 )?;
                 unsafe {
                     tcgen05.f32_accumulate_transposed(
                         stream,
                         tcgen05_launch_config(IN, OUT, N),
-                        scratch.lhs_mn_maps.get::<D, FF>(IN).as_ptr(),
-                        scratch.row_mn_maps.get::<D, FF>(OUT).as_ptr(),
+                        staging.lhs_mn_maps.get::<D, FF>(IN).as_ptr(),
+                        staging.row_mn_maps.get::<D, FF>(OUT).as_ptr(),
                         self.dw.as_device_buffer_mut(),
                         OUT as u32,
                         N as u32,
                     )
                 }
             })?;
-            // `scratch.rows` still holds the quantized `dy` written by the
+            // `staging.rows` still holds the quantized `dy` written by the
             // weight-gradient pass above; this launch consumes it as its row
             // operand, so nothing may overwrite `rows` between the two.
             profiler.measure(stream, names[1], || unsafe {
                 tcgen05.f32_store(
                     stream,
                     tcgen05_launch_config(N, IN, OUT),
-                    scratch.row_maps.get::<D, FF>(OUT).as_ptr(),
+                    staging.row_maps.get::<D, FF>(OUT).as_ptr(),
                     compute.normal_tma.as_ptr(),
                     dx.as_device_buffer_mut(),
                     IN as u32,
@@ -757,7 +891,9 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
             })
         } else {
             gemm_tn_accumulate_into(x, dy, &mut self.dw, stream, fp32, profiler, names[0])?;
-            gemm_nt_into(dy, &self.w, dx, stream, fp32, profiler, names[1])
+            let weights = scratch.oracle_weights();
+            self.w.widen_into(weights, stream, tensor)?;
+            gemm_nt_into(dy, weights, dx, stream, fp32, profiler, names[1])
         }
     }
 
@@ -767,14 +903,14 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         if let Some(compute) = &mut self.compute {
-            compute.sync_from_master(self.w.as_device_buffer(), IN, OUT, stream, kernels)?;
+            compute.sync_from_master(self.w.as_words(), IN, OUT, stream, kernels)?;
         }
         Ok(())
     }
 }
 
 pub struct GpuGroupedLinear<const IN: usize, const GROUPS: usize, const OUT: usize> {
-    pub w: GpuTensor<f32, Rank3<IN, GROUPS, OUT>>,
+    pub w: GpuBf16Tensor<Rank3<IN, GROUPS, OUT>>,
     pub dw: GpuTensor<f32, Rank3<IN, GROUPS, OUT>>,
     compute: Option<Bf16LinearWeights>,
 }
@@ -798,7 +934,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
             None
         };
         Ok(Self {
-            w: GpuTensor::from_host(stream, &weights)?,
+            w: GpuBf16Tensor::from_f32_host(stream, &weights)?,
             dw: GpuTensor::zeros(stream)?,
             compute,
         })
@@ -813,12 +949,12 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
-        scratch: Option<&mut Bf16LinearScratch<N, D, FF>>,
+        scratch: &mut LinearScratch<N, D, FF>,
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
         let width = GROUPS * OUT;
-        if let (Some(compute), Some(scratch)) = (&self.compute, scratch)
+        if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
             && tcgen05_linear_eligible(N, IN, width)
         {
             profiler.measure(stream, name, || {
@@ -826,13 +962,13 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     stream,
                     pairs_config(N * IN / 2),
                     x.as_device_buffer(),
-                    &mut scratch.rows,
+                    &mut staging.rows,
                 )?;
                 unsafe {
                     tcgen05.f32_store(
                         stream,
                         tcgen05_launch_config(N, width, IN),
-                        scratch.row_maps.get::<D, FF>(IN).as_ptr(),
+                        staging.row_maps.get::<D, FF>(IN).as_ptr(),
                         compute.transposed_tma.as_ptr(),
                         output.as_device_buffer_mut(),
                         width as u32,
@@ -841,6 +977,8 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                 }
             })
         } else {
+            let weights = scratch.oracle_weights();
+            self.w.widen_into(weights, stream, tensor)?;
             profiler.measure(stream, name, || unsafe {
                 fp32.register_gemm_store(
                     stream,
@@ -849,7 +987,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     width,
                     IN,
                     x.as_device_buffer(),
-                    self.w.as_device_buffer(),
+                    weights,
                     output.as_device_buffer_mut(),
                 )
             })
@@ -866,12 +1004,12 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
-        scratch: Option<&mut Bf16LinearScratch<N, D, FF>>,
+        scratch: &mut LinearScratch<N, D, FF>,
         profiler: &mut P,
         names: [&'static str; 2],
     ) -> Result<(), DriverError> {
         let width = GROUPS * OUT;
-        if let (Some(compute), Some(scratch)) = (&self.compute, scratch)
+        if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
             && tcgen05_linear_eligible(N, IN, width)
         {
             profiler.measure(stream, names[0], || {
@@ -882,34 +1020,34 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     stream,
                     pairs_config(N * IN / 2),
                     x.as_device_buffer(),
-                    &mut scratch.lhs,
+                    &mut staging.lhs,
                 )?;
                 tensor.convert_f32_to_bf16_pairs(
                     stream,
                     pairs_config(N * width / 2),
                     dy.as_device_buffer(),
-                    &mut scratch.rows,
+                    &mut staging.rows,
                 )?;
                 unsafe {
                     tcgen05.f32_accumulate_transposed(
                         stream,
                         tcgen05_launch_config(IN, width, N),
-                        scratch.lhs_mn_maps.get::<D, FF>(IN).as_ptr(),
-                        scratch.row_mn_maps.get::<D, FF>(width).as_ptr(),
+                        staging.lhs_mn_maps.get::<D, FF>(IN).as_ptr(),
+                        staging.row_mn_maps.get::<D, FF>(width).as_ptr(),
                         self.dw.as_device_buffer_mut(),
                         width as u32,
                         N as u32,
                     )
                 }
             })?;
-            // `scratch.rows` still holds the quantized `dy` written by the
+            // `staging.rows` still holds the quantized `dy` written by the
             // weight-gradient pass above; this launch consumes it as its row
             // operand, so nothing may overwrite `rows` between the two.
             profiler.measure(stream, names[1], || unsafe {
                 tcgen05.f32_store(
                     stream,
                     tcgen05_launch_config(N, IN, width),
-                    scratch.row_maps.get::<D, FF>(width).as_ptr(),
+                    staging.row_maps.get::<D, FF>(width).as_ptr(),
                     compute.normal_tma.as_ptr(),
                     dx.as_device_buffer_mut(),
                     IN as u32,
@@ -929,6 +1067,8 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     self.dw.as_device_buffer_mut(),
                 )
             })?;
+            let weights = scratch.oracle_weights();
+            self.w.widen_into(weights, stream, tensor)?;
             profiler.measure(stream, names[1], || unsafe {
                 fp32.register_gemm_nt_store(
                     stream,
@@ -937,7 +1077,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     IN,
                     width,
                     dy.as_device_buffer(),
-                    self.w.as_device_buffer(),
+                    weights,
                     dx.as_device_buffer_mut(),
                 )
             })
@@ -950,13 +1090,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         if let Some(compute) = &mut self.compute {
-            compute.sync_from_master(
-                self.w.as_device_buffer(),
-                IN,
-                GROUPS * OUT,
-                stream,
-                kernels,
-            )?;
+            compute.sync_from_master(self.w.as_words(), IN, GROUPS * OUT, stream, kernels)?;
         }
         Ok(())
     }
@@ -988,26 +1122,16 @@ impl StackedBf16Weights {
         columns: usize,
     ) -> Result<Self, Box<dyn Error>> {
         assert_eq!(values.len(), experts * rows * columns);
-        let pack = |low: f32, high: f32| {
-            bf16::from_f32(low).to_bits() as u32 | ((bf16::from_f32(high).to_bits() as u32) << 16)
-        };
-        let normal_values: Vec<u32> = values
-            .chunks_exact(2)
-            .map(|pair| pack(pair[0], pair[1]))
-            .collect();
         let total_rows = experts * rows;
-        let mut transposed_values = vec![0u32; values.len() / 2];
-        for column in 0..columns {
-            for pair in 0..total_rows / 2 {
-                transposed_values[column * total_rows / 2 + pair] = pack(
-                    values[2 * pair * columns + column],
-                    values[(2 * pair + 1) * columns + column],
-                );
+        let mut transposed_values = vec![0.0f32; values.len()];
+        for row in 0..total_rows {
+            for column in 0..columns {
+                transposed_values[column * total_rows + row] = values[row * columns + column];
             }
         }
 
-        let normal = DeviceBuffer::from_host(stream, &normal_values)?;
-        let transposed = DeviceBuffer::from_host(stream, &transposed_values)?;
+        let normal = DeviceBuffer::from_host(stream, &pack_bf16_pairs(values))?;
+        let transposed = DeviceBuffer::from_host(stream, &pack_bf16_pairs(&transposed_values))?;
         let normal_maps = (0..experts)
             .map(|expert| unsafe {
                 create_bf16_pairs_tma_map_region(
@@ -1045,18 +1169,15 @@ impl StackedBf16Weights {
         })
     }
 
+    /// Refresh both copies from the master; see
+    /// [`Bf16LinearWeights::sync_from_master`] for why `normal` is a copy.
     fn sync_from_master(
         &mut self,
-        master: &DeviceBuffer<f32>,
+        master: &DeviceBuffer<u32>,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        kernels.convert_f32_to_bf16_pairs(
-            stream,
-            pairs_config(master.len() / 2),
-            master,
-            &mut self.normal,
-        )?;
+        copy_device_region(&mut self.normal, 0, master, 0, master.len(), stream)?;
         unsafe {
             kernels.transpose_bf16_pairs(
                 stream,
@@ -1072,8 +1193,16 @@ impl StackedBf16Weights {
 
 /// Whether these expert shapes route every expert GEMM through tcgen05, which
 /// is also what decides whether a panel can be stored packed.
+///
+/// This has to be *exactly* the predicate the GEMMs test, not a weaker
+/// alignment check: a packed panel has no fp32 copy, so if a shape could store
+/// panels packed and still fall back to the register-tiled oracle, that oracle
+/// would ask a packed panel for `wide()` and panic. Testing both expert GEMMs
+/// (`D → 2·FF` and `FF → D`) makes packed storage and the tcgen05 path the same
+/// condition, which is what lets `wide()` and the `fp32_staging` expect be
+/// invariants rather than hazards.
 fn expert_tcgen05_aligned<const C: usize, const D: usize, const FF: usize>() -> bool {
-    C.is_multiple_of(TC_TILE) && D.is_multiple_of(TC_TILE) && FF.is_multiple_of(TC_TILE)
+    tcgen05_linear_eligible(C, D, 2 * FF) && tcgen05_linear_eligible(C, FF, D)
 }
 
 /// One expert panel `[E, C, width]` stored in the dtype its consumers read.
@@ -1164,14 +1293,7 @@ impl ExpertPanel {
             }
             Self::Packed(panel) => {
                 assert_eq!(values.len(), panel.words.len() * 2);
-                let packed: Vec<u32> = values
-                    .chunks_exact(2)
-                    .map(|pair| {
-                        bf16::from_f32(pair[0]).to_bits() as u32
-                            | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
-                    })
-                    .collect();
-                upload_device(panel.words.cu_deviceptr(), &packed, stream)
+                upload_device(panel.words.cu_deviceptr(), &pack_bf16_pairs(values), stream)
             }
         }
     }
@@ -1225,6 +1347,10 @@ fn expert_panel_maps(
 
 /// Staging used only by the non-aligned fp32 oracle. One expert is copied into
 /// these buffers and passed to the existing register-tiled GEMM launchers.
+///
+/// `b` receives the weights widened from the bf16 master (#57) rather than a
+/// copy: #59 removed the operand staging the aligned path used to need, but the
+/// oracle still reads fp32, so this is now the only place a master is widened.
 struct ExpertFp32Scratch {
     a: DeviceBuffer<f32>,
     b: DeviceBuffer<f32>,
@@ -1248,13 +1374,14 @@ impl ExpertFp32Scratch {
 #[allow(clippy::too_many_arguments)]
 fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
     input: &ExpertPanel,
-    weights: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<u32>,
     compute: Option<&StackedBf16Weights>,
     output: &mut DeviceBuffer<f32>,
     input_width: usize,
     output_width: usize,
     staging: &mut Option<ExpertFp32Scratch>,
     stream: &CudaStream,
+    tensor: &tensor_kernels::LoadedModule,
     fp32: &gemm_kernels::LoadedModule,
     tcgen05: &Tcgen05Gemm,
     profiler: &mut P,
@@ -1295,13 +1422,13 @@ fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
                     C * input_width,
                     stream,
                 )?;
-                copy_device_region(
-                    &mut fp32_scratch.b,
-                    0,
-                    weights,
-                    expert * input_width * output_width,
-                    input_width * output_width,
+                tensor.widen_bf16_region(
                     stream,
+                    pairs_config(input_width * output_width),
+                    weights,
+                    (expert * input_width * output_width) as u32,
+                    (input_width * output_width) as u32,
+                    &mut fp32_scratch.b,
                 )?;
                 unsafe {
                     fp32.register_gemm_store(
@@ -1333,7 +1460,7 @@ fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
 fn expert_linear_backward<const E: usize, const C: usize, P: KernelProfiler>(
     input: &ExpertPanel,
     output_gradient: &ExpertPanel,
-    weights: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<u32>,
     weight_gradient: &mut DeviceBuffer<f32>,
     compute: Option<&StackedBf16Weights>,
     input_gradient: &mut DeviceBuffer<f32>,
@@ -1341,6 +1468,7 @@ fn expert_linear_backward<const E: usize, const C: usize, P: KernelProfiler>(
     output_width: usize,
     staging: &mut Option<ExpertFp32Scratch>,
     stream: &CudaStream,
+    tensor: &tensor_kernels::LoadedModule,
     fp32: &gemm_kernels::LoadedModule,
     tcgen05: &Tcgen05Gemm,
     profiler: &mut P,
@@ -1452,13 +1580,13 @@ fn expert_linear_backward<const E: usize, const C: usize, P: KernelProfiler>(
                     C * output_width,
                     stream,
                 )?;
-                copy_device_region(
-                    &mut fp32_scratch.b,
-                    0,
-                    weights,
-                    expert * input_width * output_width,
-                    input_width * output_width,
+                tensor.widen_bf16_region(
                     stream,
+                    pairs_config(input_width * output_width),
+                    weights,
+                    (expert * input_width * output_width) as u32,
+                    (input_width * output_width) as u32,
+                    &mut fp32_scratch.b,
                 )?;
                 unsafe {
                     fp32.register_gemm_nt_store(
@@ -1492,9 +1620,9 @@ fn expert_linear_backward<const E: usize, const C: usize, P: KernelProfiler>(
 /// down projections share one `[E, FF, D]` entry. Aligned shapes also own one
 /// persistent packed-bf16 compute allocation per entry.
 pub struct GpuExpertFfn<const E: usize, const D: usize, const FF: usize> {
-    pub gate_up: GpuTensor<f32, Rank4<E, D, 2, FF>>,
+    pub gate_up: GpuBf16Tensor<Rank4<E, D, 2, FF>>,
     pub d_gate_up: GpuTensor<f32, Rank4<E, D, 2, FF>>,
-    pub down: GpuTensor<f32, Rank3<E, FF, D>>,
+    pub down: GpuBf16Tensor<Rank3<E, FF, D>>,
     pub d_down: GpuTensor<f32, Rank3<E, FF, D>>,
     gate_up_compute: Option<StackedBf16Weights>,
     down_compute: Option<StackedBf16Weights>,
@@ -1521,9 +1649,9 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         }
         let aligned = D.is_multiple_of(TC_TILE) && FF.is_multiple_of(TC_TILE);
         Ok(Self {
-            gate_up: GpuTensor::from_host(stream, &gate_up)?,
+            gate_up: GpuBf16Tensor::from_f32_host(stream, &gate_up)?,
             d_gate_up: GpuTensor::zeros(stream)?,
-            down: GpuTensor::from_host(stream, &down)?,
+            down: GpuBf16Tensor::from_f32_host(stream, &down)?,
             d_down: GpuTensor::zeros(stream)?,
             gate_up_compute: aligned
                 .then(|| StackedBf16Weights::new(stream, &gate_up, E, D, 2 * FF))
@@ -1538,6 +1666,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         &self,
         workspace: &mut GpuExpertWorkspace<E, C, D, FF>,
         stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
         dense: &dense_kernels::LoadedModule,
@@ -1547,6 +1676,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             &mut workspace.acts,
             &mut workspace.scratch,
             stream,
+            tensor,
             fp32,
             tcgen05,
             dense,
@@ -1560,6 +1690,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         acts: &mut GpuExpertActs<E, C, D, FF>,
         scratch: &mut GpuExpertScratch<E, C, D, FF>,
         stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
         dense: &dense_kernels::LoadedModule,
@@ -1567,13 +1698,14 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
     ) -> Result<(), DriverError> {
         expert_linear_forward::<E, C, P>(
             &acts.bin_input,
-            self.gate_up.as_device_buffer(),
+            self.gate_up.as_words(),
             self.gate_up_compute.as_ref(),
             scratch.gate_up.as_device_buffer_mut(),
             D,
             2 * FF,
             &mut scratch.fp32_staging,
             stream,
+            tensor,
             fp32,
             tcgen05,
             profiler,
@@ -1613,13 +1745,14 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         })?;
         expert_linear_forward::<E, C, P>(
             &acts.activated,
-            self.down.as_device_buffer(),
+            self.down.as_words(),
             self.down_compute.as_ref(),
             acts.bin_output.as_device_buffer_mut(),
             FF,
             D,
             &mut scratch.fp32_staging,
             stream,
+            tensor,
             fp32,
             tcgen05,
             profiler,
@@ -1632,6 +1765,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         &mut self,
         workspace: &mut GpuExpertWorkspace<E, C, D, FF>,
         stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
         dense: &dense_kernels::LoadedModule,
@@ -1641,6 +1775,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             &workspace.acts,
             &mut workspace.scratch,
             stream,
+            tensor,
             fp32,
             tcgen05,
             dense,
@@ -1654,6 +1789,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         acts: &GpuExpertActs<E, C, D, FF>,
         scratch: &mut GpuExpertScratch<E, C, D, FF>,
         stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
         dense: &dense_kernels::LoadedModule,
@@ -1662,7 +1798,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         expert_linear_backward::<E, C, P>(
             &acts.activated,
             &scratch.d_bin_output,
-            self.down.as_device_buffer(),
+            self.down.as_words(),
             self.d_down.as_device_buffer_mut(),
             self.down_compute.as_ref(),
             scratch.d_activated.as_device_buffer_mut(),
@@ -1670,6 +1806,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             D,
             &mut scratch.fp32_staging,
             stream,
+            tensor,
             fp32,
             tcgen05,
             profiler,
@@ -1733,7 +1870,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         expert_linear_backward::<E, C, P>(
             &acts.bin_input,
             &scratch.d_gate_up,
-            self.gate_up.as_device_buffer(),
+            self.gate_up.as_words(),
             self.d_gate_up.as_device_buffer_mut(),
             self.gate_up_compute.as_ref(),
             scratch.d_bin_input.as_device_buffer_mut(),
@@ -1741,6 +1878,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             2 * FF,
             &mut scratch.fp32_staging,
             stream,
+            tensor,
             fp32,
             tcgen05,
             profiler,
@@ -1780,10 +1918,10 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         tensor: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
         if let Some(compute) = &mut self.gate_up_compute {
-            compute.sync_from_master(self.gate_up.as_device_buffer(), stream, tensor)?;
+            compute.sync_from_master(self.gate_up.as_words(), stream, tensor)?;
         }
         if let Some(compute) = &mut self.down_compute {
-            compute.sync_from_master(self.down.as_device_buffer(), stream, tensor)?;
+            compute.sync_from_master(self.down.as_words(), stream, tensor)?;
         }
         Ok(())
     }
@@ -1946,30 +2084,31 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertAdamW<E, D, FF> {
             .step
             .checked_add(1)
             .expect("expert AdamW step overflow");
-        let (first_correction, second_correction) = self.config.bias_correction(self.step);
+        let corrections = self.config.bias_correction(self.step);
+        let decay = self.config.weight_decay;
         experts.gate_up.adamw_step(
             &experts.d_gate_up,
             &mut self.gate_up,
-            self.config.learning_rate,
-            self.config.beta1,
-            self.config.beta2,
-            self.config.epsilon,
-            self.config.weight_decay,
-            first_correction,
-            second_correction,
+            master_adamw(
+                self.config,
+                decay,
+                corrections,
+                self.step,
+                parameter_id::EXPERT_GATE_UP,
+            ),
             stream,
             tensor,
         )?;
         experts.down.adamw_step(
             &experts.d_down,
             &mut self.down,
-            self.config.learning_rate,
-            self.config.beta1,
-            self.config.beta2,
-            self.config.epsilon,
-            self.config.weight_decay,
-            first_correction,
-            second_correction,
+            master_adamw(
+                self.config,
+                decay,
+                corrections,
+                self.step,
+                parameter_id::EXPERT_DOWN,
+            ),
             stream,
             tensor,
         )?;
@@ -2056,8 +2195,11 @@ impl<const D: usize> GpuRmsNorm<D> {
     }
 }
 
+/// Token embedding with a bf16 master and an fp32, atomically accumulated
+/// gradient. It owns no compute copy: the lookup kernel reads the packed
+/// master directly.
 pub struct GpuEmbedding<const VOCAB: usize, const D: usize> {
-    pub w: GpuTensor<f32, Rank2<VOCAB, D>>,
+    pub w: GpuBf16Tensor<Rank2<VOCAB, D>>,
     pub dw: GpuTensor<f32, Rank2<VOCAB, D>>,
 }
 
@@ -2067,7 +2209,7 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
         layer: &nn::Embedding<N, VOCAB, D>,
     ) -> Result<Self, DriverError> {
         Ok(Self {
-            w: GpuTensor::from_cpu(stream, &layer.w)?,
+            w: GpuBf16Tensor::from_f32_host(stream, layer.w.as_slice())?,
             dw: GpuTensor::zeros(stream)?,
         })
     }
@@ -2085,7 +2227,7 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
             kernels.embedding_forward(
                 stream,
                 LaunchConfig::for_num_elems((N * D) as u32),
-                self.w.as_device_buffer(),
+                self.w.as_words(),
                 tokens.as_device_buffer(),
                 D as u32,
                 y.as_device_buffer_mut(),
@@ -2115,16 +2257,17 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
     }
 }
 
-/// bf16 lm-head with fp32 master weights (§7 phase 2).
+/// bf16 lm-head over a bf16 master (§7; masters converted in #57).
 ///
 /// The compute weight exists in both layouts the tcgen05 `C = A B^T` form
 /// needs as a K-contiguous `B` operand: `w` is `[D, VP]` (consumed by the
 /// input-gradient GEMM) and `w_t` is `[VP, D]` (consumed by the forward
-/// GEMM). `master` is the fp32 source of truth; the optimizer updates it and
-/// re-rounds both compute copies every step. `dw` accumulates in packed bf16,
+/// GEMM). `master` is the source of truth; the optimizer updates it and
+/// refreshes both compute copies every step — `w` by copy, since master and
+/// compute now share a dtype and layout. `dw` accumulates in packed bf16,
 /// produced directly by the tcgen05 accumulate epilogue.
 pub struct GpuBf16Head<const D: usize, const VP: usize> {
-    pub master: GpuTensor<f32, Rank2<D, VP>>,
+    pub master: GpuBf16Tensor<Rank2<D, VP>>,
     w: DeviceBuffer<u32>,
     w_t: DeviceBuffer<u32>,
     dw: DeviceBuffer<u32>,
@@ -2146,33 +2289,24 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         Self::from_master_values(stream, &padded)
     }
 
-    /// Rebuild the head from padded `[D, VP]` fp32 master values, rounding
-    /// both packed compute copies on the host.
+    /// Rebuild the head from padded `[D, VP]` fp32 values, rounding the master
+    /// and both packed compute copies on the host.
     pub(crate) fn from_master_values(
         stream: &CudaStream,
         values: &[f32],
     ) -> Result<Self, Box<dyn Error>> {
         assert_eq!(values.len(), D * VP);
-        let pack = |low: f32, high: f32| {
-            bf16::from_f32(low).to_bits() as u32 | ((bf16::from_f32(high).to_bits() as u32) << 16)
-        };
-        let compute: Vec<u32> = values
-            .chunks_exact(2)
-            .map(|pair| pack(pair[0], pair[1]))
-            .collect();
-        let mut transposed = vec![0u32; VP * D / 2];
-        for column in 0..VP {
-            for pair in 0..D / 2 {
-                transposed[column * D / 2 + pair] = pack(
-                    values[2 * pair * VP + column],
-                    values[(2 * pair + 1) * VP + column],
-                );
+        let compute = pack_bf16_pairs(values);
+        let mut transposed_values = vec![0.0f32; VP * D];
+        for row in 0..D {
+            for column in 0..VP {
+                transposed_values[column * D + row] = values[row * VP + column];
             }
         }
 
-        let master = GpuTensor::from_host(stream, values)?;
+        let master = GpuBf16Tensor::from_f32_host(stream, values)?;
         let w = DeviceBuffer::from_host(stream, &compute)?;
-        let w_t = DeviceBuffer::from_host(stream, &transposed)?;
+        let w_t = DeviceBuffer::from_host(stream, &pack_bf16_pairs(&transposed_values))?;
         let dw = DeviceBuffer::zeroed(stream, D * VP / 2)?;
         // SAFETY: `w` and `w_t` live in this struct beside their maps and are
         // never reallocated.
@@ -2292,17 +2426,14 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn adamw_step(
         &mut self,
         moments: &mut GpuAdamWMoments<Rank2<D, VP>>,
-        config: AdamWConfig,
-        first_correction: f32,
-        second_correction: f32,
+        config: MasterAdamW,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        kernels.adamw_master_bf16(
+        kernels.adamw_bf16_master_packed_grad(
             stream,
             pairs_config(D * VP / 2),
             &self.dw,
@@ -2311,21 +2442,30 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
             config.beta2,
             config.epsilon,
             config.weight_decay,
-            first_correction,
-            second_correction,
-            self.master.as_device_buffer_mut(),
+            config.first_correction,
+            config.second_correction,
+            config.rounding,
+            config.seed,
+            self.master.as_words_mut(),
             moments.first.as_device_buffer_mut(),
             moments.second.as_device_buffer_mut(),
-            &mut self.w,
         )
     }
 
-    /// Refresh `w_t` from `w` after an optimizer step.
-    fn sync_transposed(
+    /// Refresh both compute copies from the master after an optimizer step.
+    fn sync_compute(
         &mut self,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
+        copy_device_region(
+            &mut self.w,
+            0,
+            self.master.as_words(),
+            0,
+            D * VP / 2,
+            stream,
+        )?;
         unsafe {
             kernels.transpose_bf16_pairs(
                 stream,
@@ -2445,8 +2585,36 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         self.step = self.step.checked_add(1).expect("AdamW step overflow");
         let (first_correction, second_correction) = self.config.bias_correction(self.step);
 
-        macro_rules! update {
-            ($field:ident, $weight_decay:expr) => {
+        let corrections = (first_correction, second_correction);
+        let step = self.step;
+
+        // bf16 masters: one fused kernel does the fp32 update and the rounded
+        // write-back. Norms keep fp32 storage and the plain `adamw` kernel.
+        macro_rules! master {
+            ($field:ident, $id:expr) => {
+                profiler.measure(
+                    stream,
+                    concat!("optimizer.", stringify!($field), ".adamw"),
+                    || {
+                        model.$field.w.adamw_step(
+                            &model.$field.dw,
+                            &mut self.$field,
+                            master_adamw(
+                                self.config,
+                                self.config.weight_decay,
+                                corrections,
+                                step,
+                                $id,
+                            ),
+                            stream,
+                            kernels,
+                        )
+                    },
+                )?;
+            };
+        }
+        macro_rules! norm {
+            ($field:ident) => {
                 profiler.measure(
                     stream,
                     concat!("optimizer.", stringify!($field), ".adamw"),
@@ -2458,7 +2626,7 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
                             self.config.beta1,
                             self.config.beta2,
                             self.config.epsilon,
-                            $weight_decay,
+                            0.0,
                             first_correction,
                             second_correction,
                             stream,
@@ -2469,14 +2637,14 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
             };
         }
 
-        update!(embedding, self.config.weight_decay);
-        update!(attention_norm, 0.0);
-        update!(qkv_proj, self.config.weight_decay);
-        update!(o_proj, self.config.weight_decay);
-        update!(ffn_norm, 0.0);
-        update!(gate_up_proj, self.config.weight_decay);
-        update!(down_proj, self.config.weight_decay);
-        update!(final_norm, 0.0);
+        master!(embedding, parameter_id::EMBEDDING);
+        norm!(attention_norm);
+        master!(qkv_proj, parameter_id::QKV_PROJ);
+        master!(o_proj, parameter_id::O_PROJ);
+        norm!(ffn_norm);
+        master!(gate_up_proj, parameter_id::GATE_UP_PROJ);
+        master!(down_proj, parameter_id::DOWN_PROJ);
+        norm!(final_norm);
         macro_rules! sync_compute {
             ($field:ident) => {
                 profiler.measure(
@@ -2493,15 +2661,19 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         profiler.measure(stream, "optimizer.lm_head.adamw", || {
             model.lm_head.adamw_step(
                 &mut self.lm_head,
-                self.config,
-                first_correction,
-                second_correction,
+                master_adamw(
+                    self.config,
+                    self.config.weight_decay,
+                    corrections,
+                    step,
+                    parameter_id::LM_HEAD,
+                ),
                 stream,
                 kernels,
             )
         })?;
         profiler.measure(stream, "optimizer.lm_head.sync_w_t", || {
-            model.lm_head.sync_transposed(stream, kernels)
+            model.lm_head.sync_compute(stream, kernels)
         })?;
         Ok(())
     }
@@ -2674,16 +2846,37 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize, const
         self.step = self.step.checked_add(1).expect("AdamW step overflow");
         let (first_correction, second_correction) = self.config.bias_correction(self.step);
 
-        macro_rules! update {
+        let corrections = (first_correction, second_correction);
+        let step = self.step;
+        let decay = self.config.weight_decay;
+        let config = self.config;
+
+        // bf16 masters take the fused update-and-round kernel; the fp32
+        // parameters (norms, and the router by decision #22) keep the plain
+        // fp32 `adamw`.
+        macro_rules! master {
+            ($name:literal, $parameter:expr, $gradient:expr, $moments:expr, $id:expr) => {
+                profiler.measure(stream, $name, || {
+                    $parameter.adamw_step(
+                        $gradient,
+                        $moments,
+                        master_adamw(config, decay, corrections, step, $id),
+                        stream,
+                        kernels,
+                    )
+                })?;
+            };
+        }
+        macro_rules! fp32 {
             ($name:literal, $parameter:expr, $gradient:expr, $moments:expr, $decay:expr) => {
                 profiler.measure(stream, $name, || {
                     $parameter.adamw_step(
                         $gradient,
                         $moments,
-                        self.config.learning_rate,
-                        self.config.beta1,
-                        self.config.beta2,
-                        self.config.epsilon,
+                        config.learning_rate,
+                        config.beta1,
+                        config.beta2,
+                        config.epsilon,
                         $decay,
                         first_correction,
                         second_correction,
@@ -2694,62 +2887,67 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize, const
             };
         }
 
-        update!(
+        master!(
             "optimizer.embedding.adamw",
             model.embedding.w,
             &model.embedding.dw,
             &mut self.embedding,
-            self.config.weight_decay
+            parameter_id::EMBEDDING
         );
-        for (block, moments) in model.blocks.iter_mut().zip(self.blocks.iter_mut()) {
-            update!(
+        for (index, (block, moments)) in model
+            .blocks
+            .iter_mut()
+            .zip(self.blocks.iter_mut())
+            .enumerate()
+        {
+            fp32!(
                 "optimizer.attention_norm.adamw",
                 block.attention_norm.w,
                 &block.attention_norm.dw,
                 &mut moments.attention_norm,
                 0.0
             );
-            update!(
+            master!(
                 "optimizer.qkv_proj.adamw",
                 block.qkv_proj.w,
                 &block.qkv_proj.dw,
                 &mut moments.qkv_proj,
-                self.config.weight_decay
+                parameter_id::in_block(index, parameter_id::QKV_PROJ)
             );
-            update!(
+            master!(
                 "optimizer.o_proj.adamw",
                 block.o_proj.w,
                 &block.o_proj.dw,
                 &mut moments.o_proj,
-                self.config.weight_decay
+                parameter_id::in_block(index, parameter_id::O_PROJ)
             );
-            update!(
+            fp32!(
                 "optimizer.ffn_norm.adamw",
                 block.ffn_norm.w,
                 &block.ffn_norm.dw,
                 &mut moments.ffn_norm,
                 0.0
             );
-            update!(
+            fp32!(
                 "optimizer.router.adamw",
                 block.router,
                 &block.d_router,
                 &mut moments.router,
-                self.config.weight_decay
+                decay
             );
-            update!(
+            master!(
                 "optimizer.experts.gate_up.adamw",
                 block.experts.gate_up,
                 &block.experts.d_gate_up,
                 &mut moments.expert_gate_up,
-                self.config.weight_decay
+                parameter_id::in_block(index, parameter_id::EXPERT_GATE_UP)
             );
-            update!(
+            master!(
                 "optimizer.experts.down.adamw",
                 block.experts.down,
                 &block.experts.d_down,
                 &mut moments.expert_down,
-                self.config.weight_decay
+                parameter_id::in_block(index, parameter_id::EXPERT_DOWN)
             );
             profiler.measure(stream, "optimizer.qkv_proj.sync_compute", || {
                 block.qkv_proj.sync_compute(stream, kernels)
@@ -2761,7 +2959,7 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize, const
                 block.experts.sync_compute(stream, kernels)
             })?;
         }
-        update!(
+        fp32!(
             "optimizer.final_norm.adamw",
             model.final_norm.w,
             &model.final_norm.dw,
@@ -2771,15 +2969,13 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize, const
         profiler.measure(stream, "optimizer.lm_head.adamw", || {
             model.lm_head.adamw_step(
                 &mut self.lm_head,
-                self.config,
-                first_correction,
-                second_correction,
+                master_adamw(config, decay, corrections, step, parameter_id::LM_HEAD),
                 stream,
                 kernels,
             )
         })?;
         profiler.measure(stream, "optimizer.lm_head.sync_w_t", || {
-            model.lm_head.sync_transposed(stream, kernels)
+            model.lm_head.sync_compute(stream, kernels)
         })
     }
 }
@@ -2999,15 +3195,21 @@ fn newton_schulz_orthogonalize(
 /// whole interleaved buffer; orthogonalization and the fused decay/apply then
 /// run per group so each projection is orthogonalized on its own, matching
 /// the CPU reference's separate `q/k/v` and `gate/up` matrices.
+///
+/// Momentum, the Newton--Schulz iteration, and its f64 norm accumulation are
+/// deliberately fp32 (SPEC §7); the bf16 master is widened on read inside the
+/// apply kernel and rounded once on write-back.
 #[allow(clippy::too_many_arguments)]
 fn muon_step_raw(
-    parameter: &mut DeviceBuffer<f32>,
+    parameter: &mut DeviceBuffer<u32>,
     gradient: &DeviceBuffer<f32>,
     momentum: &mut DeviceBuffer<f32>,
     rows: usize,
     groups: usize,
     cols: usize,
     config: MuonConfig,
+    rounding: u32,
+    seed: u64,
     scratch: &mut GpuMuonScratch,
     stream: &CudaStream,
     tensor: &tensor_kernels::LoadedModule,
@@ -3061,22 +3263,32 @@ fn muon_step_raw(
             tensor,
             gemm,
         )?;
+        // Group `g`'s slots of `update` are read only by group `g`'s gather
+        // above, so writing the orthogonalized result back over them leaves
+        // every later group's input intact.
         unsafe {
-            tensor.muon_apply_group(
+            tensor.scatter_group(
                 stream,
                 pairs_config(per_group),
                 &scratch.x,
-                decay,
-                update_scale,
                 groups as u32,
                 group as u32,
                 cols as u32,
                 per_group as u32,
-                parameter,
+                &mut scratch.update,
             )?;
         }
     }
-    Ok(())
+    tensor.muon_apply_bf16(
+        stream,
+        pairs_config(total / 2),
+        &scratch.update,
+        decay,
+        update_scale,
+        rounding,
+        seed,
+        parameter,
+    )
 }
 
 /// GPU-resident mixed Muon/AdamW state mirroring `optim::DenseMuon`'s
@@ -3158,16 +3370,31 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         self.step = self.step.checked_add(1).expect("Muon step overflow");
         let (first_correction, second_correction) = self.adamw_config.bias_correction(self.step);
 
-        macro_rules! adamw {
-            ($field:ident, $weight_decay:expr) => {
+        let corrections = (first_correction, second_correction);
+        let step = self.step;
+        let config = self.adamw_config;
+
+        macro_rules! master_adamw_step {
+            ($field:ident, $id:expr) => {
                 model.$field.w.adamw_step(
                     &model.$field.dw,
                     &mut self.$field,
-                    self.adamw_config.learning_rate,
-                    self.adamw_config.beta1,
-                    self.adamw_config.beta2,
-                    self.adamw_config.epsilon,
-                    $weight_decay,
+                    master_adamw(config, config.weight_decay, corrections, step, $id),
+                    stream,
+                    tensor,
+                )?;
+            };
+        }
+        macro_rules! norm {
+            ($field:ident) => {
+                model.$field.w.adamw_step(
+                    &model.$field.dw,
+                    &mut self.$field,
+                    config.learning_rate,
+                    config.beta1,
+                    config.beta2,
+                    config.epsilon,
+                    0.0,
                     first_correction,
                     second_correction,
                     stream,
@@ -3176,15 +3403,17 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
             };
         }
         macro_rules! muon {
-            ($field:ident, $rows:expr, $groups:expr, $cols:expr) => {
+            ($field:ident, $rows:expr, $groups:expr, $cols:expr, $id:expr) => {
                 muon_step_raw(
-                    model.$field.w.as_device_buffer_mut(),
+                    model.$field.w.as_words_mut(),
                     model.$field.dw.as_device_buffer(),
                     self.$field.momentum.as_device_buffer_mut(),
                     $rows,
                     $groups,
                     $cols,
                     self.muon_config,
+                    master_rounding_selector(),
+                    stream_seed(step, $id),
                     &mut self.scratch,
                     stream,
                     tensor,
@@ -3193,24 +3422,28 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
             };
         }
 
-        adamw!(embedding, self.adamw_config.weight_decay);
-        adamw!(attention_norm, 0.0);
-        muon!(qkv_proj, D, 3, D);
-        muon!(o_proj, D, 1, D);
-        adamw!(ffn_norm, 0.0);
-        muon!(gate_up_proj, D, 2, FF);
-        muon!(down_proj, FF, 1, D);
-        adamw!(final_norm, 0.0);
+        master_adamw_step!(embedding, parameter_id::EMBEDDING);
+        norm!(attention_norm);
+        muon!(qkv_proj, D, 3, D, parameter_id::QKV_PROJ);
+        muon!(o_proj, D, 1, D, parameter_id::O_PROJ);
+        norm!(ffn_norm);
+        muon!(gate_up_proj, D, 2, FF, parameter_id::GATE_UP_PROJ);
+        muon!(down_proj, FF, 1, D, parameter_id::DOWN_PROJ);
+        norm!(final_norm);
         model.sync_linear_compute(stream, tensor)?;
         model.lm_head.adamw_step(
             &mut self.lm_head,
-            self.adamw_config,
-            first_correction,
-            second_correction,
+            master_adamw(
+                config,
+                config.weight_decay,
+                corrections,
+                step,
+                parameter_id::LM_HEAD,
+            ),
             stream,
             tensor,
         )?;
-        model.lm_head.sync_transposed(stream, tensor)
+        model.lm_head.sync_compute(stream, tensor)
     }
 }
 
@@ -3452,7 +3685,7 @@ pub struct GpuMoeWorkspace<
     head_input_mn_tma: Bf16PairsTmaMap,
     logits_tma: Bf16PairsTmaMap,
     logits_mn_tma: Bf16PairsTmaMap,
-    linear_scratch: Option<Bf16LinearScratch<N, D, FF>>,
+    linear_scratch: LinearScratch<N, D, FF>,
     flash_scratch: Option<FlashAttentionScratch<N, T, D, H>>,
     losses: GpuTensor<f32, Rank1<N>>,
     loss_sum: GpuTensor<f32, Rank1<1>>,
@@ -3476,6 +3709,9 @@ impl<
 {
     pub fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
         assert!(L > 0, "workspace needs at least one block");
+        // MoE blocks keep only the attention projections as plain linears; the
+        // expert FFN owns its own staging.
+        let linear_scratch = LinearScratch::new(stream, &[(D, 3 * D), (D, D)])?;
         let head_input = DeviceBuffer::zeroed(stream, NP * D / 2)?;
         let logits = DeviceBuffer::zeroed(stream, NP * VP / 2)?;
         // SAFETY: the mapped buffers live in this workspace beside their maps
@@ -3506,14 +3742,7 @@ impl<
             head_input_mn_tma,
             logits_tma,
             logits_mn_tma,
-            linear_scratch: if N.is_multiple_of(TC_TILE)
-                && D.is_multiple_of(TC_TILE)
-                && FF.is_multiple_of(TC_TILE)
-            {
-                Some(Bf16LinearScratch::new(stream)?)
-            } else {
-                None
-            },
+            linear_scratch,
             flash_scratch: if tcgen05_attention_eligible(T, D / H) {
                 Some(FlashAttentionScratch::new(stream)?)
             } else {
@@ -3540,7 +3769,7 @@ impl<
     /// bf16 tcgen05 path. Lets the aligned parity gate assert it is actually
     /// exercising that path rather than silently falling back to fp32.
     pub fn tcgen05_linears_active(&self) -> bool {
-        self.linear_scratch.is_some()
+        self.linear_scratch.bf16.is_some()
     }
 
     /// Whether the expert GEMMs run on the bf16 tcgen05 path. Parity-gate
@@ -3649,7 +3878,7 @@ pub struct GpuDenseWorkspace<
     head_input_mn_tma: Bf16PairsTmaMap,
     logits_tma: Bf16PairsTmaMap,
     logits_mn_tma: Bf16PairsTmaMap,
-    linear_scratch: Option<Bf16LinearScratch<N, D, FF>>,
+    linear_scratch: LinearScratch<N, D, FF>,
     flash_scratch: Option<FlashAttentionScratch<N, T, D, H>>,
     norm_backward_inv: GpuTensor<f32, Rank1<N>>,
     losses: GpuTensor<f32, Rank1<N>>,
@@ -3677,6 +3906,8 @@ impl<
 > GpuDenseWorkspace<N, NP, T, VOCAB, VP, D, H, FF>
 {
     pub fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+        let linear_scratch =
+            LinearScratch::new(stream, &[(D, 3 * D), (D, D), (D, 2 * FF), (FF, D)])?;
         let head_input = DeviceBuffer::zeroed(stream, NP * D / 2)?;
         let logits = DeviceBuffer::zeroed(stream, NP * VP / 2)?;
         // SAFETY: the mapped buffers live in this workspace beside their maps
@@ -3719,14 +3950,7 @@ impl<
             head_input_mn_tma,
             logits_tma,
             logits_mn_tma,
-            linear_scratch: if N.is_multiple_of(TC_TILE)
-                && D.is_multiple_of(TC_TILE)
-                && FF.is_multiple_of(TC_TILE)
-            {
-                Some(Bf16LinearScratch::new(stream)?)
-            } else {
-                None
-            },
+            linear_scratch,
             flash_scratch: if tcgen05_attention_eligible(T, D / H) {
                 Some(FlashAttentionScratch::new(stream)?)
             } else {
@@ -3762,7 +3986,7 @@ impl<
     /// bf16 tcgen05 path. Lets the aligned parity gate assert it is actually
     /// exercising that path rather than silently falling back to fp32.
     pub fn tcgen05_linears_active(&self) -> bool {
-        self.linear_scratch.is_some()
+        self.linear_scratch.bf16.is_some()
     }
 
     /// Host readback of one packed-bf16 logits row, widened to f32.
@@ -3876,7 +4100,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         acts: &mut GpuBlockActs<N, D, H, FF, E, K, C>,
         output: &mut GpuTensor<f32, Rank2<N, D>>,
         scratch: &mut GpuBlockScratch<N, D, H, FF, E, K, C>,
-        mut linear_scratch: Option<&mut Bf16LinearScratch<N, D, FF>>,
+        linear_scratch: &mut LinearScratch<N, D, FF>,
         mut flash_scratch: Option<&mut FlashAttentionScratch<N, T, D, H>>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
@@ -3902,7 +4126,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             tensor,
             gemm,
             gemm_bf16,
-            linear_scratch.as_deref_mut(),
+            linear_scratch,
             profiler,
             "forward.qkv_proj.gemm",
         )?;
@@ -3956,7 +4180,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             tensor,
             gemm,
             gemm_bf16,
-            linear_scratch.as_deref_mut(),
+            linear_scratch,
             profiler,
             "forward.o_proj.gemm",
         )?;
@@ -4056,6 +4280,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             &mut acts.experts,
             &mut scratch.experts,
             stream,
+            tensor,
             gemm,
             gemm_bf16,
             dense,
@@ -4106,7 +4331,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         aux_coefficient: f32,
         acts: &GpuBlockActs<N, D, H, FF, E, K, C>,
         scratch: &mut GpuBlockScratch<N, D, H, FF, E, K, C>,
-        mut linear_scratch: Option<&mut Bf16LinearScratch<N, D, FF>>,
+        linear_scratch: &mut LinearScratch<N, D, FF>,
         mut flash_scratch: Option<&mut FlashAttentionScratch<N, T, D, H>>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
@@ -4199,6 +4424,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             &acts.experts,
             &mut scratch.experts,
             stream,
+            tensor,
             gemm,
             gemm_bf16,
             dense,
@@ -4300,7 +4526,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             tensor,
             gemm,
             gemm_bf16,
-            linear_scratch.as_deref_mut(),
+            linear_scratch,
             profiler,
             ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
         )?;
@@ -4358,7 +4584,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             tensor,
             gemm,
             gemm_bf16,
-            linear_scratch.as_deref_mut(),
+            linear_scratch,
             profiler,
             [
                 "backward.qkv_proj.weight_gemm",
@@ -4585,7 +4811,7 @@ impl<
                 current,
                 output,
                 &mut workspace.block_scratch,
-                workspace.linear_scratch.as_mut(),
+                &mut workspace.linear_scratch,
                 workspace.flash_scratch.as_mut(),
                 stream,
                 tensor,
@@ -4775,7 +5001,7 @@ impl<
                 aux_coefficient,
                 acts,
                 &mut workspace.block_scratch,
-                workspace.linear_scratch.as_mut(),
+                &mut workspace.linear_scratch,
                 workspace.flash_scratch.as_mut(),
                 stream,
                 tensor,
@@ -4956,7 +5182,7 @@ impl<
             tensor,
             gemm,
             gemm_bf16,
-            workspace.linear_scratch.as_mut(),
+            &mut workspace.linear_scratch,
             profiler,
             "forward.qkv_proj.gemm",
         )?;
@@ -5010,7 +5236,7 @@ impl<
             tensor,
             gemm,
             gemm_bf16,
-            workspace.linear_scratch.as_mut(),
+            &mut workspace.linear_scratch,
             profiler,
             "forward.o_proj.gemm",
         )?;
@@ -5039,7 +5265,7 @@ impl<
             tensor,
             gemm,
             gemm_bf16,
-            workspace.linear_scratch.as_mut(),
+            &mut workspace.linear_scratch,
             profiler,
             "forward.gate_up_proj.gemm",
         )?;
@@ -5069,7 +5295,7 @@ impl<
             tensor,
             gemm,
             gemm_bf16,
-            workspace.linear_scratch.as_mut(),
+            &mut workspace.linear_scratch,
             profiler,
             "forward.down_proj.gemm",
         )?;
@@ -5214,7 +5440,7 @@ impl<
             tensor,
             gemm,
             gemm_bf16,
-            workspace.linear_scratch.as_mut(),
+            &mut workspace.linear_scratch,
             profiler,
             [
                 "backward.down_proj.weight_gemm",
@@ -5249,7 +5475,7 @@ impl<
             tensor,
             gemm,
             gemm_bf16,
-            workspace.linear_scratch.as_mut(),
+            &mut workspace.linear_scratch,
             profiler,
             [
                 "backward.gate_up_proj.weight_gemm",
@@ -5284,7 +5510,7 @@ impl<
             tensor,
             gemm,
             gemm_bf16,
-            workspace.linear_scratch.as_mut(),
+            &mut workspace.linear_scratch,
             profiler,
             ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
         )?;
@@ -5342,7 +5568,7 @@ impl<
             tensor,
             gemm,
             gemm_bf16,
-            workspace.linear_scratch.as_mut(),
+            &mut workspace.linear_scratch,
             profiler,
             [
                 "backward.qkv_proj.weight_gemm",

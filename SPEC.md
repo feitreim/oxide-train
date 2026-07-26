@@ -120,25 +120,59 @@ trait Module {
 2. **Phase 2: bf16 compute + fp32 master weights and optimizer states**
    (tcgen05 GEMMs want bf16 inputs). Loss scaling not expected to be needed
    for bf16; revisit if grads underflow.
+3. **Phase 3: bf16 masters** (#57) — the fp32 masters were phase 2's
+   gradcheck-clarity choice, not a numerical requirement. Optimizer moments,
+   gradients, activations, and every accumulator stay fp32.
 
 Phase 2 was adopted head-first (7e5), then extended to the block linears after
 the post-7e7 profile put their fp32 GEMMs at 47.3% of the step (7e9). The
 lm-head keeps packed-bf16 outputs/gradients; block linears use bf16 operands
-with fp32 store/accumulate tcgen05 epilogues so activations, gradient
-accumulation, AdamW state, and checkpoints remain fp32. Device-side bf16 is
-stored as packed pairs (`u32` = two adjacent row elements). The master-weight
-mechanism is observable: the tiny overfit gate plateaus while per-step updates
-are below one bf16 ulp of the compute weights, then escapes once the fp32
-master crosses a rounding boundary
-(`crates/optim/examples/overfit_probe.rs` reproduces this on CPU).
+with fp32 store/accumulate tcgen05 epilogues so activations and gradient
+accumulation remain fp32. Device-side bf16 is stored as packed pairs (`u32` =
+two adjacent row elements).
+
+**What is bf16 and what is not**, as of phase 3:
+
+| | dtype | why |
+|---|---|---|
+| embedding, `qkv_proj`, `o_proj`, stacked experts, `lm_head` | bf16 master | 4.39B of the 4.39B params; the compute copies were already bf16 |
+| norm weights | fp32 | `2·L+1` vectors of `D` — no memory leverage, high sensitivity |
+| router | fp32 | decision #22: rounding near a top-k boundary reassigns tokens |
+| AdamW first/second moments | fp32 | the second moment sits inside a `sqrt` in a denominator |
+| Muon momentum + Newton–Schulz | fp32 (f64 norm) | deliberately; it reads the bf16 master and widens |
+| weight gradients, tcgen05 epilogues | fp32 | decision #20 |
+| activation/gradient buffers | fp32 except four expert panels | audited buffer by buffer in §7.1 (#59) |
+
+The write-back is the whole numerical question: `w -= lr·update` computed in
+fp32 and then rounded drops any update below half a bf16 ulp of `w`. Both
+roundings live in the same fused kernel behind `model::MASTER_ROUNDING` —
+round-to-nearest (shipped) and deterministic stochastic rounding, whose draws
+come from a splitmix64 stream keyed on `(step, parameter id, element index)`
+and never from runtime entropy, so reruns and checkpoint resumes stay
+bit-identical under either. The master-weight plateau is still observable and
+still escapes under both: the tiny overfit gate stalls while per-step updates
+are below one bf16 ulp, then escapes once a weight crosses a rounding
+boundary (`crates/optim/examples/overfit_probe.rs` reproduces this on CPU and
+now runs both roundings side by side).
+
+The CPU reference mirrors the master dtype: it keeps `f32` storage but snaps
+every bf16-master parameter onto the bf16 grid at construction
+(`optim::Bf16MasterInit`) and after each update (`optim::MasterStorage`), so
+GPU/CPU parity compares the same trajectory rather than two dtypes. Post-update
+masters are compared *on the bf16 grid* — one integer ulp, not a float
+tolerance — because a sub-ulp fp32 difference in summation order can straddle a
+rounding boundary and move the stored weight a whole ulp, and a float tolerance
+wide enough to allow that would hide real defects.
 
 CPU reference reductions accumulate in f64 so the reference never loses to
 the thing it checks.
 
 ### 7.1 Activation & gradient buffer audit (#59)
 
-One question decides every activation and gradient buffer: **is anything
-accumulated or compared in it, or is it pure storage between two kernels?**
+This section covers *buffers*; parameters are §7's table above, where every
+master has been bf16 since #57. One question decides every activation and
+gradient buffer: **is anything accumulated or compared in it, or is it pure
+storage between two kernels?**
 Accumulation and comparison keep fp32; pure storage whose only consumers
 quantize it to a bf16 tcgen05 operand is stored packed once instead, and the
 `convert_f32_to_bf16_pairs` launch that fed the GEMM is deleted.
@@ -831,12 +865,12 @@ Each gated on tests; correctness before speed at every step.
    `L * saved + 1 * scratch`. Block backward keeps the residual-stream
    gradient resident in `d_model_1` across the reverse loop (no
    inter-block copies). Per-block aux losses accumulate into the same loss
-   scalar; checkpoint v4 adds `L` and streams blocks; `GpuDense::initialized`
+   scalar; checkpoint v4 added `L` and streams blocks (v5 since #57); `GpuDense::initialized`
    builds one CPU block at a time so the 4.4B-param config never
    materializes host-side. Canonical config moved to
    `L=12, D=3072, H=24, HD=128, FF=4096, E=8, K=2` at `B=8, T=2048`
    (`C=4096` keeps `N·K == E·C`). Gates: CPU deep overfit, two-block
-   CPU/GPU parity on both expert paths, checkpoint v4 bit-identical resume
+   CPU/GPU parity on both expert paths, checkpoint bit-identical resume
    with `L`-mismatch rejection.
    - ✅ **Weight-gradient staging fusion** (#43): the weight-grad GEMM staged
      both operands with a separate `convert_f32_to_bf16_pairs` then a full
@@ -1031,6 +1065,87 @@ Each gated on tests; correctness before speed at every step.
      single win is `gate_up_weight_gemm` 53.61 → 43.74 ms,
      confirming #53's read that these GEMMs are operand-DRAM-bandwidth bound —
      halving the operand bytes moves them where re-orienting them did not.
+   - ✅ **bf16 master weights** (#57, SPEC §7 phase 3, decision #23): the
+     embedding, `qkv_proj`/`o_proj`, the stacked experts, and the lm-head store
+     their masters as packed bf16 — the same `u32` pair layout every compute
+     copy already used — while moments, gradients, norms, the router, and Muon's
+     fp32 internals stay fp32. The update is unchanged fp32 arithmetic against
+     fp32 moments; the only new numerics is the write-back rounding, which lives
+     in one fused kernel per gradient dtype (`adamw_bf16_master`,
+     `adamw_bf16_master_packed_grad`, `muon_apply_bf16`) behind
+     `model::MASTER_ROUNDING`. That collapsed each `adamw` + `sync_compute` pair
+     into one pass: `sync_from_master` is now a device copy plus the transpose
+     rather than a quantize, since master and compute share a dtype.
+     Two structural consequences worth remembering. (1) Muon can no longer apply
+     per group — `width` may be odd, so a packed word straddles two groups and
+     two group launches would race for it; each group now scatters its
+     orthogonalized result back into the shared update buffer and one flat
+     `muon_apply_bf16` runs at the end. (2) The fp32 register-tiled oracle reads
+     fp32 weights and is reachable by *tile-aligned* weights too (the token
+     count decides), so its widened weight operand is shared workspace staging
+     allocated only when some linear can reach the fallback — never at a real
+     training shape — instead of a per-linear fp32 shadow, which would have
+     given back most of the win.
+     **B200 same-container A/B vs main at the §13.9 shape (B=12 T=2048):** VRAM
+     164.3 → 156.1 GiB (−8.2 GiB, free headroom 14.0 → 22.2 GiB), full step
+     607.22 → 585.20 ms (−3.6%). The optimizer span is the reliable signal and
+     moved as predicted by the traffic: `experts.gate_up.adamw` 17.60 → 10.04 ms
+     (−43%), `experts.down.adamw` 8.85 → 5.06 (−43%), `experts.sync_compute`
+     8.74 → 5.52 (−37%), `qkv_proj.adamw` 2.54 → 1.49 (−42%),
+     `embedding.adamw` 1.17 → 0.67 (−43%), `o_proj.adamw` 0.91 → 0.55 (−40%);
+     the whole optimizer 42.15 → 24.33 ms (−42%). The fp32 parameters are the
+     control and did not move (`attention_norm` 0.086 → 0.087, `router`
+     0.097 → 0.093). Only `lm_head.sync_w_t` regressed, 0.146 → 0.242 ms, because
+     it now copies `w` from the master as well as transposing it — #58 deletes
+     that span entirely. Checkpoints halve their parameter section (v5).
+     **Rounding decision, on evidence:** round-to-nearest, with stochastic
+     rounding implemented beside it rather than adopted. All fourteen gates pass
+     on nearest across two full reruns with no flake, overfit finals
+     `1.526702 → 0.000002` (AdamW), `→ 0.000000` (Muon), `3.105938 → 0.000039`
+     / `0.000051` (aligned linears, the two reruns), `→ 0.000000` (aligned
+     Muon), `2.949433 → 0.000017` (MoE with aux loss) — no stall anywhere, so
+     nothing demands the alternative. The stochastic path is gated at the kernel
+     level in `gpu/tensor-gpu` (reproducible across launches, provably within
+     one bf16 ulp of nearest, and actually different from it) and both roundings
+     converge in `crates/optim/examples/overfit_probe.rs` at the documented
+     knife-edge lr 0.03. Running the model gates on it also produced a result
+     worth recording: the first AdamW parity gate passes (one stochastic step
+     stays inside the one-ulp budget) and the *second*, chained one fails at 9
+     ulps on an embedding element, because the two sides draw independent
+     streams and a near-cancelling update amplifies one ulp at `w ≈ 2e-2` into
+     nine at `w ≈ 1e-3`. No keying fixes that — the grouped `qkv`/`gate_up`
+     masters are one interleaved parameter on the GPU and three or two separate
+     ones on the CPU — so adopting stochastic rounding means re-deciding what
+     the master parity gates compare, not widening them.
+   - ✅ **#57 + #59 integrated**: the two landed independently and both rewrote
+     `expert_linear_forward`/`backward`, so the union needed deciding rather
+     than merging. #59's `ExpertPanel` inputs and #57's packed-bf16 weights
+     compose directly on the tcgen05 path — every operand is already addressed
+     in place — but the fp32 register-tiled oracle needs *both* operands wide,
+     and after #59 a packed panel has no fp32 copy at all while after #57 the
+     weights have none either. Resolution: the oracle widens the master into the
+     staging buffer it already owned (`ExpertFp32Scratch.b`), which is why
+     `tensor_kernels` comes back as a parameter #59 had just removed — the same
+     argument, needed again for the opposite reason.
+     That exposed a latent hazard in the panel-packing predicate and fixed it.
+     `expert_tcgen05_aligned` tested 128-alignment while the GEMMs test 256, so
+     a shape in between (`C=D=FF=128`) would store panels packed and then fall
+     back to the oracle, which would ask a packed panel for `wide()` and panic.
+     The predicate is now literally the two expert GEMMs' eligibility, making
+     packed storage and the tcgen05 path the same condition — `wide()` and the
+     `fp32_staging` expect are invariants now, not hazards. Behaviour is
+     unchanged for the canonical config and every gate shape, which sit on one
+     side or the other of both predicates.
+     **Combined B200 same-container A/B vs pre-#57 main (64e74a4) at the §13.9
+     shape (B=12 T=2048):** VRAM 164.3 → 145.7 GiB (−18.6 GiB, exactly the two
+     issues' −8.2 and −10.4 summed; free headroom 14.0 → 32.6 GiB, +133%), full
+     step 608.08 → 552.80 ms (−9.1%). Both sets of spans survive the merge
+     intact: the optimizer 42.33 → 24.63 ms (−42%, #57) alongside
+     `forward.experts.swiglu` 11.40 → 6.57, `forward.router.scatter`
+     8.42 → 4.74, `forward.experts.down_gemm` 17.05 → 13.33 (#59). The step
+     delta is a little under the sum of the two individual measurements
+     (−55.3 vs −61.9 ms), which is the expected small overlap plus
+     container-to-container spread.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 
@@ -1060,3 +1175,4 @@ Each gated on tests; correctness before speed at every step.
 | 20 | Block tcgen05 keeps fp32 model tensors | Quantize operands into persistent scratch and use concrete fp32-output store/accumulate epilogues; buffers, optimizer/checkpoint layout, and the naive fp32 fallback stay fp32, though epilogue values are bf16-rounded (the drain reuses the packed-bf16 shared-memory staging, so each GEMM result carries bf16 mantissa precision after full-K fp32 accumulation — doubling SMEM_OUT for true fp32 staging wasn't warranted) |
 | 21 | MoE aux-loss coefficient is runtime config, not const | Const generics are reserved for values the compiler specializes on — `E`/`K`/`C` size buffers, bins, and launch grids; the coefficient is one scalar FMA that shapes nothing, needs a step schedule, and must be sweepable without a Modal rebuild (stable Rust also forbids f32 const generics). It flows host→kernel per step like `learning_rate` and is recorded in the checkpoint header like `AdamWConfig` |
 | 22 | MoE router is fp32 over bf16 experts | Routing is discrete: bf16 rounding near a top-k boundary doesn't perturb the output, it reassigns the token (the 7e7 bf16 two-logit tie showed how violently trajectories react to that). The router GEMM is `[N,D]×[D,E]` — skinny, off the tcgen05 tile contract, and a rounding-error share of step FLOPs — so fp32 costs nothing measurable while keeping gate weights and the aux loss in the precision gradcheck trusts |
+| 23 | bf16 masters (successor to #8) | #8's fp32 masters bought gradcheck clarity, and the price rose with the model: 16.3 GiB of the 4.39B config and half of every checkpoint, duplicating bf16 compute copies that already existed beside them. The update stays fp32 against fp32 moments — only the write-back is bf16 — so what was actually given up is sub-half-ulp accumulation across steps, and the overfit gates (the documented knife-edge sensor) converge on round-to-nearest with margin. Stochastic rounding is implemented in the same kernel behind one constant for when they stop, deterministic by construction (splitmix64 keyed on step/parameter/element, never runtime entropy) so bit-identical reruns and resumes survive either choice. Norms, the router (#22), moments, and Muon's fp32 internals stay fp32 — all cheap and all numerically load-bearing |

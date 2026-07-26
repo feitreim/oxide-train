@@ -1,8 +1,11 @@
 //! Versioned checkpoints for the reference trainer.
 //!
-//! The lm-head is stored as its fp32 master weights with the padded
-//! vocabulary columns stripped: those columns (and their moments) are zero by
-//! construction, so the payload is identical to the pre-bf16 format and does
+//! Parameters are stored in their master dtype and moments in fp32. Since v5
+//! that means every matrix-shaped parameter is two bytes per element (#57);
+//! norms and the router stay fp32, as they do in memory.
+//!
+//! The lm-head is stored with the padded vocabulary columns stripped: those
+//! columns (and their moments) are zero by construction, so the payload does
 //! not depend on the build's choice of `VP`.
 
 use std::error::Error;
@@ -12,13 +15,16 @@ use std::path::Path;
 
 use cuda_core::CudaStream;
 use optim::{AdamWConfig, AuxLossSchedule};
-use tensor_core::{Rank2, Shape};
+use tensor_core::{Rank2, Shape, bf16};
 
-use super::tensor_device::GpuTensor;
+use super::tensor_device::{GpuBf16Tensor, GpuTensor};
 use super::{GpuBf16Head, GpuDense, GpuDenseAdamW};
 
 const MAGIC: &[u8; 8] = b"RTCKPT01";
-const VERSION: u32 = 4;
+/// v5 stores bf16 masters. v4 (fp32 masters) is rejected by the version check
+/// rather than converted: the fp32 bits it carries are precision this build
+/// cannot represent, and silently rounding a resume is worse than refusing it.
+const VERSION: u32 = 5;
 const CONFIG_FLOATS: usize = 7;
 
 pub struct LoadedCheckpoint<
@@ -97,7 +103,31 @@ fn read_tensor<S: Shape>(
     Ok(GpuTensor::from_host(stream, &host)?)
 }
 
-/// Write a padded `[D, VP]` head tensor as its first `vocab` columns.
+fn write_master<S: Shape>(
+    writer: &mut impl Write,
+    tensor: &GpuBf16Tensor<S>,
+    stream: &CudaStream,
+) -> Result<(), Box<dyn Error>> {
+    for value in tensor.to_f32_host(stream)? {
+        writer.write_all(&bf16::from_f32(value).to_bits().to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_master<S: Shape>(
+    reader: &mut impl Read,
+    stream: &CudaStream,
+) -> Result<GpuBf16Tensor<S>, Box<dyn Error>> {
+    let mut bits = vec![0u16; S::NUM_ELEMENTS];
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(bits.as_mut_ptr().cast::<u8>(), bits.len() * 2) };
+    reader.read_exact(bytes)?;
+    let values: Vec<f32> = bits.iter().map(|&b| bf16::from_bits(b).to_f32()).collect();
+    Ok(GpuBf16Tensor::from_f32_host(stream, &values)?)
+}
+
+/// Write a padded `[D, VP]` fp32 head tensor (a moment) as its first `vocab`
+/// columns.
 fn write_head_tensor<const D: usize, const VP: usize>(
     writer: &mut impl Write,
     tensor: &GpuTensor<f32, Rank2<D, VP>>,
@@ -114,8 +144,8 @@ fn write_head_tensor<const D: usize, const VP: usize>(
     Ok(())
 }
 
-/// Read `[D, vocab]` head values back into padded `[D, VP]` form; the padded
-/// columns are zero.
+/// Read `[D, vocab]` fp32 head moments back into padded `[D, VP]` form; the
+/// padded columns are zero.
 fn read_head_values<const D: usize, const VP: usize>(
     reader: &mut impl Read,
     vocab: usize,
@@ -127,6 +157,42 @@ fn read_head_values<const D: usize, const VP: usize>(
             std::slice::from_raw_parts_mut(columns.as_mut_ptr().cast::<u8>(), columns.len() * 4)
         };
         reader.read_exact(bytes)?;
+    }
+    Ok(padded)
+}
+
+/// [`write_head_tensor`] for the bf16 head master.
+fn write_head_master<const D: usize, const VP: usize>(
+    writer: &mut impl Write,
+    tensor: &GpuBf16Tensor<Rank2<D, VP>>,
+    vocab: usize,
+    stream: &CudaStream,
+) -> Result<(), Box<dyn Error>> {
+    let host = tensor.to_f32_host(stream)?;
+    for row in 0..D {
+        for &value in &host[row * VP..row * VP + vocab] {
+            writer.write_all(&bf16::from_f32(value).to_bits().to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// Read `[D, vocab]` bf16 head master values back into padded `[D, VP]` f32
+/// form; the padded columns are zero.
+fn read_head_master_values<const D: usize, const VP: usize>(
+    reader: &mut impl Read,
+    vocab: usize,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    let mut padded = vec![0.0f32; D * VP];
+    let mut bits = vec![0u16; vocab];
+    for row in 0..D {
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(bits.as_mut_ptr().cast::<u8>(), bits.len() * 2)
+        };
+        reader.read_exact(bytes)?;
+        for (slot, &b) in padded[row * VP..row * VP + vocab].iter_mut().zip(&bits) {
+            *slot = bf16::from_bits(b).to_f32();
+        }
     }
     Ok(padded)
 }
@@ -217,25 +283,32 @@ pub fn save<
     write_u64(&mut writer, next_batch)?;
     write_config(&mut writer, optimizer.config(), optimizer.aux_schedule())?;
 
-    macro_rules! write_parameter {
+    macro_rules! write_master_parameter {
+        ($parameter:expr, $moments:expr) => {
+            write_master(&mut writer, $parameter, stream)?;
+            write_tensor(&mut writer, &$moments.first, stream)?;
+            write_tensor(&mut writer, &$moments.second, stream)?;
+        };
+    }
+    macro_rules! write_fp32_parameter {
         ($parameter:expr, $moments:expr) => {
             write_tensor(&mut writer, $parameter, stream)?;
             write_tensor(&mut writer, &$moments.first, stream)?;
             write_tensor(&mut writer, &$moments.second, stream)?;
         };
     }
-    write_parameter!(&model.embedding.w, optimizer.embedding);
+    write_master_parameter!(&model.embedding.w, optimizer.embedding);
     for (block, moments) in model.blocks.iter().zip(optimizer.blocks.iter()) {
-        write_parameter!(&block.attention_norm.w, moments.attention_norm);
-        write_parameter!(&block.qkv_proj.w, moments.qkv_proj);
-        write_parameter!(&block.o_proj.w, moments.o_proj);
-        write_parameter!(&block.ffn_norm.w, moments.ffn_norm);
-        write_parameter!(&block.router, moments.router);
-        write_parameter!(&block.experts.gate_up, moments.expert_gate_up);
-        write_parameter!(&block.experts.down, moments.expert_down);
+        write_fp32_parameter!(&block.attention_norm.w, moments.attention_norm);
+        write_master_parameter!(&block.qkv_proj.w, moments.qkv_proj);
+        write_master_parameter!(&block.o_proj.w, moments.o_proj);
+        write_fp32_parameter!(&block.ffn_norm.w, moments.ffn_norm);
+        write_fp32_parameter!(&block.router, moments.router);
+        write_master_parameter!(&block.experts.gate_up, moments.expert_gate_up);
+        write_master_parameter!(&block.experts.down, moments.expert_down);
     }
-    write_parameter!(&model.final_norm.w, optimizer.final_norm);
-    write_head_tensor::<D, VP>(&mut writer, &model.lm_head.master, VOCAB, stream)?;
+    write_fp32_parameter!(&model.final_norm.w, optimizer.final_norm);
+    write_head_master::<D, VP>(&mut writer, &model.lm_head.master, VOCAB, stream)?;
     write_head_tensor::<D, VP>(&mut writer, &optimizer.lm_head.first, VOCAB, stream)?;
     write_head_tensor::<D, VP>(&mut writer, &optimizer.lm_head.second, VOCAB, stream)?;
 
@@ -300,27 +373,36 @@ pub fn load<
     )?;
     let mut optimizer = GpuDenseAdamW::new(stream, config, aux_schedule, L)?;
 
-    macro_rules! read_parameter {
+    macro_rules! read_master_parameter {
+        ($parameter:expr, $moments:expr) => {
+            *$parameter = read_master(&mut reader, stream)?;
+            $moments.first = read_tensor(&mut reader, stream)?;
+            $moments.second = read_tensor(&mut reader, stream)?;
+        };
+    }
+    macro_rules! read_fp32_parameter {
         ($parameter:expr, $moments:expr) => {
             *$parameter = read_tensor(&mut reader, stream)?;
             $moments.first = read_tensor(&mut reader, stream)?;
             $moments.second = read_tensor(&mut reader, stream)?;
         };
     }
-    read_parameter!(&mut model.embedding.w, optimizer.embedding);
+    read_master_parameter!(&mut model.embedding.w, optimizer.embedding);
     for (block, moments) in model.blocks.iter_mut().zip(optimizer.blocks.iter_mut()) {
-        read_parameter!(&mut block.attention_norm.w, moments.attention_norm);
-        read_parameter!(&mut block.qkv_proj.w, moments.qkv_proj);
-        read_parameter!(&mut block.o_proj.w, moments.o_proj);
-        read_parameter!(&mut block.ffn_norm.w, moments.ffn_norm);
-        read_parameter!(&mut block.router, moments.router);
-        read_parameter!(&mut block.experts.gate_up, moments.expert_gate_up);
-        read_parameter!(&mut block.experts.down, moments.expert_down);
+        read_fp32_parameter!(&mut block.attention_norm.w, moments.attention_norm);
+        read_master_parameter!(&mut block.qkv_proj.w, moments.qkv_proj);
+        read_master_parameter!(&mut block.o_proj.w, moments.o_proj);
+        read_fp32_parameter!(&mut block.ffn_norm.w, moments.ffn_norm);
+        read_fp32_parameter!(&mut block.router, moments.router);
+        read_master_parameter!(&mut block.experts.gate_up, moments.expert_gate_up);
+        read_master_parameter!(&mut block.experts.down, moments.expert_down);
     }
-    read_parameter!(&mut model.final_norm.w, optimizer.final_norm);
+    read_fp32_parameter!(&mut model.final_norm.w, optimizer.final_norm);
     model.sync_compute(stream, tensor)?;
-    model.lm_head =
-        GpuBf16Head::from_master_values(stream, &read_head_values::<D, VP>(&mut reader, VOCAB)?)?;
+    model.lm_head = GpuBf16Head::from_master_values(
+        stream,
+        &read_head_master_values::<D, VP>(&mut reader, VOCAB)?,
+    )?;
     optimizer.lm_head.first =
         GpuTensor::from_host(stream, &read_head_values::<D, VP>(&mut reader, VOCAB)?)?;
     optimizer.lm_head.second =
