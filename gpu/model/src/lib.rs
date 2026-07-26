@@ -1070,93 +1070,6 @@ impl StackedBf16Weights {
     }
 }
 
-struct ExpertBf16MapSet {
-    d: Vec<Bf16PairsTmaMap>,
-    ff: Vec<Bf16PairsTmaMap>,
-    gate_up: Vec<Bf16PairsTmaMap>,
-}
-
-impl ExpertBf16MapSet {
-    fn get<const D: usize, const FF: usize>(&self, width: usize) -> &[Bf16PairsTmaMap] {
-        if width == D {
-            &self.d
-        } else if width == FF {
-            &self.ff
-        } else if width == 2 * FF {
-            &self.gate_up
-        } else {
-            panic!("unsupported expert tcgen05 width {width}")
-        }
-    }
-}
-
-/// Packed operand staging shared by every expert launch. Both weight-gradient
-/// operands are read MN-major out of these native `[E*C, width]` panels (#53),
-/// so there is no transposed staging at all — only a second map set per buffer.
-struct ExpertBf16Scratch<const E: usize, const C: usize, const D: usize, const FF: usize> {
-    rows: DeviceBuffer<u32>,
-    lhs: DeviceBuffer<u32>,
-    row_maps: ExpertBf16MapSet,
-    row_mn_maps: ExpertBf16MapSet,
-    lhs_mn_maps: ExpertBf16MapSet,
-}
-
-impl<const E: usize, const C: usize, const D: usize, const FF: usize>
-    ExpertBf16Scratch<E, C, D, FF>
-{
-    fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
-        let max_width = D.max(FF).max(2 * FF);
-        let words = E * C * max_width / 2;
-        let rows = DeviceBuffer::zeroed(stream, words)?;
-        let lhs = DeviceBuffer::zeroed(stream, words)?;
-        let row_maps = Self::maps(stream, &rows, TmaLayout::KMajor)?;
-        let row_mn_maps = Self::maps(stream, &rows, TmaLayout::MnMajor)?;
-        let lhs_mn_maps = Self::maps(stream, &lhs, TmaLayout::MnMajor)?;
-        Ok(Self {
-            rows,
-            lhs,
-            row_maps,
-            row_mn_maps,
-            lhs_mn_maps,
-        })
-    }
-
-    fn maps(
-        stream: &CudaStream,
-        buffer: &DeviceBuffer<u32>,
-        layout: TmaLayout,
-    ) -> Result<ExpertBf16MapSet, Box<dyn Error>> {
-        fn make(
-            stream: &CudaStream,
-            buffer: &DeviceBuffer<u32>,
-            experts: usize,
-            capacity: usize,
-            width: usize,
-            layout: TmaLayout,
-        ) -> Result<Vec<Bf16PairsTmaMap>, Box<dyn Error>> {
-            (0..experts)
-                .map(|expert| unsafe {
-                    create_bf16_pairs_tma_map_region(
-                        stream,
-                        buffer,
-                        expert * capacity * width / 2,
-                        width,
-                        capacity,
-                        width,
-                        layout,
-                    )
-                })
-                .collect()
-        }
-
-        Ok(ExpertBf16MapSet {
-            d: make(stream, buffer, E, C, D, layout)?,
-            ff: make(stream, buffer, E, C, FF, layout)?,
-            gate_up: make(stream, buffer, E, C, 2 * FF, layout)?,
-        })
-    }
-}
-
 /// Whether these expert shapes route every expert GEMM through tcgen05, which
 /// is also what decides whether a panel can be stored packed.
 fn expert_tcgen05_aligned<const C: usize, const D: usize, const FF: usize>() -> bool {
@@ -1332,57 +1245,31 @@ impl ExpertFp32Scratch {
     }
 }
 
-struct ExpertLinearScratch<const E: usize, const C: usize, const D: usize, const FF: usize> {
-    bf16: Option<ExpertBf16Scratch<E, C, D, FF>>,
-    fp32: Option<ExpertFp32Scratch>,
-}
-
 #[allow(clippy::too_many_arguments)]
-fn expert_linear_forward<
-    const E: usize,
-    const C: usize,
-    const D: usize,
-    const FF: usize,
-    P: KernelProfiler,
->(
+fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
     input: &ExpertPanel,
     weights: &DeviceBuffer<f32>,
     compute: Option<&StackedBf16Weights>,
     output: &mut DeviceBuffer<f32>,
     input_width: usize,
     output_width: usize,
-    scratch: &mut ExpertLinearScratch<E, C, D, FF>,
+    staging: &mut Option<ExpertFp32Scratch>,
     stream: &CudaStream,
-    tensor: &tensor_kernels::LoadedModule,
     fp32: &gemm_kernels::LoadedModule,
     tcgen05: &Tcgen05Gemm,
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    if let (Some(compute), Some(bf16_scratch)) = (compute, scratch.bf16.as_mut())
+    if let (Some(compute), ExpertPanel::Packed(input)) = (compute, input)
         && tcgen05_linear_eligible(C, input_width, output_width)
     {
         profiler.measure(stream, name, || {
-            // A packed panel is already the operand; a wide one is quantized
-            // into the shared staging first.
-            if let ExpertPanel::Wide(values) = input {
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(E * C * input_width / 2),
-                    values,
-                    &mut bf16_scratch.rows,
-                )?;
-            }
-            let input_maps = match input {
-                ExpertPanel::Packed(panel) => panel.k_maps.as_slice(),
-                ExpertPanel::Wide(_) => bf16_scratch.row_maps.get::<D, FF>(input_width),
-            };
             for expert in 0..E {
                 unsafe {
                     tcgen05.f32_store_at(
                         stream,
                         tcgen05_launch_config(C, output_width, input_width),
-                        input_maps[expert].as_ptr(),
+                        input.k_maps[expert].as_ptr(),
                         compute.transposed_maps[expert].as_ptr(),
                         output,
                         expert * C * output_width,
@@ -1395,8 +1282,7 @@ fn expert_linear_forward<
             Ok(())
         })
     } else {
-        let fp32_scratch = scratch
-            .fp32
+        let fp32_scratch = staging
             .as_mut()
             .expect("non-aligned experts must own fp32 staging");
         profiler.measure(stream, name, || {
@@ -1444,13 +1330,7 @@ fn expert_linear_forward<
 }
 
 #[allow(clippy::too_many_arguments)]
-fn expert_linear_backward<
-    const E: usize,
-    const C: usize,
-    const D: usize,
-    const FF: usize,
-    P: KernelProfiler,
->(
+fn expert_linear_backward<const E: usize, const C: usize, P: KernelProfiler>(
     input: &ExpertPanel,
     output_gradient: &ExpertPanel,
     weights: &DeviceBuffer<f32>,
@@ -1459,53 +1339,28 @@ fn expert_linear_backward<
     input_gradient: &mut DeviceBuffer<f32>,
     input_width: usize,
     output_width: usize,
-    scratch: &mut ExpertLinearScratch<E, C, D, FF>,
+    staging: &mut Option<ExpertFp32Scratch>,
     stream: &CudaStream,
-    tensor: &tensor_kernels::LoadedModule,
     fp32: &gemm_kernels::LoadedModule,
     tcgen05: &Tcgen05Gemm,
     profiler: &mut P,
     names: [&'static str; 2],
 ) -> Result<(), DriverError> {
-    if let (Some(compute), Some(bf16_scratch)) = (compute, scratch.bf16.as_mut())
+    if let (Some(compute), ExpertPanel::Packed(input), ExpertPanel::Packed(dy)) =
+        (compute, input, output_gradient)
         && tcgen05_linear_eligible(C, input_width, output_width)
     {
+        // Both weight-gradient operands are read MN-major out of their native
+        // `[E*C, width]` panels (#53), and since #59 both panels are stored
+        // packed, so no operand is staged or transposed at all.
         profiler.measure(stream, names[0], || {
-            // Both weight-gradient operands are read MN-major out of their
-            // native `[E*C, width]` panels (#53), so a panel still stored wide
-            // is a plain quantize and nothing is transposed. `rows` doubles as
-            // the input GEMM's row operand below.
-            if let ExpertPanel::Wide(values) = input {
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(E * C * input_width / 2),
-                    values,
-                    &mut bf16_scratch.lhs,
-                )?;
-            }
-            if let ExpertPanel::Wide(values) = output_gradient {
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(E * C * output_width / 2),
-                    values,
-                    &mut bf16_scratch.rows,
-                )?;
-            }
-            let lhs_maps = match input {
-                ExpertPanel::Packed(panel) => panel.mn_maps.as_slice(),
-                ExpertPanel::Wide(_) => bf16_scratch.lhs_mn_maps.get::<D, FF>(input_width),
-            };
-            let rhs_maps = match output_gradient {
-                ExpertPanel::Packed(panel) => panel.mn_maps.as_slice(),
-                ExpertPanel::Wide(_) => bf16_scratch.row_mn_maps.get::<D, FF>(output_width),
-            };
             for expert in 0..E {
                 unsafe {
                     tcgen05.f32_accumulate_transposed_at(
                         stream,
                         tcgen05_launch_config(input_width, output_width, C),
-                        lhs_maps[expert].as_ptr(),
-                        rhs_maps[expert].as_ptr(),
+                        input.mn_maps[expert].as_ptr(),
+                        dy.mn_maps[expert].as_ptr(),
                         weight_gradient,
                         expert * input_width * output_width,
                         input_width * output_width,
@@ -1516,18 +1371,13 @@ fn expert_linear_backward<
             }
             Ok(())
         })?;
-        // A wide output gradient is still packed in `rows` from the pass above.
         profiler.measure(stream, names[1], || {
-            let output_maps = match output_gradient {
-                ExpertPanel::Packed(panel) => panel.k_maps.as_slice(),
-                ExpertPanel::Wide(_) => bf16_scratch.row_maps.get::<D, FF>(output_width),
-            };
             for expert in 0..E {
                 unsafe {
                     tcgen05.f32_store_at(
                         stream,
                         tcgen05_launch_config(C, input_width, output_width),
-                        output_maps[expert].as_ptr(),
+                        dy.k_maps[expert].as_ptr(),
                         compute.normal_maps[expert].as_ptr(),
                         input_gradient,
                         expert * C * input_width,
@@ -1540,8 +1390,7 @@ fn expert_linear_backward<
             Ok(())
         })
     } else {
-        let fp32_scratch = scratch
-            .fp32
+        let fp32_scratch = staging
             .as_mut()
             .expect("non-aligned experts must own fp32 staging");
         profiler.measure(stream, names[0], || {
@@ -1689,7 +1538,6 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         &self,
         workspace: &mut GpuExpertWorkspace<E, C, D, FF>,
         stream: &CudaStream,
-        tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
         dense: &dense_kernels::LoadedModule,
@@ -1699,7 +1547,6 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             &mut workspace.acts,
             &mut workspace.scratch,
             stream,
-            tensor,
             fp32,
             tcgen05,
             dense,
@@ -1713,22 +1560,20 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         acts: &mut GpuExpertActs<E, C, D, FF>,
         scratch: &mut GpuExpertScratch<E, C, D, FF>,
         stream: &CudaStream,
-        tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
         dense: &dense_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        expert_linear_forward(
+        expert_linear_forward::<E, C, P>(
             &acts.bin_input,
             self.gate_up.as_device_buffer(),
             self.gate_up_compute.as_ref(),
             scratch.gate_up.as_device_buffer_mut(),
             D,
             2 * FF,
-            &mut scratch.linears,
+            &mut scratch.fp32_staging,
             stream,
-            tensor,
             fp32,
             tcgen05,
             profiler,
@@ -1766,16 +1611,15 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
                 values,
             ),
         })?;
-        expert_linear_forward(
+        expert_linear_forward::<E, C, P>(
             &acts.activated,
             self.down.as_device_buffer(),
             self.down_compute.as_ref(),
             acts.bin_output.as_device_buffer_mut(),
             FF,
             D,
-            &mut scratch.linears,
+            &mut scratch.fp32_staging,
             stream,
-            tensor,
             fp32,
             tcgen05,
             profiler,
@@ -1788,7 +1632,6 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         &mut self,
         workspace: &mut GpuExpertWorkspace<E, C, D, FF>,
         stream: &CudaStream,
-        tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
         dense: &dense_kernels::LoadedModule,
@@ -1798,7 +1641,6 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             &workspace.acts,
             &mut workspace.scratch,
             stream,
-            tensor,
             fp32,
             tcgen05,
             dense,
@@ -1812,13 +1654,12 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         acts: &GpuExpertActs<E, C, D, FF>,
         scratch: &mut GpuExpertScratch<E, C, D, FF>,
         stream: &CudaStream,
-        tensor: &tensor_kernels::LoadedModule,
         fp32: &gemm_kernels::LoadedModule,
         tcgen05: &Tcgen05Gemm,
         dense: &dense_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
-        expert_linear_backward(
+        expert_linear_backward::<E, C, P>(
             &acts.activated,
             &scratch.d_bin_output,
             self.down.as_device_buffer(),
@@ -1827,9 +1668,8 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             scratch.d_activated.as_device_buffer_mut(),
             FF,
             D,
-            &mut scratch.linears,
+            &mut scratch.fp32_staging,
             stream,
-            tensor,
             fp32,
             tcgen05,
             profiler,
@@ -1890,7 +1730,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
                 },
             },
         )?;
-        expert_linear_backward(
+        expert_linear_backward::<E, C, P>(
             &acts.bin_input,
             &scratch.d_gate_up,
             self.gate_up.as_device_buffer(),
@@ -1899,9 +1739,8 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             scratch.d_bin_input.as_device_buffer_mut(),
             D,
             2 * FF,
-            &mut scratch.linears,
+            &mut scratch.fp32_staging,
             stream,
-            tensor,
             fp32,
             tcgen05,
             profiler,
@@ -1999,11 +1838,12 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize> GpuExpertA
 /// Expert buffers no backward pass reads after the launch that consumed them,
 /// so one instance serves every block of a deep model.
 ///
-/// The fp32 buffers occupy `4 * E * C * (2 * D + 7 * FF)` bytes. Aligned
-/// tcgen05 shapes add two packed-bf16 operand buffers totaling
-/// `4 * E * C * max(D, FF, 2 * FF)` bytes, shrinking as SPEC §7.1 moves each
-/// panel into packed storage; non-aligned oracle shapes allocate three
-/// one-expert fp32 staging buffers instead.
+/// `d_bin_output` and `d_gate_up` are packed bf16 (every reader is a tcgen05
+/// operand, SPEC §7.1); the rest stay fp32 as epilogue targets or pointwise
+/// operands, occupying `4 * E * C * (D + 5 * FF)` bytes plus
+/// `2 * E * C * (D + 2 * FF)` packed. Aligned tcgen05 shapes now stage nothing
+/// at all — every operand is addressed in place — so only the non-aligned
+/// oracle allocates the three one-expert fp32 staging buffers.
 pub struct GpuExpertScratch<const E: usize, const C: usize, const D: usize, const FF: usize> {
     gate_up: GpuTensor<f32, Rank4<E, C, 2, FF>>,
     pub d_bin_output: ExpertPanel,
@@ -2012,7 +1852,7 @@ pub struct GpuExpertScratch<const E: usize, const C: usize, const D: usize, cons
     d_up: GpuTensor<f32, Rank3<E, C, FF>>,
     d_gate_up: ExpertPanel,
     pub d_bin_input: GpuTensor<f32, Rank3<E, C, D>>,
-    linears: ExpertLinearScratch<E, C, D, FF>,
+    fp32_staging: Option<ExpertFp32Scratch>,
 }
 
 impl<const E: usize, const C: usize, const D: usize, const FF: usize>
@@ -2029,19 +1869,14 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize>
             d_up: GpuTensor::zeros(stream)?,
             d_gate_up: ExpertPanel::new(stream, E, C, 2 * FF, aligned)?,
             d_bin_input: GpuTensor::zeros(stream)?,
-            linears: ExpertLinearScratch {
-                bf16: aligned
-                    .then(|| ExpertBf16Scratch::new(stream))
-                    .transpose()?,
-                fp32: (!aligned)
-                    .then(|| ExpertFp32Scratch::new::<C, D, FF>(stream))
-                    .transpose()?,
-            },
+            fp32_staging: (!aligned)
+                .then(|| ExpertFp32Scratch::new::<C, D, FF>(stream))
+                .transpose()?,
         })
     }
 
     pub fn tcgen05_active(&self) -> bool {
-        self.linears.bf16.is_some()
+        self.fp32_staging.is_none()
     }
 }
 
@@ -4221,7 +4056,6 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             &mut acts.experts,
             &mut scratch.experts,
             stream,
-            tensor,
             gemm,
             gemm_bf16,
             dense,
@@ -4365,7 +4199,6 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             &acts.experts,
             &mut scratch.experts,
             stream,
-            tensor,
             gemm,
             gemm_bf16,
             dense,

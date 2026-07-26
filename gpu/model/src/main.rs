@@ -254,7 +254,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
     let contexts = forward_pairs.map(|(_, context)| context);
 
     workspace.upload_bins(&bins, stream)?;
-    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
+    gpu.forward(&mut workspace, stream, gemm, gemm_bf16, dense)?;
     let sparse_output = workspace.acts.bin_output.to_host(stream)?;
     let (atol, rtol) = if aligned {
         (BF16_ATOL, BF16_RTOL)
@@ -296,7 +296,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
         }
     }
     workspace.upload_bins(&full_bins, stream)?;
-    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
+    gpu.forward(&mut workspace, stream, gemm, gemm_bf16, dense)?;
     let full_output = workspace.acts.bin_output.to_host(stream)?;
     for expert in 0..E {
         for slot in 0..live_slots {
@@ -313,7 +313,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
 
     // Restore the sparse forward state before backward.
     workspace.upload_bins(&bins, stream)?;
-    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
+    gpu.forward(&mut workspace, stream, gemm, gemm_bf16, dense)?;
     let output_gradient: Vec<f32> = uniform_vec(E * C * D, 803)
         .into_iter()
         .map(|value| (value - 0.5) * 0.05)
@@ -333,7 +333,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
         expected_input_gradient[expert * C * D..(expert + 1) * C * D]
             .copy_from_slice(expected_input_gradients[expert].as_slice());
     }
-    gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
+    gpu.backward(&mut workspace, stream, gemm, gemm_bf16, dense)?;
     assert_close_slices(
         &format!("{label} input gradient"),
         &workspace.scratch.d_bin_input.to_host(stream)?,
@@ -375,8 +375,8 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
             CpuTensor::from_slice(&output_gradient[start..start + C * D]),
         );
     }
-    gpu.forward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
-    gpu.backward(&mut workspace, stream, tensor, gemm, gemm_bf16, dense)?;
+    gpu.forward(&mut workspace, stream, gemm, gemm_bf16, dense)?;
+    gpu.backward(&mut workspace, stream, gemm, gemm_bf16, dense)?;
     let (expected_gate_up, expected_down) = stacked_expert_gradients(&cpu);
     assert_close(
         &format!("{label} accumulated gate/up gradient"),
