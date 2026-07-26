@@ -505,63 +505,63 @@ fn copy_device_region<E: DeviceCopy>(
         .cu_deviceptr()
         .checked_add(source_bytes as u64)
         .expect("device copy source pointer overflow");
-    // SAFETY: the checked element ranges above are within their allocations.
-    // Expert staging and master/compute refreshes always copy between distinct
-    // allocations.
+    // SAFETY: the checked element ranges above are within their allocations,
+    // and expert oracle staging — the only remaining caller — always copies
+    // between distinct allocations.
     unsafe { cuda_core::memory::memcpy_dtod_async(destination, source, bytes, stream.cu_stream()) }
 }
 
-/// Packed-bf16 compute copies of one linear's bf16 master, in the two layouts
-/// the tcgen05 `C = A B^T` form needs as a K-contiguous `B` operand.
+/// The two tcgen05 `B` operands of one linear, in the layouts the `C = A B^T`
+/// form needs as a K-contiguous operand: `[rows, columns]` for the input
+/// gradient `dx = dy·Wᵀ` and `[columns, rows]` for the forward `y = x·W`.
 ///
-/// `normal` is byte-identical to the master since #57 made both bf16; it stays
-/// a separate allocation only because the TMA descriptors are bound to fixed
-/// device addresses, which #58 rebinds onto the master itself.
+/// The `[rows, columns]` operand *is* the bf16 master. #57 made master and
+/// compute copy the same dtype and layout, so #58 encoded `normal_tma` against
+/// the master's own words instead of a byte-identical duplicate: only
+/// `transposed` is still stored, and only it is refreshed after a step.
 struct Bf16LinearWeights {
-    normal: DeviceBuffer<u32>,
     transposed: DeviceBuffer<u32>,
     normal_tma: Bf16PairsTmaMap,
     transposed_tma: Bf16PairsTmaMap,
 }
 
 impl Bf16LinearWeights {
+    /// `master` is the linear's packed `[rows, columns]` master, mapped in
+    /// place; `values` are the same weights on the host, for the transpose.
     fn new(
         stream: &CudaStream,
+        master: &DeviceBuffer<u32>,
         values: &[f32],
         rows: usize,
         columns: usize,
     ) -> Result<Self, Box<dyn Error>> {
         assert_eq!(values.len(), rows * columns);
-        let packed = pack_bf16_pairs(values);
         let mut transposed_values = vec![0.0f32; rows * columns];
         for row in 0..rows {
             for column in 0..columns {
                 transposed_values[column * rows + row] = values[row * columns + column];
             }
         }
-        let packed_t = pack_bf16_pairs(&transposed_values);
-        let normal = DeviceBuffer::from_host(stream, &packed)?;
-        let transposed = DeviceBuffer::from_host(stream, &packed_t)?;
-        // SAFETY: both allocations live beside their maps and are never
-        // replaced. Optimizer refreshes mutate their contents in place.
-        let normal_tma = unsafe {
-            create_bf16_pairs_tma_map(stream, &normal, columns, rows, TmaLayout::KMajor)?
-        };
+        let transposed = DeviceBuffer::from_host(stream, &pack_bf16_pairs(&transposed_values))?;
+        // SAFETY: `transposed` lives beside its map here and the master beside
+        // both in the owning linear; neither is ever reallocated, including on
+        // checkpoint resume, which refills masters in place. Optimizer
+        // write-back and the transpose refresh mutate contents only.
+        let normal_tma =
+            unsafe { create_bf16_pairs_tma_map(stream, master, columns, rows, TmaLayout::KMajor)? };
         let transposed_tma = unsafe {
             create_bf16_pairs_tma_map(stream, &transposed, rows, columns, TmaLayout::KMajor)?
         };
         Ok(Self {
-            normal,
             transposed,
             normal_tma,
             transposed_tma,
         })
     }
 
-    /// Refresh both copies from the master the optimizer just wrote.
-    ///
-    /// Master and `normal` are the same dtype and layout, so this is a device
-    /// copy rather than a quantize; only the transpose does real work.
+    /// Re-transpose the master the optimizer just wrote. The `[rows, columns]`
+    /// operand needs no refresh at all: the fused write-back already stored the
+    /// bytes its descriptor reads.
     fn sync_from_master(
         &mut self,
         master: &DeviceBuffer<u32>,
@@ -570,14 +570,13 @@ impl Bf16LinearWeights {
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        copy_device_region(&mut self.normal, 0, master, 0, rows * columns / 2, stream)?;
-        // SAFETY: `normal` holds the master's rows * columns packed pairs and
+        // SAFETY: the master holds rows * columns packed pairs and
         // `transposed` is the same allocation size.
         unsafe {
             kernels.transpose_bf16_pairs(
                 stream,
                 transpose_pairs_config(rows, columns),
-                &self.normal,
+                master,
                 rows as u32,
                 columns as u32,
                 &mut self.transposed,
@@ -781,13 +780,15 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         stream: &CudaStream,
         layer: &nn::Linear<N, IN, OUT>,
     ) -> Result<Self, Box<dyn Error>> {
+        let w = GpuBf16Tensor::from_f32_host(stream, layer.w.as_slice())?;
         let compute = if IN.is_multiple_of(TC_TILE) && OUT.is_multiple_of(TC_TILE) {
-            Some(Bf16LinearWeights::new(stream, layer.w.as_slice(), IN, OUT)?)
+            let values = layer.w.as_slice();
+            Some(Bf16LinearWeights::new(stream, w.as_words(), values, IN, OUT)?)
         } else {
             None
         };
         Ok(Self {
-            w: GpuBf16Tensor::from_f32_host(stream, layer.w.as_slice())?,
+            w,
             dw: GpuTensor::zeros(stream)?,
             compute,
         })
@@ -937,13 +938,21 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                 weights[destination..destination + OUT].copy_from_slice(source);
             }
         }
+        let w = GpuBf16Tensor::from_f32_host(stream, &weights)?;
         let compute = if IN.is_multiple_of(TC_TILE) && (GROUPS * OUT).is_multiple_of(TC_TILE) {
-            Some(Bf16LinearWeights::new(stream, &weights, IN, GROUPS * OUT)?)
+            let master = w.as_words();
+            Some(Bf16LinearWeights::new(
+                stream,
+                master,
+                &weights,
+                IN,
+                GROUPS * OUT,
+            )?)
         } else {
             None
         };
         Ok(Self {
-            w: GpuBf16Tensor::from_f32_host(stream, &weights)?,
+            w,
             dw: GpuTensor::zeros(stream)?,
             compute,
         })
@@ -1108,15 +1117,14 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
     }
 }
 
-/// Packed-bf16 compute copies for `experts` row-major `[rows, columns]`
-/// matrices held in one stacked allocation.
+/// The tcgen05 operands for `experts` row-major `[rows, columns]` matrices held
+/// in one stacked allocation.
 ///
-/// `normal` keeps experts contiguous. `transposed` is the transpose of the
-/// global `[experts * rows, columns]` matrix; each expert is addressed through
-/// a strided TMA descriptor, avoiding one allocation or transpose launch per
-/// expert.
+/// `normal_maps` address the stacked bf16 master itself, one strided descriptor
+/// per expert (#58). `transposed` is the transpose of the global
+/// `[experts * rows, columns]` matrix, likewise one strided descriptor per
+/// expert, which avoids an allocation or a transpose launch each.
 struct StackedBf16Weights {
-    normal: DeviceBuffer<u32>,
     transposed: DeviceBuffer<u32>,
     normal_maps: Vec<Bf16PairsTmaMap>,
     transposed_maps: Vec<Bf16PairsTmaMap>,
@@ -1126,8 +1134,11 @@ struct StackedBf16Weights {
 }
 
 impl StackedBf16Weights {
+    /// `master` is the stacked packed master `normal_maps` address in place;
+    /// `values` are the same weights on the host, for the transpose.
     fn new(
         stream: &CudaStream,
+        master: &DeviceBuffer<u32>,
         values: &[f32],
         experts: usize,
         rows: usize,
@@ -1142,13 +1153,15 @@ impl StackedBf16Weights {
             }
         }
 
-        let normal = DeviceBuffer::from_host(stream, &pack_bf16_pairs(values))?;
         let transposed = DeviceBuffer::from_host(stream, &pack_bf16_pairs(&transposed_values))?;
+        // SAFETY: `transposed` lives beside its maps here and the master beside
+        // both in the owning expert FFN; neither is ever reallocated, including
+        // on checkpoint resume, which refills masters in place.
         let normal_maps = (0..experts)
             .map(|expert| unsafe {
                 create_bf16_pairs_tma_map_region(
                     stream,
-                    &normal,
+                    master,
                     expert * rows * columns / 2,
                     columns,
                     rows,
@@ -1171,7 +1184,6 @@ impl StackedBf16Weights {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            normal,
             transposed,
             normal_maps,
             transposed_maps,
@@ -1181,22 +1193,20 @@ impl StackedBf16Weights {
         })
     }
 
-    /// Refresh both copies from the master; see
-    /// [`Bf16LinearWeights::sync_from_master`] for why `normal` is a copy.
+    /// Re-transpose the master; see [`Bf16LinearWeights::sync_from_master`] for
+    /// why the untransposed operand needs nothing.
     fn sync_from_master(
         &mut self,
         master: &DeviceBuffer<u32>,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        copy_device_region(&mut self.normal, 0, master, 0, master.len(), stream)?;
-        // SAFETY: `normal` mirrors the master's packed-pair length and
-        // `transposed` is allocated to the same size.
+        // SAFETY: `transposed` is allocated to the master's packed-pair length.
         unsafe {
             kernels.transpose_bf16_pairs(
                 stream,
                 transpose_pairs_config(self.experts * self.rows, self.columns),
-                &self.normal,
+                master,
                 (self.experts * self.rows) as u32,
                 self.columns as u32,
                 &mut self.transposed,
@@ -1669,17 +1679,23 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
                 .copy_from_slice(source.down_proj.w.as_slice());
         }
         let aligned = D.is_multiple_of(TC_TILE) && FF.is_multiple_of(TC_TILE);
+        let gate_up_master = GpuBf16Tensor::from_f32_host(stream, &gate_up)?;
+        let down_master = GpuBf16Tensor::from_f32_host(stream, &down)?;
+        let gate_up_compute = aligned
+            .then(|| {
+                StackedBf16Weights::new(stream, gate_up_master.as_words(), &gate_up, E, D, 2 * FF)
+            })
+            .transpose()?;
+        let down_compute = aligned
+            .then(|| StackedBf16Weights::new(stream, down_master.as_words(), &down, E, FF, D))
+            .transpose()?;
         Ok(Self {
-            gate_up: GpuBf16Tensor::from_f32_host(stream, &gate_up)?,
+            gate_up: gate_up_master,
             d_gate_up: GpuTensor::zeros(stream)?,
-            down: GpuBf16Tensor::from_f32_host(stream, &down)?,
+            down: down_master,
             d_down: GpuTensor::zeros(stream)?,
-            gate_up_compute: aligned
-                .then(|| StackedBf16Weights::new(stream, &gate_up, E, D, 2 * FF))
-                .transpose()?,
-            down_compute: aligned
-                .then(|| StackedBf16Weights::new(stream, &down, E, FF, D))
-                .transpose()?,
+            gate_up_compute,
+            down_compute,
         })
     }
 
@@ -1954,18 +1970,22 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         Ok(())
     }
 
+    /// The stacked global transpose of the gate/up master. Parity-test
+    /// accessor: binaries other than the parity check see it as dead code.
     #[allow(dead_code)]
-    pub fn gate_up_compute_words(&self) -> Option<(&DeviceBuffer<u32>, &DeviceBuffer<u32>)> {
+    pub fn gate_up_transposed_words(&self) -> Option<&DeviceBuffer<u32>> {
         self.gate_up_compute
             .as_ref()
-            .map(|weights| (&weights.normal, &weights.transposed))
+            .map(|weights| &weights.transposed)
     }
 
+    /// The stacked global transpose of the down master; see
+    /// [`Self::gate_up_transposed_words`].
     #[allow(dead_code)]
-    pub fn down_compute_words(&self) -> Option<(&DeviceBuffer<u32>, &DeviceBuffer<u32>)> {
+    pub fn down_transposed_words(&self) -> Option<&DeviceBuffer<u32>> {
         self.down_compute
             .as_ref()
-            .map(|weights| (&weights.normal, &weights.transposed))
+            .map(|weights| &weights.transposed)
     }
 }
 
@@ -2290,16 +2310,14 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
 
 /// bf16 lm-head over a bf16 master (§7; masters converted in #57).
 ///
-/// The compute weight exists in both layouts the tcgen05 `C = A B^T` form
-/// needs as a K-contiguous `B` operand: `w` is `[D, VP]` (consumed by the
-/// input-gradient GEMM) and `w_t` is `[VP, D]` (consumed by the forward
-/// GEMM). `master` is the source of truth; the optimizer updates it and
-/// refreshes both compute copies every step — `w` by copy, since master and
-/// compute now share a dtype and layout. `dw` accumulates in packed bf16,
-/// produced directly by the tcgen05 accumulate epilogue.
+/// The weight is needed in both layouts the tcgen05 `C = A B^T` form takes as
+/// a K-contiguous `B` operand: `[D, VP]` for the input-gradient GEMM and
+/// `[VP, D]` for the forward. The first *is* the master — `w_tma` maps its
+/// words in place (#58) — so only `w_t` is stored beside it, and only `w_t` is
+/// refreshed after a step. `dw` accumulates in packed bf16, produced directly
+/// by the tcgen05 accumulate epilogue.
 pub struct GpuBf16Head<const D: usize, const VP: usize> {
     pub master: GpuBf16Tensor<Rank2<D, VP>>,
-    w: DeviceBuffer<u32>,
     w_t: DeviceBuffer<u32>,
     dw: DeviceBuffer<u32>,
     w_tma: Bf16PairsTmaMap,
@@ -2321,13 +2339,12 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
     }
 
     /// Rebuild the head from padded `[D, VP]` fp32 values, rounding the master
-    /// and both packed compute copies on the host.
+    /// and its transpose on the host.
     pub(crate) fn from_master_values(
         stream: &CudaStream,
         values: &[f32],
     ) -> Result<Self, Box<dyn Error>> {
         assert_eq!(values.len(), D * VP);
-        let compute = pack_bf16_pairs(values);
         let mut transposed_values = vec![0.0f32; VP * D];
         for row in 0..D {
             for column in 0..VP {
@@ -2336,16 +2353,17 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         }
 
         let master = GpuBf16Tensor::from_f32_host(stream, values)?;
-        let w = DeviceBuffer::from_host(stream, &compute)?;
         let w_t = DeviceBuffer::from_host(stream, &pack_bf16_pairs(&transposed_values))?;
         let dw = DeviceBuffer::zeroed(stream, D * VP / 2)?;
-        // SAFETY: `w` and `w_t` live in this struct beside their maps and are
-        // never reallocated.
-        let w_tma = unsafe { create_bf16_pairs_tma_map(stream, &w, VP, D, TmaLayout::KMajor)? };
+        // SAFETY: the master and `w_t` live in this struct beside their maps
+        // and are never reallocated — checkpoint resume rebuilds the whole
+        // head through this constructor, maps included.
+        let w_tma = unsafe {
+            create_bf16_pairs_tma_map(stream, master.as_words(), VP, D, TmaLayout::KMajor)?
+        };
         let w_t_tma = unsafe { create_bf16_pairs_tma_map(stream, &w_t, D, VP, TmaLayout::KMajor)? };
         Ok(Self {
             master,
-            w,
             w_t,
             dw,
             w_tma,
@@ -2358,13 +2376,6 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
     #[allow(dead_code)]
     pub fn dw_words(&self) -> &DeviceBuffer<u32> {
         &self.dw
-    }
-
-    /// Packed-bf16 `[D, VP]` compute weights. Parity-test accessor: binaries
-    /// other than the parity check see it as dead code.
-    #[allow(dead_code)]
-    pub fn w_words(&self) -> &DeviceBuffer<u32> {
-        &self.w
     }
 
     /// Packed-bf16 `[VP, D]` transposed compute weights. Parity-test accessor:
@@ -2488,25 +2499,19 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         }
     }
 
-    /// Refresh both compute copies from the master after an optimizer step.
+    /// Re-transpose the master after an optimizer step; the `[D, VP]` operand
+    /// is the master itself and needs nothing.
     fn sync_compute(
         &mut self,
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        copy_device_region(
-            &mut self.w,
-            0,
-            self.master.as_words(),
-            0,
-            D * VP / 2,
-            stream,
-        )?;
+        // SAFETY: the master and `w_t` are both D * VP / 2 packed words.
         unsafe {
             kernels.transpose_bf16_pairs(
                 stream,
                 transpose_pairs_config(D, VP),
-                &self.w,
+                self.master.as_words(),
                 D as u32,
                 VP as u32,
                 &mut self.w_t,

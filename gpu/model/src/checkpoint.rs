@@ -114,16 +114,20 @@ fn write_master<S: Shape>(
     Ok(())
 }
 
-fn read_master<S: Shape>(
+/// Refill a master in place. The tensor is never replaced: since #58 the
+/// forward and backward TMA descriptors are encoded against the master's own
+/// device address.
+fn read_master_into<S: Shape>(
     reader: &mut impl Read,
+    tensor: &mut GpuBf16Tensor<S>,
     stream: &CudaStream,
-) -> Result<GpuBf16Tensor<S>, Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let mut bits = vec![0u16; S::NUM_ELEMENTS];
     let bytes =
         unsafe { std::slice::from_raw_parts_mut(bits.as_mut_ptr().cast::<u8>(), bits.len() * 2) };
     reader.read_exact(bytes)?;
     let values: Vec<f32> = bits.iter().map(|&b| bf16::from_bits(b).to_f32()).collect();
-    Ok(GpuBf16Tensor::from_f32_host(stream, &values)?)
+    Ok(tensor.load_f32_host(stream, &values)?)
 }
 
 /// Write a padded `[D, VP]` fp32 head tensor (a moment) as its first `vocab`
@@ -375,7 +379,7 @@ pub fn load<
 
     macro_rules! read_master_parameter {
         ($parameter:expr, $moments:expr) => {
-            *$parameter = read_master(&mut reader, stream)?;
+            read_master_into(&mut reader, $parameter, stream)?;
             $moments.first = read_tensor(&mut reader, stream)?;
             $moments.second = read_tensor(&mut reader, stream)?;
         };

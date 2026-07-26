@@ -136,7 +136,7 @@ two adjacent row elements).
 
 | | dtype | why |
 |---|---|---|
-| embedding, `qkv_proj`, `o_proj`, stacked experts, `lm_head` | bf16 master | 4.39B of the 4.39B params; the compute copies were already bf16 |
+| embedding, `qkv_proj`, `o_proj`, stacked experts, `lm_head` | bf16 master | 4.39B of the 4.39B params; the compute copies were already bf16, and since #58 the master *is* the untransposed one |
 | norm weights | fp32 | `2·L+1` vectors of `D` — no memory leverage, high sensitivity |
 | router | fp32 | decision #22: rounding near a top-k boundary reassigns tokens |
 | AdamW first/second moments | fp32 | the second moment sits inside a `sqrt` in a denominator |
@@ -1163,8 +1163,10 @@ Each gated on tests; correctness before speed at every step.
      `optimizer.experts.sync_compute` 5.52 → 7.11 ms (+29%) and
      `optimizer.lm_head.sync_w_t` 0.242 → 0.306 (+26%) — the two spans whose
      time is `transpose_bf16_pairs`, and the only spans anywhere in the step
-     that move by more than a few percent (≈1.7 ms of the 21; #58 deletes
-     `sync_w_t` and the redundant compute copies outright). Flat: everything
+     that move by more than a few percent (≈1.7 ms of the 21; #58 step 1 then
+     deleted the redundant compute copies, taking those spans back to 4.77 and
+     0.209 ms — the surviving `transpose_bf16_pairs` is what step 2 would have
+     retired). Flat: everything
      else sits at +3%, uniform across memory-bound AdamW and compute-bound
      tcgen05 alike, which is the signature of container epoch rather than
      codegen — and the kernel-level flash benches, the one measurement directly
@@ -1173,6 +1175,52 @@ Each gated on tests; correctness before speed at every step.
      against 2.425 / 181, with ptxas budgets unchanged to the byte (persistent
      206 regs / 592 spill / maxntid 192). The `transpose_bf16_pairs` cost is
      the one thing the bump is actually on the hook for.
+   - ✅ **The bf16 master is the untransposed compute operand** (#58 step 1):
+     #57 made the masters packed bf16, which left every aligned parameter
+     carrying a `normal` compute copy byte-identical to its master plus a device
+     copy per step to keep the two equal. Encoding the forward/backward TMA
+     descriptor against the master's own words deletes both. Gone: the `normal`
+     buffer of `Bf16LinearWeights` and `StackedBf16Weights`, `GpuBf16Head.w`,
+     and the `copy_device_region` half of every `sync_compute`; what remains of
+     those spans is the `transpose_bf16_pairs` that still feeds the `transposed`
+     operand. The descriptors bind to fixed device addresses, so the masters
+     inherit the copies' never-reallocate discipline — which is what
+     `GpuBf16Tensor::load_f32_host` is for: checkpoint resume used to *replace*
+     the master, which would now free the memory every compute map points at,
+     and instead refills the words in place. **B200 same-container A/B vs main
+     (4471225) at the §13.9 shape (B=12 T=2048):** VRAM 145.7 → 137.8 GiB
+     (−7.9 GiB, exactly 2 bytes × the 4.23B copy-bearing params; free headroom
+     32.6 → 40.5 GiB, +24%), full step 575.57 → 572.12 ms (−0.6%). The sync
+     spans lose their copy half and nothing else moves:
+     `optimizer.experts.sync_compute` 7.05 → 4.77 ms, `qkv_proj.sync_compute`
+     0.731 → 0.534, `o_proj.sync_compute` 0.298 → 0.235,
+     `lm_head.sync_w_t` 0.304 → 0.209 — 8.38 → 5.74 ms of sync in total.
+   - ⛔ **Dropping the `transposed` copies too** (#58 step 2): **implemented,
+     measured, and reverted.** The issue expected the `transposed` copies to
+     feed the `dx = dy·Wᵀ` GEMMs; after step 1 they feed the *forward* GEMMs
+     instead (`dx` reads the master K-major, which is what the default
+     `C = A·Bᵀ` wants), so the conversion is `y = x·W` reading its weight
+     MN-major out of the master's `[K, N]` layout. That needs something #53 did
+     not build: `transpose_a` and `transpose_b` as *independent* bits, since the
+     forward's activation operand must stay K-major while only the weight
+     transposes. Splitting the kernel's `transposed` argument into a two-bit
+     mask is small and demonstrably correct — the new `run.sh gemm` case
+     asserted the mixed-mode output **bit-identical** to the same GEMM fed a
+     materialized transpose, at 256x256x256, 512x768x512, and 256x1024x768
+     (one tile, several N tiles, several K pipeline cycles), and every CPU
+     parity gate passed. What stopped it: the 1200-step aligned-MoE overfit gate
+     landed at **0.051512** against its `< 0.05` threshold, twice, bit-for-bit
+     identical across reruns, where step 1 reaches 0.000060. Since the GEMM
+     itself is bit-identical, the trajectory change has to enter through
+     something order-sensitive — the embedding backward's float atomics are the
+     candidate, their interleaving perturbed by five fewer launches per step —
+     and near the documented bf16 master-weight plateau (§7) a perturbation that
+     small decides whether 1200 steps is enough to escape. Benign or not, a
+     reproducible red gate is not shippable, so the whole step is reverted; the
+     prize it leaves on the table is a second **7.9 GiB** and the last
+     **5.74 ms** of sync spans. Whoever picks it up starts from a proven
+     descriptor route and should first establish whether that overfit gate is
+     measuring convergence or launch-order luck.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 
@@ -1204,3 +1252,4 @@ Each gated on tests; correctness before speed at every step.
 | 22 | MoE router is fp32 over bf16 experts | Routing is discrete: bf16 rounding near a top-k boundary doesn't perturb the output, it reassigns the token (the 7e7 bf16 two-logit tie showed how violently trajectories react to that). The router GEMM is `[N,D]×[D,E]` — skinny, off the tcgen05 tile contract, and a rounding-error share of step FLOPs — so fp32 costs nothing measurable while keeping gate weights and the aux loss in the precision gradcheck trusts |
 | 23 | bf16 masters (successor to #8) | #8's fp32 masters bought gradcheck clarity, and the price rose with the model: 16.3 GiB of the 4.39B config and half of every checkpoint, duplicating bf16 compute copies that already existed beside them. The update stays fp32 against fp32 moments — only the write-back is bf16 — so what was actually given up is sub-half-ulp accumulation across steps, and the overfit gates (the documented knife-edge sensor) converge on round-to-nearest with margin. Stochastic rounding is implemented in the same kernel behind one constant for when they stop, deterministic by construction (splitmix64 keyed on step/parameter/element, never runtime entropy) so bit-identical reruns and resumes survive either choice. Norms, the router (#22), moments, and Muon's fp32 internals stay fp32 — all cheap and all numerically load-bearing |
 | 24 | Pin cuda-oxide to immutable upstream revisions | The tcgen05 generated-intrinsics API evolves between releases; one SHA keeps the codegen backend, proc macros, device crates, lockfiles, and Modal image reproducible and unlocks `tcgen05.st` without carrying a fork |
+| 25 | Masters are TMA-mapped in place; nothing may reallocate one | Once a parameter's own words are a GEMM operand (#58), the tensor map encoded against its device address outlives every launch, so a master is refilled (`GpuBf16Tensor::load_f32_host`) rather than replaced. The alternative — rebuilding descriptors whenever a master is rewritten — puts a correctness obligation on every future load path instead of on one constructor, and checkpoint resume is exactly the path where a stale descriptor would go unnoticed |
