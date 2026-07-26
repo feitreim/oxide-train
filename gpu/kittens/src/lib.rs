@@ -18,13 +18,10 @@
 //! into pure-PTX artifacts like flash-attn's `flash.ptx`, which libNVVM
 //! would reject for its tcgen05 constructs.
 //!
-//! Modules through phase 3 (shared tiles, TMA global layouts, semaphores,
-//! register tiles + maps, stmatrix movers, TMEM views, MMA walks); the
-//! pipeline harness lands in a later phase:
-
 pub mod global;
 pub mod ldst;
 pub mod mma;
+pub mod pipeline;
 pub mod reg;
 pub mod shared;
 pub mod sync;

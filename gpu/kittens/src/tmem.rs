@@ -13,7 +13,45 @@
 //! not what the instruction touches.
 
 use cuda_device::cusimd::TmemRegs4;
-use cuda_device::tcgen05::{tcgen05_ld_16x256b_pure, tcgen05_load_wait};
+use cuda_device::tcgen05::{
+    tcgen05_alloc, tcgen05_dealloc, tcgen05_ld_16x256b_pure, tcgen05_load_wait,
+};
+use cuda_device::{thread, warp};
+
+/// CTA-wide TMEM allocation, the lifecycle every tcgen05 kernel opens with:
+/// warp 0 allocates `columns` into the shared staging word, a block sync
+/// publishes it, and every thread reads back the address.
+///
+/// # Safety
+///
+/// Every thread of the block must call this together; `slot` must point to
+/// shared memory (a `SharedArray<u32, 1, 4>` static).
+#[inline(always)]
+pub unsafe fn alloc_block(slot: *mut u32, columns: u32) -> u32 {
+    unsafe {
+        if warp::warp_id() == 0 {
+            tcgen05_alloc(slot, columns);
+        }
+        thread::sync_threads();
+        *(slot as *const u32)
+    }
+}
+
+/// Release the CTA's TMEM allocation from warp 0, after the caller's own
+/// fence/sync has retired every outstanding read of it.
+///
+/// # Safety
+///
+/// No thread may touch the allocation afterwards; `columns` must match the
+/// [`alloc_block`] call.
+#[inline(always)]
+pub unsafe fn dealloc_block(address: u32, columns: u32) {
+    unsafe {
+        if warp::warp_id() == 0 {
+            tcgen05_dealloc(address, columns);
+        }
+    }
+}
 
 /// An fp32 accumulator segment in tensor memory.
 #[derive(Clone, Copy)]

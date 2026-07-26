@@ -44,6 +44,15 @@ use host::{
 /// the sync oracle dipped 126→115 with its 8-reg drop, tolerated because
 /// it is a correctness reference, not a production path. The pins track
 /// the measured allocation rather than fighting ordering sensitivity.
+///
+/// Phase-4 re-pins (2026-07-26): the pipeline.rs port (forward kernels
+/// fully on kittens semaphores/streams, persistent scaffold extracted to
+/// `pipeline::run`) lands at pipelined 180 / persistent 240 — +1 each with
+/// opcode-identical-or-smaller PTX (persistent net −1 instruction), stable
+/// across two formulations; a third formulation that reordered barrier
+/// init after the TMEM alloc cost pipelined +3 more and was reverted, so
+/// the init-before-alloc ordering is deliberate. Sync stays 40, backwards
+/// untouched. No occupancy boundary anywhere near (TMEM pins 1 CTA/SM).
 const KERNEL_BUDGETS: [KernelBudget; 5] = [
     KernelBudget {
         name: "forward sync",
@@ -52,12 +61,12 @@ const KERNEL_BUDGETS: [KernelBudget; 5] = [
     },
     KernelBudget {
         name: "forward pipelined",
-        max_registers: 179,
+        max_registers: 180,
         max_spill_bytes: 592,
     },
     KernelBudget {
         name: "forward persistent",
-        max_registers: 239,
+        max_registers: 240,
         max_spill_bytes: 592,
     },
     KernelBudget {

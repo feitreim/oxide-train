@@ -68,24 +68,25 @@
 
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{
-    Barrier, fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_expect_tx,
-    mbarrier_init, mbarrier_inval, mbarrier_try_wait_parity,
+    Barrier, fence_proxy_async_shared_cta, mbarrier_arrive_expect_tx, mbarrier_init,
+    mbarrier_inval, mbarrier_try_wait_parity,
 };
 use cuda_device::shared::{DynamicSharedArray, SharedArray};
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    cvt_f32x2_bf16x2, tcgen05_alloc, tcgen05_commit_shared_cluster,
-    tcgen05_dealloc, tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync,
-    tcgen05_ld_16x256b_pure, tcgen05_load_wait,
+    cvt_f32x2_bf16x2, tcgen05_alloc, tcgen05_commit_shared_cluster, tcgen05_dealloc,
+    tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync, tcgen05_ld_16x256b_pure,
+    tcgen05_load_wait,
 };
 use cuda_device::tma::{TmaDescriptor, cp_async_bulk_tensor_3d_g2s};
 use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
 use kittens::ldst::stmatrix_m8n8_x2;
-use kittens::mma::{mma_ab, mma_abt};
+use kittens::mma::{self, mma_ab, mma_abt};
+use kittens::pipeline;
 use kittens::reg::{RegTile, RegVec, exp2_approx, fmax, log2_approx, online_rescale};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
-use kittens::sync::SemaphoreRing;
-use kittens::tmem::TmemTile;
+use kittens::sync::{Semaphore, SemaphoreRing};
+use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
 
 // Tile contract; `host.rs` mirrors these as FLASH_TILE / FLASH_HD (kept
 // non-pub here so SWEEP's one-definition rule never sees two copies).
@@ -106,8 +107,11 @@ const HD: usize = 128;
 /// moves the pipelined kernel's loader warp onto these; later phases absorb
 /// the rest of the raw swizzle/barrier machinery.
 type Panel = SharedTile<Bf16, TILE, HD, Swizzle128B>;
-/// A `PIPELINE_STAGES`-deep ring of panels (the K and V streams).
-type PanelRing = SharedTileRing<Bf16, TILE, HD, Swizzle128B, PIPELINE_STAGES>;
+/// An `N`-deep ring of panels (the K and V streams); the pipelined and
+/// persistent kernels pick their own stage depths.
+type PanelRingN<const N: usize> = SharedTileRing<Bf16, TILE, HD, Swizzle128B, N>;
+type PanelRing = PanelRingN<PIPELINE_STAGES>;
+type PersistentPanelRing = PanelRingN<PERSISTENT_STAGES>;
 /// The single-subtile `[TILE, TILE]` bf16 probability tile the softmax
 /// warpgroup writes with swizzled `stmatrix` stores. Its `swizzled_chunk`
 /// folds in the tile base's absolute 128-byte row phase — the fact the
@@ -172,7 +176,8 @@ pub const PIPELINE_STAGES: usize = 3;
 const _: () = assert!(2 <= PIPELINE_STAGES && PIPELINE_STAGES <= 4);
 /// Dynamic shared plan of the pipelined kernel: Q, the K and V rings, and
 /// the single P subtile.
-pub const FLASH_PIPELINE_SMEM: usize = (1 + 2 * PIPELINE_STAGES) * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
+pub const FLASH_PIPELINE_SMEM: usize =
+    (1 + 2 * PIPELINE_STAGES) * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
 /// Threads of the pipelined kernel: the softmax/correction/epilogue
 /// warpgroup plus the TMA-load warp and the MMA-issue warp.
 pub const FLASH_PIPELINE_BLOCK: usize = TILE + 64;
@@ -205,7 +210,11 @@ pub const CORRECTION_THRESHOLD: f32 = 8.0;
 /// K/V ring depth of the persistent kernel: `PIPELINE_STAGES` capped at 3 so
 /// the doubled Q/P footprint of two workstreams stays inside the ~227 KiB
 /// shared-memory budget.
-pub const PERSISTENT_STAGES: usize = if PIPELINE_STAGES < 3 { PIPELINE_STAGES } else { 3 };
+pub const PERSISTENT_STAGES: usize = if PIPELINE_STAGES < 3 {
+    PIPELINE_STAGES
+} else {
+    3
+};
 /// Dynamic shared plan of the persistent kernel: two Q panels, the K and V
 /// rings, and one P subtile per workstream.
 pub const FLASH_PERSISTENT_SMEM: usize =
@@ -304,7 +313,7 @@ pub mod kernels {
         lane: u32,
         p: PTile,
         votes: *mut u32,
-        vote_barrier: *const Barrier,
+        vote: Semaphore,
         m_ref: &mut RegVec<4>,
         running_sum: &mut RegVec<4>,
         out_acc: &mut RegTile<4, 32>,
@@ -330,21 +339,57 @@ pub mod kernels {
                         let col = column + 2 * quad as u32;
                         let mut max_a = tile_max.0[slot_a];
                         max_a = fmax(max_a, if col <= row_a { low[0] } else { MASKED_SCORE });
-                        max_a =
-                            fmax(max_a, if col + 1 <= row_a { low[1] } else { MASKED_SCORE });
-                        max_a =
-                            fmax(max_a, if col + 8 <= row_a { high[0] } else { MASKED_SCORE });
-                        max_a =
-                            fmax(max_a, if col + 9 <= row_a { high[1] } else { MASKED_SCORE });
+                        max_a = fmax(
+                            max_a,
+                            if col + 1 <= row_a {
+                                low[1]
+                            } else {
+                                MASKED_SCORE
+                            },
+                        );
+                        max_a = fmax(
+                            max_a,
+                            if col + 8 <= row_a {
+                                high[0]
+                            } else {
+                                MASKED_SCORE
+                            },
+                        );
+                        max_a = fmax(
+                            max_a,
+                            if col + 9 <= row_a {
+                                high[1]
+                            } else {
+                                MASKED_SCORE
+                            },
+                        );
                         tile_max.0[slot_a] = max_a;
                         let mut max_b = tile_max.0[slot_b];
                         max_b = fmax(max_b, if col <= row_b { low[2] } else { MASKED_SCORE });
-                        max_b =
-                            fmax(max_b, if col + 1 <= row_b { low[3] } else { MASKED_SCORE });
-                        max_b =
-                            fmax(max_b, if col + 8 <= row_b { high[2] } else { MASKED_SCORE });
-                        max_b =
-                            fmax(max_b, if col + 9 <= row_b { high[3] } else { MASKED_SCORE });
+                        max_b = fmax(
+                            max_b,
+                            if col + 1 <= row_b {
+                                low[3]
+                            } else {
+                                MASKED_SCORE
+                            },
+                        );
+                        max_b = fmax(
+                            max_b,
+                            if col + 8 <= row_b {
+                                high[2]
+                            } else {
+                                MASKED_SCORE
+                            },
+                        );
+                        max_b = fmax(
+                            max_b,
+                            if col + 9 <= row_b {
+                                high[3]
+                            } else {
+                                MASKED_SCORE
+                            },
+                        );
                         tile_max.0[slot_b] = max_b;
                     } else {
                         tile_max.0[slot_a] = fmax(
@@ -371,8 +416,8 @@ pub mod kernels {
             if lane == 0 {
                 *votes.add((parity * 4 + warp_id) as usize) = warp_vote as u32;
             }
-            mbarrier_arrive(vote_barrier);
-            while !mbarrier_try_wait_parity(vote_barrier, parity) {}
+            vote.arrive();
+            vote.wait(parity);
             // Only two warps make up the softmax warpgroup at TILE=64, so the
             // warpgroup-wide OR spans two vote words.
             let base = (parity * 4) as usize;
@@ -404,14 +449,46 @@ pub mod kernels {
                     let row_b = row_a + 8;
                     let col = column + 2 * quad as u32;
 
-                    let s_a0 = if !diagonal || col <= row_a { low[0] } else { MASKED_SCORE };
-                    let s_a1 = if !diagonal || col + 1 <= row_a { low[1] } else { MASKED_SCORE };
-                    let s_a8 = if !diagonal || col + 8 <= row_a { high[0] } else { MASKED_SCORE };
-                    let s_a9 = if !diagonal || col + 9 <= row_a { high[1] } else { MASKED_SCORE };
-                    let s_b0 = if !diagonal || col <= row_b { low[2] } else { MASKED_SCORE };
-                    let s_b1 = if !diagonal || col + 1 <= row_b { low[3] } else { MASKED_SCORE };
-                    let s_b8 = if !diagonal || col + 8 <= row_b { high[2] } else { MASKED_SCORE };
-                    let s_b9 = if !diagonal || col + 9 <= row_b { high[3] } else { MASKED_SCORE };
+                    let s_a0 = if !diagonal || col <= row_a {
+                        low[0]
+                    } else {
+                        MASKED_SCORE
+                    };
+                    let s_a1 = if !diagonal || col + 1 <= row_a {
+                        low[1]
+                    } else {
+                        MASKED_SCORE
+                    };
+                    let s_a8 = if !diagonal || col + 8 <= row_a {
+                        high[0]
+                    } else {
+                        MASKED_SCORE
+                    };
+                    let s_a9 = if !diagonal || col + 9 <= row_a {
+                        high[1]
+                    } else {
+                        MASKED_SCORE
+                    };
+                    let s_b0 = if !diagonal || col <= row_b {
+                        low[2]
+                    } else {
+                        MASKED_SCORE
+                    };
+                    let s_b1 = if !diagonal || col + 1 <= row_b {
+                        low[3]
+                    } else {
+                        MASKED_SCORE
+                    };
+                    let s_b8 = if !diagonal || col + 8 <= row_b {
+                        high[2]
+                    } else {
+                        MASKED_SCORE
+                    };
+                    let s_b9 = if !diagonal || col + 9 <= row_b {
+                        high[3]
+                    } else {
+                        MASKED_SCORE
+                    };
                     let p_a0 = exp2_approx(s_a0 - m_ref.0[slot_a]);
                     let p_a1 = exp2_approx(s_a1 - m_ref.0[slot_a]);
                     let p_a8 = exp2_approx(s_a8 - m_ref.0[slot_a]);
@@ -426,7 +503,11 @@ pub mod kernels {
                     // P is a single 64-wide subtile (128-byte rows), so the
                     // eight 16-byte chunks index the whole row directly.
                     let chunk_low = (column_block * 2) as usize;
-                    let chunk = if (8..16).contains(&lane) { chunk_low + 1 } else { chunk_low };
+                    let chunk = if (8..16).contains(&lane) {
+                        chunk_low + 1
+                    } else {
+                        chunk_low
+                    };
                     let row_low = tmem_row as usize + (lane % 8) as usize;
                     let row_high = row_low + 8;
                     stmatrix_m8n8_x2(
@@ -510,16 +591,14 @@ pub mod kernels {
             while slot < 4 {
                 let local_row =
                     warp_id as usize * 32 + (slot / 2) * 16 + (slot % 2) * 8 + row_in_16;
-                let global_row =
-                    (batch * t) as usize + query_tile as usize * TILE + local_row;
+                let global_row = (batch * t) as usize + query_tile as usize * TILE + local_row;
                 let inverse = 1.0 / running_sum.0[slot];
                 let out_base = global_row * d_model + head as usize * HD;
                 let mut column_block = 0usize;
                 while column_block < 8 {
                     let column = column_block * 16 + 2 * quad;
                     let base = column_block * 4;
-                    *output.get_unchecked_mut(out_base + column) =
-                        out_acc.0[slot][base] * inverse;
+                    *output.get_unchecked_mut(out_base + column) = out_acc.0[slot][base] * inverse;
                     *output.get_unchecked_mut(out_base + column + 1) =
                         out_acc.0[slot][base + 1] * inverse;
                     *output.get_unchecked_mut(out_base + column + 8) =
@@ -543,16 +622,8 @@ pub mod kernels {
     /// phantom rows 64..128 read the operand's `TILE_BYTES` tail and land in
     /// accumulator rows the drain never touches.
     #[inline(always)]
-    unsafe fn score_mma(s_tmem: u32, q_smem: *mut u8, k_smem: *mut u8, s_instruction: u32) {
-        unsafe {
-            mma_abt(
-                s_tmem,
-                Panel::from_raw(q_smem),
-                Panel::from_raw(k_smem),
-                s_instruction,
-                false,
-            );
-        }
+    unsafe fn score_mma(s_tmem: u32, q: Panel, k: Panel, s_instruction: u32) {
+        unsafe { mma_abt(s_tmem, q, k, s_instruction, false) }
     }
 
     /// Store one thread's eight-value bf16 fragment into a stacked
@@ -583,15 +654,25 @@ pub mod kernels {
             // The dS / Pᵀ / dSᵀ operands are a single 64-wide subtile
             // (128-byte rows), so the eight 16-byte chunks index the row.
             let chunk_low = (column_block * 2) as usize;
-            let chunk = if (8..16).contains(&lane) { chunk_low + 1 } else { chunk_low };
+            let chunk = if (8..16).contains(&lane) {
+                chunk_low + 1
+            } else {
+                chunk_low
+            };
             let row_low = tmem_row as usize + (lane % 8) as usize;
             let row_high = row_low + 8;
-            let address_low =
-                smem.add(row_low * 128 + (chunk ^ ((row_low + phase) & 7)) * 16);
-            let address_high =
-                smem.add(row_high * 128 + (chunk ^ ((row_high + phase) & 7)) * 16);
-            stmatrix_m8n8_x2(address_low, cvt_f32x2_bf16x2(a0, a1), cvt_f32x2_bf16x2(a8, a9));
-            stmatrix_m8n8_x2(address_high, cvt_f32x2_bf16x2(b0, b1), cvt_f32x2_bf16x2(b8, b9));
+            let address_low = smem.add(row_low * 128 + (chunk ^ ((row_low + phase) & 7)) * 16);
+            let address_high = smem.add(row_high * 128 + (chunk ^ ((row_high + phase) & 7)) * 16);
+            stmatrix_m8n8_x2(
+                address_low,
+                cvt_f32x2_bf16x2(a0, a1),
+                cvt_f32x2_bf16x2(a8, a9),
+            );
+            stmatrix_m8n8_x2(
+                address_high,
+                cvt_f32x2_bf16x2(b0, b1),
+                cvt_f32x2_bf16x2(b8, b9),
+            );
         }
     }
 
@@ -650,31 +731,84 @@ pub mod kernels {
                     let lse_b = *lse2.add(row_b as usize);
                     let dot_b = *dot.add(row_b as usize);
 
-                    let ds_a0 =
-                        backward_dscore(s_low[0], dp_low[0], lse_a, dot_a, SCALE, !diagonal || col <= row_a);
+                    let ds_a0 = backward_dscore(
+                        s_low[0],
+                        dp_low[0],
+                        lse_a,
+                        dot_a,
+                        SCALE,
+                        !diagonal || col <= row_a,
+                    );
                     let ds_a1 = backward_dscore(
-                        s_low[1], dp_low[1], lse_a, dot_a, SCALE, !diagonal || col + 1 <= row_a,
+                        s_low[1],
+                        dp_low[1],
+                        lse_a,
+                        dot_a,
+                        SCALE,
+                        !diagonal || col + 1 <= row_a,
                     );
                     let ds_a8 = backward_dscore(
-                        s_high[0], dp_high[0], lse_a, dot_a, SCALE, !diagonal || col + 8 <= row_a,
+                        s_high[0],
+                        dp_high[0],
+                        lse_a,
+                        dot_a,
+                        SCALE,
+                        !diagonal || col + 8 <= row_a,
                     );
                     let ds_a9 = backward_dscore(
-                        s_high[1], dp_high[1], lse_a, dot_a, SCALE, !diagonal || col + 9 <= row_a,
+                        s_high[1],
+                        dp_high[1],
+                        lse_a,
+                        dot_a,
+                        SCALE,
+                        !diagonal || col + 9 <= row_a,
                     );
-                    let ds_b0 =
-                        backward_dscore(s_low[2], dp_low[2], lse_b, dot_b, SCALE, !diagonal || col <= row_b);
+                    let ds_b0 = backward_dscore(
+                        s_low[2],
+                        dp_low[2],
+                        lse_b,
+                        dot_b,
+                        SCALE,
+                        !diagonal || col <= row_b,
+                    );
                     let ds_b1 = backward_dscore(
-                        s_low[3], dp_low[3], lse_b, dot_b, SCALE, !diagonal || col + 1 <= row_b,
+                        s_low[3],
+                        dp_low[3],
+                        lse_b,
+                        dot_b,
+                        SCALE,
+                        !diagonal || col + 1 <= row_b,
                     );
                     let ds_b8 = backward_dscore(
-                        s_high[2], dp_high[2], lse_b, dot_b, SCALE, !diagonal || col + 8 <= row_b,
+                        s_high[2],
+                        dp_high[2],
+                        lse_b,
+                        dot_b,
+                        SCALE,
+                        !diagonal || col + 8 <= row_b,
                     );
                     let ds_b9 = backward_dscore(
-                        s_high[3], dp_high[3], lse_b, dot_b, SCALE, !diagonal || col + 9 <= row_b,
+                        s_high[3],
+                        dp_high[3],
+                        lse_b,
+                        dot_b,
+                        SCALE,
+                        !diagonal || col + 9 <= row_b,
                     );
                     write_bf16_fragment(
-                        ds_smem, ds_phase, tmem_row, column_block, lane, ds_a0, ds_a1, ds_a8,
-                        ds_a9, ds_b0, ds_b1, ds_b8, ds_b9,
+                        ds_smem,
+                        ds_phase,
+                        tmem_row,
+                        column_block,
+                        lane,
+                        ds_a0,
+                        ds_a1,
+                        ds_a8,
+                        ds_a9,
+                        ds_b0,
+                        ds_b1,
+                        ds_b8,
+                        ds_b9,
                     );
                     column_block += 1;
                 }
@@ -728,20 +862,46 @@ pub mod kernels {
                     let lse_c9 = *lse2.add(col as usize + 9);
                     let dot_c9 = *dot.add(col as usize + 9);
 
-                    let p_a0 = if !diagonal || row_a <= col { exp2_approx(s_low[0] - lse_c0) } else { 0.0 };
-                    let p_a1 =
-                        if !diagonal || row_a <= col + 1 { exp2_approx(s_low[1] - lse_c1) } else { 0.0 };
-                    let p_a8 =
-                        if !diagonal || row_a <= col + 8 { exp2_approx(s_high[0] - lse_c8) } else { 0.0 };
-                    let p_a9 =
-                        if !diagonal || row_a <= col + 9 { exp2_approx(s_high[1] - lse_c9) } else { 0.0 };
-                    let p_b0 = if !diagonal || row_b <= col { exp2_approx(s_low[2] - lse_c0) } else { 0.0 };
-                    let p_b1 =
-                        if !diagonal || row_b <= col + 1 { exp2_approx(s_low[3] - lse_c1) } else { 0.0 };
-                    let p_b8 =
-                        if !diagonal || row_b <= col + 8 { exp2_approx(s_high[2] - lse_c8) } else { 0.0 };
-                    let p_b9 =
-                        if !diagonal || row_b <= col + 9 { exp2_approx(s_high[3] - lse_c9) } else { 0.0 };
+                    let p_a0 = if !diagonal || row_a <= col {
+                        exp2_approx(s_low[0] - lse_c0)
+                    } else {
+                        0.0
+                    };
+                    let p_a1 = if !diagonal || row_a <= col + 1 {
+                        exp2_approx(s_low[1] - lse_c1)
+                    } else {
+                        0.0
+                    };
+                    let p_a8 = if !diagonal || row_a <= col + 8 {
+                        exp2_approx(s_high[0] - lse_c8)
+                    } else {
+                        0.0
+                    };
+                    let p_a9 = if !diagonal || row_a <= col + 9 {
+                        exp2_approx(s_high[1] - lse_c9)
+                    } else {
+                        0.0
+                    };
+                    let p_b0 = if !diagonal || row_b <= col {
+                        exp2_approx(s_low[2] - lse_c0)
+                    } else {
+                        0.0
+                    };
+                    let p_b1 = if !diagonal || row_b <= col + 1 {
+                        exp2_approx(s_low[3] - lse_c1)
+                    } else {
+                        0.0
+                    };
+                    let p_b8 = if !diagonal || row_b <= col + 8 {
+                        exp2_approx(s_high[2] - lse_c8)
+                    } else {
+                        0.0
+                    };
+                    let p_b9 = if !diagonal || row_b <= col + 9 {
+                        exp2_approx(s_high[3] - lse_c9)
+                    } else {
+                        0.0
+                    };
 
                     let ds_a0 = p_a0 * (dp_low[0] - dot_c0) * LN2;
                     let ds_a1 = p_a1 * (dp_low[1] - dot_c1) * LN2;
@@ -753,12 +913,34 @@ pub mod kernels {
                     let ds_b9 = p_b9 * (dp_high[3] - dot_c9) * LN2;
 
                     write_bf16_fragment(
-                        p_smem, p_phase, tmem_row, column_block, lane, p_a0, p_a1, p_a8, p_a9,
-                        p_b0, p_b1, p_b8, p_b9,
+                        p_smem,
+                        p_phase,
+                        tmem_row,
+                        column_block,
+                        lane,
+                        p_a0,
+                        p_a1,
+                        p_a8,
+                        p_a9,
+                        p_b0,
+                        p_b1,
+                        p_b8,
+                        p_b9,
                     );
                     write_bf16_fragment(
-                        ds_smem, ds_phase, tmem_row, column_block, lane, ds_a0, ds_a1, ds_a8,
-                        ds_a9, ds_b0, ds_b1, ds_b8, ds_b9,
+                        ds_smem,
+                        ds_phase,
+                        tmem_row,
+                        column_block,
+                        lane,
+                        ds_a0,
+                        ds_a1,
+                        ds_a8,
+                        ds_a9,
+                        ds_b0,
+                        ds_b1,
+                        ds_b8,
+                        ds_b9,
                     );
                     column_block += 1;
                 }
@@ -818,40 +1000,83 @@ pub mod kernels {
                     let dot_b = *dot.add(row_b as usize);
 
                     let ds_a0 = backward_dscore(
-                        s_low[0], dp_low[0], lse_a, dot_a, SCALE,
+                        s_low[0],
+                        dp_low[0],
+                        lse_a,
+                        dot_a,
+                        SCALE,
                         !masked_all && (!diagonal || col <= qrow_a),
                     );
                     let ds_a1 = backward_dscore(
-                        s_low[1], dp_low[1], lse_a, dot_a, SCALE,
+                        s_low[1],
+                        dp_low[1],
+                        lse_a,
+                        dot_a,
+                        SCALE,
                         !masked_all && (!diagonal || col + 1 <= qrow_a),
                     );
                     let ds_a8 = backward_dscore(
-                        s_high[0], dp_high[0], lse_a, dot_a, SCALE,
+                        s_high[0],
+                        dp_high[0],
+                        lse_a,
+                        dot_a,
+                        SCALE,
                         !masked_all && (!diagonal || col + 8 <= qrow_a),
                     );
                     let ds_a9 = backward_dscore(
-                        s_high[1], dp_high[1], lse_a, dot_a, SCALE,
+                        s_high[1],
+                        dp_high[1],
+                        lse_a,
+                        dot_a,
+                        SCALE,
                         !masked_all && (!diagonal || col + 9 <= qrow_a),
                     );
                     let ds_b0 = backward_dscore(
-                        s_low[2], dp_low[2], lse_b, dot_b, SCALE,
+                        s_low[2],
+                        dp_low[2],
+                        lse_b,
+                        dot_b,
+                        SCALE,
                         !masked_all && (!diagonal || col <= qrow_b),
                     );
                     let ds_b1 = backward_dscore(
-                        s_low[3], dp_low[3], lse_b, dot_b, SCALE,
+                        s_low[3],
+                        dp_low[3],
+                        lse_b,
+                        dot_b,
+                        SCALE,
                         !masked_all && (!diagonal || col + 1 <= qrow_b),
                     );
                     let ds_b8 = backward_dscore(
-                        s_high[2], dp_high[2], lse_b, dot_b, SCALE,
+                        s_high[2],
+                        dp_high[2],
+                        lse_b,
+                        dot_b,
+                        SCALE,
                         !masked_all && (!diagonal || col + 8 <= qrow_b),
                     );
                     let ds_b9 = backward_dscore(
-                        s_high[3], dp_high[3], lse_b, dot_b, SCALE,
+                        s_high[3],
+                        dp_high[3],
+                        lse_b,
+                        dot_b,
+                        SCALE,
                         !masked_all && (!diagonal || col + 9 <= qrow_b),
                     );
                     write_bf16_fragment(
-                        ds_smem, ds_phase, tmem_row, column_block, lane, ds_a0, ds_a1, ds_a8,
-                        ds_a9, ds_b0, ds_b1, ds_b8, ds_b9,
+                        ds_smem,
+                        ds_phase,
+                        tmem_row,
+                        column_block,
+                        lane,
+                        ds_a0,
+                        ds_a1,
+                        ds_a8,
+                        ds_a9,
+                        ds_b0,
+                        ds_b1,
+                        ds_b8,
+                        ds_b9,
                     );
                     column_block += 1;
                 }
@@ -925,14 +1150,46 @@ pub mod kernels {
                     let keep_b8 = !masked_all && (!diagonal || krow_b <= col + 8);
                     let keep_b9 = !masked_all && (!diagonal || krow_b <= col + 9);
 
-                    let p_a0 = if keep_a0 { exp2_approx(s_low[0] - lse_c0) } else { 0.0 };
-                    let p_a1 = if keep_a1 { exp2_approx(s_low[1] - lse_c1) } else { 0.0 };
-                    let p_a8 = if keep_a8 { exp2_approx(s_high[0] - lse_c8) } else { 0.0 };
-                    let p_a9 = if keep_a9 { exp2_approx(s_high[1] - lse_c9) } else { 0.0 };
-                    let p_b0 = if keep_b0 { exp2_approx(s_low[2] - lse_c0) } else { 0.0 };
-                    let p_b1 = if keep_b1 { exp2_approx(s_low[3] - lse_c1) } else { 0.0 };
-                    let p_b8 = if keep_b8 { exp2_approx(s_high[2] - lse_c8) } else { 0.0 };
-                    let p_b9 = if keep_b9 { exp2_approx(s_high[3] - lse_c9) } else { 0.0 };
+                    let p_a0 = if keep_a0 {
+                        exp2_approx(s_low[0] - lse_c0)
+                    } else {
+                        0.0
+                    };
+                    let p_a1 = if keep_a1 {
+                        exp2_approx(s_low[1] - lse_c1)
+                    } else {
+                        0.0
+                    };
+                    let p_a8 = if keep_a8 {
+                        exp2_approx(s_high[0] - lse_c8)
+                    } else {
+                        0.0
+                    };
+                    let p_a9 = if keep_a9 {
+                        exp2_approx(s_high[1] - lse_c9)
+                    } else {
+                        0.0
+                    };
+                    let p_b0 = if keep_b0 {
+                        exp2_approx(s_low[2] - lse_c0)
+                    } else {
+                        0.0
+                    };
+                    let p_b1 = if keep_b1 {
+                        exp2_approx(s_low[3] - lse_c1)
+                    } else {
+                        0.0
+                    };
+                    let p_b8 = if keep_b8 {
+                        exp2_approx(s_high[2] - lse_c8)
+                    } else {
+                        0.0
+                    };
+                    let p_b9 = if keep_b9 {
+                        exp2_approx(s_high[3] - lse_c9)
+                    } else {
+                        0.0
+                    };
 
                     let ds_a0 = p_a0 * (dp_low[0] - dot_c0) * LN2;
                     let ds_a1 = p_a1 * (dp_low[1] - dot_c1) * LN2;
@@ -944,12 +1201,34 @@ pub mod kernels {
                     let ds_b9 = p_b9 * (dp_high[3] - dot_c9) * LN2;
 
                     write_bf16_fragment(
-                        p_smem, p_phase, tmem_row, column_block, lane, p_a0, p_a1, p_a8, p_a9,
-                        p_b0, p_b1, p_b8, p_b9,
+                        p_smem,
+                        p_phase,
+                        tmem_row,
+                        column_block,
+                        lane,
+                        p_a0,
+                        p_a1,
+                        p_a8,
+                        p_a9,
+                        p_b0,
+                        p_b1,
+                        p_b8,
+                        p_b9,
                     );
                     write_bf16_fragment(
-                        ds_smem, ds_phase, tmem_row, column_block, lane, ds_a0, ds_a1, ds_a8,
-                        ds_a9, ds_b0, ds_b1, ds_b8, ds_b9,
+                        ds_smem,
+                        ds_phase,
+                        tmem_row,
+                        column_block,
+                        lane,
+                        ds_a0,
+                        ds_a1,
+                        ds_a8,
+                        ds_a9,
+                        ds_b0,
+                        ds_b1,
+                        ds_b8,
+                        ds_b9,
                     );
                     column_block += 1;
                 }
@@ -967,7 +1246,13 @@ pub mod kernels {
     /// `fresh` starts a new TMEM accumulator (the block's first visited tile);
     /// otherwise it accumulates with `enable_d`.
     #[inline(always)]
-    unsafe fn grad_mma(acc_tmem: u32, a_smem: *mut u8, b_smem: *mut u8, instruction: u32, fresh: bool) {
+    unsafe fn grad_mma(
+        acc_tmem: u32,
+        a_smem: *mut u8,
+        b_smem: *mut u8,
+        instruction: u32,
+        fresh: bool,
+    ) {
         unsafe {
             mma_ab(
                 acc_tmem,
@@ -1144,7 +1429,12 @@ pub mod kernels {
                 .build()
                 .raw();
             if is_leader {
-                score_mma(tmem, a_smem, b_smem, instruction);
+                score_mma(
+                    tmem,
+                    Panel::from_raw(a_smem),
+                    Panel::from_raw(b_smem),
+                    instruction,
+                );
                 tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
             }
             while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, 0) {}
@@ -1160,8 +1450,7 @@ pub mod kernels {
                     let column = (column_block * 16) as usize;
                     let low = tcgen05_ld_16x256b_pure(tmem + (tmem_row << 16) + column as u32);
                     tcgen05_load_wait();
-                    let high =
-                        tcgen05_ld_16x256b_pure(tmem + (tmem_row << 16) + column as u32 + 8);
+                    let high = tcgen05_ld_16x256b_pure(tmem + (tmem_row << 16) + column as u32 + 8);
                     tcgen05_load_wait();
                     let row_a = tmem_row as usize + row_in_16;
                     let row_b = row_a + 8;
@@ -1215,10 +1504,13 @@ pub mod kernels {
             static mut VOTES: SharedArray<u32, 8, 4> = SharedArray::UNINIT;
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let q_smem = smem;
-            let k_smem = smem.add(TILE_BYTES);
-            let v_smem = smem.add(2 * TILE_BYTES);
-            let p_smem = smem.add(3 * TILE_BYTES);
+            let q = Panel::from_raw(smem);
+            let k = Panel::from_raw(smem.add(TILE_BYTES));
+            let v = Panel::from_raw(smem.add(2 * TILE_BYTES));
+            // The 128B swizzle XORs *absolute* shared-address bits [9:7], not
+            // tile-relative rows; `PTile::swizzled_chunk` folds the base's
+            // row phase in.
+            let p = PTile::from_raw(smem.add(3 * TILE_BYTES));
 
             let tid = thread::threadIdx_x();
             if thread::blockDim_x() as usize != TILE {
@@ -1228,6 +1520,10 @@ pub mod kernels {
             let lane = warp::lane_id();
             let is_leader = tid == 0;
 
+            let tma_sem = Semaphore::attach(&raw mut TMA_BARRIER);
+            let mma_sem = Semaphore::attach(&raw mut MMA_BARRIER);
+            let vote = Semaphore::attach(&raw mut VOTE_BARRIER);
+
             let query_tile = thread::blockIdx_x();
             let head = thread::blockIdx_y();
             let batch = thread::blockIdx_z();
@@ -1236,17 +1532,13 @@ pub mod kernels {
             let plane = (batch * h + head) as i32;
 
             if is_leader {
-                mbarrier_init(&raw mut TMA_BARRIER, 1);
-                mbarrier_init(&raw mut MMA_BARRIER, 1);
-                mbarrier_init(&raw mut VOTE_BARRIER, TILE as u32);
+                tma_sem.init(1);
+                mma_sem.init(1);
+                vote.init(TILE as u32);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
-            if warp_id == 0 {
-                tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            }
-            thread::sync_threads();
-            let tmem = *(&raw const TMEM_ADDRESS as *const u32);
+            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
             let s_tmem = STmem::from_raw(tmem);
             let o_tmem = AccTmem::from_raw(tmem + 256);
 
@@ -1266,16 +1558,10 @@ pub mod kernels {
 
             // Q stays operand-A resident for the whole key stream.
             if is_leader {
-                load_panel(
-                    q_smem,
-                    q_tma,
-                    (query_tile * TILE as u32) as i32,
-                    plane,
-                    &raw mut TMA_BARRIER,
-                );
-                mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, TILE_BYTES as u32);
+                q.tma_load(q_tma, (query_tile * TILE as u32) as i32, plane, tma_sem);
+                tma_sem.expect_tx(TILE_BYTES as u32);
             }
-            while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, 0) {}
+            tma_sem.wait(0);
             thread::sync_threads();
 
             let mut m_ref = RegVec::<4>::splat(MASKED_SCORE);
@@ -1283,32 +1569,27 @@ pub mod kernels {
             let mut out_acc = RegTile::<4, 32>::zero();
             let mut corrections = 0u32;
 
-            // The 128B swizzle XORs *absolute* shared-address bits [9:7], not
-            // tile-relative rows; `PTile::swizzled_chunk` folds the base's
-            // row phase in.
-            let p = PTile::from_raw(p_smem);
-
             let mut tma_phase = 1u32;
             let mut mma_phase = 0u32;
             let mut key_tile = 0u32;
             while key_tile <= query_tile {
                 if is_leader {
                     let key_row = (key_tile * TILE as u32) as i32;
-                    load_panel(k_smem, k_tma, key_row, plane, &raw mut TMA_BARRIER);
-                    load_panel(v_smem, v_tma, key_row, plane, &raw mut TMA_BARRIER);
-                    mbarrier_arrive_expect_tx(&raw const TMA_BARRIER, 1, 2 * TILE_BYTES as u32);
+                    k.tma_load(k_tma, key_row, plane, tma_sem);
+                    v.tma_load(v_tma, key_row, plane, tma_sem);
+                    tma_sem.expect_tx(2 * TILE_BYTES as u32);
                 }
-                while !mbarrier_try_wait_parity(&raw const TMA_BARRIER, tma_phase & 1) {}
+                tma_sem.wait(tma_phase & 1);
                 tma_phase += 1;
                 thread::sync_threads();
 
                 // S = Q·Kᵀ, fresh accumulation each tile.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    score_mma(s_tmem.raw(), q_smem, k_smem, s_instruction);
-                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                    score_mma(s_tmem.raw(), q, k, s_instruction);
+                    mma::commit(mma_sem);
                 }
-                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
+                mma_sem.wait(mma_phase & 1);
                 mma_phase += 1;
                 thread::sync_threads();
 
@@ -1321,7 +1602,7 @@ pub mod kernels {
                     lane,
                     p,
                     &raw mut VOTES as *mut u32,
-                    &raw const VOTE_BARRIER,
+                    vote,
                     &mut m_ref,
                     &mut running_sum,
                     &mut out_acc,
@@ -1341,10 +1622,10 @@ pub mod kernels {
                 // across the block, so the leader's copy is the vote).
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    grad_mma(o_tmem.raw(), p_smem, v_smem, o_instruction, correction);
-                    tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
+                    mma_ab(o_tmem.raw(), p, v, o_instruction, !correction);
+                    mma::commit(mma_sem);
                 }
-                while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
+                mma_sem.wait(mma_phase & 1);
                 mma_phase += 1;
 
                 tcgen05_fence_before_thread_sync();
@@ -1371,19 +1652,16 @@ pub mod kernels {
             if is_leader {
                 let tiles = t as usize / TILE;
                 *correction_counts
-                    .get_unchecked_mut(plane as usize * tiles + query_tile as usize) =
-                    corrections;
+                    .get_unchecked_mut(plane as usize * tiles + query_tile as usize) = corrections;
             }
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            if warp_id == 0 {
-                tcgen05_dealloc(tmem, 512);
-            }
+            dealloc_block(tmem, 512);
             if is_leader {
-                mbarrier_inval(&raw mut TMA_BARRIER);
-                mbarrier_inval(&raw mut MMA_BARRIER);
-                mbarrier_inval(&raw mut VOTE_BARRIER);
+                tma_sem.inval();
+                mma_sem.inval();
+                vote.inval();
             }
         }
     }
@@ -1556,7 +1834,13 @@ pub mod kernels {
                 // dQ += dS·K, continuing the accumulator (fresh on key 0).
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    grad_mma(dq_tmem.raw(), ds_smem, k_smem, grad_instruction, key_tile == 0);
+                    grad_mma(
+                        dq_tmem.raw(),
+                        ds_smem,
+                        k_smem,
+                        grad_instruction,
+                        key_tile == 0,
+                    );
                     tcgen05_commit_shared_cluster(&raw mut MMA_BARRIER as *mut u64);
                 }
                 while !mbarrier_try_wait_parity(&raw const MMA_BARRIER, mma_phase & 1) {}
@@ -1802,25 +2086,24 @@ pub mod kernels {
     /// flag for this tile says its vote drained it — and commit completion
     /// into `o_full`. The flag read is ordered by the `p_full` wait (the
     /// warpgroup writes it before arriving).
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    unsafe fn output_mma(
+    unsafe fn output_mma<const STAGES: usize, const S_BUFFERS: usize>(
         tile: u32,
-        stages: usize,
-        o_tmem: u32,
-        p_smem: *mut u8,
-        v_ring: *mut u8,
+        stream: Stream<S_BUFFERS>,
+        v: PanelRingN<STAGES>,
         o_instruction: u32,
-        p_full: *const Barrier,
-        o_full: *mut Barrier,
-        restart: *const u32,
     ) {
         unsafe {
-            while !mbarrier_try_wait_parity(p_full, tile & 1) {}
-            let fresh = *restart.add((tile & 1) as usize) != 0;
-            let v_smem = v_ring.add((tile as usize % stages) * TILE_BYTES);
-            grad_mma(o_tmem, p_smem, v_smem, o_instruction, fresh);
-            tcgen05_commit_shared_cluster(o_full as *mut u64);
+            stream.p_full.wait(tile & 1);
+            let fresh = *stream.restart.add((tile & 1) as usize) != 0;
+            mma_ab(
+                stream.o_tmem.raw(),
+                stream.p,
+                v.tile(tile),
+                o_instruction,
+                !fresh,
+            );
+            mma::commit(stream.o_full);
         }
     }
 
@@ -1829,53 +2112,38 @@ pub mod kernels {
     /// correction vote), publish the segment-restart flag and P, then wait
     /// out this tile's O MMA and recycle the K/V stage. Callers pass
     /// `diagonal` as a literal so the mask logic folds out of the full-tile
-    /// loop, and `double_s` as a literal to select the pipelined kernel's
-    /// double-buffered S phase arithmetic. `tid_in_group`/`warp_id` are
-    /// warpgroup-local.
+    /// loop; `S_BUFFERS` picks the S ring depth (2 for the pipelined
+    /// kernel's double-buffered S, 1 for the persistent kernel's
+    /// single-buffered per-stream S — the rings own both kernels' phase
+    /// arithmetic). `tid_in_group`/`warp_id` are warpgroup-local.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    unsafe fn warpgroup_tile(
+    unsafe fn warpgroup_tile<const STAGES: usize, const S_BUFFERS: usize>(
         i: u32,
         diagonal: bool,
-        stages: usize,
-        double_s: bool,
         tid_in_group: u32,
         warp_id: u32,
         lane: u32,
-        s_tmem: STmem,
-        o_tmem: AccTmem,
-        p: PTile,
-        votes: *mut u32,
-        vote_barrier: *const Barrier,
-        restart: *mut u32,
-        s_full: *mut Barrier,
-        s_free: *mut Barrier,
-        p_full: *const Barrier,
-        o_full: *const Barrier,
-        kv_free: *mut Barrier,
+        stream: Stream<S_BUFFERS>,
+        kv_free: SemaphoreRing<STAGES>,
         m_ref: &mut RegVec<4>,
         running_sum: &mut RegVec<4>,
         out_acc: &mut RegTile<4, 32>,
         corrections: &mut u32,
     ) {
         unsafe {
-            let (buffer, s_parity) = if double_s {
-                ((i & 1) as usize, (i / 2) & 1)
-            } else {
-                (0usize, i & 1)
-            };
-            while !mbarrier_try_wait_parity(s_full.add(buffer), s_parity) {}
+            stream.s_full.wait(i);
             let correction = softmax_tile(
-                // The double-buffered S is 64 columns wide per buffer.
-                s_tmem.columns_right((buffer as u32) * 64),
-                o_tmem,
+                // Each S buffer is 64 columns wide.
+                stream.s_tmem.columns_right((i % S_BUFFERS as u32) * 64),
+                stream.o_tmem,
                 i,
                 diagonal,
                 warp_id,
                 lane,
-                p,
-                votes,
-                vote_barrier,
+                stream.p,
+                stream.votes,
+                stream.vote,
                 m_ref,
                 running_sum,
                 out_acc,
@@ -1884,17 +2152,17 @@ pub mod kernels {
                 *corrections += 1;
             }
             if tid_in_group == 0 {
-                *restart.add((i & 1) as usize) = correction as u32;
+                *stream.restart.add((i & 1) as usize) = correction as u32;
             }
             // Both S passes are drained and P is fenced into the async
             // proxy: release the S buffer and publish P (which also
             // releases the restart flag to the MMA warp).
             fence_proxy_async_shared_cta();
-            mbarrier_arrive(s_free.add(buffer));
-            mbarrier_arrive(p_full);
-            while !mbarrier_try_wait_parity(o_full, i & 1) {}
+            stream.s_free.sem(i).arrive();
+            stream.p_full.arrive();
+            stream.o_full.wait(i & 1);
             if tid_in_group == 0 {
-                mbarrier_arrive(kv_free.add(i as usize % stages));
+                kv_free.sem(i).arrive();
             }
         }
     }
@@ -1958,10 +2226,9 @@ pub mod kernels {
             static mut RESTART: SharedArray<u32, 2, 4> = SharedArray::UNINIT;
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let q_smem = smem;
-            let k_ring = smem.add(TILE_BYTES);
-            let v_ring = smem.add((1 + PIPELINE_STAGES) * TILE_BYTES);
-            let p_smem = smem.add((1 + 2 * PIPELINE_STAGES) * TILE_BYTES);
+            let q = Panel::from_raw(smem);
+            let k = PanelRing::attach(smem.add(TILE_BYTES));
+            let v = PanelRing::attach(smem.add((1 + PIPELINE_STAGES) * TILE_BYTES));
 
             let tid = thread::threadIdx_x();
             if thread::blockDim_x() as usize != FLASH_PIPELINE_BLOCK {
@@ -1970,10 +2237,10 @@ pub mod kernels {
             let warp_id = warp::warp_id();
             let lane = warp::lane_id();
 
-            let kv_full = &raw mut KV_FULL as *mut Barrier;
-            let kv_free = &raw mut KV_FREE as *mut Barrier;
-            let s_full = &raw mut S_FULL as *mut Barrier;
-            let s_free = &raw mut S_FREE as *mut Barrier;
+            let kv_full =
+                SemaphoreRing::<PIPELINE_STAGES>::attach(&raw mut KV_FULL as *mut Barrier);
+            let kv_free =
+                SemaphoreRing::<PIPELINE_STAGES>::attach(&raw mut KV_FREE as *mut Barrier);
 
             let query_tile = thread::blockIdx_x();
             let head = thread::blockIdx_y();
@@ -1983,63 +2250,55 @@ pub mod kernels {
             let plane = (batch * h + head) as i32;
             let key_tiles = query_tile + 1;
 
+            // Barrier init precedes the TMEM allocation (the validated
+            // ordering); the stream handle needs `tmem`, so its barriers are
+            // initialized through ring/semaphore views of the same words.
             if tid == 0 {
-                let mut stage = 0usize;
-                while stage < PIPELINE_STAGES {
-                    mbarrier_init(kv_full.add(stage), 1);
-                    mbarrier_init(kv_free.add(stage), 1);
-                    stage += 1;
-                }
-                mbarrier_init(s_full, 1);
-                mbarrier_init(s_full.add(1), 1);
-                mbarrier_init(s_free, TILE as u32);
-                mbarrier_init(s_free.add(1), TILE as u32);
-                mbarrier_init(&raw mut P_FULL, TILE as u32);
-                mbarrier_init(&raw mut O_FULL, 1);
-                mbarrier_init(&raw mut VOTE_BARRIER, TILE as u32);
+                kv_full.init_all(1);
+                kv_free.init_all(1);
+                SemaphoreRing::<2>::attach(&raw mut S_FULL as *mut Barrier).init_all(1);
+                SemaphoreRing::<2>::attach(&raw mut S_FREE as *mut Barrier).init_all(TILE as u32);
+                Semaphore::attach(&raw mut P_FULL).init(TILE as u32);
+                Semaphore::attach(&raw mut O_FULL).init(1);
+                Semaphore::attach(&raw mut VOTE_BARRIER).init(TILE as u32);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
-            if warp_id == 0 {
-                tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            }
-            thread::sync_threads();
-            let tmem = *(&raw const TMEM_ADDRESS as *const u32);
-            // Two 64-wide S buffers occupy columns 0..128; O follows at 128.
-            let s_tmem = STmem::from_raw(tmem);
-            let o_tmem = AccTmem::from_raw(tmem + 128);
+
+            // Two 64-wide S buffers occupy TMEM columns 0..128; O follows at
+            // 128. The P subtile's `PTile` folds the tile base's absolute
+            // 128-byte row phase into its swizzled `stmatrix` addresses.
+            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
+            let stream = Stream::<2>::attach(
+                0,
+                tmem,
+                smem.add((1 + 2 * PIPELINE_STAGES) * TILE_BYTES),
+                &raw mut VOTES as *mut u32,
+                &raw mut RESTART as *mut u32,
+                &raw mut VOTE_BARRIER,
+                &raw mut S_FULL as *mut Barrier,
+                &raw mut S_FREE as *mut Barrier,
+                &raw mut P_FULL,
+                &raw mut O_FULL,
+            );
 
             if tid < TILE as u32 {
                 // Softmax / correction / epilogue warpgroup. The key loop
                 // is split so the diagonal tile is the only one paying for
                 // mask logic (the full-tile calls fold `diagonal = false`).
-                let p = PTile::from_raw(p_smem);
-                let votes = &raw mut VOTES as *mut u32;
-                let restart = &raw mut RESTART as *mut u32;
                 let mut m_ref = RegVec::<4>::splat(MASKED_SCORE);
                 let mut running_sum = RegVec::<4>::splat(0.0);
                 let mut out_acc = RegTile::<4, 32>::zero();
                 let mut corrections = 0u32;
                 let mut i = 0u32;
                 while i + 1 < key_tiles {
-                    warpgroup_tile(
+                    warpgroup_tile::<PIPELINE_STAGES, 2>(
                         i,
                         false,
-                        PIPELINE_STAGES,
-                        true,
                         tid,
                         warp_id,
                         lane,
-                        s_tmem,
-                        o_tmem,
-                        p,
-                        votes,
-                        &raw const VOTE_BARRIER,
-                        restart,
-                        s_full,
-                        s_free,
-                        &raw const P_FULL,
-                        &raw const O_FULL,
+                        stream,
                         kv_free,
                         &mut m_ref,
                         &mut running_sum,
@@ -2048,31 +2307,20 @@ pub mod kernels {
                     );
                     i += 1;
                 }
-                warpgroup_tile(
+                warpgroup_tile::<PIPELINE_STAGES, 2>(
                     i,
-                    true,
-                    PIPELINE_STAGES,
                     true,
                     tid,
                     warp_id,
                     lane,
-                    s_tmem,
-                    o_tmem,
-                    p,
-                    votes,
-                    &raw const VOTE_BARRIER,
-                    restart,
-                    s_full,
-                    s_free,
-                    &raw const P_FULL,
-                    &raw const O_FULL,
+                    stream,
                     kv_free,
                     &mut m_ref,
                     &mut running_sum,
                     &mut out_acc,
                     &mut corrections,
                 );
-                merge_output_tile(o_tmem, warp_id, &mut out_acc);
+                merge_output_tile(stream.o_tmem, warp_id, &mut out_acc);
                 store_outputs(
                     batch,
                     t,
@@ -2097,11 +2345,6 @@ pub mod kernels {
                 // TMA load warp leader: Q once, then the K/V ring, on kittens
                 // tiles — the ring types own the stage selection and free-slot
                 // parity, the panel type the two-subtile box issue.
-                let kv_full = SemaphoreRing::<PIPELINE_STAGES>::attach(kv_full);
-                let kv_free = SemaphoreRing::<PIPELINE_STAGES>::attach(kv_free);
-                let q = Panel::from_raw(q_smem);
-                let k = PanelRing::attach(k_ring);
-                let v = PanelRing::attach(v_ring);
                 let mut i = 0u32;
                 while i < key_tiles {
                     kv_free.wait_recycled(i);
@@ -2135,69 +2378,30 @@ pub mod kernels {
                 tcgen05_fence_after_thread_sync();
                 let mut i = 0u32;
                 while i < key_tiles {
-                    let stage = (i as usize) % PIPELINE_STAGES;
-                    while !mbarrier_try_wait_parity(
-                        kv_full.add(stage),
-                        ((i as usize / PIPELINE_STAGES) & 1) as u32,
-                    ) {}
-                    let buffer = (i & 1) as usize;
-                    if i >= 2 {
-                        while !mbarrier_try_wait_parity(s_free.add(buffer), (i / 2 - 1) & 1) {}
-                    }
+                    kv_full.wait(i);
+                    stream.s_free.wait_recycled(i);
                     score_mma(
-                        tmem + (buffer as u32) * 64,
-                        q_smem,
-                        k_ring.add(stage * TILE_BYTES),
+                        stream.s_tmem.columns_right((i & 1) * 64).raw(),
+                        q,
+                        k.tile(i),
                         s_instruction,
                     );
-                    tcgen05_commit_shared_cluster(s_full.add(buffer) as *mut u64);
+                    mma::commit(stream.s_full.sem(i));
                     if i > 0 {
-                        output_mma(
-                            i - 1,
-                            PIPELINE_STAGES,
-                            o_tmem.raw(),
-                            p_smem,
-                            v_ring,
-                            o_instruction,
-                            &raw const P_FULL,
-                            &raw mut O_FULL,
-                            &raw const RESTART as *const u32,
-                        );
+                        output_mma(i - 1, stream, v, o_instruction);
                     }
                     i += 1;
                 }
-                output_mma(
-                    key_tiles - 1,
-                    PIPELINE_STAGES,
-                    o_tmem.raw(),
-                    p_smem,
-                    v_ring,
-                    o_instruction,
-                    &raw const P_FULL,
-                    &raw mut O_FULL,
-                    &raw const RESTART as *const u32,
-                );
+                output_mma(key_tiles - 1, stream, v, o_instruction);
             }
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            if warp_id == 0 {
-                tcgen05_dealloc(tmem, 512);
-            }
+            dealloc_block(tmem, 512);
             if tid == 0 {
-                let mut stage = 0usize;
-                while stage < PIPELINE_STAGES {
-                    mbarrier_inval(kv_full.add(stage));
-                    mbarrier_inval(kv_free.add(stage));
-                    stage += 1;
-                }
-                mbarrier_inval(s_full);
-                mbarrier_inval(s_full.add(1));
-                mbarrier_inval(s_free);
-                mbarrier_inval(s_free.add(1));
-                mbarrier_inval(&raw mut P_FULL);
-                mbarrier_inval(&raw mut O_FULL);
-                mbarrier_inval(&raw mut VOTE_BARRIER);
+                kv_full.inval_all();
+                kv_free.inval_all();
+                stream.inval();
             }
         }
     }
@@ -2256,12 +2460,94 @@ pub mod kernels {
         }
     }
 
+    /// One softmax workstream's resources, shared by the pipelined kernel
+    /// (a single stream with a double-buffered S, `S_BUFFERS = 2`) and the
+    /// persistent kernel (two ping-pong streams, each with a single-buffered
+    /// S): the stream's S/O TMEM segments, P tile, vote/restart words, and
+    /// the barrier set the softmax warpgroup handshakes with the MMA warp.
+    /// The S rings own both kernels' phase arithmetic — double-buffered
+    /// `(i & 1, (i / 2) & 1)` and single-buffered `(0, i & 1)` are the same
+    /// `SemaphoreRing` walk at different depths.
+    #[derive(Clone, Copy)]
+    struct Stream<const S_BUFFERS: usize> {
+        s_tmem: STmem,
+        o_tmem: AccTmem,
+        p: PTile,
+        votes: *mut u32,
+        restart: *mut u32,
+        vote: Semaphore,
+        s_full: SemaphoreRing<S_BUFFERS>,
+        s_free: SemaphoreRing<S_BUFFERS>,
+        p_full: Semaphore,
+        o_full: Semaphore,
+    }
+
+    impl<const S_BUFFERS: usize> Stream<S_BUFFERS> {
+        /// Stream `index` (A = 0, B = 1) of the kernel's resource plan: S at
+        /// TMEM column `64·index`, O at `128 + 128·index`, the `index`-th P
+        /// subtile, and slot `index` of every per-stream barrier pair and
+        /// vote/restart array. The pipelined kernel is the one-stream case.
+        #[allow(clippy::too_many_arguments)]
+        #[inline(always)]
+        unsafe fn attach(
+            index: usize,
+            tmem: u32,
+            p: *mut u8,
+            votes: *mut u32,
+            restart: *mut u32,
+            vote: *mut Barrier,
+            s_full: *mut Barrier,
+            s_free: *mut Barrier,
+            p_full: *mut Barrier,
+            o_full: *mut Barrier,
+        ) -> Self {
+            unsafe {
+                Self {
+                    s_tmem: STmem::from_raw(tmem + 64 * index as u32),
+                    o_tmem: AccTmem::from_raw(tmem + 128 + 128 * index as u32),
+                    p: PTile::from_raw(p.add(index * SUBTILE_BYTES)),
+                    votes: votes.add(8 * index),
+                    restart: restart.add(2 * index),
+                    vote: Semaphore::attach(vote.add(index)),
+                    s_full: SemaphoreRing::attach(s_full.add(index)),
+                    s_free: SemaphoreRing::attach(s_free.add(index)),
+                    p_full: Semaphore::attach(p_full.add(index)),
+                    o_full: Semaphore::attach(o_full.add(index)),
+                }
+            }
+        }
+
+        /// (Re)initialize the stream's barriers for one work item.
+        #[inline(always)]
+        unsafe fn init(self) {
+            unsafe {
+                self.s_full.init_all(1);
+                self.s_free.init_all(TILE as u32);
+                self.p_full.init(TILE as u32);
+                self.o_full.init(1);
+                self.vote.init(TILE as u32);
+            }
+        }
+
+        /// Invalidate the stream's barriers between work items.
+        #[inline(always)]
+        unsafe fn inval(self) {
+            unsafe {
+                self.s_full.inval_all();
+                self.s_free.inval_all();
+                self.p_full.inval();
+                self.o_full.inval();
+                self.vote.inval();
+            }
+        }
+    }
+
     /// One full workstream of the persistent forward, run by one softmax
     /// warpgroup: the split full-tile/diagonal key loop, the final segment
     /// drain, and the outputs. All indices (`tid_in_group`, `warp_id`) are
-    /// warpgroup-local; the barrier pointers are this stream's own set
-    /// except `kv_free`, which both streams share (each arrives once per
-    /// tile it consumed).
+    /// warpgroup-local; the barriers are this stream's own set except
+    /// `kv_free`, which both streams share (each arrives once per tile it
+    /// consumed).
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn persistent_stream(
@@ -2273,17 +2559,8 @@ pub mod kernels {
         tid_in_group: u32,
         warp_id: u32,
         lane: u32,
-        s_tmem: STmem,
-        o_tmem: AccTmem,
-        p: PTile,
-        votes: *mut u32,
-        vote_barrier: *const Barrier,
-        restart: *mut u32,
-        s_full: *mut Barrier,
-        s_free: *mut Barrier,
-        p_full: *const Barrier,
-        o_full: *const Barrier,
-        kv_free: *mut Barrier,
+        stream: Stream<1>,
+        kv_free: SemaphoreRing<PERSISTENT_STAGES>,
         output: &mut DisjointSlice<f32>,
         logsumexp: &mut DisjointSlice<f32>,
         correction_counts: &mut DisjointSlice<u32>,
@@ -2296,24 +2573,13 @@ pub mod kernels {
             let mut corrections = 0u32;
             let mut i = 0u32;
             while i + 1 < key_tiles {
-                warpgroup_tile(
+                warpgroup_tile::<PERSISTENT_STAGES, 1>(
                     i,
-                    false,
-                    PERSISTENT_STAGES,
                     false,
                     tid_in_group,
                     warp_id,
                     lane,
-                    s_tmem,
-                    o_tmem,
-                    p,
-                    votes,
-                    vote_barrier,
-                    restart,
-                    s_full,
-                    s_free,
-                    p_full,
-                    o_full,
+                    stream,
                     kv_free,
                     &mut m_ref,
                     &mut running_sum,
@@ -2322,31 +2588,20 @@ pub mod kernels {
                 );
                 i += 1;
             }
-            warpgroup_tile(
+            warpgroup_tile::<PERSISTENT_STAGES, 1>(
                 i,
                 true,
-                PERSISTENT_STAGES,
-                false,
                 tid_in_group,
                 warp_id,
                 lane,
-                s_tmem,
-                o_tmem,
-                p,
-                votes,
-                vote_barrier,
-                restart,
-                s_full,
-                s_free,
-                p_full,
-                o_full,
+                stream,
                 kv_free,
                 &mut m_ref,
                 &mut running_sum,
                 &mut out_acc,
                 &mut corrections,
             );
-            merge_output_tile(o_tmem, warp_id, &mut out_acc);
+            merge_output_tile(stream.o_tmem, warp_id, &mut out_acc);
             store_outputs(
                 batch,
                 t,
@@ -2363,74 +2618,214 @@ pub mod kernels {
             );
             if tid_in_group == 0 {
                 let tiles = t as usize / TILE;
-                *correction_counts.get_unchecked_mut(
-                    (batch * h + head) as usize * tiles + query_tile as usize,
-                ) = corrections;
+                *correction_counts
+                    .get_unchecked_mut((batch * h + head) as usize * tiles + query_tile as usize) =
+                    corrections;
             }
         }
     }
 
-    /// (Re)initialize the persistent kernel's barrier set for one work
-    /// item. `kv_free` counts one arrival per active consumer stream.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn persistent_barriers_init(
-        kv_full: *mut Barrier,
-        kv_free: *mut Barrier,
-        s_full: *mut Barrier,
-        s_free: *mut Barrier,
-        p_full: *mut Barrier,
-        o_full: *mut Barrier,
-        vote_barrier: *mut Barrier,
-        kv_consumers: u32,
-    ) {
-        unsafe {
-            let mut stage = 0usize;
-            while stage < PERSISTENT_STAGES {
-                mbarrier_init(kv_full.add(stage), 1);
-                mbarrier_init(kv_free.add(stage), kv_consumers);
-                stage += 1;
-            }
-            let mut stream = 0usize;
-            while stream < 2 {
-                mbarrier_init(s_full.add(stream), 1);
-                mbarrier_init(s_free.add(stream), TILE as u32);
-                mbarrier_init(p_full.add(stream), TILE as u32);
-                mbarrier_init(o_full.add(stream), 1);
-                mbarrier_init(vote_barrier.add(stream), TILE as u32);
-                stream += 1;
-            }
+    /// The persistent forward as a [`pipeline::Job`]: tile and semaphore
+    /// handles built once at launch, work items decoded per iteration, and
+    /// the whole barrier set re-initialized per item by the harness —
+    /// `kv_free`'s arrival count is re-chosen each time (one consumer
+    /// stream, or two when the pair's odd tail leaves stream B active).
+    struct PersistentForward<'k, 'o, 'l, 'c> {
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        t: u32,
+        h: u32,
+        tiles: u32,
+        pairs: u32,
+        plane_count: u32,
+        tid: u32,
+        warp_id: u32,
+        lane: u32,
+        q_a: Panel,
+        q_b: Panel,
+        k: PersistentPanelRing,
+        v: PersistentPanelRing,
+        kv_full: SemaphoreRing<PERSISTENT_STAGES>,
+        kv_free: SemaphoreRing<PERSISTENT_STAGES>,
+        a: Stream<1>,
+        b: Stream<1>,
+        output: &'k mut DisjointSlice<'o, f32>,
+        logsumexp: &'k mut DisjointSlice<'l, f32>,
+        correction_counts: &'k mut DisjointSlice<'c, u32>,
+    }
+
+    impl PersistentForward<'_, '_, '_, '_> {
+        /// Decode a work item into its (pair, plane) coordinates. Items are
+        /// ordered by *descending* pair index, so the causally long pairs
+        /// are dealt out before the cheap ones.
+        #[inline(always)]
+        fn item_pair(&self, item: u32) -> (u32, u32) {
+            (
+                self.pairs - 1 - item / self.plane_count,
+                item % self.plane_count,
+            )
         }
     }
 
-    /// Invalidate the persistent kernel's barrier set between work items
-    /// (and at exit), wiping whatever unbalanced arrivals the item left.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn persistent_barriers_inval(
-        kv_full: *mut Barrier,
-        kv_free: *mut Barrier,
-        s_full: *mut Barrier,
-        s_free: *mut Barrier,
-        p_full: *mut Barrier,
-        o_full: *mut Barrier,
-        vote_barrier: *mut Barrier,
-    ) {
-        unsafe {
-            let mut stage = 0usize;
-            while stage < PERSISTENT_STAGES {
-                mbarrier_inval(kv_full.add(stage));
-                mbarrier_inval(kv_free.add(stage));
-                stage += 1;
+    impl pipeline::Job for PersistentForward<'_, '_, '_, '_> {
+        #[inline(always)]
+        unsafe fn init(&self, item: u32) {
+            unsafe {
+                let (pair, _) = self.item_pair(item);
+                let b_active = pair * 2 + 1 < self.tiles;
+                self.kv_full.init_all(1);
+                // One arrival per active consumer stream per tile consumed.
+                self.kv_free.init_all(1 + b_active as u32);
+                self.a.init();
+                self.b.init();
             }
-            let mut stream = 0usize;
-            while stream < 2 {
-                mbarrier_inval(s_full.add(stream));
-                mbarrier_inval(s_free.add(stream));
-                mbarrier_inval(p_full.add(stream));
-                mbarrier_inval(o_full.add(stream));
-                mbarrier_inval(vote_barrier.add(stream));
-                stream += 1;
+        }
+
+        #[inline(always)]
+        unsafe fn inval(&self) {
+            unsafe {
+                self.kv_full.inval_all();
+                self.kv_free.inval_all();
+                self.a.inval();
+                self.b.inval();
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn work(&mut self, item: u32) {
+            unsafe {
+                let (pair, plane) = self.item_pair(item);
+                let batch = plane / self.h;
+                let head = plane % self.h;
+                let tile_a = pair * 2;
+                let tile_b = tile_a + 1;
+                let b_active = tile_b < self.tiles;
+                let tiles_a = tile_a + 1;
+                let tiles_b = tile_b + 1;
+                let stream_tiles = if b_active { tiles_b } else { tiles_a };
+
+                if self.tid < TILE as u32 {
+                    persistent_stream(
+                        tile_a,
+                        batch,
+                        self.t,
+                        self.h,
+                        head,
+                        self.tid,
+                        self.warp_id,
+                        self.lane,
+                        self.a,
+                        self.kv_free,
+                        self.output,
+                        self.logsumexp,
+                        self.correction_counts,
+                    );
+                } else if self.tid >= 2 * TILE as u32 {
+                    // Stream B runs on warps 4-5 (warpgroup-1 positions 0-1),
+                    // NOT warps 2-3: a `tcgen05.ld` warp can only reach TMEM
+                    // lanes `(warp % 4) * 32 .. +32`, and a 64-row tile's M128
+                    // accumulator keeps its real rows in lanes 0..63. Warps
+                    // 2-3 (positions 2-3) would read lanes 64..127 — the
+                    // undrained phantom rows — so stream B must sit at a
+                    // warpgroup boundary (positions 0-1) to reach lanes 0..63.
+                    if b_active {
+                        persistent_stream(
+                            tile_b,
+                            batch,
+                            self.t,
+                            self.h,
+                            head,
+                            self.tid - 2 * TILE as u32,
+                            self.warp_id - (2 * TILE / 32) as u32,
+                            self.lane,
+                            self.b,
+                            self.kv_free,
+                            self.output,
+                            self.logsumexp,
+                            self.correction_counts,
+                        );
+                    }
+                } else if self.tid == TILE as u32 {
+                    // TMA load warp leader (warp 2): both Q tiles once, then
+                    // the shared K/V ring over the longer stream.
+                    let plane = plane as i32;
+                    let mut i = 0u32;
+                    while i < stream_tiles {
+                        self.kv_free.wait_recycled(i);
+                        let full = self.kv_full.sem(i);
+                        let key_row = (i * TILE as u32) as i32;
+                        self.k.tile(i).tma_load(self.k_tma, key_row, plane, full);
+                        self.v.tile(i).tma_load(self.v_tma, key_row, plane, full);
+                        if i == 0 {
+                            self.q_a.tma_load(
+                                self.q_tma,
+                                (tile_a * TILE as u32) as i32,
+                                plane,
+                                full,
+                            );
+                            if b_active {
+                                self.q_b.tma_load(
+                                    self.q_tma,
+                                    (tile_b * TILE as u32) as i32,
+                                    plane,
+                                    full,
+                                );
+                            }
+                            let q_tiles = 1 + b_active as u32;
+                            full.expect_tx((2 + q_tiles) * TILE_BYTES as u32);
+                        } else {
+                            full.expect_tx(2 * TILE_BYTES as u32);
+                        }
+                        i += 1;
+                    }
+                } else if self.tid == (TILE + 32) as u32 {
+                    // MMA warp leader (warp 3): per shared tile, S-MMAs for
+                    // both streams (each gated by its own single-buffered S
+                    // being free), then the previous tile's O-MMAs — the
+                    // same stagger as the pipelined kernel, per stream.
+                    let s_instruction = Tcgen05InstructionDescriptor::builder()
+                        .shape(Tcgen05MmaShape::M128_N64)
+                        .element_type(Tcgen05ElementType::BF16)
+                        .accumulator_type(Tcgen05AccumulatorType::F32)
+                        .build()
+                        .raw();
+                    let o_instruction = Tcgen05InstructionDescriptor::builder()
+                        .shape(Tcgen05MmaShape::M128_N64)
+                        .element_type(Tcgen05ElementType::BF16)
+                        .accumulator_type(Tcgen05AccumulatorType::F32)
+                        .transpose_b(true)
+                        .build()
+                        .raw();
+                    tcgen05_fence_after_thread_sync();
+                    let mut i = 0u32;
+                    while i < stream_tiles {
+                        self.kv_full.wait(i);
+                        let k_tile = self.k.tile(i);
+                        if i < tiles_a {
+                            self.a.s_free.wait_recycled(i);
+                            score_mma(self.a.s_tmem.raw(), self.q_a, k_tile, s_instruction);
+                            mma::commit(self.a.s_full.sem(i));
+                        }
+                        if b_active {
+                            self.b.s_free.wait_recycled(i);
+                            score_mma(self.b.s_tmem.raw(), self.q_b, k_tile, s_instruction);
+                            mma::commit(self.b.s_full.sem(i));
+                        }
+                        if i > 0 {
+                            output_mma(i - 1, self.a, self.v, o_instruction);
+                            if b_active {
+                                output_mma(i - 1, self.b, self.v, o_instruction);
+                            }
+                        }
+                        i += 1;
+                    }
+                    if b_active {
+                        output_mma(tiles_b - 1, self.b, self.v, o_instruction);
+                    } else {
+                        output_mma(tiles_a - 1, self.a, self.v, o_instruction);
+                    }
+                }
             }
         }
     }
@@ -2455,18 +2850,19 @@ pub mod kernels {
     /// main use of the SM's issue slots now that TMEM pins occupancy to one
     /// CTA.
     ///
-    /// CTAs run a static strided work-item loop (`blockIdx.x`, stepping by
-    /// `gridDim.x`) with items ordered by *descending* pair index, so the
-    /// causally long pairs are dealt out before the cheap ones. Launching
-    /// with grid = the full item count degenerates to one item per CTA —
-    /// the non-persistent config kept for hang debugging. Every mbarrier is
-    /// re-initialized per item behind a block sync, so each item's phase
-    /// arithmetic starts from zero and unbalanced arrivals (stream A never
-    /// arrives for the shared stream's extra diagonal tile; an inactive
-    /// stream B never arrives at all) are wiped, not threaded through
-    /// parity math. `kv_free`'s arrival count is likewise chosen per item:
-    /// two consumer streams normally, one when the last odd pair leaves
-    /// stream B inactive.
+    /// The strided work-item loop and its per-item barrier lifecycle are
+    /// `kittens::pipeline::run` (extracted from this kernel); the
+    /// [`PersistentForward`] job orders items by *descending* pair index, so
+    /// the causally long pairs are dealt out before the cheap ones.
+    /// Launching with grid = the full item count degenerates to one item
+    /// per CTA — the non-persistent config kept for hang debugging. The
+    /// per-item re-initialization means each item's phase arithmetic starts
+    /// from zero and unbalanced arrivals (stream A never arrives for the
+    /// shared stream's extra diagonal tile; an inactive stream B never
+    /// arrives at all) are wiped, not threaded through parity math;
+    /// `kv_free`'s arrival count is likewise chosen per item — two consumer
+    /// streams normally, one when the last odd pair leaves stream B
+    /// inactive.
     #[kernel]
     #[launch_bounds(192, 1)]
     pub unsafe fn flash_forward_persistent(
@@ -2494,12 +2890,11 @@ pub mod kernels {
             static mut RESTART: SharedArray<u32, 4, 4> = SharedArray::UNINIT;
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let q_a = smem;
-            let q_b = smem.add(TILE_BYTES);
-            let k_ring = smem.add(2 * TILE_BYTES);
-            let v_ring = smem.add((2 + PERSISTENT_STAGES) * TILE_BYTES);
+            let q_a = Panel::from_raw(smem);
+            let q_b = Panel::from_raw(smem.add(TILE_BYTES));
+            let k = PersistentPanelRing::attach(smem.add(2 * TILE_BYTES));
+            let v = PersistentPanelRing::attach(smem.add((2 + PERSISTENT_STAGES) * TILE_BYTES));
             let p_a = smem.add((2 + 2 * PERSISTENT_STAGES) * TILE_BYTES);
-            let p_b = p_a.add(SUBTILE_BYTES);
 
             let tid = thread::threadIdx_x();
             if thread::blockDim_x() as usize != FLASH_PERSISTENT_BLOCK {
@@ -2508,13 +2903,11 @@ pub mod kernels {
             let warp_id = warp::warp_id();
             let lane = warp::lane_id();
 
-            let kv_full = &raw mut KV_FULL as *mut Barrier;
-            let kv_free = &raw mut KV_FREE as *mut Barrier;
             let s_full = &raw mut S_FULL as *mut Barrier;
             let s_free = &raw mut S_FREE as *mut Barrier;
             let p_full = &raw mut P_FULL as *mut Barrier;
             let o_full = &raw mut O_FULL as *mut Barrier;
-            let vote_barrier = &raw mut VOTE as *mut Barrier;
+            let vote = &raw mut VOTE as *mut Barrier;
             let votes = &raw mut VOTES as *mut u32;
             let restart = &raw mut RESTART as *mut u32;
 
@@ -2525,259 +2918,46 @@ pub mod kernels {
             let plane_count = h * batches;
             let work_items = pairs * plane_count;
 
-            if warp_id == 0 {
-                tcgen05_alloc(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            }
-            thread::sync_threads();
-            let tmem = *(&raw const TMEM_ADDRESS as *const u32);
+            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
             // TMEM columns: S_A 0..64, S_B 64..128, O_A 128..256,
             // O_B 256..384.
+            let a = Stream::<1>::attach(
+                0, tmem, p_a, votes, restart, vote, s_full, s_free, p_full, o_full,
+            );
+            let b = Stream::<1>::attach(
+                1, tmem, p_a, votes, restart, vote, s_full, s_free, p_full, o_full,
+            );
 
-            let mut initialized = false;
-            let mut item = thread::blockIdx_x();
-            while item < work_items {
-                let pair = pairs - 1 - item / plane_count;
-                let plane = item % plane_count;
-                let batch = plane / h;
-                let head = plane % h;
-                let tile_a = pair * 2;
-                let tile_b = tile_a + 1;
-                let b_active = tile_b < tiles;
-                let tiles_a = tile_a + 1;
-                let tiles_b = tile_b + 1;
-                let stream_tiles = if b_active { tiles_b } else { tiles_a };
-
-                if tid == 0 {
-                    if initialized {
-                        persistent_barriers_inval(
-                            kv_full, kv_free, s_full, s_free, p_full, o_full, vote_barrier,
-                        );
-                    }
-                    persistent_barriers_init(
-                        kv_full,
-                        kv_free,
-                        s_full,
-                        s_free,
-                        p_full,
-                        o_full,
-                        vote_barrier,
-                        1 + b_active as u32,
-                    );
-                    fence_proxy_async_shared_cta();
-                }
-                initialized = true;
-                thread::sync_threads();
-
-                if tid < TILE as u32 {
-                    persistent_stream(
-                        tile_a,
-                        batch,
-                        t,
-                        h,
-                        head,
-                        tid,
-                        warp_id,
-                        lane,
-                        STmem::from_raw(tmem),
-                        AccTmem::from_raw(tmem + 128),
-                        PTile::from_raw(p_a),
-                        votes,
-                        vote_barrier,
-                        restart,
-                        s_full,
-                        s_free,
-                        p_full,
-                        o_full,
-                        kv_free,
-                        &mut output,
-                        &mut logsumexp,
-                        &mut correction_counts,
-                    );
-                } else if tid >= 2 * TILE as u32 {
-                    // Stream B runs on warps 4-5 (warpgroup-1 positions 0-1),
-                    // NOT warps 2-3: a `tcgen05.ld` warp can only reach TMEM
-                    // lanes `(warp % 4) * 32 .. +32`, and a 64-row tile's M128
-                    // accumulator keeps its real rows in lanes 0..63. Warps
-                    // 2-3 (positions 2-3) would read lanes 64..127 — the
-                    // undrained phantom rows — so stream B must sit at a
-                    // warpgroup boundary (positions 0-1) to reach lanes 0..63.
-                    if b_active {
-                        persistent_stream(
-                            tile_b,
-                            batch,
-                            t,
-                            h,
-                            head,
-                            tid - 2 * TILE as u32,
-                            warp_id - (2 * TILE / 32) as u32,
-                            lane,
-                            STmem::from_raw(tmem + 64),
-                            AccTmem::from_raw(tmem + 256),
-                            PTile::from_raw(p_b),
-                            votes.add(8),
-                            vote_barrier.add(1),
-                            restart.add(2),
-                            s_full.add(1),
-                            s_free.add(1),
-                            p_full.add(1),
-                            o_full.add(1),
-                            kv_free,
-                            &mut output,
-                            &mut logsumexp,
-                            &mut correction_counts,
-                        );
-                    }
-                } else if tid == TILE as u32 {
-                    // TMA load warp leader (warp 2): both Q tiles once, then
-                    // the shared K/V ring over the longer stream.
-                    let plane_index = plane as i32;
-                    let mut i = 0u32;
-                    while i < stream_tiles {
-                        let stage = (i as usize) % PERSISTENT_STAGES;
-                        if i as usize >= PERSISTENT_STAGES {
-                            let parity = ((i as usize / PERSISTENT_STAGES - 1) & 1) as u32;
-                            while !mbarrier_try_wait_parity(kv_free.add(stage), parity) {}
-                        }
-                        let key_row = (i * TILE as u32) as i32;
-                        load_panel(k_ring.add(stage * TILE_BYTES), k_tma, key_row, plane_index, kv_full.add(stage));
-                        load_panel(v_ring.add(stage * TILE_BYTES), v_tma, key_row, plane_index, kv_full.add(stage));
-                        if i == 0 {
-                            load_panel(
-                                q_a,
-                                q_tma,
-                                (tile_a * TILE as u32) as i32,
-                                plane_index,
-                                kv_full.add(stage),
-                            );
-                            if b_active {
-                                load_panel(
-                                    q_b,
-                                    q_tma,
-                                    (tile_b * TILE as u32) as i32,
-                                    plane_index,
-                                    kv_full.add(stage),
-                                );
-                            }
-                            let q_tiles = 1 + b_active as u32;
-                            mbarrier_arrive_expect_tx(
-                                kv_full.add(stage),
-                                1,
-                                (2 + q_tiles) * TILE_BYTES as u32,
-                            );
-                        } else {
-                            mbarrier_arrive_expect_tx(kv_full.add(stage), 1, 2 * TILE_BYTES as u32);
-                        }
-                        i += 1;
-                    }
-                } else if tid == (TILE + 32) as u32 {
-                    // MMA warp leader (warp 3): per shared tile, S-MMAs for both
-                    // streams (each gated by its own single-buffered S
-                    // being free), then the previous tile's O-MMAs — the
-                    // same stagger as the pipelined kernel, per stream.
-                    let s_instruction = Tcgen05InstructionDescriptor::builder()
-                        .shape(Tcgen05MmaShape::M128_N64)
-                        .element_type(Tcgen05ElementType::BF16)
-                        .accumulator_type(Tcgen05AccumulatorType::F32)
-                        .build()
-                        .raw();
-                    let o_instruction = Tcgen05InstructionDescriptor::builder()
-                        .shape(Tcgen05MmaShape::M128_N64)
-                        .element_type(Tcgen05ElementType::BF16)
-                        .accumulator_type(Tcgen05AccumulatorType::F32)
-                        .transpose_b(true)
-                        .build()
-                        .raw();
-                    tcgen05_fence_after_thread_sync();
-                    let mut i = 0u32;
-                    while i < stream_tiles {
-                        let stage = (i as usize) % PERSISTENT_STAGES;
-                        while !mbarrier_try_wait_parity(
-                            kv_full.add(stage),
-                            ((i as usize / PERSISTENT_STAGES) & 1) as u32,
-                        ) {}
-                        let k_smem = k_ring.add(stage * TILE_BYTES);
-                        if i < tiles_a {
-                            if i >= 1 {
-                                while !mbarrier_try_wait_parity(s_free, (i - 1) & 1) {}
-                            }
-                            score_mma(tmem, q_a, k_smem, s_instruction);
-                            tcgen05_commit_shared_cluster(s_full as *mut u64);
-                        }
-                        if b_active {
-                            if i >= 1 {
-                                while !mbarrier_try_wait_parity(s_free.add(1), (i - 1) & 1) {}
-                            }
-                            score_mma(tmem + 64, q_b, k_smem, s_instruction);
-                            tcgen05_commit_shared_cluster(s_full.add(1) as *mut u64);
-                        }
-                        if i > 0 {
-                            output_mma(
-                                i - 1,
-                                PERSISTENT_STAGES,
-                                tmem + 128,
-                                p_a,
-                                v_ring,
-                                o_instruction,
-                                p_full,
-                                o_full,
-                                restart,
-                            );
-                            if b_active {
-                                output_mma(
-                                    i - 1,
-                                    PERSISTENT_STAGES,
-                                    tmem + 256,
-                                    p_b,
-                                    v_ring,
-                                    o_instruction,
-                                    p_full.add(1),
-                                    o_full.add(1),
-                                    restart.add(2),
-                                );
-                            }
-                        }
-                        i += 1;
-                    }
-                    if b_active {
-                        output_mma(
-                            tiles_b - 1,
-                            PERSISTENT_STAGES,
-                            tmem + 256,
-                            p_b,
-                            v_ring,
-                            o_instruction,
-                            p_full.add(1),
-                            o_full.add(1),
-                            restart.add(2),
-                        );
-                    } else {
-                        output_mma(
-                            tiles_a - 1,
-                            PERSISTENT_STAGES,
-                            tmem + 128,
-                            p_a,
-                            v_ring,
-                            o_instruction,
-                            p_full,
-                            o_full,
-                            restart,
-                        );
-                    }
-                }
-
-                tcgen05_fence_before_thread_sync();
-                thread::sync_threads();
-                item += thread::gridDim_x();
-            }
-
-            if warp_id == 0 {
-                tcgen05_dealloc(tmem, 512);
-            }
-            if tid == 0 && initialized {
-                persistent_barriers_inval(
-                    kv_full, kv_free, s_full, s_free, p_full, o_full, vote_barrier,
-                );
-            }
+            let mut job = PersistentForward {
+                q_tma,
+                k_tma,
+                v_tma,
+                t,
+                h,
+                tiles,
+                pairs,
+                plane_count,
+                tid,
+                warp_id,
+                lane,
+                q_a,
+                q_b,
+                k,
+                v,
+                kv_full: SemaphoreRing::<PERSISTENT_STAGES>::attach(
+                    &raw mut KV_FULL as *mut Barrier,
+                ),
+                kv_free: SemaphoreRing::<PERSISTENT_STAGES>::attach(
+                    &raw mut KV_FREE as *mut Barrier,
+                ),
+                a,
+                b,
+                output: &mut output,
+                logsumexp: &mut logsumexp,
+                correction_counts: &mut correction_counts,
+            };
+            pipeline::run(&mut job, work_items);
+            dealloc_block(tmem, 512);
         }
     }
 }
