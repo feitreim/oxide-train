@@ -71,11 +71,11 @@ use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::{DynamicSharedArray, SharedArray};
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    cvt_f32x2_bf16x2, tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync,
+    tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync,
 };
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
-use kittens::ldst::{stmatrix_m8n8_x2, store_fragment_bf16};
+use kittens::ldst::store_fragment_bf16;
 use kittens::mma::{self, mma_ab, mma_abt};
 use kittens::pipeline;
 use kittens::reg::{
@@ -324,10 +324,12 @@ pub mod kernels {
         out_acc: &mut RegTile<4, 32>,
     ) -> bool {
         unsafe {
-            let quad = (lane % 4) as usize;
+            let lane_column = 2 * (lane % 4);
             let row_in_16 = (lane / 4) as usize;
 
-            // Pass 1: tile row maxima (masked, base-2 domain).
+            // Pass 1: tile row maxima (masked, base-2 domain). The two-branch
+            // shape is load-bearing: off the diagonal the four values reduce as
+            // a TREE, which a uniform masked loop would flatten into a chain.
             let mut tile_max = RegVec::<4>::splat(MASKED_SCORE);
             let mut row_block = 0u32;
             while row_block < 2 {
@@ -341,7 +343,7 @@ pub mod kernels {
                     if diagonal {
                         let row_a = (tmem_row as usize + row_in_16) as u32;
                         let row_b = row_a + 8;
-                        let col = column + 2 * quad as u32;
+                        let col = column + lane_column;
                         let mut max_a = tile_max.0[slot_a];
                         max_a = fmax(max_a, if col <= row_a { low[0] } else { MASKED_SCORE });
                         max_a = fmax(
@@ -436,96 +438,49 @@ pub mod kernels {
             }
 
             // Pass 2: probabilities — re-drain S, exponentiate against the
-            // segment reference, accumulate row sums, and store bf16 P
-            // through the swizzle-aware stmatrix addresses (base phase
-            // hoisted once, like the old `p_phase`).
+            // segment reference, accumulate row sums, and store the bf16 P
+            // fragment through the library's swizzled `stmatrix` path (base
+            // phase hoisted once, like the old `p_phase`).
             let p_chunks = p.chunk_writer();
             let mut tile_sum = RegVec::<4>::splat(0.0);
             let mut row_block = 0u32;
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column_block = 0u32;
-                while column_block < 4 {
-                    let column = column_block * 16;
-                    let (low, high) = s_tmem.fragment(tmem_row, column);
+                let mut column = 0u32;
+                while column < TILE as u32 {
+                    let s = s_tmem.fragment_tile(tmem_row, column);
                     let slot_a = (row_block * 2) as usize;
                     let slot_b = slot_a + 1;
-                    let row_a = (tmem_row as usize + row_in_16) as u32;
+                    let row_a = tmem_row + row_in_16 as u32;
                     let row_b = row_a + 8;
-                    let col = column + 2 * quad as u32;
-
-                    let s_a0 = if !diagonal || col <= row_a {
-                        low[0]
-                    } else {
-                        MASKED_SCORE
-                    };
-                    let s_a1 = if !diagonal || col + 1 <= row_a {
-                        low[1]
-                    } else {
-                        MASKED_SCORE
-                    };
-                    let s_a8 = if !diagonal || col + 8 <= row_a {
-                        high[0]
-                    } else {
-                        MASKED_SCORE
-                    };
-                    let s_a9 = if !diagonal || col + 9 <= row_a {
-                        high[1]
-                    } else {
-                        MASKED_SCORE
-                    };
-                    let s_b0 = if !diagonal || col <= row_b {
-                        low[2]
-                    } else {
-                        MASKED_SCORE
-                    };
-                    let s_b1 = if !diagonal || col + 1 <= row_b {
-                        low[3]
-                    } else {
-                        MASKED_SCORE
-                    };
-                    let s_b8 = if !diagonal || col + 8 <= row_b {
-                        high[2]
-                    } else {
-                        MASKED_SCORE
-                    };
-                    let s_b9 = if !diagonal || col + 9 <= row_b {
-                        high[3]
-                    } else {
-                        MASKED_SCORE
-                    };
-                    let p_a0 = exp2_approx(s_a0 - m_ref.0[slot_a]);
-                    let p_a1 = exp2_approx(s_a1 - m_ref.0[slot_a]);
-                    let p_a8 = exp2_approx(s_a8 - m_ref.0[slot_a]);
-                    let p_a9 = exp2_approx(s_a9 - m_ref.0[slot_a]);
-                    let p_b0 = exp2_approx(s_b0 - m_ref.0[slot_b]);
-                    let p_b1 = exp2_approx(s_b1 - m_ref.0[slot_b]);
-                    let p_b8 = exp2_approx(s_b8 - m_ref.0[slot_b]);
-                    let p_b9 = exp2_approx(s_b9 - m_ref.0[slot_b]);
-                    tile_sum.0[slot_a] += p_a0 + p_a1 + p_a8 + p_a9;
-                    tile_sum.0[slot_b] += p_b0 + p_b1 + p_b8 + p_b9;
-
-                    // P is a single 64-wide subtile (128-byte rows), so the
-                    // eight 16-byte chunks index the whole row directly.
-                    let chunk_low = (column_block * 2) as usize;
-                    let chunk = if (8..16).contains(&lane) {
-                        chunk_low + 1
-                    } else {
-                        chunk_low
-                    };
-                    let row_low = tmem_row as usize + (lane % 8) as usize;
-                    let row_high = row_low + 8;
-                    stmatrix_m8n8_x2(
-                        p_chunks.at(row_low, chunk),
-                        cvt_f32x2_bf16x2(p_a0, p_a1),
-                        cvt_f32x2_bf16x2(p_a8, p_a9),
-                    );
-                    stmatrix_m8n8_x2(
-                        p_chunks.at(row_high, chunk),
-                        cvt_f32x2_bf16x2(p_b0, p_b1),
-                        cvt_f32x2_bf16x2(p_b8, p_b9),
-                    );
-                    column_block += 1;
+                    let col = column + lane_column;
+                    let m_a = m_ref.0[slot_a];
+                    let m_b = m_ref.0[slot_b];
+                    // Built as a literal, not filled through a loop: an indexed
+                    // write per value leaves the fragment in the local depot
+                    // (measured +64 B frame, +76 `st.local` in this loop), and
+                    // local traffic in the softmax inner loop is the one cost
+                    // this library is not allowed to introduce.
+                    let probabilities: Fragment = RegTile([
+                        [
+                            masked_exp2(s.0[0][0], col, row_a, m_a, diagonal),
+                            masked_exp2(s.0[0][1], col + 1, row_a, m_a, diagonal),
+                            masked_exp2(s.0[0][2], col + 8, row_a, m_a, diagonal),
+                            masked_exp2(s.0[0][3], col + 9, row_a, m_a, diagonal),
+                        ],
+                        [
+                            masked_exp2(s.0[1][0], col, row_b, m_b, diagonal),
+                            masked_exp2(s.0[1][1], col + 1, row_b, m_b, diagonal),
+                            masked_exp2(s.0[1][2], col + 8, row_b, m_b, diagonal),
+                            masked_exp2(s.0[1][3], col + 9, row_b, m_b, diagonal),
+                        ],
+                    ]);
+                    let a = probabilities.0[0];
+                    let b = probabilities.0[1];
+                    tile_sum.0[slot_a] += a[0] + a[1] + a[2] + a[3];
+                    tile_sum.0[slot_b] += b[0] + b[1] + b[2] + b[3];
+                    store_fragment_bf16(p_chunks, tmem_row, column, lane, probabilities);
+                    column += 16;
                 }
                 row_block += 1;
             }
@@ -629,6 +584,21 @@ pub mod kernels {
     #[inline(always)]
     unsafe fn score_mma(s_tmem: u32, q: Panel, k: Panel, s_instruction: u32) {
         unsafe { mma_abt(s_tmem, q, k, s_instruction, false) }
+    }
+
+    /// One score element's probability against a segment reference:
+    /// `exp2(s − m_ref)`, with positions past the causal edge flushed through
+    /// the finite `MASKED_SCORE` sentinel rather than branched around (the
+    /// running-max recurrence stays NaN-free that way). The forward twin of
+    /// [`backward_dscore`].
+    #[inline(always)]
+    fn masked_exp2(score: f32, key_column: u32, query_row: u32, m_ref: f32, diagonal: bool) -> f32 {
+        let masked = if !diagonal || key_column <= query_row {
+            score
+        } else {
+            MASKED_SCORE
+        };
+        exp2_approx(masked - m_ref)
     }
 
     /// True `dS = P·(dP − D)·scale` for one score element, base-2 domain.

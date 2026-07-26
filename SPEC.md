@@ -976,28 +976,36 @@ Each gated on tests; correctness before speed at every step.
        eight hand-written `keep_*` expressions each re-derived) and three
        `cvta.shared`s.
 
-       **Negative result worth keeping** (same day, reverted): unifying
-       `softmax_tile`'s pass-2 P-write onto `store_fragment_bf16` — the
-       last hand-rolled fragment store in the crate — is correct and −60
-       lines, but costs the *production* forward. Two formulations were
-       measured. Filling the fragment through an indexed loop
-       (`p.0[slot][value] = ...`) does not scalarize: local frame 592→656 B
-       and +76 `st.local`/+40 `ld.local` **in the softmax inner loop** —
-       issue #61's risk 1 arriving exactly as predicted. Building it as a
-       *literal* over an `#[inline(always)]` `masked_exp2` helper fixes that
-       completely (frame back to 592, `ld/st.local` and the FMA/mul/select
-       histogram identical to the byte, 13–28 *fewer* instructions per
-       forward kernel) — but ptxas then re-rolls the schedule: pipelined
-       180→216 regs, persistent 240→236, sync 40→32, stable across two
-       runs, and the B200 bench reads persistent **231.6** TFLOP/s vs
-       234.7/234.9/234.7 in the three prior runs (−1.3%, well outside that
-       ±0.1% spread), pipelined 191.5 (flat), sync 125.9 (+10% — this
-       incidentally *undoes* phase 2's 126→115 sync dip). Reverted: the
-       forwards were already kittens-native, so the change bought lines and
-       not capability, and 1.3% on the production attention forward is not
-       a price an optional cleanup gets to charge. Keeping the tight
-       40/180/240 pins is worth more than the 60 lines. The formulation is
-       recorded here if a future toolkit bump re-rolls the schedule anyway.
+       **The unified P-store** (same day): `softmax_tile`'s pass-2 write moved
+       onto `store_fragment_bf16` too, so the library is now the *only*
+       fragment-store path in the crate — `cvt_f32x2_bf16x2` and
+       `stmatrix_m8n8_x2` are no longer imported by `tcgen05.rs` at all.
+       Two formulations were measured and the difference between them is the
+       phase's sharpest lesson. Filling the fragment through an indexed loop
+       (`p.0[slot][value] = ...`) does **not** scalarize: local frame 592→656 B
+       and +76 `st.local`/+40 `ld.local` **inside the softmax inner loop** —
+       issue #61's risk 1 arriving exactly as predicted, and invisible in the
+       Rust. Building it as a *literal* over an `#[inline(always)]`
+       `masked_exp2` helper hands SROA constant indices and the tile
+       evaporates: frame back to 592, `ld/st.local` and the FMA/mul/select
+       histogram identical to the byte, and 13–28 *fewer* instructions per
+       forward kernel. Pass 1 (the row-max drain) stays hand-written on
+       purpose: its `diagonal`/else split reduces the four values as a TREE
+       off the diagonal, which a uniform masked loop would flatten into a
+       4-deep dependent `fmax` chain — a latency change, not a scheduling one.
+       **Cost, and the call:** ptxas re-rolls the schedule against the change —
+       sync 40→32, pipelined 180→216, persistent 240→236, reproducible to the
+       register across two runs — and the B200 bench reads persistent
+       **231.6 / 231.8** TFLOP/s against 234.7 / 234.9 / 234.7 in the three
+       prior runs, i.e. a reproducible ≈1.3%, alongside pipelined 191.5 (flat)
+       and sync **125.8–125.9** (+10%, which incidentally undoes phase 2's
+       126→115 sync dip). Occupancy is untouched (TMEM pins 1 CTA/SM;
+       216×128 threads ≈ 27.6K of the 64K register file), forward parity is
+       identical to the digit at every gate shape, and the backwards are
+       unaffected. Decision (Finn): the 3 TFLOP/s is inside what he is willing
+       to pay for one fragment-store path; adopted, pins re-set to the measured
+       allocation. If it is ever worth reclaiming, the lever is the schedule,
+       not the source — the instruction stream is strictly smaller.
 
        **Phase 5, the kittens-first kernels** (2026-07-26): the backward pair
        rewritten warp-specialized — the acceptance criterion's "one new kernel

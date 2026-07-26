@@ -66,6 +66,19 @@ use host::{
 /// `keep_*` expressions each re-derived) and three `cvta.shared`s. Local
 /// frames unchanged to the byte, forwards byte-identical, bench flat.
 ///
+/// Forward re-pins for the unified P-store (2026-07-26): `softmax_tile`'s
+/// pass-2 write moved onto `store_fragment_bf16`, making the library the only
+/// fragment-store path in the crate. Statically the change is strictly
+/// cleaner — local frames unchanged at 592 B, `ld/st.local` and the
+/// FMA/mul/select histogram identical to the byte, 13–28 *fewer* instructions
+/// per forward kernel (the fragment is built as a literal over an
+/// `#[inline(always)]` `masked_exp2`; filling it through an indexed loop
+/// instead does NOT scalarize, and puts 64 B of frame and 76 `st.local` into
+/// the softmax inner loop — issue #61's risk 1, worth remembering). ptxas
+/// re-rolls the schedule against it: sync 40→32, pipelined 180→216,
+/// persistent 240→236, reproducible across runs. Occupancy is unaffected
+/// (TMEM pins 1 CTA/SM; 216×128 threads ≈ 27.6K of the 64K register file).
+///
 /// `backward q pipelined` (2026-07-26) is the first kernel written
 /// kittens-first rather than ported: same Design-B math as `backward q`, the
 /// forward's three-role warp specialization instead of four block syncs per
@@ -75,17 +88,17 @@ use host::{
 const KERNEL_BUDGETS: [KernelBudget; 7] = [
     KernelBudget {
         name: "forward sync",
-        max_registers: 40,
+        max_registers: 32,
         max_spill_bytes: 592,
     },
     KernelBudget {
         name: "forward pipelined",
-        max_registers: 180,
+        max_registers: 216,
         max_spill_bytes: 592,
     },
     KernelBudget {
         name: "forward persistent",
-        max_registers: 240,
+        max_registers: 236,
         max_spill_bytes: 592,
     },
     KernelBudget {
