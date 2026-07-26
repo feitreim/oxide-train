@@ -135,6 +135,94 @@ master crosses a rounding boundary
 CPU reference reductions accumulate in f64 so the reference never loses to
 the thing it checks.
 
+### 7.1 Activation & gradient buffer audit (#59)
+
+One question decides every activation and gradient buffer: **is anything
+accumulated or compared in it, or is it pure storage between two kernels?**
+Accumulation and comparison keep fp32; pure storage whose only consumers
+quantize it to a bf16 tcgen05 operand is stored packed once instead, and the
+`convert_f32_to_bf16_pairs` launch that fed the GEMM is deleted.
+
+Sizes below are the canonical training config (`bin/profile.rs`, `bin/train.rs`):
+`L=12`, `B=12`, `T=2048` so `N=24576`, `D=3072`, `FF=4096`, `H=24`, `E=8`,
+`K=2`, `C=6144`. "Live" is the resident total: per-block activations are
+allocated `L` times, scratch once.
+
+#### Expert bins — `GpuExpertActs` (per block) and `GpuExpertScratch` (shared)
+
+| Buffer | Shape | fp32 live | Written by | Read by | Verdict |
+|---|---|---|---|---|---|
+| `acts.gate` | `[E,C,FF]` | 9.0 GiB | `split_group2` | `swiglu_forward`, `swiglu_backward_gate/up` | **fp32** — the SwiGLU pointwise math (`sigmoid`, `dsilu`) reads it three times and is the one real fp32 consumer the issue flags |
+| `acts.up` | `[E,C,FF]` | 9.0 GiB | `split_group2` | `swiglu_forward`, `swiglu_backward_gate` | **fp32** — same pointwise math |
+| `acts.activated` | `[E,C,FF]` | 9.0 GiB | `swiglu_forward` | down-GEMM forward (quantized), down-weight-GEMM backward (quantized) | ✅ **bf16** — both consumers quantize it; single writer, no accumulation. −4.5 GiB, 2 quantizes deleted |
+| `acts.bin_input` | `[E,C,D]` | 6.75 GiB | `moe_scatter` | gate/up-GEMM forward (quantized), gate/up-weight-GEMM backward (quantized) | ✅ **bf16** — deterministic bin assignment gives one writer per slot; both consumers quantize. −3.375 GiB, 2 quantizes deleted |
+| `acts.bin_output` | `[E,C,D]` | 6.75 GiB | tcgen05 down-GEMM epilogue | `moe_gather_combine` (gate-weighted `+=` over top-k), `moe_scatter_dy` (gate-gradient dot product) | **fp32** — decision #20 epilogue, and the gate-gradient dot accumulates the whole `D` row |
+| `scratch.d_gate_up` | `[E,C,2,FF]` | 1.5 GiB | `join_group2` | gate/up-weight-GEMM and gate/up-input-GEMM backward (both quantize it) | ✅ **bf16** — pure restaging of `d_gate`/`d_up`. −0.75 GiB, 1 quantize deleted |
+| `scratch.gate_up` | `[E,C,2,FF]` | 1.5 GiB | tcgen05 gate/up-GEMM epilogue | `split_group2` | **fp32** — decision #20 epilogue |
+| `scratch.d_activated` | `[E,C,FF]` | 0.75 GiB | tcgen05 down-input-GEMM epilogue | `swiglu_backward_gate/up` | **fp32** — decision #20 epilogue feeding pointwise math |
+| `scratch.d_gate` | `[E,C,FF]` | 0.75 GiB | `swiglu_backward_gate` | `join_group2` | **fp32** — a bf16 round here and again in `d_gate_up` would double-round the same value; the better win is fusing the join into the SwiGLU backward (out of scope) |
+| `scratch.d_up` | `[E,C,FF]` | 0.75 GiB | `swiglu_backward_up` | `join_group2` | **fp32** — same |
+| `scratch.d_bin_output` | `[E,C,D]` | 0.56 GiB | `moe_zero_dead_bins` + `moe_scatter_dy` | down-weight-GEMM and down-input-GEMM backward (both quantize it) | ✅ **bf16** — single writer per row, both consumers quantize; the gate-gradient dot stays fp32 over the same quads in the same lane order, so router gradients are bit-identical. −0.28 GiB, 1 quantize deleted |
+| `scratch.d_bin_input` | `[E,C,D]` | 0.56 GiB | tcgen05 gate/up-input-GEMM epilogue | `moe_gather_dx` (sums top-k paths) | **fp32** — decision #20 epilogue |
+| `scratch.linears.bf16.{rows,lhs}` | `[E·C,2FF]` bf16 | 1.5 GiB | the quantize launches above | every expert tcgen05 GEMM | ✅ **deleted** — with all four panels packed no expert GEMM stages anything, so the buffers and their three map sets are gone. −1.5 GiB |
+
+#### Residual stream and attention — `GpuBlockActs` / `GpuBlockScratch`
+
+| Buffer | Shape | fp32 live | Verdict |
+|---|---|---|---|
+| `acts.input` | `[N,D]` | 3.4 GiB | **fp32** — RMSNorm forward and backward both reduce over it |
+| `acts.ffn_input` | `[N,D]` | 3.4 GiB | **fp32** — same, plus it is a residual summand |
+| `acts.ffn_normalized` | `[N,D]` | 3.4 GiB | **fp32** — router logits and `router_backward_weight_split` read it; router is fp32 end to end (decision #22) |
+| `acts.attention_normalized` | `[N,D]` | 3.4 GiB | **fp32 for now** — both consumers (qkv forward, qkv weight-grad) do quantize it, so it is a genuine candidate, but it shares `Bf16LinearScratch` with the lm-head and o_proj; deferred to a follow-up rather than mixed into the expert-bin work |
+| `acts.q`, `acts.k`, `acts.v` | `[N,D]` ×3 | 10.1 GiB | **fp32 for now** — flash re-stages them into `FlashAttentionScratch` as bf16, so they are candidates, but the backward re-reads all three and RoPE writes `q`/`k`; deferred with `attention_normalized` |
+| `acts.attended` | `[N,D]` | 3.4 GiB | **fp32 for now** — same family as above |
+| `acts.attention_logsumexp` | `[N,H]` | 27 MiB | **fp32** — softmax internals |
+| `acts.routing.probabilities`, `gate_weights` | `[N,E]`, `[N,K]` | 11 MiB | **fp32** — router, decision #22 |
+| `scratch.d_model_0..4` | `[N,D]` ×5 | 1.4 GiB | **fp32** — `d_model_1` carries the residual-stream gradient across the whole reverse block loop; bf16 would drop low-order bits `L` times |
+| `scratch.qkv` | `[N,3D]` | 864 MiB | **fp32** — written by a tcgen05 epilogue (#20), and the backward join writes it before the weight GEMM quantizes it |
+| `scratch.projection_output` | `[N,D]` | 288 MiB | **fp32** — `moe_gather_combine` accumulates the top-k paths into it |
+| `scratch.router_logits`, `dlogits`, `router_dx`, `router_dweight_partials`, `gate_gradients` | — | 314 MiB | **fp32** — router end to end, decision #22, re-affirmed by the #44/#52 determinism constraints |
+| `scratch.attention_dot`, `norm_backward_inv`, `probability_sums` | — | 2.3 MiB | **fp32** — reduction accumulators |
+
+#### Rejections
+
+None. Every buffer the survey cleared converted and held parity on the first
+run; nothing had to be reverted. A rejected buffer belongs here with its
+evidence so it is not re-attempted blind.
+
+#### Landed (#59)
+
+B200 same-container A/B vs main at the §13.9 shape (B=12, T=2048), the four
+converted panels plus the deleted staging:
+
+| span | main | #59 | Δ |
+|---|---|---|---|
+| `backward.experts.gate_up_weight_gemm` | 53.61 | 43.74 | −9.87 |
+| `backward.experts.gate_up_join` | 12.11 | 5.45 | −6.66 |
+| `backward.experts.down_weight_gemm` | 29.05 | 22.59 | −6.46 |
+| `forward.experts.swiglu` | 11.04 | 6.40 | −4.63 |
+| `forward.experts.down_gemm` | 17.05 | 13.35 | −3.70 |
+| `forward.router.scatter` | 8.23 | 4.66 | −3.57 |
+| `forward.experts.gate_up_gemm` | 32.08 | 29.29 | −2.78 |
+| `forward.router.zero_bins` | 3.68 | 1.88 | −1.81 |
+| `backward.router.scatter_dy` | 2.79 | 2.55 | −0.24 |
+
+The deleted quantizes do not appear as spans going to zero: each ran inside
+its GEMM's `profiler.measure`, so the win shows up as the GEMM span shrinking.
+Every other span in the step moved by at most 0.17 ms, which is this pass's
+noise floor — including the two input GEMMs, which only swap a descriptor
+(`down_input_gemm` +0.07, `gate_up_input_gemm` +0.01) and the untouched
+attention backward (`flash_q` −0.10, `flash_kv` +0.01). Full step
+603.11 → 563.23 ms (−6.6%); workspace VRAM 164.3 → 153.9 GiB, free headroom
+14.0 → 24.5 GiB (+75%).
+
+Deferred with evidence: `attention_normalized`, `q`/`k`/`v` and `attended`
+(20 GiB fp32 live between them) are genuine candidates by the same test — the
+qkv/o_proj GEMMs and the flash staging all quantize them — but they share
+`Bf16LinearScratch` with the lm-head and `FlashAttentionScratch` with the
+attention backward, so they need their own follow-up rather than riding on the
+expert-bin work.
+
 ## 8. Optimizers
 
 - **AdamW first**: one fused elementwise GPU kernel over params/grads/m/v.
@@ -920,6 +1008,29 @@ Each gated on tests; correctness before speed at every step.
      weight reuse is the only one left there; #54 (router weight-reuse)
      since landed, 14.64 to 3.19 ms; #55 (vectorized scatter +
      `zero_dy_bins` fold) since landed, 7.49 to 3.31 ms.
+   - ✅ **Expert bin panels stored bf16** (#59): the SPEC §7.1 audit asked one
+     question of every activation and gradient buffer — is anything accumulated
+     or compared in it, or is it pure storage between two kernels? Four expert
+     panels (`bin_input`, `activated`, `d_bin_output`, `d_gate_up`) had a single
+     writer and only bf16 tcgen05 operands as readers, so they now live as
+     packed-bf16 `ExpertPanel`s with their own per-expert K-major and MN-major
+     descriptors: the producing kernel rounds once (`moe_scatter_bf16`,
+     `swiglu_forward_bf16`, `moe_scatter_dy_bf16`, `join_group2_bf16`,
+     `moe_zero_dead_bins_bf16`) and every GEMM addresses the panel in place.
+     Six `convert_f32_to_bf16_pairs` launches disappear, and with no operand
+     left to stage the shared `rows`/`lhs` scratch and its three map sets are
+     deleted outright — after #53 removed the transposes, #59 removes the
+     staging itself. `gate`/`up` stay fp32 (SwiGLU pointwise math), as do every
+     tcgen05 epilogue target (decision #20), the residual stream, and the router
+     (decision #22). The `moe_scatter_dy` gate dot still accumulates fp32 over
+     the same quads in the same lane order, so router gradients are
+     bit-identical. B200 same-container A/B vs main at the §13.9 shape (B=12
+     T=2048): full step 603.1 → 563.2 ms (−6.6%), workspace VRAM
+     164.3 → 153.9 GiB (free headroom 14.0 → 24.5 GiB, +75%); per-span table in
+     §7.1, with every untouched span inside a 0.17 ms noise floor. The largest
+     single win is `gate_up_weight_gemm` 53.61 → 43.74 ms,
+     confirming #53's read that these GEMMs are operand-DRAM-bandwidth bound —
+     halving the operand bytes moves them where re-orienting them did not.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 

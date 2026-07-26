@@ -469,6 +469,29 @@ pub mod kernels {
         }
     }
 
+    /// [`swiglu_forward`] storing packed-bf16 pairs, one word per thread.
+    ///
+    /// The expert `activated` panel is only ever read as a bf16 tcgen05
+    /// operand, so it is rounded once here instead of stored wide and
+    /// quantized again by each of the two GEMMs that read it (#59).
+    #[kernel]
+    pub fn swiglu_forward_bf16(gate: &[f32], up: &[f32], mut y: DisjointSlice<u32>) {
+        let index = thread::index_1d();
+        let pair = index.get();
+        if 2 * pair + 1 >= gate.len() || 2 * pair + 1 >= up.len() {
+            return;
+        }
+        if let Some(slot) = y.get_mut(index) {
+            let mut packed = 0u32;
+            for half in 0..2 {
+                let i = 2 * pair + half;
+                let sigmoid = 1.0 / (1.0 + (-gate[i]).exp());
+                packed |= (f32_to_bf16_bits(gate[i] * sigmoid * up[i]) as u32) << (16 * half);
+            }
+            *slot = packed;
+        }
+    }
+
     #[kernel]
     pub fn swiglu_backward_gate(
         gate: &[f32],
@@ -536,6 +559,43 @@ pub mod kernels {
         unsafe {
             *output.get_unchecked_mut(base) = first[i];
             *output.get_unchecked_mut(base + width) = second[i];
+        }
+    }
+
+    /// [`join_group2`] storing packed-bf16 pairs, one word per thread per
+    /// group. `width` counts f32 columns per group and must be even; the two
+    /// groups land `width / 2` words apart inside each interleaved row (#59).
+    #[kernel]
+    pub unsafe fn join_group2_bf16(
+        first: &[f32],
+        second: &[f32],
+        width: u32,
+        mut output: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        let width = width as usize;
+        if width == 0 || !width.is_multiple_of(2) {
+            return;
+        }
+        let half = width / 2;
+        let row = i / half;
+        let column = i % half;
+        let source = row * width + 2 * column;
+        if source + 1 >= first.len() || source + 1 >= second.len() {
+            return;
+        }
+        let base = row * width + column;
+        if base + half >= output.len() {
+            return;
+        }
+        let low = f32_to_bf16_bits(first[source]) as u32
+            | ((f32_to_bf16_bits(first[source + 1]) as u32) << 16);
+        let high = f32_to_bf16_bits(second[source]) as u32
+            | ((f32_to_bf16_bits(second[source + 1]) as u32) << 16);
+        // SAFETY: both indices were bounds-checked and one thread owns each.
+        unsafe {
+            *output.get_unchecked_mut(base) = low;
+            *output.get_unchecked_mut(base + half) = high;
         }
     }
 
@@ -1794,6 +1854,52 @@ pub mod kernels {
         }
     }
 
+    /// [`moe_scatter`] storing packed-bf16 pairs, one word per thread.
+    ///
+    /// Both readers of the expert input panel are bf16 tcgen05 operands, so
+    /// the routing copy rounds once here rather than writing a wide panel that
+    /// two quantize launches then re-read (#59). `dim` must be even.
+    #[kernel]
+    pub unsafe fn moe_scatter_bf16(
+        x: &[f32],
+        selected_experts: &[u32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut expert_input: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if d == 0 || k == 0 || !d.is_multiple_of(2) {
+            return;
+        }
+        let half = d / 2;
+        let pair = i / half;
+        let column = i % half;
+        if pair >= selected_experts.len() || pair >= slots.len() {
+            return;
+        }
+        let slot = slots[pair];
+        if slot == MOE_DROPPED_SLOT {
+            return;
+        }
+        let expert = selected_experts[pair] as usize;
+        let token = pair / k;
+        let output = (expert * c + slot as usize) * half + column;
+        let source = token * d + 2 * column;
+        if source + 1 >= x.len() || output >= expert_input.len() {
+            return;
+        }
+        // Deterministic bin assignment guarantees one writer per accepted slot.
+        unsafe {
+            *expert_input.get_unchecked_mut(output) = f32_to_bf16_bits(x[source]) as u32
+                | ((f32_to_bf16_bits(x[source + 1]) as u32) << 16);
+        }
+    }
+
     /// Gather expert outputs to token order using the renormalized gate weights.
     #[kernel]
     pub fn moe_gather_combine(
@@ -1965,6 +2071,133 @@ pub mod kernels {
         }
     }
 
+    /// [`moe_scatter_dy`] storing the bin gradient as packed-bf16 pairs.
+    ///
+    /// Both readers of that panel are bf16 tcgen05 operands (#59). The gate dot
+    /// product still accumulates in fp32 over the same quads in the same lane
+    /// order, so it is bit-identical to the wide kernel wherever `dim` is a
+    /// multiple of [`QUAD_LANES`]; only the store narrows.
+    #[kernel]
+    pub unsafe fn moe_scatter_dy_bf16(
+        expert_output: &[f32],
+        dy: &[f32],
+        selected_experts: &[u32],
+        gate_weights: &[f32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut expert_output_gradient: DisjointSlice<u32>,
+        mut gate_gradients: DisjointSlice<f32>,
+    ) {
+        static mut DOT: SharedArray<f32, MOE_SCATTER_DY_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != MOE_SCATTER_DY_THREADS {
+            return;
+        }
+        let pair = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if pair >= selected_experts.len()
+            || pair >= gate_weights.len()
+            || pair >= slots.len()
+            || pair >= gate_gradients.len()
+            || d == 0
+            || k == 0
+            || !d.is_multiple_of(2)
+        {
+            return;
+        }
+
+        let slot = slots[pair];
+        if slot == MOE_DROPPED_SLOT {
+            if tid == 0 {
+                // SAFETY: this block exclusively owns `pair`.
+                unsafe {
+                    *gate_gradients.get_unchecked_mut(pair) = 0.0;
+                }
+            }
+            return;
+        }
+
+        let token = pair / k;
+        let expert = selected_experts[pair] as usize;
+        let bin_base = (expert * c + slot as usize) * d;
+        let token_base = token * d;
+        if bin_base + d > expert_output.len()
+            || (bin_base + d) / 2 > expert_output_gradient.len()
+            || token_base + d > dy.len()
+        {
+            return;
+        }
+
+        let gate = gate_weights[pair];
+        let mut dot = 0.0f32;
+        if d.is_multiple_of(QUAD_LANES) {
+            // SAFETY: `bin_base` and `token_base` are multiples of `dim`, hence
+            // of `QUAD_LANES`, so both fp32 rows are 16-byte aligned and the
+            // packed row's `bin_base / 2` base is 8-byte aligned; the row
+            // bounds were checked above. Each lane owns distinct quads.
+            let dy_row = unsafe { dy.as_ptr().add(token_base) as *const u128 };
+            let output_row = unsafe { expert_output.as_ptr().add(bin_base) as *const u128 };
+            let gradient_row =
+                unsafe { expert_output_gradient.as_mut_ptr().add(bin_base / 2) as *mut u64 };
+            let mut quad = tid;
+            while quad < d / QUAD_LANES {
+                let grad = quad_lanes(unsafe { *dy_row.add(quad) });
+                let output = quad_lanes(unsafe { *output_row.add(quad) });
+                let mut packed = 0u64;
+                for lane in 0..QUAD_LANES {
+                    dot += output[lane] * grad[lane];
+                    packed |= (f32_to_bf16_bits(gate * grad[lane]) as u64) << (16 * lane);
+                }
+                unsafe {
+                    *gradient_row.add(quad) = packed;
+                }
+                quad += MOE_SCATTER_DY_THREADS;
+            }
+        } else {
+            let mut word = tid;
+            while word < d / 2 {
+                let column = 2 * word;
+                let low = dy[token_base + column];
+                let high = dy[token_base + column + 1];
+                dot += expert_output[bin_base + column] * low
+                    + expert_output[bin_base + column + 1] * high;
+                // SAFETY: each lane owns distinct words of this block's bin row.
+                unsafe {
+                    *expert_output_gradient.get_unchecked_mut(bin_base / 2 + word) =
+                        f32_to_bf16_bits(gate * low) as u32
+                            | ((f32_to_bf16_bits(gate * high) as u32) << 16);
+                }
+                word += MOE_SCATTER_DY_THREADS;
+            }
+        }
+        unsafe {
+            DOT[tid] = dot;
+        }
+        thread::sync_threads();
+
+        let mut stride = MOE_SCATTER_DY_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    DOT[tid] += DOT[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            // SAFETY: this block exclusively owns `pair`.
+            unsafe {
+                *gate_gradients.get_unchecked_mut(pair) = DOT[0];
+            }
+        }
+    }
+
     /// Zero the expert-bin gradient rows the routing left unassigned.
     ///
     /// Capacity assignment hands expert `e` the slots `0..min(count[e], C)` and
@@ -2015,6 +2248,57 @@ pub mod kernels {
                 // SAFETY: each lane owns distinct columns of this dead bin row.
                 unsafe {
                     *expert_output_gradient.get_unchecked_mut(base + column) = 0.0;
+                }
+                column += threads;
+            }
+        }
+    }
+
+    /// [`moe_zero_dead_bins`] over a packed-bf16 gradient panel (#59).
+    #[kernel]
+    pub unsafe fn moe_zero_dead_bins_bf16(
+        assignment_counts: &[u32],
+        dim: u32,
+        capacity: u32,
+        mut expert_output_gradient: DisjointSlice<u32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let threads = thread::blockDim_x() as usize;
+        let bin = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        let c = capacity as usize;
+        if d == 0 || c == 0 || !d.is_multiple_of(2) {
+            return;
+        }
+        let words = d / 2;
+        let expert = bin / c;
+        let slot = bin % c;
+        let base = bin * words;
+        if expert >= assignment_counts.len() || base + words > expert_output_gradient.len() {
+            return;
+        }
+        if slot < assignment_counts[expert] as usize {
+            return;
+        }
+
+        if words.is_multiple_of(QUAD_LANES) {
+            // SAFETY: `base` is a multiple of `words`, hence of `QUAD_LANES`,
+            // so the row is 16-byte aligned; bounds were checked above. Each
+            // lane owns distinct quads of this block's dead bin row.
+            let row = unsafe { expert_output_gradient.as_mut_ptr().add(base) as *mut u128 };
+            let mut quad = tid;
+            while quad < words / QUAD_LANES {
+                unsafe {
+                    *row.add(quad) = 0;
+                }
+                quad += threads;
+            }
+        } else {
+            let mut column = tid;
+            while column < words {
+                // SAFETY: each lane owns distinct words of this dead bin row.
+                unsafe {
+                    *expert_output_gradient.get_unchecked_mut(base + column) = 0;
                 }
                 column += threads;
             }
