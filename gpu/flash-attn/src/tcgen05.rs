@@ -217,6 +217,13 @@ pub const FLASH_BACKWARD_Q_PIPELINED_SMEM: usize = (5 + 2 * BACKWARD_STAGES) * T
 pub const FLASH_BACKWARD_Q_PIPELINED_BLOCK: usize = 2 * TILE + 64;
 /// Mirrors the `FLASH_PIPELINE_BLOCK` `.maxntid` note.
 const _: () = assert!(FLASH_BACKWARD_Q_PIPELINED_BLOCK == 192);
+/// Dynamic shared plan of the PIPELINED key-parallel backward: the resident
+/// stacked K and V pairs, the Q and dY rings, and the stacked Pᵀ and dSᵀ
+/// tiles (both single-buffered, released by the same `grad_done` wait that
+/// recycles the ring).
+pub const FLASH_BACKWARD_KV_PIPELINED_SMEM: usize = (6 + 2 * BACKWARD_STAGES) * TILE_BYTES;
+/// Threads of the pipelined key-parallel backward; same three roles.
+pub const FLASH_BACKWARD_KV_PIPELINED_BLOCK: usize = 2 * TILE + 64;
 
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
@@ -1800,6 +1807,293 @@ pub mod kernels {
                 s_free.inval_all();
                 ds_full.inval();
                 dq_done.inval();
+            }
+        }
+    }
+
+    /// Issue one query tile's `dV += Pᵀ·dY` and `dK += dSᵀ·Q` from the MMA
+    /// warp: wait for the gradient warpgroup to publish both operand tiles,
+    /// chain each gradient MMA across the streamed panel's two HD subtiles,
+    /// and commit into `grad_done`. As in kernel A that commit is what
+    /// releases the operand tiles AND the ring stage — Q and dY are each read
+    /// twice, once by a score MMA and once here.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn gradient_mma_kv<const STAGES: usize>(
+        step: u32,
+        p: PairedPTile,
+        ds: PairedPTile,
+        q: PanelRingN<STAGES>,
+        dy: PanelRingN<STAGES>,
+        dv_tmem: AccTmem,
+        dk_tmem: AccTmem,
+        pds_full: Semaphore,
+        grad_done: Semaphore,
+        instruction: u32,
+    ) {
+        unsafe {
+            pds_full.wait(step & 1);
+            let accumulate = step != 0;
+            mma_ab(dv_tmem.raw(), p, dy.tile(step), instruction, accumulate);
+            mma_ab(dk_tmem.raw(), ds, q.tile(step), instruction, accumulate);
+            mma::commit(grad_done);
+        }
+    }
+
+    /// Warp-specialized pipelined key-parallel backward — kernel B's half of
+    /// the phase-5 kittens-first pair. Launch with
+    /// `host::flash_backward_kv_pipelined_config`. Identical operand,
+    /// statistic, and output contract to `flash_backward_kv_tcgen05`, with the
+    /// same three roles as `flash_backward_q_pipelined`.
+    ///
+    /// Two differences from kernel A, both forced by the transposed math:
+    /// - **the loop is relative.** Kernel B streams query tiles `key_a..T/64`,
+    ///   so every ring index and phase parity runs off `step = query - key_a`
+    ///   while the data addressing keeps the absolute tile. A `SemaphoreRing`
+    ///   derives its parity from the visit count, which is the step, not the
+    ///   tile.
+    /// - **the per-tile statistics ride the ring.** Rows are key rows and
+    ///   columns are query rows here, so `lse2`/`dot` index by the *streamed*
+    ///   tile's 64 rows and must be re-staged every step — which the
+    ///   synchronous kernel did behind a block sync that no longer exists.
+    ///   The TMA warp stages them into a `BACKWARD_STAGES`-deep window and
+    ///   publishes them on the stage's own `qdy_full`: a `warp::sync_mask`
+    ///   orders the 32 lanes' stores ahead of the leader's `expect_tx`, and
+    ///   the mbarrier's release makes them visible to the warpgroup exactly
+    ///   like the forward's `restart` flag.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(192, 1)]
+    pub unsafe fn flash_backward_kv_pipelined(
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &[f32],
+        dot: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        mut dk: DisjointSlice<f32>,
+        mut dv: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
+            static mut QDY_FULL: SharedArray<u64, BACKWARD_STAGES, 8> = SharedArray::UNINIT;
+            static mut QDY_FREE: SharedArray<u64, BACKWARD_STAGES, 8> = SharedArray::UNINIT;
+            static mut S_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
+            static mut S_FREE: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
+            static mut PDS_FULL: Barrier = Barrier::UNINIT;
+            static mut GRAD_DONE: Barrier = Barrier::UNINIT;
+            static mut LSE2: SharedArray<f32, { TILE * BACKWARD_STAGES }> = SharedArray::UNINIT;
+            static mut DOTS: SharedArray<f32, { TILE * BACKWARD_STAGES }> = SharedArray::UNINIT;
+
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let k = PairedPanel::from_raw(smem);
+            let v = PairedPanel::from_raw(smem.add(2 * TILE_BYTES));
+            let q = PanelRingN::<BACKWARD_STAGES>::attach(smem.add(4 * TILE_BYTES));
+            let dy = PanelRingN::<BACKWARD_STAGES>::attach(
+                smem.add((4 + BACKWARD_STAGES) * TILE_BYTES),
+            );
+            let p = PairedPTile::from_raw(smem.add((4 + 2 * BACKWARD_STAGES) * TILE_BYTES));
+            let ds = PairedPTile::from_raw(smem.add((5 + 2 * BACKWARD_STAGES) * TILE_BYTES));
+
+            let tid = thread::threadIdx_x();
+            if thread::blockDim_x() as usize != FLASH_BACKWARD_KV_PIPELINED_BLOCK {
+                return;
+            }
+            let warp_id = warp::warp_id();
+            let lane = warp::lane_id();
+            let group = 2 * TILE as u32;
+
+            let pair = thread::blockIdx_x();
+            let head = thread::blockIdx_y();
+            let batch = thread::blockIdx_z();
+            let t = sequence_length;
+            let h = heads;
+            let plane = (batch * h + head) as i32;
+            let tiles = t / TILE as u32;
+            let key_a = pair * 2;
+            let key_b = key_a + 1;
+            let steps = tiles - key_a;
+
+            let qdy_full =
+                SemaphoreRing::<BACKWARD_STAGES>::attach(&raw mut QDY_FULL as *mut Barrier);
+            let qdy_free =
+                SemaphoreRing::<BACKWARD_STAGES>::attach(&raw mut QDY_FREE as *mut Barrier);
+            let s_full = SemaphoreRing::<2>::attach(&raw mut S_FULL as *mut Barrier);
+            let s_free = SemaphoreRing::<2>::attach(&raw mut S_FREE as *mut Barrier);
+            let pds_full = Semaphore::attach(&raw mut PDS_FULL);
+            let grad_done = Semaphore::attach(&raw mut GRAD_DONE);
+            let lse_base = &raw mut LSE2 as *mut f32;
+            let dot_base = &raw mut DOTS as *mut f32;
+
+            if tid == 0 {
+                qdy_full.init_all(1);
+                qdy_free.init_all(1);
+                s_full.init_all(1);
+                s_free.init_all(group);
+                pds_full.init(group);
+                grad_done.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+
+            // Sᵀ/dPᵀ take two 64-column buffers each (columns 0..256); the two
+            // 128-column gradient accumulators fill the rest of the 512.
+            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
+            let st_tmem = STmem::from_raw(tmem);
+            let dpt_tmem = STmem::from_raw(tmem + 128);
+            let dv_tmem = AccTmem::from_raw(tmem + 256);
+            let dk_tmem = AccTmem::from_raw(tmem + 384);
+
+            if tid < group {
+                // Gradient warpgroup.
+                let mut step = 0u32;
+                while step < steps {
+                    let stage = (step as usize % BACKWARD_STAGES) * TILE;
+                    s_full.wait(step);
+                    backward_kv_tile_paired(
+                        st_tmem.columns_right((step & 1) * 64),
+                        dpt_tmem.columns_right((step & 1) * 64),
+                        key_a + step,
+                        key_a,
+                        key_b,
+                        warp_id,
+                        lane,
+                        lse_base.add(stage) as *const f32,
+                        dot_base.add(stage) as *const f32,
+                        p,
+                        ds,
+                    );
+                    fence_proxy_async_shared_cta();
+                    s_free.sem(step).arrive();
+                    pds_full.arrive();
+                    grad_done.wait(step & 1);
+                    if tid == 0 {
+                        qdy_free.sem(step).arrive();
+                    }
+                    step += 1;
+                }
+                let mut dv_acc = RegTile::<4, 32>::zero();
+                let mut dk_acc = RegTile::<4, 32>::zero();
+                merge_output_tile(dv_tmem, warp_id, &mut dv_acc);
+                merge_output_tile(dk_tmem, warp_id, &mut dk_acc);
+                store_grad_tile(batch, t, h, head, key_a, warp_id, lane, &dv_acc, &mut dv);
+                store_grad_tile(batch, t, h, head, key_a, warp_id, lane, &dk_acc, &mut dk);
+            } else if warp_id == group / 32 {
+                // TMA load warp: every lane stages two of the streamed tile's
+                // 64 per-query-row statistics, then the leader issues the
+                // boxes and charges the stage's expected bytes.
+                let mut step = 0u32;
+                while step < steps {
+                    let query_tile = key_a + step;
+                    qdy_free.wait_recycled(step);
+                    let stage = (step as usize % BACKWARD_STAGES) * TILE;
+                    let mut row = lane;
+                    while row < TILE as u32 {
+                        let global_row =
+                            (batch * t) as usize + query_tile as usize * TILE + row as usize;
+                        let stat_index = global_row * h as usize + head as usize;
+                        *lse_base.add(stage + row as usize) = logsumexp[stat_index] * LOG2E;
+                        *dot_base.add(stage + row as usize) = dot[stat_index];
+                        row += 32;
+                    }
+                    warp::sync_mask(u32::MAX);
+                    if lane == 0 {
+                        let full = qdy_full.sem(step);
+                        let query_row = (query_tile * TILE as u32) as i32;
+                        q.tile(step).tma_load(q_tma, query_row, plane, full);
+                        dy.tile(step).tma_load(dy_tma, query_row, plane, full);
+                        if step == 0 {
+                            let row_a = (key_a * TILE as u32) as i32;
+                            let row_b = (key_b * TILE as u32) as i32;
+                            k.tma_load_at(k_tma, 0, row_a, plane, full);
+                            k.tma_load_at(k_tma, TILE, row_b, plane, full);
+                            v.tma_load_at(v_tma, 0, row_a, plane, full);
+                            v.tma_load_at(v_tma, TILE, row_b, plane, full);
+                            full.expect_tx((2 * Panel::BYTES + 2 * PairedPanel::BYTES) as u32);
+                        } else {
+                            full.expect_tx(2 * Panel::BYTES as u32);
+                        }
+                    }
+                    step += 1;
+                }
+            } else if tid == group + 32 {
+                // MMA warp leader.
+                let s_instruction = Tcgen05InstructionDescriptor::builder()
+                    .shape(Tcgen05MmaShape::M128_N64)
+                    .element_type(Tcgen05ElementType::BF16)
+                    .accumulator_type(Tcgen05AccumulatorType::F32)
+                    .build()
+                    .raw();
+                let grad_instruction = Tcgen05InstructionDescriptor::builder()
+                    .shape(Tcgen05MmaShape::M128_N64)
+                    .element_type(Tcgen05ElementType::BF16)
+                    .accumulator_type(Tcgen05AccumulatorType::F32)
+                    .transpose_b(true)
+                    .build()
+                    .raw();
+                tcgen05_fence_after_thread_sync();
+                let mut step = 0u32;
+                while step < steps {
+                    qdy_full.wait(step);
+                    s_free.wait_recycled(step);
+                    let buffer = (step & 1) * 64;
+                    mma_abt(
+                        st_tmem.columns_right(buffer).raw(),
+                        k,
+                        q.tile(step),
+                        s_instruction,
+                        false,
+                    );
+                    mma_abt(
+                        dpt_tmem.columns_right(buffer).raw(),
+                        v,
+                        dy.tile(step),
+                        s_instruction,
+                        false,
+                    );
+                    mma::commit(s_full.sem(step));
+                    if step > 0 {
+                        gradient_mma_kv(
+                            step - 1,
+                            p,
+                            ds,
+                            q,
+                            dy,
+                            dv_tmem,
+                            dk_tmem,
+                            pds_full,
+                            grad_done,
+                            grad_instruction,
+                        );
+                    }
+                    step += 1;
+                }
+                gradient_mma_kv(
+                    steps - 1,
+                    p,
+                    ds,
+                    q,
+                    dy,
+                    dv_tmem,
+                    dk_tmem,
+                    pds_full,
+                    grad_done,
+                    grad_instruction,
+                );
+            }
+
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
+            dealloc_block(tmem, 512);
+            if tid == 0 {
+                qdy_full.inval_all();
+                qdy_free.inval_all();
+                s_full.inval_all();
+                s_free.inval_all();
+                pds_full.inval();
+                grad_done.inval();
             }
         }
     }

@@ -25,7 +25,8 @@ mod tcgen05_device;
 use host::{
     FLASH_HD, FLASH_SUBTILE_HD, FLASH_TILE, Tcgen05Flash, correction_count_len,
     create_flash_head_tma_map, device_sm_count, flash_backward_kv_config,
-    flash_backward_q_config, flash_backward_q_pipelined_config,
+    flash_backward_kv_pipelined_config, flash_backward_q_config,
+    flash_backward_q_pipelined_config,
     flash_forward_config, flash_persistent_config, flash_pipelined_config,
 };
 
@@ -71,7 +72,7 @@ use host::{
 /// key tile. It costs **one** register over the synchronous kernel (52 → 53,
 /// same 512 B frame) — the tile library's overhead for a whole pipeline is
 /// inside the noise of a single scalar.
-const KERNEL_BUDGETS: [KernelBudget; 6] = [
+const KERNEL_BUDGETS: [KernelBudget; 7] = [
     KernelBudget {
         name: "forward sync",
         max_registers: 40,
@@ -103,6 +104,17 @@ const KERNEL_BUDGETS: [KernelBudget; 6] = [
     KernelBudget {
         name: "backward kv",
         max_registers: 60,
+        max_spill_bytes: 1024,
+    },
+    KernelBudget {
+        // Kernel B's pipelined form, first flight: 72 regs / 1024 B frame.
+        // The +12 over the synchronous kernel (against kernel A's +1) is the
+        // second gradient accumulator's drain — two `RegTile<4, 32>`s live
+        // through the epilogue instead of one. Occupancy is TMEM-pinned at
+        // one CTA/SM (this kernel uses all 512 columns), so it buys nothing
+        // to fight.
+        name: "backward kv pipelined",
+        max_registers: 72,
         max_spill_bytes: 1024,
     },
 ];
@@ -669,6 +681,8 @@ fn check_backward(
     let mut dq_pipelined = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dk_pipelined = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut dv_pipelined = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     unsafe {
         flash.backward_q(
             stream,
@@ -710,6 +724,20 @@ fn check_backward(
             h as u32,
             &mut dq_pipelined,
         )?;
+        flash.backward_kv_pipelined(
+            stream,
+            flash_backward_kv_pipelined_config(b, t, h),
+            q_tma.as_ptr(),
+            k_tma.as_ptr(),
+            v_tma.as_ptr(),
+            dy_tma.as_ptr(),
+            &lse_device,
+            &dot_device,
+            t as u32,
+            h as u32,
+            &mut dk_pipelined,
+            &mut dv_pipelined,
+        )?;
     }
     println!("tcgen05 backward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]");
     // The pipelined backward is a pure scheduling change: same per-tile math in
@@ -719,6 +747,16 @@ fn check_backward(
         "dq pipelined vs sync",
         &dq_pipelined.to_host_vec(stream)?,
         &dq.to_host_vec(stream)?,
+    );
+    assert_identical(
+        "dk pipelined vs sync",
+        &dk_pipelined.to_host_vec(stream)?,
+        &dk.to_host_vec(stream)?,
+    );
+    assert_identical(
+        "dv pipelined vs sync",
+        &dv_pipelined.to_host_vec(stream)?,
+        &dv.to_host_vec(stream)?,
     );
     assert_close("dq", &dq.to_host_vec(stream)?, &expected_dq, 5.0e-3, 5.0e-3);
     assert_close("dk", &dk.to_host_vec(stream)?, &expected_dk, 5.0e-3, 5.0e-3);
@@ -826,6 +864,50 @@ fn bench(
     // warp specialization bought. Per key-tile visit kernel A issues two
     // 128x128x64 score GEMMs plus one 128x64x128 gradient GEMM.
     let q_flop = visits * 3.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    // Kernel B issues two score GEMMs plus two gradient GEMMs per visit.
+    let kv_flop = visits * 4.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    for (name, pipelined) in [("sync", false), ("pipelined", true)] {
+        let milliseconds = time_gpu_iters(stream, 3, 20, || {
+            unsafe {
+                if pipelined {
+                    flash.backward_kv_pipelined(
+                        stream,
+                        flash_backward_kv_pipelined_config(b, t, h),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        dy_tma.as_ptr(),
+                        &lse_in,
+                        &dot_in,
+                        t as u32,
+                        h as u32,
+                        &mut dk,
+                        &mut dv,
+                    )?;
+                } else {
+                    flash.backward_kv(
+                        stream,
+                        flash_backward_kv_config(b, t, h),
+                        q_tma.as_ptr(),
+                        k_tma.as_ptr(),
+                        v_tma.as_ptr(),
+                        dy_tma.as_ptr(),
+                        &lse_in,
+                        &dot_in,
+                        t as u32,
+                        h as u32,
+                        &mut dk,
+                        &mut dv,
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+        println!(
+            "tcgen05 backward kv {name} [{b},{t},{h},{FLASH_HD}]: {milliseconds:.3} ms, {:.1} TFLOP/s",
+            kv_flop / (milliseconds * 1.0e-3) / 1.0e12
+        );
+    }
     for (name, pipelined) in [("sync", false), ("pipelined", true)] {
         let milliseconds = time_gpu_iters(stream, 3, 20, || {
             unsafe {
@@ -949,6 +1031,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host::FLASH_BACKWARD_Q_PIPELINED_BLOCK_THREADS as usize,
         tcgen05_device::FLASH_BACKWARD_Q_PIPELINED_BLOCK,
         "host.rs and tcgen05.rs disagree on the pipelined-backward block width"
+    );
+    assert!(
+        tcgen05_device::FLASH_BACKWARD_KV_PIPELINED_SMEM
+            <= host::FLASH_BACKWARD_KV_PIPELINED_SMEM_BYTES as usize,
+        "BACKWARD_STAGES overflows the kernel-B host-side shared-memory ceiling"
+    );
+    assert_eq!(
+        host::FLASH_BACKWARD_KV_PIPELINED_BLOCK_THREADS as usize,
+        tcgen05_device::FLASH_BACKWARD_KV_PIPELINED_BLOCK,
+        "host.rs and tcgen05.rs disagree on the pipelined kernel-B block width"
     );
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
