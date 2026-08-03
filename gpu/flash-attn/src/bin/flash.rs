@@ -99,8 +99,8 @@ const KERNEL_BUDGETS: [KernelBudget; 5] = [
         // was designed, present in the library now) lets the rescale happen in
         // the O segment. See the PR.
         name: "forward",
-        max_registers: 244,
-        max_spill_bytes: 1136,
+        max_registers: 246,
+        max_spill_bytes: 1072,
     },
     KernelBudget {
         // 52 → 53 with nothing in this kernel changed. Three kernels left the
