@@ -1744,6 +1744,19 @@ pub mod kernels {
                 let mut key_tile = 0u32;
                 while key_tile < key_tiles {
                     if leader {
+                        // Refill before issuing, not after. A K/V stage is
+                        // free once the output MMA that read its V completed,
+                        // so the refill is `FORWARD_STAGES - 1` tiles ahead —
+                        // and at the ring's floor of two stages that is
+                        // `key_tile + 1`, exactly the tile the score MMA below
+                        // is about to wait for. Issuing first deadlocks the
+                        // leader against a load it has not made yet, which is
+                        // invisible at three stages and immediate at two.
+                        let refill = key_tile + FORWARD_STAGES as u32 - 1;
+                        if key_tile > 0 && refill < key_tiles {
+                            self.shared.accumulated.wait(key_tile - 1);
+                            self.load_kv(refill, plane as i32);
+                        }
                         // The next tile's scores are issued before this tile's
                         // softmax runs, so the tensor core and the warpgroup
                         // overlap. Its segment is the one drained last tile,
@@ -1756,13 +1769,6 @@ pub mod kernels {
                                 self.shared.k.tile(key_tile + 1),
                             );
                             mma::commit(self.shared.scored.sem(key_tile + 1));
-                        }
-                        // A K/V stage is free once the output MMA that read its
-                        // V has completed.
-                        let refill = key_tile + FORWARD_STAGES as u32 - 1;
-                        if key_tile > 0 && refill < key_tiles {
-                            self.shared.accumulated.wait(key_tile - 1);
-                            self.load_kv(refill, plane as i32);
                         }
                     }
 
