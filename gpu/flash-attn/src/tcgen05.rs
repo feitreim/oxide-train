@@ -2,9 +2,10 @@
 //! phase 4).
 //!
 //! At cuda-oxide b099f64 this module shares a pure-PTX artifact with the
-//! libdevice-backed oracle kernels. The softmax's software `exp2` and LSE
-//! epilogue's software `log2` remain deliberate FA4 SFU-offload optimizations,
-//! not artifact-path workarounds.
+//! libdevice-backed oracle kernels. The LSE epilogue's software `log2` is a
+//! deliberate FA4 SFU-offload optimization, not an artifact-path workaround;
+//! the forward softmax's `exp2` is the SFU one (#68), because a four-warp
+//! warpgroup that is not tensor-core bound has nothing to offload to.
 //!
 //! Kernel shape contract (the host launchers in `host.rs` enforce it):
 //! - operands are packed-bf16 staging buffers `[B*H, T, HD]`, one contiguous
@@ -68,7 +69,7 @@ use kittens::mma::{self, MmaShape, mma_ab, mma_abt};
 use kittens::pipeline;
 use kittens::plan::SharedPlan;
 use kittens::reg::{
-    BaseLdtm, Exp2Approx, Fragment, Max, RegTile, RegVec, exp2_approx, log2_approx, online_rescale,
+    BaseLdtm, Exp2Hw, Fragment, Max, RegTile, RegVec, exp2_approx, log2_approx, online_rescale,
     warp_reduce,
 };
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, SharedVec, Swizzle128B};
@@ -1831,7 +1832,18 @@ pub mod kernels {
                             );
                         }
                         chunk.sub_row_assign(m_ref);
-                        chunk.unary_map_assign::<Exp2Approx>();
+                        // The SFU `exp2`, not the software polynomial the
+                        // extracted kernels used. The polynomial was an
+                        // FA4-shaped SFU-offload choice made when the softmax
+                        // shared an SM with two other warp roles; this kernel
+                        // is four warps and is not tensor-core bound, so the
+                        // offload has nothing to offload to. It is also the
+                        // *more* accurate of the two here — `ex2.approx.f32`
+                        // is ~2 ULP against the polynomial's measured 7.5e-5
+                        // relative — and `log2` in the LSE epilogue stays
+                        // software, where it is once per row rather than 64
+                        // times per thread per key tile.
+                        chunk.unary_map_assign::<Exp2Hw>();
                         tile_sum.add_assign(chunk.row_sum());
                         store_tile(probabilities, band, column, lane, chunk);
                         column += SCORE_CHUNK as u32;
