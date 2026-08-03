@@ -1,5 +1,5 @@
-//! FA4-shaped tcgen05 attention forward (issue #35, phases 1–3) and backward
-//! (phase 4).
+//! FA4-shaped tcgen05 attention forward (issue #68) and backward (issue #35
+//! phase 4).
 //!
 //! At cuda-oxide b099f64 this module shares a pure-PTX artifact with the
 //! libdevice-backed oracle kernels. The softmax's software `exp2` and LSE
@@ -11,43 +11,36 @@
 //!   `[T, HD]` panel per head, produced by tensor-gpu's
 //!   `stage_attention_heads_bf16` (Q arrives pre-scaled by
 //!   `softmax_scale * log2(e)`, so scores are base-2 native);
-//! - `T` is a multiple of the 64-row tile; `HD == 128`; non-aligned shapes
-//!   stay on the fp32 tiled kernels in `lib.rs`;
+//! - `T` is a multiple of the 128-row query block; `HD == 128`; non-aligned
+//!   shapes stay on the fp32 tiled kernels in `lib.rs`;
 //! - outputs keep the existing contract: fp32 `y[B*T, H*HD]` and fp32
 //!   `logsumexp[B*T, H]` in natural-log units.
 //!
-//! One CTA workstream owns a 64-query tile of one `(batch, head)` and
-//! streams 64-key tiles: TMA loads Q/K/V into swizzled shared tiles (each
-//! 128-wide head panel is two stacked 64-wide SWIZZLE_128B subtiles),
-//! `S = Q·Kᵀ` accumulates in fp32 TMEM, a register softmax (mask → row max →
-//! software exp2 → running sum) packs bf16 probabilities back to shared
-//! memory with swizzled `stmatrix` stores, and `O += P·V` accumulates in a
-//! TMEM *segment* under a fixed per-row max reference (`enable_d` across
-//! tiles). FA4's conditional correction, adapted for the missing
-//! `tcgen05.st`: only when some row's tile max climbs more than
+//! `flash_forward` is one kernel where there were three (#68). A CTA owns a
+//! `QUERIES = 128` query block of one `(batch, head)` and streams the causal
+//! `TILE`-key tiles beneath it: TMA loads Q/K/V into swizzled shared tiles
+//! (each 128-wide head panel is two stacked 64-wide SWIZZLE_128B subtiles),
+//! `S = Q·Kᵀ` accumulates in a double-buffered fp32 TMEM segment, a register
+//! softmax (mask → row max → software exp2 → running sum) packs bf16
+//! probabilities back to shared memory with swizzled `stmatrix` stores, and
+//! `O += P·V` accumulates in a TMEM *segment* under a fixed per-row max
+//! reference (`enable_d` across tiles). FA4's conditional correction, adapted
+//! for the missing `tcgen05.st`: only when some row's tile max climbs more than
 //! `CORRECTION_THRESHOLD` above the reference does the warpgroup drain the
-//! segment into per-thread registers, rescale, and restart it — otherwise
-//! the segment just keeps accumulating and the softmax warpgroup never
-//! touches O TMEM.
+//! segment into per-thread registers, rescale, and restart it — otherwise the
+//! segment just keeps accumulating and the warpgroup never touches O TMEM.
 //!
-//! Three kernels share the per-tile math (`softmax_tile` /
-//! `merge_output_tile` / `store_outputs`):
-//! - `flash_forward_tcgen05` — the phase-1 synchronous form, one stage of
-//!   everything, block-wide `sync_threads` between stages. Kept as the
-//!   in-artifact oracle and the debug fallback for pipeline hangs.
-//! - `flash_forward_pipelined` — the phase-2 warp-specialized form: a TMA
-//!   load warp runs a `PIPELINE_STAGES`-deep K/V ring, an MMA warp issues
-//!   tcgen05 into a double-buffered S so `S-MMA(i+1)` runs while the
-//!   128-thread softmax warpgroup works tile `i`, and every handoff is an
-//!   mbarrier phase-parity spin (no named barriers in v0.2.1; FA4 does the
-//!   same). Correction and epilogue stay fused into the softmax warpgroup:
-//!   the output accumulator lives in its registers and TMEM lane ownership
-//!   pins the drains to warps 0–3 — a separate correction warpgroup only
-//!   becomes possible with `tcgen05.st` (#34).
-//! - `flash_forward_persistent` — the phase-3 form: two softmax warpgroups
-//!   ping-pong adjacent query tiles over one shared K/V ring and one MMA
-//!   warp, and CTAs run a static persistent work-item loop. See the kernel
-//!   doc for the scheduling and barrier story.
+//! The three generations it replaces were all shaped by a 64-query tile against
+//! an `M128` accumulator: every MMA filled 64 real rows and 64 phantom ones,
+//! and the phase-2 and phase-3 kernels bought that half back with structure — a
+//! dedicated TMA warp and MMA warp, then two softmax warpgroups ping-ponging
+//! adjacent query tiles. At 128 query rows the MMA is whole, the softmax
+//! warpgroup is naturally the accumulator's four warps, and one
+//! double-buffered score segment is the whole of the overlap. What is left is
+//! the library's: `SharedPlan` for the plan, `pipeline::run` for the persistent
+//! work-item loop, `make_causal_at` for the coordinate-origin mask,
+//! `online_rescale` for the flash rescale, and `block_reduce` for the
+//! correction vote all three kernels used to open-code.
 //!
 //! Two synchronous backward kernels share the same idioms —
 //! the swizzle-aware bf16 fragment writes, the transposed-B gradient MMA
@@ -69,14 +62,17 @@ use cuda_device::shared::{DynamicSharedArray, SharedArray};
 use cuda_device::tcgen05::{tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync};
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
-use kittens::ldst::store_fragment;
+use kittens::global::{GlobalRows, store_row_vec, store_rows};
+use kittens::ldst::{store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mma_ab, mma_abt};
 use kittens::pipeline;
+use kittens::plan::SharedPlan;
 use kittens::reg::{
-    Add, BaseLdtm, Fragment, RegTile, RegVec, exp2_approx, fmax, log2_approx, online_rescale,
+    BaseLdtm, Exp2Approx, Fragment, Max, RegTile, RegVec, exp2_approx, log2_approx, online_rescale,
+    warp_reduce,
 };
-use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
-use kittens::sync::{PhasedSemaphore, Semaphore, SemaphoreRing};
+use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, SharedVec, Swizzle128B};
+use kittens::sync::{PhasedSemaphore, Semaphore, SemaphoreRing, block_reduce};
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
 
 // Tile contract; `host.rs` mirrors these as FLASH_TILE / FLASH_HD (kept
@@ -92,6 +88,10 @@ use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
 // subtile.
 const TILE: usize = 64;
 const HD: usize = 128;
+/// Query rows one forward CTA owns, and the `M` of every MMA in this module:
+/// two stacked `TILE` blocks, so an `M128` accumulator's 128 rows are all real.
+/// The 64-query forward that filled half of one is what #68 removed.
+const QUERIES: usize = 2 * TILE;
 
 /// Every MMA here is one warpgroup's `M128_N64`. The element type, the fp32
 /// accumulator and the transpose flags are the operand tiles' and the entry
@@ -103,102 +103,105 @@ const MMA_SHAPE: MmaShape = MmaShape::M128_N64;
 /// moves the pipelined kernel's loader warp onto these; later phases absorb
 /// the rest of the raw swizzle/barrier machinery.
 type Panel = SharedTile<Bf16, TILE, HD, Swizzle128B>;
-/// An `N`-deep ring of panels (the K and V streams); the pipelined and
-/// persistent kernels pick their own stage depths.
+/// An `N`-deep ring of panels — the K and V streams of every kernel here; each
+/// picks its own stage depth.
 type PanelRingN<const N: usize> = SharedTileRing<Bf16, TILE, HD, Swizzle128B, N>;
-type PanelRing = PanelRingN<PIPELINE_STAGES>;
-type PersistentPanelRing = PanelRingN<PERSISTENT_STAGES>;
-/// The single-subtile `[TILE, TILE]` bf16 probability tile the softmax
-/// warpgroup writes with swizzled `stmatrix` stores. Its `swizzled_chunk`
-/// folds in the tile base's absolute 128-byte row phase — the fact the
-/// per-kernel `p_phase` variables used to carry by hand.
+/// The forward's K/V ring.
+type ForwardPanelRing = PanelRingN<FORWARD_STAGES>;
+/// The single-subtile `[TILE, TILE]` bf16 tile the swizzle probe writes. Its
+/// `swizzled_chunk` folds in the tile base's absolute 128-byte row phase — the
+/// fact the per-kernel `p_phase` variables used to carry by hand.
 type PTile = SharedTile<Bf16, TILE, TILE, Swizzle128B>;
-/// 7e15's paired K-major operand: two adjacent 64-row tiles stacked into
-/// `[2·TILE, HD]`, so each of its two HD subtiles is 128 rows and the
-/// K-major MMA walk strides `TILE_BYTES` between them (Q for backward dQ,
-/// K/V for backward dK/dV).
-type PairedPanel = SharedTile<Bf16, { 2 * TILE }, HD, Swizzle128B>;
-/// The paired single-subtile `[2·TILE, TILE]` bf16 operand the backward
-/// kernels store through `store_fragment` (dS, Pᵀ, dSᵀ): 128 swizzled
-/// 128-byte rows feeding the gradient MMAs' A side.
-type PairedPTile = SharedTile<Bf16, { 2 * TILE }, TILE, Swizzle128B>;
+/// The paired K-major operand: two adjacent 64-row tiles stacked into
+/// `[QUERIES, HD]`, so each of its two HD subtiles is 128 rows and the K-major
+/// MMA walk strides `TILE_BYTES` between them. The forward's resident Q, and
+/// the backward's Q (dQ) or K/V (dK/dV).
+type PairedPanel = SharedTile<Bf16, QUERIES, HD, Swizzle128B>;
+/// The paired single-subtile `[QUERIES, TILE]` bf16 probability/gradient
+/// operand: 128 swizzled 128-byte rows feeding an MMA's A side. The forward's
+/// P, and the backward's dS / Pᵀ / dSᵀ.
+type PairedPTile = SharedTile<Bf16, QUERIES, TILE, Swizzle128B>;
+/// The forward's two-deep P ring: tile `i` writes the slot the output MMA of
+/// tile `i - 2` finished reading.
+type ProbabilityRing = SharedTileRing<Bf16, QUERIES, TILE, Swizzle128B, 2>;
 const _: () = assert!(Panel::BYTES == TILE_BYTES && Panel::SUBTILE_BYTES == SUBTILE_BYTES);
 const _: () = assert!(PTile::BYTES == SUBTILE_BYTES);
 const _: () = assert!(PairedPanel::SUBTILE_BYTES == TILE_BYTES);
 const _: () = assert!(PairedPTile::BYTES == 2 * SUBTILE_BYTES && PairedPTile::SUBTILES == 1);
 
-/// The `S = Q·Kᵀ` (and `dP = dY·Vᵀ`) score accumulator segment. `M128_N64`
-/// writes 128 TMEM rows; the forward kernels drain the real 64, the paired
-/// backwards all 128.
-type STmem = TmemTile<{ 2 * TILE }, TILE>;
+/// The `S = Q·Kᵀ` (and `dP = dY·Vᵀ`) score accumulator segment. Every kernel
+/// here fills all 128 of its `M128` rows.
+type STmem = TmemTile<QUERIES, TILE>;
 /// An HD-wide output/gradient accumulator segment (`O`, `dQ`, `dK`, `dV`) —
 /// two 64-column MMA bands side by side.
-type AccTmem = TmemTile<{ 2 * TILE }, HD>;
+type AccTmem = TmemTile<QUERIES, HD>;
+
+/// One warp's band of a score segment, and of the output accumulator: the
+/// four warps of a `M128` drain own 32 TMEM lanes each.
+type ScoreBand = RegTile<32, TILE, BaseLdtm>;
+type OutBand = RegTile<32, HD, BaseLdtm>;
+/// A per-row statistic of one of those bands — the running max, the running
+/// sum, the LSE.
+type Rows = RegVec<32, BaseLdtm>;
 
 /// Bytes of one full-width bf16 `[TILE, HD]` operand (two stacked subtiles).
 const TILE_BYTES: usize = TILE * HD * 2;
 /// Bytes of one 64-wide `[TILE, 64]` SWIZZLE_128B subtile — half a `TILE_BYTES`
-/// panel, and the footprint of a `[TILE, TILE]` P/dS probability operand.
+/// panel.
 const SUBTILE_BYTES: usize = TILE_BYTES / 2;
-/// Phantom-read pad, used by the three FORWARD kernels (sync, pipelined,
-/// persistent) — all still on the `M128`-over-64-row scheme. Each of their MMAs
-/// reads 128 operand rows but only fills a 64-row tile, so the unused rows
-/// 64..128 stream a `TILE_BYTES` tail past each operand's base; one extra
-/// `TILE_BYTES` at the end of the plan keeps those reads in bounds (the garbage
-/// lands in accumulator rows 64..128, never drained). The BACKWARD kernels
-/// (Design B, #47 item 2) instead PAIR two adjacent 64-row tiles into every
-/// M128 MMA — all 128 rows are real — so their plans carry no `PHANTOM_PAD`.
-///
-/// The natural `M64_N64` shape is NOT an option: its shared-memory A operand
-/// reads only 32 distinct rows. Measured with `transpose_b_probe` (`A[m,k]=m`,
-/// `B=1`), accumulator row `m` reads A-row `16*(m>>5) + (m&15)` — rows `m` and
-/// `m+16` alias and A-rows 32..63 are never read at all, i.e. the read drops
-/// datapath-lane bits [5:4]. It is a property of the `M64` SS-operand→datapath
-/// mapping, not of the descriptor: sweeping the A stride-byte-offset
-/// (512/1024/2048) moves *which* 32 rows are read and never reaches 64. The
-/// forward pairing that would recover the wasted half is correct but measured
-/// SLOWER (226 → 170 TFLOP/s) — it fuses the two query tiles into one
-/// warpgroup and so destroys the persistent kernel's ping-pong.
-const PHANTOM_PAD: usize = TILE_BYTES;
-/// Dynamic shared plan of the synchronous kernel: Q, K, V panels plus the
-/// single P subtile.
-pub const FLASH_DYNAMIC_SMEM: usize = 3 * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
 
-/// K/V ring depth of the pipelined kernel (SWEEP knob). Two is the floor:
-/// the staggered issue order (`S-MMA(i)` before `O-MMA(i-1)`) needs one
-/// stage of load-ahead to make progress. Four is the ceiling the host-side
-/// launch allocation (`host::FLASH_PIPELINE_SMEM_BYTES`) is sized for.
-pub const PIPELINE_STAGES: usize = 3;
-const _: () = assert!(2 <= PIPELINE_STAGES && PIPELINE_STAGES <= 4);
-/// Dynamic shared plan of the pipelined kernel: Q, the K and V rings, and
-/// the single P subtile.
-pub const FLASH_PIPELINE_SMEM: usize =
-    (1 + 2 * PIPELINE_STAGES) * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD;
-/// Threads of the pipelined kernel: the softmax/correction/epilogue
-/// warpgroup plus the TMA-load warp and the MMA-issue warp.
-pub const FLASH_PIPELINE_BLOCK: usize = TILE + 64;
+/// K/V ring depth of the forward (SWEEP knob). Two is the floor: the staggered
+/// issue order (`S-MMA(i+1)` before `O-MMA(i)`) needs a stage of load-ahead to
+/// make progress. Four is the ceiling the host-side launch allocation
+/// (`host::FLASH_FORWARD_SMEM_BYTES`) is sized for.
+pub const FORWARD_STAGES: usize = 3;
+const _: () = assert!(2 <= FORWARD_STAGES && FORWARD_STAGES <= 4);
+/// Depth of the `O = P·V` completion ring. Three rather than two because the
+/// deepest wait on it reaches *two* tiles back — the probability slot tile `i`
+/// overwrites was last read by the output MMA of tile `i - 2` — and a ring
+/// cannot be as shallow as its own deepest wait.
+const OUTPUT_LAG: usize = 3;
+/// Warps of the forward: exactly the four an `M128` accumulator's 128 TMEM
+/// lanes are drained by, which is why there is no separate MMA or TMA warp.
+const FORWARD_WARPS: usize = QUERIES / 32;
+/// Threads of the forward.
+pub const FLASH_FORWARD_BLOCK: usize = QUERIES;
 /// `#[launch_bounds]` only accepts integer literals, so the kernel's
 /// `.maxntid` is spelled out; keep it equal to the block width. Declaring more
 /// threads than are launched makes ptxas budget registers for a block that
 /// never exists (`65536 / maxntid` per thread), which is how the HD=128
 /// conversion's stale 128-row-era values silently squeezed the register-hungry
 /// softmax warpgroup.
-const _: () = assert!(FLASH_PIPELINE_BLOCK == 128);
+const _: () = assert!(FLASH_FORWARD_BLOCK == 128);
+/// Dynamic shared plan of the forward, as the plan itself computes it.
+pub const FLASH_FORWARD_SMEM: usize = forward_plan(SharedPlan::sizing()).plan.bytes();
+/// Columns of tensor memory the forward allocates: two `[QUERIES, TILE]` score
+/// segments plus the `[QUERIES, HD]` output beside them. `tcgen05.alloc` takes a
+/// power of two in `[32, 512]`, and 256 is exactly the sum.
+const FORWARD_TMEM_COLUMNS: u32 = 256;
+const _: () = assert!(
+    FORWARD_TMEM_COLUMNS as usize == 2 * TILE + HD
+        && FORWARD_TMEM_COLUMNS.is_power_of_two()
+        && FORWARD_TMEM_COLUMNS >= 32
+        && FORWARD_TMEM_COLUMNS <= 512,
+    "tcgen05.alloc takes a power of two in [32, 512] that covers the scores and the output"
+);
 
 /// Dynamic shared plan of the PAIRED query-parallel backward (kernel A, Design
 /// B): the resident stacked `[Q_A;Q_B]` and `[dY_A;dY_B]` operands
 /// (`2 * TILE_BYTES` each), the streamed K and V panels, and the single stacked
-/// `[128, 64]` dS tile (`TILE_BYTES`). No `PHANTOM_PAD` — every paired MMA fills
-/// 128 real query rows.
+/// `[128, 64]` dS tile (`TILE_BYTES`). Every paired MMA fills 128 real query
+/// rows, so there is no phantom-read pad in any plan here any more — the
+/// forward's 64-query tile was the last thing that needed one.
 pub const FLASH_BACKWARD_Q_SMEM: usize = 7 * TILE_BYTES;
 /// Dynamic shared plan of the PAIRED key-parallel backward (kernel B, Design B):
 /// the resident stacked `[K_A;K_B]` and `[V_A;V_B]` operands (`2 * TILE_BYTES`
 /// each), the streamed Q and dY panels, and the stacked `[128, 64]` Pᵀ and dSᵀ
-/// tiles (`TILE_BYTES` each). No `PHANTOM_PAD`.
+/// tiles (`TILE_BYTES` each).
 pub const FLASH_BACKWARD_KV_SMEM: usize = 8 * TILE_BYTES;
 
 /// K/V ring depth of the warp-specialized backward (SWEEP knob). Two is the
-/// floor for the same reason as `PIPELINE_STAGES`: the staggered issue order
+/// floor for the same reason as `FORWARD_STAGES`: the staggered issue order
 /// (`S/dP-MMA(i)` before `dQ-MMA(i-1)`) needs a stage of load-ahead, and the
 /// K stage of tile `i` cannot recycle until `dQ-MMA(i)` — which reads it a
 /// second time — has been observed.
@@ -206,15 +209,14 @@ pub const BACKWARD_STAGES: usize = 3;
 const _: () = assert!(2 <= BACKWARD_STAGES && BACKWARD_STAGES <= 4);
 /// Dynamic shared plan of the PIPELINED query-parallel backward: the resident
 /// stacked Q and dY pairs (`2 * TILE_BYTES` each), the K and V rings, and the
-/// single stacked `[128, 64]` dS tile. dS stays single-buffered for the same
-/// reason P does in the forward — the warpgroup's `dq_done(i)` wait proves the
-/// gradient MMA finished reading it before tile `i+1` overwrites it.
+/// single stacked `[128, 64]` dS tile. dS stays single-buffered because the
+/// warpgroup's `dq_done(i)` wait proves the gradient MMA finished reading it
+/// before tile `i+1` overwrites it.
 pub const FLASH_BACKWARD_Q_PIPELINED_SMEM: usize = (5 + 2 * BACKWARD_STAGES) * TILE_BYTES;
-/// Threads of the pipelined backward: the 128-thread gradient warpgroup (the
-/// paired `S` is 128 real rows, so it takes four warps, not the forward's two)
-/// plus the TMA-load warp and the MMA-issue warp.
-pub const FLASH_BACKWARD_Q_PIPELINED_BLOCK: usize = 2 * TILE + 64;
-/// Mirrors the `FLASH_PIPELINE_BLOCK` `.maxntid` note.
+/// Threads of the pipelined backward: the 128-thread gradient warpgroup plus
+/// the TMA-load warp and the MMA-issue warp.
+pub const FLASH_BACKWARD_Q_PIPELINED_BLOCK: usize = QUERIES + 64;
+/// Mirrors the `FLASH_FORWARD_BLOCK` `.maxntid` note.
 const _: () = assert!(FLASH_BACKWARD_Q_PIPELINED_BLOCK == 192);
 /// Dynamic shared plan of the PIPELINED key-parallel backward: the resident
 /// stacked K and V pairs, the Q and dY rings, and the stacked Pᵀ and dSᵀ
@@ -222,7 +224,7 @@ const _: () = assert!(FLASH_BACKWARD_Q_PIPELINED_BLOCK == 192);
 /// recycles the ring).
 pub const FLASH_BACKWARD_KV_PIPELINED_SMEM: usize = (6 + 2 * BACKWARD_STAGES) * TILE_BYTES;
 /// Threads of the pipelined key-parallel backward; same three roles.
-pub const FLASH_BACKWARD_KV_PIPELINED_BLOCK: usize = 2 * TILE + 64;
+pub const FLASH_BACKWARD_KV_PIPELINED_BLOCK: usize = QUERIES + 64;
 
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
@@ -230,23 +232,55 @@ pub const FLASH_BACKWARD_KV_PIPELINED_BLOCK: usize = 2 * TILE + 64;
 /// accumulation headroom of a full key stream.
 pub const CORRECTION_THRESHOLD: f32 = 8.0;
 
-/// K/V ring depth of the persistent kernel: `PIPELINE_STAGES` capped at 3 so
-/// the doubled Q/P footprint of two workstreams stays inside the ~227 KiB
-/// shared-memory budget.
-pub const PERSISTENT_STAGES: usize = if PIPELINE_STAGES < 3 {
-    PIPELINE_STAGES
-} else {
-    3
-};
-/// Dynamic shared plan of the persistent kernel: two Q panels, the K and V
-/// rings, and one P subtile per workstream.
-pub const FLASH_PERSISTENT_SMEM: usize =
-    (2 + 2 * PERSISTENT_STAGES) * TILE_BYTES + 2 * SUBTILE_BYTES + PHANTOM_PAD;
-/// Threads of the persistent kernel: two softmax warpgroups plus the
-/// TMA-load warp and the MMA-issue warp.
-pub const FLASH_PERSISTENT_BLOCK: usize = 2 * TILE + 64;
-/// Mirrors the `FLASH_PIPELINE_BLOCK` `.maxntid` note.
-const _: () = assert!(FLASH_PERSISTENT_BLOCK == 192);
+/// The forward's shared plan, as a [`SharedPlan`] carve rather than a
+/// column of `smem.add(n * TILE_BYTES)`: the resident `[2·TILE, HD]` query
+/// pair, the K and V rings, the two-deep probability ring, every mbarrier,
+/// the correction vote's scratch and the TMEM staging word.
+struct Forward {
+    q: PairedPanel,
+    k: ForwardPanelRing,
+    v: ForwardPanelRing,
+    p: ProbabilityRing,
+    /// One arrival per K/V stage, filled by the TMA engine.
+    kv_loaded: SemaphoreRing<FORWARD_STAGES>,
+    /// `S = Q·Kᵀ` completion, one per double-buffered score segment.
+    scored: SemaphoreRing<2>,
+    /// `O = P·V` completion. [`OUTPUT_LAG`] deep, not two: the deepest wait
+    /// on it reaches two tiles back.
+    accumulated: SemaphoreRing<OUTPUT_LAG>,
+    q_loaded: Semaphore,
+    /// `block_reduce`'s per-warp partials — the correction vote.
+    votes: SharedVec<F32, FORWARD_WARPS>,
+    tmem_slot: *mut u32,
+    plan: SharedPlan,
+}
+
+#[inline(always)]
+const fn forward_plan(at: SharedPlan) -> Forward {
+    let (q, at) = at.tile::<Bf16, QUERIES, HD, Swizzle128B>();
+    let (k, at) = at.tile_ring::<Bf16, TILE, HD, Swizzle128B, FORWARD_STAGES>();
+    let (v, at) = at.tile_ring::<Bf16, TILE, HD, Swizzle128B, FORWARD_STAGES>();
+    let (p, at) = at.tile_ring::<Bf16, QUERIES, TILE, Swizzle128B, 2>();
+    let (kv_loaded, at) = at.semaphores::<FORWARD_STAGES>();
+    let (scored, at) = at.semaphores::<2>();
+    let (accumulated, at) = at.semaphores::<OUTPUT_LAG>();
+    let (q_loaded, at) = at.semaphore();
+    let (votes, at) = at.vec::<F32, FORWARD_WARPS>();
+    let (tmem_slot, at) = at.tmem_slot();
+    Forward {
+        q,
+        k,
+        v,
+        p,
+        kv_loaded,
+        scored,
+        accumulated,
+        q_loaded,
+        votes,
+        tmem_slot,
+        plan: at,
+    }
+}
 
 /// Finite stand-in for "masked" in the base-2 score domain; far enough below
 /// any real score that `exp2` flushes it to a subnormal-scale value while the
@@ -275,223 +309,10 @@ pub mod kernels {
     // mover in kittens::ldst. Same code, same bits — see their docs for the
     // libdevice discipline they encode.
 
-    /// One key tile of register softmax, shared by the three forward
-    /// kernels. `warp_id` and every row coordinate are warpgroup-local: the
-    /// persistent kernel's second warpgroup passes `warp::warp_id() - 4`.
-    ///
-    /// Drains `S[128, 128]` from `s_tmem` twice — pass 1 for masked row
-    /// maxima, pass 2 to exponentiate against the O segment's per-row max
-    /// reference `m_ref` — and stores bf16 probabilities into the P tile via
-    /// `stmatrix` at `PTile::swizzled_chunk` addresses (the 16-byte-chunk
-    /// XOR the TMA swizzle would have produced, absolute base phase folded
-    /// in, so the O-MMA descriptors read P exactly like a TMA-loaded
-    /// operand).
-    ///
-    /// Between the passes sits FA4's conditional correction, adapted to the
-    /// missing `tcgen05.st`: the O TMEM segment keeps accumulating under
-    /// `m_ref` (the caller issues `O = P·V` with `enable_d` set) until some
-    /// row's tile max exceeds `m_ref + CORRECTION_THRESHOLD`. A segment
-    /// restart is collective — one row over the line forces every row — so
-    /// the decision is a per-warp `vote.any` published in
-    /// `votes[(tile & 1) * 4 + warp]` and made warpgroup-wide by one
-    /// 128-count phase of `vote_barrier`. On a correction the warpgroup
-    /// drains the segment (tiles `.. tile`, complete because the caller
-    /// waited out the previous tile's O MMA) into `out_acc`, rescales
-    /// `out_acc`/`running_sum` to the new reference, and returns `true` so
-    /// the caller restarts the segment on this tile's O MMA. Tile 0 always
-    /// votes yes — it starts the first segment — but skips the drain.
-    ///
-    /// Per-thread fragment ownership (base-LDTM 16x256b): for each 16-row
-    /// half-warp block this thread owns rows `lane/4` and `lane/4 + 8`,
-    /// columns `2*(lane%4)` and `+1` of each 8-column half. Row statistics
-    /// live once per owned row, replicated across the 4 lanes of a quad by
-    /// shuffle reductions.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn softmax_tile(
-        s_tmem: STmem,
-        o_tmem: AccTmem,
-        tile: u32,
-        diagonal: bool,
-        warp_id: u32,
-        lane: u32,
-        p: PTile,
-        votes: *mut u32,
-        vote: Semaphore,
-        m_ref: &mut RegVec<32, BaseLdtm>,
-        running_sum: &mut RegVec<32, BaseLdtm>,
-        out_acc: &mut RegTile<32, 128, BaseLdtm>,
-    ) -> bool {
-        unsafe {
-            let lane_column = 2 * (lane % 4);
-            let row_in_16 = (lane / 4) as usize;
-
-            // Pass 1: tile row maxima (masked, base-2 domain). The two-branch
-            // shape is load-bearing: off the diagonal the four values reduce as
-            // a TREE, which a uniform masked loop would flatten into a chain.
-            let mut tile_max = RegVec::<32, BaseLdtm>::splat(MASKED_SCORE);
-            let mut row_block = 0u32;
-            while row_block < 2 {
-                let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column_block = 0u32;
-                while column_block < 4 {
-                    let column = column_block * 16;
-                    let (low, high) = s_tmem.fragment(tmem_row, column);
-                    let slot_a = (row_block * 2) as usize;
-                    let slot_b = slot_a + 1;
-                    if diagonal {
-                        let row_a = (tmem_row as usize + row_in_16) as u32;
-                        let row_b = row_a + 8;
-                        let col = column + lane_column;
-                        let mut max_a = tile_max.0[slot_a];
-                        max_a = fmax(max_a, if col <= row_a { low[0] } else { MASKED_SCORE });
-                        max_a = fmax(
-                            max_a,
-                            if col + 1 <= row_a {
-                                low[1]
-                            } else {
-                                MASKED_SCORE
-                            },
-                        );
-                        max_a = fmax(
-                            max_a,
-                            if col + 8 <= row_a {
-                                high[0]
-                            } else {
-                                MASKED_SCORE
-                            },
-                        );
-                        max_a = fmax(
-                            max_a,
-                            if col + 9 <= row_a {
-                                high[1]
-                            } else {
-                                MASKED_SCORE
-                            },
-                        );
-                        tile_max.0[slot_a] = max_a;
-                        let mut max_b = tile_max.0[slot_b];
-                        max_b = fmax(max_b, if col <= row_b { low[2] } else { MASKED_SCORE });
-                        max_b = fmax(
-                            max_b,
-                            if col + 1 <= row_b {
-                                low[3]
-                            } else {
-                                MASKED_SCORE
-                            },
-                        );
-                        max_b = fmax(
-                            max_b,
-                            if col + 8 <= row_b {
-                                high[2]
-                            } else {
-                                MASKED_SCORE
-                            },
-                        );
-                        max_b = fmax(
-                            max_b,
-                            if col + 9 <= row_b {
-                                high[3]
-                            } else {
-                                MASKED_SCORE
-                            },
-                        );
-                        tile_max.0[slot_b] = max_b;
-                    } else {
-                        tile_max.0[slot_a] = fmax(
-                            fmax(fmax(tile_max.0[slot_a], low[0]), fmax(low[1], high[0])),
-                            high[1],
-                        );
-                        tile_max.0[slot_b] = fmax(
-                            fmax(fmax(tile_max.0[slot_b], low[2]), fmax(low[3], high[2])),
-                            high[3],
-                        );
-                    }
-                    column_block += 1;
-                }
-                row_block += 1;
-            }
-            let row_max = tile_max.quad_max();
-            let exceed = row_max.any_exceeds(*m_ref, CORRECTION_THRESHOLD);
-
-            // Collective correction vote (tile 0 always trips it: m_ref
-            // still sits at MASKED_SCORE). One word per warp, one barrier
-            // phase per tile.
-            let parity = tile & 1;
-            let warp_vote = warp::any(exceed);
-            if lane == 0 {
-                *votes.add((parity * 4 + warp_id) as usize) = warp_vote as u32;
-            }
-            vote.arrive();
-            vote.wait(parity);
-            // Only two warps make up the softmax warpgroup at TILE=64, so the
-            // warpgroup-wide OR spans two vote words.
-            let base = (parity * 4) as usize;
-            let correction = (*votes.add(base) | *votes.add(base + 1)) != 0;
-
-            if correction {
-                if tile > 0 {
-                    merge_output_tile(o_tmem, warp_id, out_acc);
-                }
-                online_rescale(m_ref, row_max, running_sum, out_acc);
-            }
-
-            // Pass 2: probabilities — re-drain S, exponentiate against the
-            // segment reference, accumulate row sums, and store the bf16 P
-            // fragment through the library's swizzled `stmatrix` path (base
-            // phase hoisted once, like the old `p_phase`).
-            let p_chunks = p.chunk_writer();
-            let mut tile_sum = RegVec::<32, BaseLdtm>::splat(0.0);
-            let mut row_block = 0u32;
-            while row_block < 2 {
-                let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column = 0u32;
-                while column < TILE as u32 {
-                    let s = s_tmem.fragment_tile(tmem_row, column);
-                    let slot_a = (row_block * 2) as usize;
-                    let slot_b = slot_a + 1;
-                    let row_a = tmem_row + row_in_16 as u32;
-                    let row_b = row_a + 8;
-                    let col = column + lane_column;
-                    let m_a = m_ref.0[slot_a];
-                    let m_b = m_ref.0[slot_b];
-                    // Built as a literal, not filled through a loop: an indexed
-                    // write per value leaves the fragment in the local depot
-                    // (measured +64 B frame, +76 `st.local` in this loop), and
-                    // local traffic in the softmax inner loop is the one cost
-                    // this library is not allowed to introduce.
-                    let probabilities: Fragment = RegTile([
-                        [
-                            masked_exp2(s.0[0][0], col, row_a, m_a, diagonal),
-                            masked_exp2(s.0[0][1], col + 1, row_a, m_a, diagonal),
-                            masked_exp2(s.0[0][2], col + 8, row_a, m_a, diagonal),
-                            masked_exp2(s.0[0][3], col + 9, row_a, m_a, diagonal),
-                        ],
-                        [
-                            masked_exp2(s.0[1][0], col, row_b, m_b, diagonal),
-                            masked_exp2(s.0[1][1], col + 1, row_b, m_b, diagonal),
-                            masked_exp2(s.0[1][2], col + 8, row_b, m_b, diagonal),
-                            masked_exp2(s.0[1][3], col + 9, row_b, m_b, diagonal),
-                        ],
-                    ]);
-                    let a = probabilities.0[0];
-                    let b = probabilities.0[1];
-                    tile_sum.0[slot_a] += a[0] + a[1] + a[2] + a[3];
-                    tile_sum.0[slot_b] += b[0] + b[1] + b[2] + b[3];
-                    store_fragment(p_chunks, tmem_row, column, lane, probabilities);
-                    column += 16;
-                }
-                row_block += 1;
-            }
-            running_sum.bin_map_assign::<Add>(tile_sum.quad_sum());
-            correction
-        }
-    }
-
-    /// Drain the `O = P·V` TMEM segment and add it into the per-thread
-    /// output accumulator. Called by `softmax_tile` on a correction (which
-    /// then rescales the merged accumulator to the new reference) and by
-    /// the epilogue for the final segment. `warp_id` is warpgroup-local.
+    /// Drain an accumulator segment and add it into the per-thread output
+    /// accumulator: the forward's `O = P·V` on a correction and at the
+    /// epilogue, and the backward's `dQ`/`dK`/`dV` at theirs. `warp_id` is
+    /// warpgroup-local, and its four values cover the segment's 128 rows.
     #[inline(always)]
     unsafe fn merge_output_tile(
         o_tmem: AccTmem,
@@ -524,84 +345,18 @@ pub mod kernels {
         }
     }
 
-    /// Normalize the accumulated output and store fp32 `y` plus the
-    /// natural-log LSE straight to global memory through the fragment map.
-    /// `max_ref` is whatever per-row reference `running_sum` is relative to
-    /// (the final segment's `m_ref`), so the LSE is exact even when the
-    /// reference trails the true row max by up to the correction threshold.
-    /// `warp_id` is warpgroup-local.
-    #[allow(clippy::too_many_arguments)]
+    /// Issue one `S = Q·Kᵀ` tile from the current leader thread — `M128_N64`,
+    /// eight chained K=16 MMAs walking the two stacked HD subtiles of both
+    /// operands; the caller owns the commit. `AR` is the A operand's row count,
+    /// `QUERIES` for the forward's paired query block and `TILE` for the
+    /// operand probe that only fills half the accumulator on purpose.
     #[inline(always)]
-    unsafe fn store_outputs(
-        batch: u32,
-        t: u32,
-        h: u32,
-        head: u32,
-        query_tile: u32,
-        warp_id: u32,
-        lane: u32,
-        max_ref: &RegVec<32, BaseLdtm>,
-        running_sum: &RegVec<32, BaseLdtm>,
-        out_acc: &RegTile<32, 128, BaseLdtm>,
-        output: &mut DisjointSlice<f32>,
-        logsumexp: &mut DisjointSlice<f32>,
+    unsafe fn score_mma<const AR: usize>(
+        s_tmem: u32,
+        q: SharedTile<Bf16, AR, HD, Swizzle128B>,
+        k: Panel,
     ) {
-        unsafe {
-            let quad = (lane % 4) as usize;
-            let row_in_16 = (lane / 4) as usize;
-            let d_model = (h as usize) * HD;
-            let mut slot = 0usize;
-            while slot < 4 {
-                let local_row =
-                    warp_id as usize * 32 + (slot / 2) * 16 + (slot % 2) * 8 + row_in_16;
-                let global_row = (batch * t) as usize + query_tile as usize * TILE + local_row;
-                let inverse = 1.0 / running_sum.0[slot];
-                let out_base = global_row * d_model + head as usize * HD;
-                let mut column_block = 0usize;
-                while column_block < 8 {
-                    let column = column_block * 16 + 2 * quad;
-                    let base = column_block * 4;
-                    *output.get_unchecked_mut(out_base + column) = out_acc.0[slot][base] * inverse;
-                    *output.get_unchecked_mut(out_base + column + 1) =
-                        out_acc.0[slot][base + 1] * inverse;
-                    *output.get_unchecked_mut(out_base + column + 8) =
-                        out_acc.0[slot][base + 2] * inverse;
-                    *output.get_unchecked_mut(out_base + column + 9) =
-                        out_acc.0[slot][base + 3] * inverse;
-                    column_block += 1;
-                }
-                if quad == 0 {
-                    *logsumexp.get_unchecked_mut(global_row * h as usize + head as usize) =
-                        LN2 * (max_ref.0[slot] + log2_approx(running_sum.0[slot]));
-                }
-                slot += 1;
-            }
-        }
-    }
-
-    /// Issue one `S = Q·Kᵀ` tile (M128_N64 over the 64-row tile, eight chained
-    /// K=16 MMAs walking the two stacked HD subtiles of both operands) from the
-    /// current leader thread; the caller owns the commit. The `M128` shape's
-    /// phantom rows 64..128 read the operand's `TILE_BYTES` tail and land in
-    /// accumulator rows the drain never touches.
-    #[inline(always)]
-    unsafe fn score_mma(s_tmem: u32, q: Panel, k: Panel) {
         unsafe { mma_abt(s_tmem, q, k, MMA_SHAPE, false) }
-    }
-
-    /// One score element's probability against a segment reference:
-    /// `exp2(s − m_ref)`, with positions past the causal edge flushed through
-    /// the finite `MASKED_SCORE` sentinel rather than branched around (the
-    /// running-max recurrence stays NaN-free that way). The forward twin of
-    /// [`backward_dscore`].
-    #[inline(always)]
-    fn masked_exp2(score: f32, key_column: u32, query_row: u32, m_ref: f32, diagonal: bool) -> f32 {
-        let masked = if !diagonal || key_column <= query_row {
-            score
-        } else {
-            MASKED_SCORE
-        };
-        exp2_approx(masked - m_ref)
     }
 
     /// True `dS = P·(dP − D)·scale` for one score element, base-2 domain.
@@ -878,8 +633,15 @@ pub mod kernels {
     /// decoded (row, column) fragment map. A failure here isolates the
     /// operand descriptor / fragment map from the softmax and epilogue.
     ///
-    /// It is also the harness that settled why `M64_N64` is unusable (see
-    /// `PHANTOM_PAD`): seed A and B host-side with structured encodings and
+    /// It is also the harness that settled why `M64_N64` is unusable, which is
+    /// why every MMA in this module is `M128`: its shared-memory A operand
+    /// reads only 32 distinct rows. Accumulator row `m` reads A-row
+    /// `16*(m>>5) + (m&15)` — rows `m` and `m+16` alias and A-rows 32..63 are
+    /// never read at all, i.e. the read drops datapath-lane bits [5:4]. It is a
+    /// property of the `M64` SS-operand→datapath mapping, not of the
+    /// descriptor: sweeping the A stride-byte-offset (512/1024/2048) moves
+    /// *which* 32 rows are read and never reaches 64. Seed A and B host-side
+    /// with structured encodings and
     /// solve the raw dump offline. `A[m,k]=m, B=1` reads back the A-row each
     /// accumulator row actually consumed — the M-broadcast probe; `A[m,k]=k`
     /// against one-hot `B` reads back the K-index pairing (identity, so there
@@ -960,179 +722,6 @@ pub mod kernels {
             if is_leader {
                 tma.inval();
                 mma.inval();
-            }
-        }
-    }
-
-    /// Synchronous tcgen05 causal attention forward. Launch with
-    /// `host::flash_forward_config`: grid `(T/64, H, B)`, 64 threads,
-    /// `FLASH_DYNAMIC_SMEM` dynamic shared bytes (opted in by the loader).
-    /// `correction_counts` gets one word per CTA (`plane * tiles +
-    /// query_tile`): how many mid-stream O-segment corrections the key
-    /// stream triggered.
-    #[kernel]
-    pub unsafe fn flash_forward_tcgen05(
-        q_tma: *const TmaDescriptor,
-        k_tma: *const TmaDescriptor,
-        v_tma: *const TmaDescriptor,
-        sequence_length: u32,
-        heads: u32,
-        mut output: DisjointSlice<f32>,
-        mut logsumexp: DisjointSlice<f32>,
-        mut correction_counts: DisjointSlice<u32>,
-    ) {
-        unsafe {
-            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
-            static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
-            static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
-            static mut VOTE_BARRIER: Barrier = Barrier::UNINIT;
-            static mut VOTES: SharedArray<u32, 8, 4> = SharedArray::UNINIT;
-
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let q = Panel::from_raw(smem);
-            let k = Panel::from_raw(smem.add(TILE_BYTES));
-            let v = Panel::from_raw(smem.add(2 * TILE_BYTES));
-            // The 128B swizzle XORs *absolute* shared-address bits [9:7], not
-            // tile-relative rows; `PTile::swizzled_chunk` folds the base's
-            // row phase in.
-            let p = PTile::from_raw(smem.add(3 * TILE_BYTES));
-
-            let tid = thread::threadIdx_x();
-            if thread::blockDim_x() as usize != TILE {
-                return;
-            }
-            let warp_id = warp::warp_id();
-            let lane = warp::lane_id();
-            let is_leader = tid == 0;
-
-            let tma_sem = Semaphore::attach(&raw mut TMA_BARRIER);
-            let mma_sem = Semaphore::attach(&raw mut MMA_BARRIER);
-            let vote = Semaphore::attach(&raw mut VOTE_BARRIER);
-
-            let query_tile = thread::blockIdx_x();
-            let head = thread::blockIdx_y();
-            let batch = thread::blockIdx_z();
-            let t = sequence_length;
-            let h = heads;
-            let plane = (batch * h + head) as i32;
-
-            if is_leader {
-                tma_sem.init(1);
-                mma_sem.init(1);
-                vote.init(TILE as u32);
-                fence_proxy_async_shared_cta();
-            }
-            thread::sync_threads();
-            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            let s_tmem = STmem::from_raw(tmem);
-            let o_tmem = AccTmem::from_raw(tmem + 256);
-
-            // Q stays operand-A resident for the whole key stream.
-            if is_leader {
-                let charge = q.tma_load(q_tma, (query_tile * TILE as u32) as i32, plane, tma_sem);
-                tma_sem.expect_tx(charge);
-            }
-            tma_sem.wait(0);
-            thread::sync_threads();
-
-            let mut m_ref = RegVec::<32, BaseLdtm>::splat(MASKED_SCORE);
-            let mut running_sum = RegVec::<32, BaseLdtm>::splat(0.0);
-            let mut out_acc = RegTile::<32, 128, BaseLdtm>::zero();
-            let mut corrections = 0u32;
-
-            let mut tma_phase = 1u32;
-            let mut mma_phase = 0u32;
-            let mut key_tile = 0u32;
-            while key_tile <= query_tile {
-                if is_leader {
-                    let key_row = (key_tile * TILE as u32) as i32;
-                    let charge = k.tma_load(k_tma, key_row, plane, tma_sem)
-                        + v.tma_load(v_tma, key_row, plane, tma_sem);
-                    tma_sem.expect_tx(charge);
-                }
-                tma_sem.wait(tma_phase & 1);
-                tma_phase += 1;
-                thread::sync_threads();
-
-                // S = Q·Kᵀ, fresh accumulation each tile.
-                if is_leader {
-                    tcgen05_fence_after_thread_sync();
-                    score_mma(s_tmem.raw(), q, k);
-                    mma::commit(mma_sem);
-                }
-                mma_sem.wait(mma_phase & 1);
-                mma_phase += 1;
-                thread::sync_threads();
-
-                let correction = softmax_tile(
-                    s_tmem,
-                    o_tmem,
-                    key_tile,
-                    key_tile == query_tile,
-                    warp_id,
-                    lane,
-                    p,
-                    &raw mut VOTES as *mut u32,
-                    vote,
-                    &mut m_ref,
-                    &mut running_sum,
-                    &mut out_acc,
-                );
-                if key_tile > 0 && correction {
-                    corrections += 1;
-                }
-
-                // P was written through the generic proxy; fence before the
-                // async-proxy MMA consumes it.
-                fence_proxy_async_shared_cta();
-                tcgen05_fence_before_thread_sync();
-                thread::sync_threads();
-
-                // O = P·V: continue the TMEM segment, or restart it when
-                // this tile's vote drained it (`correction` is uniform
-                // across the block, so the leader's copy is the vote).
-                if is_leader {
-                    tcgen05_fence_after_thread_sync();
-                    mma_ab(o_tmem.raw(), p, v, MMA_SHAPE, !correction);
-                    mma::commit(mma_sem);
-                }
-                mma_sem.wait(mma_phase & 1);
-                mma_phase += 1;
-
-                tcgen05_fence_before_thread_sync();
-                thread::sync_threads();
-                key_tile += 1;
-            }
-
-            merge_output_tile(o_tmem, warp_id, &mut out_acc);
-
-            store_outputs(
-                batch,
-                t,
-                h,
-                head,
-                query_tile,
-                warp_id,
-                lane,
-                &m_ref,
-                &running_sum,
-                &out_acc,
-                &mut output,
-                &mut logsumexp,
-            );
-            if is_leader {
-                let tiles = t as usize / TILE;
-                *correction_counts
-                    .get_unchecked_mut(plane as usize * tiles + query_tile as usize) = corrections;
-            }
-
-            tcgen05_fence_before_thread_sync();
-            thread::sync_threads();
-            dealloc_block(tmem, 512);
-            if is_leader {
-                tma_sem.inval();
-                mma_sem.inval();
-                vote.inval();
             }
         }
     }
@@ -1982,711 +1571,292 @@ pub mod kernels {
         }
     }
 
-    /// Issue one tile's `O = P·V` from the MMA warp: wait for the softmax
-    /// warpgroup to publish P, chain the eight K=16 MMAs — continuing the
-    /// TMEM segment, or starting a fresh one when the warpgroup's restart
-    /// flag for this tile says its vote drained it — and commit completion
-    /// into `o_full`. The flag read is ordered by the `p_full` wait (the
-    /// warpgroup writes it before arriving).
-    #[inline(always)]
-    unsafe fn output_mma<const STAGES: usize, const S_BUFFERS: usize>(
-        tile: u32,
-        stream: Stream<S_BUFFERS>,
-        v: PanelRingN<STAGES>,
-    ) {
-        unsafe {
-            stream.p_full.wait(tile & 1);
-            let fresh = *stream.restart.add((tile & 1) as usize) != 0;
-            mma_ab(
-                stream.o_tmem.raw(),
-                stream.p,
-                v.tile(tile),
-                MMA_SHAPE,
-                !fresh,
-            );
-            mma::commit(stream.o_full);
-        }
-    }
-
-    /// One softmax-warpgroup tile step, shared by the pipelined and
-    /// persistent forwards: wait for S, run `softmax_tile` (with the
-    /// correction vote), publish the segment-restart flag and P, then wait
-    /// out this tile's O MMA and recycle the K/V stage. Callers pass
-    /// `diagonal` as a literal so the mask logic folds out of the full-tile
-    /// loop; `S_BUFFERS` picks the S ring depth (2 for the pipelined
-    /// kernel's double-buffered S, 1 for the persistent kernel's
-    /// single-buffered per-stream S — the rings own both kernels' phase
-    /// arithmetic). `tid_in_group`/`warp_id` are warpgroup-local.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn warpgroup_tile<const STAGES: usize, const S_BUFFERS: usize>(
-        i: u32,
-        diagonal: bool,
-        tid_in_group: u32,
-        warp_id: u32,
-        lane: u32,
-        stream: Stream<S_BUFFERS>,
-        kv_free: SemaphoreRing<STAGES>,
-        m_ref: &mut RegVec<32, BaseLdtm>,
-        running_sum: &mut RegVec<32, BaseLdtm>,
-        out_acc: &mut RegTile<32, 128, BaseLdtm>,
-        corrections: &mut u32,
-    ) {
-        unsafe {
-            stream.s_full.wait(i);
-            let correction = softmax_tile(
-                // Each S buffer is 64 columns wide.
-                stream.s_tmem.columns_right((i % S_BUFFERS as u32) * 64),
-                stream.o_tmem,
-                i,
-                diagonal,
-                warp_id,
-                lane,
-                stream.p,
-                stream.votes,
-                stream.vote,
-                m_ref,
-                running_sum,
-                out_acc,
-            );
-            if i > 0 && correction {
-                *corrections += 1;
-            }
-            if tid_in_group == 0 {
-                *stream.restart.add((i & 1) as usize) = correction as u32;
-            }
-            // Both S passes are drained and P is fenced into the async
-            // proxy: release the S buffer and publish P (which also
-            // releases the restart flag to the MMA warp).
-            fence_proxy_async_shared_cta();
-            stream.s_free.sem(i).arrive();
-            stream.p_full.arrive();
-            stream.o_full.wait(i & 1);
-            if tid_in_group == 0 {
-                kv_free.sem(i).arrive();
-            }
-        }
-    }
-
-    /// Warp-specialized pipelined causal forward (issue #35, phase 2).
-    /// Launch with `host::flash_pipelined_config`: grid `(T/64, H, B)`,
-    /// `FLASH_PIPELINE_BLOCK` threads, `host::FLASH_PIPELINE_SMEM_BYTES`
-    /// dynamic shared bytes (opted in by the loader). Same operand and
-    /// output contract as `flash_forward_tcgen05`.
-    ///
-    /// Roles, connected only by mbarrier phase-parity spins:
-    /// - warp 4's leader streams TMA — Q once, then the K/V ring running
-    ///   `PIPELINE_STAGES` tiles ahead (`kv_full[stage]` expect_tx,
-    ///   recycling on `kv_free[stage]`);
-    /// - warp 5's leader issues MMAs, staggered so `S-MMA(i)` (S buffer
-    ///   `i % 2`, guarded by `s_free`) reaches the tensor core before
-    ///   `O-MMA(i-1)` (guarded by `p_full`): while the warpgroup runs
-    ///   softmax(i), the core is already producing `S(i+1)` — the phase-2
-    ///   overlap. The stagger is also why `PIPELINE_STAGES >= 2`: with one
-    ///   stage, `S-MMA(i)`'s wait for `kv_full` would precede the
-    ///   `O-MMA(i-1)` whose completion recycles the stage.
-    /// - warps 0–3 are the softmax warpgroup: wait `s_full`, run
-    ///   `softmax_tile` (which only drains the O segment on a correction
-    ///   vote), release `s_free` and `p_full`, wait `o_full`, recycle the
-    ///   K/V stage. Correction and epilogue stay fused here — the output
-    ///   accumulator lives in these registers and TMEM lane ownership pins
-    ///   every drain to warps 0–3.
-    ///
-    /// P stays single-buffered: the warpgroup's `o_full(i)` wait proves
-    /// O-MMA(i) has finished reading P before pass 2 of tile `i+1`
-    /// overwrites it. The same wait is where the warpgroup — not a second
-    /// tcgen05 commit, whose "prior operations" scope is ambiguous —
-    /// releases `kv_free`. Phase-parity arithmetic is sound because every
-    /// barrier's completions lead their waiter by at most one phase: each
-    /// producer's next completion transitively requires the previous
-    /// consumer wait.
-    #[kernel]
-    #[launch_bounds(128, 1)]
-    pub unsafe fn flash_forward_pipelined(
-        q_tma: *const TmaDescriptor,
-        k_tma: *const TmaDescriptor,
-        v_tma: *const TmaDescriptor,
-        sequence_length: u32,
-        heads: u32,
-        mut output: DisjointSlice<f32>,
-        mut logsumexp: DisjointSlice<f32>,
-        mut correction_counts: DisjointSlice<u32>,
-    ) {
-        unsafe {
-            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
-            // Barrier rings as raw u64 words (a Barrier is one 64-bit state
-            // word); pointer-cast so the lengths can follow PIPELINE_STAGES.
-            static mut KV_FULL: SharedArray<u64, PIPELINE_STAGES, 8> = SharedArray::UNINIT;
-            static mut KV_FREE: SharedArray<u64, PIPELINE_STAGES, 8> = SharedArray::UNINIT;
-            static mut S_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut S_FREE: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut P_FULL: Barrier = Barrier::UNINIT;
-            static mut O_FULL: Barrier = Barrier::UNINIT;
-            static mut VOTE_BARRIER: Barrier = Barrier::UNINIT;
-            static mut VOTES: SharedArray<u32, 8, 4> = SharedArray::UNINIT;
-            static mut RESTART: SharedArray<u32, 2, 4> = SharedArray::UNINIT;
-
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let q = Panel::from_raw(smem);
-            let k = PanelRing::attach(smem.add(TILE_BYTES));
-            let v = PanelRing::attach(smem.add((1 + PIPELINE_STAGES) * TILE_BYTES));
-
-            let tid = thread::threadIdx_x();
-            if thread::blockDim_x() as usize != FLASH_PIPELINE_BLOCK {
-                return;
-            }
-            let warp_id = warp::warp_id();
-            let lane = warp::lane_id();
-
-            let kv_full =
-                SemaphoreRing::<PIPELINE_STAGES>::attach(&raw mut KV_FULL as *mut Barrier);
-            let kv_free =
-                SemaphoreRing::<PIPELINE_STAGES>::attach(&raw mut KV_FREE as *mut Barrier);
-
-            let query_tile = thread::blockIdx_x();
-            let head = thread::blockIdx_y();
-            let batch = thread::blockIdx_z();
-            let t = sequence_length;
-            let h = heads;
-            let plane = (batch * h + head) as i32;
-            let key_tiles = query_tile + 1;
-
-            // Barrier init precedes the TMEM allocation (the validated
-            // ordering); the stream handle needs `tmem`, so its barriers are
-            // initialized through ring/semaphore views of the same words.
-            if tid == 0 {
-                kv_full.init_all(1);
-                kv_free.init_all(1);
-                SemaphoreRing::<2>::attach(&raw mut S_FULL as *mut Barrier).init_all(1);
-                SemaphoreRing::<2>::attach(&raw mut S_FREE as *mut Barrier).init_all(TILE as u32);
-                Semaphore::attach(&raw mut P_FULL).init(TILE as u32);
-                Semaphore::attach(&raw mut O_FULL).init(1);
-                Semaphore::attach(&raw mut VOTE_BARRIER).init(TILE as u32);
-                fence_proxy_async_shared_cta();
-            }
-            thread::sync_threads();
-
-            // Two 64-wide S buffers occupy TMEM columns 0..128; O follows at
-            // 128. The P subtile's `PTile` folds the tile base's absolute
-            // 128-byte row phase into its swizzled `stmatrix` addresses.
-            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            let stream = Stream::<2>::attach(
-                0,
-                tmem,
-                smem.add((1 + 2 * PIPELINE_STAGES) * TILE_BYTES),
-                &raw mut VOTES as *mut u32,
-                &raw mut RESTART as *mut u32,
-                &raw mut VOTE_BARRIER,
-                &raw mut S_FULL as *mut Barrier,
-                &raw mut S_FREE as *mut Barrier,
-                &raw mut P_FULL,
-                &raw mut O_FULL,
-            );
-
-            if tid < TILE as u32 {
-                // Softmax / correction / epilogue warpgroup. The key loop
-                // is split so the diagonal tile is the only one paying for
-                // mask logic (the full-tile calls fold `diagonal = false`).
-                let mut m_ref = RegVec::<32, BaseLdtm>::splat(MASKED_SCORE);
-                let mut running_sum = RegVec::<32, BaseLdtm>::splat(0.0);
-                let mut out_acc = RegTile::<32, 128, BaseLdtm>::zero();
-                let mut corrections = 0u32;
-                let mut i = 0u32;
-                while i + 1 < key_tiles {
-                    warpgroup_tile::<PIPELINE_STAGES, 2>(
-                        i,
-                        false,
-                        tid,
-                        warp_id,
-                        lane,
-                        stream,
-                        kv_free,
-                        &mut m_ref,
-                        &mut running_sum,
-                        &mut out_acc,
-                        &mut corrections,
-                    );
-                    i += 1;
-                }
-                warpgroup_tile::<PIPELINE_STAGES, 2>(
-                    i,
-                    true,
-                    tid,
-                    warp_id,
-                    lane,
-                    stream,
-                    kv_free,
-                    &mut m_ref,
-                    &mut running_sum,
-                    &mut out_acc,
-                    &mut corrections,
-                );
-                merge_output_tile(stream.o_tmem, warp_id, &mut out_acc);
-                store_outputs(
-                    batch,
-                    t,
-                    h,
-                    head,
-                    query_tile,
-                    warp_id,
-                    lane,
-                    &m_ref,
-                    &running_sum,
-                    &out_acc,
-                    &mut output,
-                    &mut logsumexp,
-                );
-                if tid == 0 {
-                    let tiles = t as usize / TILE;
-                    *correction_counts.get_unchecked_mut(
-                        (batch * h + head) as usize * tiles + query_tile as usize,
-                    ) = corrections;
-                }
-            } else if tid == TILE as u32 {
-                // TMA load warp leader: Q once, then the K/V ring, on kittens
-                // tiles — the ring types own the stage selection and free-slot
-                // parity, the panel type the two-subtile box issue.
-                let mut i = 0u32;
-                while i < key_tiles {
-                    kv_free.wait_recycled(i);
-                    let full = kv_full.sem(i);
-                    let key_row = (i * TILE as u32) as i32;
-                    let mut charge = k.tile(i).tma_load(k_tma, key_row, plane, full)
-                        + v.tile(i).tma_load(v_tma, key_row, plane, full);
-                    if i == 0 {
-                        charge = charge
-                            + q.tma_load(q_tma, (query_tile * TILE as u32) as i32, plane, full);
-                    }
-                    full.expect_tx(charge);
-                    i += 1;
-                }
-            } else if tid == (TILE + 32) as u32 {
-                // MMA warp leader.
-                tcgen05_fence_after_thread_sync();
-                let mut i = 0u32;
-                while i < key_tiles {
-                    kv_full.wait(i);
-                    stream.s_free.wait_recycled(i);
-                    score_mma(
-                        stream.s_tmem.columns_right((i & 1) * 64).raw(),
-                        q,
-                        k.tile(i),
-                    );
-                    mma::commit(stream.s_full.sem(i));
-                    if i > 0 {
-                        output_mma(i - 1, stream, v);
-                    }
-                    i += 1;
-                }
-                output_mma(key_tiles - 1, stream, v);
-            }
-
-            tcgen05_fence_before_thread_sync();
-            thread::sync_threads();
-            dealloc_block(tmem, 512);
-            if tid == 0 {
-                kv_full.inval_all();
-                kv_free.inval_all();
-                stream.inval();
-            }
-        }
-    }
-
-    /// One softmax workstream's resources, shared by the pipelined kernel
-    /// (a single stream with a double-buffered S, `S_BUFFERS = 2`) and the
-    /// persistent kernel (two ping-pong streams, each with a single-buffered
-    /// S): the stream's S/O TMEM segments, P tile, vote/restart words, and
-    /// the barrier set the softmax warpgroup handshakes with the MMA warp.
-    /// The S rings own both kernels' phase arithmetic — double-buffered
-    /// `(i & 1, (i / 2) & 1)` and single-buffered `(0, i & 1)` are the same
-    /// `SemaphoreRing` walk at different depths.
-    #[derive(Clone, Copy)]
-    struct Stream<const S_BUFFERS: usize> {
-        s_tmem: STmem,
-        o_tmem: AccTmem,
-        p: PTile,
-        votes: *mut u32,
-        restart: *mut u32,
-        vote: Semaphore,
-        s_full: SemaphoreRing<S_BUFFERS>,
-        s_free: SemaphoreRing<S_BUFFERS>,
-        p_full: Semaphore,
-        o_full: Semaphore,
-    }
-
-    impl<const S_BUFFERS: usize> Stream<S_BUFFERS> {
-        /// Stream `index` (A = 0, B = 1) of the kernel's resource plan: S at
-        /// TMEM column `64·index`, O at `128 + 128·index`, the `index`-th P
-        /// subtile, and slot `index` of every per-stream barrier pair and
-        /// vote/restart array. The pipelined kernel is the one-stream case.
-        #[allow(clippy::too_many_arguments)]
-        #[inline(always)]
-        unsafe fn attach(
-            index: usize,
-            tmem: u32,
-            p: *mut u8,
-            votes: *mut u32,
-            restart: *mut u32,
-            vote: *mut Barrier,
-            s_full: *mut Barrier,
-            s_free: *mut Barrier,
-            p_full: *mut Barrier,
-            o_full: *mut Barrier,
-        ) -> Self {
-            unsafe {
-                Self {
-                    s_tmem: STmem::from_raw(tmem + 64 * index as u32),
-                    o_tmem: AccTmem::from_raw(tmem + 128 + 128 * index as u32),
-                    p: PTile::from_raw(p.add(index * SUBTILE_BYTES)),
-                    votes: votes.add(8 * index),
-                    restart: restart.add(2 * index),
-                    vote: Semaphore::attach(vote.add(index)),
-                    s_full: SemaphoreRing::attach(s_full.add(index)),
-                    s_free: SemaphoreRing::attach(s_free.add(index)),
-                    p_full: Semaphore::attach(p_full.add(index)),
-                    o_full: Semaphore::attach(o_full.add(index)),
-                }
-            }
-        }
-
-        /// (Re)initialize the stream's barriers for one work item.
-        #[inline(always)]
-        unsafe fn init(self) {
-            unsafe {
-                self.s_full.init_all(1);
-                self.s_free.init_all(TILE as u32);
-                self.p_full.init(TILE as u32);
-                self.o_full.init(1);
-                self.vote.init(TILE as u32);
-            }
-        }
-
-        /// Invalidate the stream's barriers between work items.
-        #[inline(always)]
-        unsafe fn inval(self) {
-            unsafe {
-                self.s_full.inval_all();
-                self.s_free.inval_all();
-                self.p_full.inval();
-                self.o_full.inval();
-                self.vote.inval();
-            }
-        }
-    }
-
-    /// One full workstream of the persistent forward, run by one softmax
-    /// warpgroup: the split full-tile/diagonal key loop, the final segment
-    /// drain, and the outputs. All indices (`tid_in_group`, `warp_id`) are
-    /// warpgroup-local; the barriers are this stream's own set except
-    /// `kv_free`, which both streams share (each arrives once per tile it
-    /// consumed).
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn persistent_stream(
-        query_tile: u32,
-        batch: u32,
-        t: u32,
-        h: u32,
-        head: u32,
-        tid_in_group: u32,
-        warp_id: u32,
-        lane: u32,
-        stream: Stream<1>,
-        kv_free: SemaphoreRing<PERSISTENT_STAGES>,
-        output: &mut DisjointSlice<f32>,
-        logsumexp: &mut DisjointSlice<f32>,
-        correction_counts: &mut DisjointSlice<u32>,
-    ) {
-        unsafe {
-            let key_tiles = query_tile + 1;
-            let mut m_ref = RegVec::<32, BaseLdtm>::splat(MASKED_SCORE);
-            let mut running_sum = RegVec::<32, BaseLdtm>::splat(0.0);
-            let mut out_acc = RegTile::<32, 128, BaseLdtm>::zero();
-            let mut corrections = 0u32;
-            let mut i = 0u32;
-            while i + 1 < key_tiles {
-                warpgroup_tile::<PERSISTENT_STAGES, 1>(
-                    i,
-                    false,
-                    tid_in_group,
-                    warp_id,
-                    lane,
-                    stream,
-                    kv_free,
-                    &mut m_ref,
-                    &mut running_sum,
-                    &mut out_acc,
-                    &mut corrections,
-                );
-                i += 1;
-            }
-            warpgroup_tile::<PERSISTENT_STAGES, 1>(
-                i,
-                true,
-                tid_in_group,
-                warp_id,
-                lane,
-                stream,
-                kv_free,
-                &mut m_ref,
-                &mut running_sum,
-                &mut out_acc,
-                &mut corrections,
-            );
-            merge_output_tile(stream.o_tmem, warp_id, &mut out_acc);
-            store_outputs(
-                batch,
-                t,
-                h,
-                head,
-                query_tile,
-                warp_id,
-                lane,
-                &m_ref,
-                &running_sum,
-                &out_acc,
-                output,
-                logsumexp,
-            );
-            if tid_in_group == 0 {
-                let tiles = t as usize / TILE;
-                *correction_counts
-                    .get_unchecked_mut((batch * h + head) as usize * tiles + query_tile as usize) =
-                    corrections;
-            }
-        }
-    }
-
-    /// The persistent forward as a [`pipeline::Job`]: tile and semaphore
-    /// handles built once at launch, work items decoded per iteration, and
-    /// the whole barrier set re-initialized per item by the harness —
-    /// `kv_free`'s arrival count is re-chosen each time (one consumer
-    /// stream, or two when the pair's odd tail leaves stream B active).
-    struct PersistentForward<'k, 'o, 'l, 'c> {
+    /// The forward as a [`pipeline::Job`]: handles built once at launch, work
+    /// items decoded per iteration, and the whole barrier set re-initialized
+    /// per item by the harness — so each item's phase arithmetic starts from
+    /// zero and a short key stream's unbalanced arrivals are wiped rather than
+    /// threaded through parity math.
+    struct ForwardStream<'k, 'c> {
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
         v_tma: *const TmaDescriptor,
         t: u32,
         h: u32,
         tiles: u32,
-        pairs: u32,
-        plane_count: u32,
-        tid: u32,
+        planes: u32,
+        leader: bool,
         warp_id: u32,
         lane: u32,
-        q_a: Panel,
-        q_b: Panel,
-        k: PersistentPanelRing,
-        v: PersistentPanelRing,
-        kv_full: SemaphoreRing<PERSISTENT_STAGES>,
-        kv_free: SemaphoreRing<PERSISTENT_STAGES>,
-        a: Stream<1>,
-        b: Stream<1>,
-        output: &'k mut DisjointSlice<'o, f32>,
-        logsumexp: &'k mut DisjointSlice<'l, f32>,
-        correction_counts: &'k mut DisjointSlice<'c, u32>,
+        shared: Forward,
+        scores: STmem,
+        accumulator: AccTmem,
+        y: GlobalRows<F32>,
+        lse: GlobalRows<F32>,
+        corrections: &'k mut DisjointSlice<'c, u32>,
     }
 
-    impl PersistentForward<'_, '_, '_, '_> {
-        /// Decode a work item into its (pair, plane) coordinates. Items are
-        /// ordered by *descending* pair index, so the causally long pairs
-        /// are dealt out before the cheap ones.
+    impl ForwardStream<'_, '_> {
+        /// The double-buffered score segment tile `key_tile` lands in.
         #[inline(always)]
-        fn item_pair(&self, item: u32) -> (u32, u32) {
-            (
-                self.pairs - 1 - item / self.plane_count,
-                item % self.plane_count,
-            )
+        fn score_segment(&self, key_tile: u32) -> STmem {
+            if key_tile & 1 == 0 {
+                self.scores
+            } else {
+                self.scores.columns_right(TILE as u32)
+            }
+        }
+
+        /// Stage `key_tile`'s K and V panels, charging one barrier for both.
+        #[inline(always)]
+        unsafe fn load_kv(&self, key_tile: u32, plane: i32) {
+            unsafe {
+                let row = (key_tile * TILE as u32) as i32;
+                let full = self.shared.kv_loaded.sem(key_tile);
+                let charge = self
+                    .shared
+                    .k
+                    .tile(key_tile)
+                    .tma_load(self.k_tma, row, plane, full)
+                    + self
+                        .shared
+                        .v
+                        .tile(key_tile)
+                        .tma_load(self.v_tma, row, plane, full);
+                full.expect_tx(charge);
+            }
         }
     }
 
-    impl pipeline::Job for PersistentForward<'_, '_, '_, '_> {
+    impl pipeline::Job for ForwardStream<'_, '_> {
         #[inline(always)]
-        unsafe fn init(&self, item: u32) {
+        unsafe fn init(&self, _item: u32) {
             unsafe {
-                let (pair, _) = self.item_pair(item);
-                let b_active = pair * 2 + 1 < self.tiles;
-                self.kv_full.init_all(1);
-                // One arrival per active consumer stream per tile consumed.
-                self.kv_free.init_all(1 + b_active as u32);
-                self.a.init();
-                self.b.init();
+                self.shared.kv_loaded.init_all(1);
+                self.shared.scored.init_all(1);
+                self.shared.accumulated.init_all(1);
+                self.shared.q_loaded.init(1);
             }
         }
 
         #[inline(always)]
         unsafe fn inval(&self) {
             unsafe {
-                self.kv_full.inval_all();
-                self.kv_free.inval_all();
-                self.a.inval();
-                self.b.inval();
+                self.shared.kv_loaded.inval_all();
+                self.shared.scored.inval_all();
+                self.shared.accumulated.inval_all();
+                self.shared.q_loaded.inval();
             }
         }
 
         #[inline(always)]
         unsafe fn work(&mut self, item: u32) {
             unsafe {
-                let (pair, plane) = self.item_pair(item);
-                let batch = plane / self.h;
+                // Descending query tile: the causal cost of tile `i` is `i + 1`
+                // query-tile-heights of keys, so dealing the long streams first
+                // is what keeps the tail of a persistent grid short.
+                let query_tile = self.tiles - 1 - item / self.planes;
+                let plane = item % self.planes;
                 let head = plane % self.h;
-                let tile_a = pair * 2;
-                let tile_b = tile_a + 1;
-                let b_active = tile_b < self.tiles;
-                let tiles_a = tile_a + 1;
-                let tiles_b = tile_b + 1;
-                let stream_tiles = if b_active { tiles_b } else { tiles_a };
+                let batch = plane / self.h;
+                let query_base = query_tile * QUERIES as u32;
+                // A query block is two key tiles tall, and its last row attends
+                // to its own key: `2 * query_tile + 2` tiles, the last two of
+                // them crossing the diagonal.
+                let key_tiles = 2 * query_tile + 2;
+                let first_masked = 2 * query_tile;
 
-                if self.tid < TILE as u32 {
-                    persistent_stream(
-                        tile_a,
-                        batch,
-                        self.t,
-                        self.h,
-                        head,
-                        self.tid,
-                        self.warp_id,
-                        self.lane,
-                        self.a,
-                        self.kv_free,
-                        self.output,
-                        self.logsumexp,
-                        self.correction_counts,
+                let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
+                let band = 32 * warp_id;
+
+                if leader {
+                    tcgen05_fence_after_thread_sync();
+                    let charge = self.shared.q.tma_load(
+                        self.q_tma,
+                        query_base as i32,
+                        plane as i32,
+                        self.shared.q_loaded,
                     );
-                } else if self.tid >= 2 * TILE as u32 {
-                    // Stream B runs on warps 4-5 (warpgroup-1 positions 0-1),
-                    // NOT warps 2-3: a `tcgen05.ld` warp can only reach TMEM
-                    // lanes `(warp % 4) * 32 .. +32`, and a 64-row tile's M128
-                    // accumulator keeps its real rows in lanes 0..63. Warps
-                    // 2-3 (positions 2-3) would read lanes 64..127 — the
-                    // undrained phantom rows — so stream B must sit at a
-                    // warpgroup boundary (positions 0-1) to reach lanes 0..63.
-                    if b_active {
-                        persistent_stream(
-                            tile_b,
-                            batch,
-                            self.t,
-                            self.h,
-                            head,
-                            self.tid - 2 * TILE as u32,
-                            self.warp_id - (2 * TILE / 32) as u32,
-                            self.lane,
-                            self.b,
-                            self.kv_free,
-                            self.output,
-                            self.logsumexp,
-                            self.correction_counts,
+                    self.shared.q_loaded.expect_tx(charge);
+                    let mut stage = 0u32;
+                    while stage < FORWARD_STAGES as u32 && stage < key_tiles {
+                        self.load_kv(stage, plane as i32);
+                        stage += 1;
+                    }
+                    // Only the MMA reads Q and K, so only the issuing thread
+                    // waits for them.
+                    self.shared.q_loaded.wait(0);
+                    self.shared.kv_loaded.wait(0);
+                    score_mma(
+                        self.score_segment(0).raw(),
+                        self.shared.q,
+                        self.shared.k.tile(0),
+                    );
+                    mma::commit(self.shared.scored.sem(0));
+                }
+
+                let mut m_ref = Rows::splat(MASKED_SCORE);
+                let mut running_sum = Rows::splat(0.0);
+                let mut out_acc = OutBand::zero();
+                let mut corrections = 0u32;
+
+                let mut key_tile = 0u32;
+                while key_tile < key_tiles {
+                    if leader {
+                        // The next tile's scores are issued before this tile's
+                        // softmax runs, so the tensor core and the warpgroup
+                        // overlap. Its segment is the one drained last tile,
+                        // which the item's `sync_threads` proved free.
+                        if key_tile + 1 < key_tiles {
+                            self.shared.kv_loaded.wait(key_tile + 1);
+                            score_mma(
+                                self.score_segment(key_tile + 1).raw(),
+                                self.shared.q,
+                                self.shared.k.tile(key_tile + 1),
+                            );
+                            mma::commit(self.shared.scored.sem(key_tile + 1));
+                        }
+                        // A K/V stage is free once the output MMA that read its
+                        // V has completed.
+                        let refill = key_tile + FORWARD_STAGES as u32 - 1;
+                        if key_tile > 0 && refill < key_tiles {
+                            self.shared.accumulated.wait(key_tile - 1);
+                            self.load_kv(refill, plane as i32);
+                        }
+                    }
+
+                    self.shared.scored.wait(key_tile);
+                    let mut scores: ScoreBand = self.score_segment(key_tile).tile_x8(band, 0);
+                    if key_tile >= first_masked {
+                        // Both origins go in rather than their difference: that
+                        // is negative for a band above the diagonal, and a `u32`
+                        // subtraction there would wrap and mask nothing.
+                        scores.make_causal_at(
+                            lane,
+                            query_base + band,
+                            key_tile * TILE as u32,
+                            MASKED_SCORE,
                         );
                     }
-                } else if self.tid == TILE as u32 {
-                    // TMA load warp leader (warp 2): both Q tiles once, then
-                    // the shared K/V ring over the longer stream.
-                    let plane = plane as i32;
-                    let mut i = 0u32;
-                    while i < stream_tiles {
-                        self.kv_free.wait_recycled(i);
-                        let full = self.kv_full.sem(i);
-                        let key_row = (i * TILE as u32) as i32;
-                        let mut charge = self.k.tile(i).tma_load(self.k_tma, key_row, plane, full)
-                            + self.v.tile(i).tma_load(self.v_tma, key_row, plane, full);
-                        if i == 0 {
-                            charge = charge
-                                + self.q_a.tma_load(
-                                    self.q_tma,
-                                    (tile_a * TILE as u32) as i32,
-                                    plane,
-                                    full,
-                                );
-                            if b_active {
-                                charge = charge
-                                    + self.q_b.tma_load(
-                                        self.q_tma,
-                                        (tile_b * TILE as u32) as i32,
-                                        plane,
-                                        full,
-                                    );
-                            }
+
+                    // FA4's conditional correction. The output segment keeps
+                    // accumulating under `m_ref` until some row's tile max
+                    // climbs more than `CORRECTION_THRESHOLD` above it; a
+                    // restart is collective, since `enable_d` is one flag for
+                    // the whole MMA, so the per-thread test folds to a warp
+                    // value and then to a block one. Tile 0 always trips it —
+                    // `m_ref` is still the sentinel — and starts the first
+                    // segment without a drain.
+                    let row_max = scores.row_max();
+                    let exceeded = row_max.any_exceeds(m_ref, CORRECTION_THRESHOLD);
+                    let restart = block_reduce::<Max, FORWARD_WARPS>(
+                        self.shared.votes,
+                        warp_reduce::<Max>(if exceeded { 1.0 } else { 0.0 }),
+                    ) != 0.0;
+                    if restart {
+                        if key_tile > 0 {
+                            self.shared.accumulated.wait(key_tile - 1);
+                            merge_output_tile(self.accumulator, warp_id, &mut out_acc);
+                            corrections += 1;
                         }
-                        full.expect_tx(charge);
-                        i += 1;
+                        online_rescale(&mut m_ref, row_max, &mut running_sum, &mut out_acc);
                     }
-                } else if self.tid == (TILE + 32) as u32 {
-                    // MMA warp leader (warp 3): per shared tile, S-MMAs for
-                    // both streams (each gated by its own single-buffered S
-                    // being free), then the previous tile's O-MMAs — the
-                    // same stagger as the pipelined kernel, per stream.
-                    tcgen05_fence_after_thread_sync();
-                    let mut i = 0u32;
-                    while i < stream_tiles {
-                        self.kv_full.wait(i);
-                        let k_tile = self.k.tile(i);
-                        if i < tiles_a {
-                            self.a.s_free.wait_recycled(i);
-                            score_mma(self.a.s_tmem.raw(), self.q_a, k_tile);
-                            mma::commit(self.a.s_full.sem(i));
-                        }
-                        if b_active {
-                            self.b.s_free.wait_recycled(i);
-                            score_mma(self.b.s_tmem.raw(), self.q_b, k_tile);
-                            mma::commit(self.b.s_full.sem(i));
-                        }
-                        if i > 0 {
-                            output_mma(i - 1, self.a, self.v);
-                            if b_active {
-                                output_mma(i - 1, self.b, self.v);
-                            }
-                        }
-                        i += 1;
+
+                    scores.sub_row_assign(m_ref);
+                    scores.unary_map_assign::<Exp2Approx>();
+                    running_sum.add_assign(scores.row_sum());
+
+                    // The probability ring is two deep, so this slot was last
+                    // read by the output MMA two tiles back.
+                    if key_tile >= 2 {
+                        self.shared.accumulated.wait(key_tile - 2);
                     }
-                    if b_active {
-                        output_mma(tiles_b - 1, self.b, self.v);
-                    } else {
-                        output_mma(tiles_a - 1, self.a, self.v);
+                    store_tile(
+                        self.shared.p.tile(key_tile).chunk_writer(),
+                        band,
+                        0,
+                        lane,
+                        scores,
+                    );
+
+                    // P was written through the generic proxy; fence before the
+                    // async-proxy MMA reads it.
+                    fence_proxy_async_shared_cta();
+                    tcgen05_fence_before_thread_sync();
+                    thread::sync_threads();
+                    if leader {
+                        tcgen05_fence_after_thread_sync();
+                        mma_ab(
+                            self.accumulator.raw(),
+                            self.shared.p.tile(key_tile),
+                            self.shared.v.tile(key_tile),
+                            MMA_SHAPE,
+                            !restart,
+                        );
+                        mma::commit(self.shared.accumulated.sem(key_tile));
                     }
+                    key_tile += 1;
+                }
+
+                self.shared.accumulated.wait(key_tiles - 1);
+                merge_output_tile(self.accumulator, warp_id, &mut out_acc);
+                out_acc.scale_rows(running_sum.recip());
+
+                let row = batch * self.t + query_base + band;
+                store_rows(self.y, row, head * HD as u32, lane, out_acc);
+                // The reference the sum is relative to trails the true row max
+                // by at most the correction threshold, and adding it back is
+                // what makes the LSE exact anyway.
+                let mut lse = running_sum.log2();
+                lse.add_assign(m_ref);
+                lse.scale_assign(LN2);
+                store_row_vec(self.lse, row, head, lane, lse);
+
+                if leader {
+                    *self
+                        .corrections
+                        .get_unchecked_mut((plane * self.tiles + query_tile) as usize) =
+                        corrections;
                 }
             }
         }
     }
 
-    /// Persistent two-Q-tile ping-pong forward (issue #35, phase 3).
-    /// Launch with `host::flash_persistent_config`: a 1-D grid of at most
-    /// `ceil(tiles/2) * H * B` CTAs, `FLASH_PERSISTENT_BLOCK` threads,
-    /// `host::FLASH_PERSISTENT_SMEM_BYTES` dynamic shared bytes. Operand
-    /// and output contracts match the other tcgen05 forwards.
+    /// tcgen05 causal attention forward — one kernel, replacing the
+    /// synchronous, pipelined and persistent generations of issue #35.
     ///
-    /// Each work item is a (query-tile *pair*, head, batch): stream A
-    /// (warps 0–1) owns query tile `2p`, stream B (warps 4–5) owns `2p+1`,
-    /// and both share one K/V ring, one TMA-load warp (warp 2) and one MMA
-    /// warp (warp 3). A stream is only two warps because a 64-row tile fills
-    /// TMEM lanes 0..63; stream B sits at warpgroup-1 positions 0–1 (warps
-    /// 4–5) — NOT the adjacent warps 2–3 — because a `tcgen05.ld` warp
-    /// reaches only lanes `(warp % 4) * 32 .. +32`, so only positions 0–1 of
-    /// a warpgroup can drain the accumulator's real rows 0..63. TMEM holds a
-    /// single-buffered S plus an O segment per stream (384 of the 512
-    /// columns): while one stream runs softmax, the MMA warp feeds the
-    /// other — the ping-pong a single warpgroup could not reach, and the
-    /// main use of the SM's issue slots now that TMEM pins occupancy to one
-    /// CTA.
+    /// Launch with `host::flash_forward_config`: a 1-D grid of at most
+    /// `(T / QUERIES) * H * B` CTAs, `FLASH_FORWARD_BLOCK` threads,
+    /// `host::FLASH_FORWARD_SMEM_BYTES` dynamic shared bytes.
     ///
-    /// The strided work-item loop and its per-item barrier lifecycle are
-    /// `kittens::pipeline::run` (extracted from this kernel); the
-    /// [`PersistentForward`] job orders items by *descending* pair index, so
-    /// the causally long pairs are dealt out before the cheap ones. `run`
-    /// deals items by `%clusterid` and takes the item boundary at `Job::RANKS`
-    /// scope; this kernel is not `#[cluster_launch]`, so its cluster is one CTA
-    /// and both degenerate to the `blockIdx.x`/`sync_threads` loop written here.
-    /// Launching with grid = the full item count degenerates to one item
-    /// per CTA — the non-persistent config kept for hang debugging. The
-    /// per-item re-initialization means each item's phase arithmetic starts
-    /// from zero and unbalanced arrivals (stream A never arrives for the
-    /// shared stream's extra diagonal tile; an inactive stream B never
-    /// arrives at all) are wiped, not threaded through parity math;
-    /// `kv_free`'s arrival count is likewise chosen per item — two consumer
-    /// streams normally, one when the last odd pair leaves stream B
-    /// inactive.
+    /// One work item is a (query tile, head, batch). A CTA owns `QUERIES = 128`
+    /// query rows — **a whole `M128` accumulator, not half of one** — and
+    /// streams the causal `TILE`-key tiles beneath them. That is the single
+    /// change that collapses the three generations: at 64 query rows every MMA
+    /// filled 64 real accumulator rows and 64 phantom ones, so half the tensor
+    /// core was thrown away and the kernels bought it back with structure — two
+    /// warpgroups ping-ponging two query tiles (persistent), a separate MMA warp
+    /// and TMA warp to keep either one fed (pipelined). At 128 the warpgroup is
+    /// four warps because the accumulator is 128 lanes, one softmax pass covers
+    /// twice the keys, and the overlap that took three roles is a
+    /// double-buffered score segment: the leader issues `S(i+1)` before the
+    /// warpgroup runs the softmax of tile `i`, so the tensor core is running
+    /// `S(i+1)` and `O(i-1)` throughout it.
+    ///
+    /// The rest is the library's. `SharedPlan` carves the plan,
+    /// `pipeline::run` is the persistent work-item loop (items dealt by
+    /// descending query tile, longest key streams first), `make_causal_at`
+    /// masks against the *pair* of block origins, `online_rescale` is the flash
+    /// rescale, and `block_reduce` is the correction vote three kernels used to
+    /// open-code as a votes array and a barrier phase.
+    ///
+    /// Operand and output contracts are the extraction's: packed-bf16
+    /// `[B*H, T, HD]` staging panels with Q pre-scaled by
+    /// `softmax_scale * log2(e)`, fp32 `y[B*T, H*HD]`, fp32 `logsumexp[B*T, H]`
+    /// in natural-log units, and one `correction_counts` word per work item
+    /// (`plane * tiles + query_tile`) counting mid-stream segment restarts.
     #[kernel]
-    #[launch_bounds(192, 1)]
-    pub unsafe fn flash_forward_persistent(
+    #[launch_bounds(128, 1)]
+    pub unsafe fn flash_forward(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
         v_tma: *const TmaDescriptor,
@@ -2698,87 +1868,38 @@ pub mod kernels {
         mut correction_counts: DisjointSlice<u32>,
     ) {
         unsafe {
-            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
-            static mut KV_FULL: SharedArray<u64, PERSISTENT_STAGES, 8> = SharedArray::UNINIT;
-            static mut KV_FREE: SharedArray<u64, PERSISTENT_STAGES, 8> = SharedArray::UNINIT;
-            // Two-stream barrier pairs, indexed A = 0, B = 1.
-            static mut S_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut S_FREE: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut P_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut O_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut VOTE: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut VOTES: SharedArray<u32, 16, 4> = SharedArray::UNINIT;
-            static mut RESTART: SharedArray<u32, 4, 4> = SharedArray::UNINIT;
-
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let q_a = Panel::from_raw(smem);
-            let q_b = Panel::from_raw(smem.add(TILE_BYTES));
-            let k = PersistentPanelRing::attach(smem.add(2 * TILE_BYTES));
-            let v = PersistentPanelRing::attach(smem.add((2 + PERSISTENT_STAGES) * TILE_BYTES));
-            let p_a = smem.add((2 + 2 * PERSISTENT_STAGES) * TILE_BYTES);
-
-            let tid = thread::threadIdx_x();
-            if thread::blockDim_x() as usize != FLASH_PERSISTENT_BLOCK {
+            if thread::blockDim_x() as usize != FLASH_FORWARD_BLOCK {
                 return;
             }
-            let warp_id = warp::warp_id();
-            let lane = warp::lane_id();
+            let shared = forward_plan(SharedPlan::attach());
+            let tmem = alloc_block(shared.tmem_slot, FORWARD_TMEM_COLUMNS);
+            // Two `[QUERIES, TILE]` score segments, then the `[QUERIES, HD]`
+            // output beside them: 64 + 64 + 128 of the 256 columns.
+            let scores = STmem::from_raw(tmem);
+            let accumulator: AccTmem = scores.columns_right(TILE as u32).split_columns();
 
-            let s_full = &raw mut S_FULL as *mut Barrier;
-            let s_free = &raw mut S_FREE as *mut Barrier;
-            let p_full = &raw mut P_FULL as *mut Barrier;
-            let o_full = &raw mut O_FULL as *mut Barrier;
-            let vote = &raw mut VOTE as *mut Barrier;
-            let votes = &raw mut VOTES as *mut u32;
-            let restart = &raw mut RESTART as *mut u32;
-
-            let t = sequence_length;
-            let h = heads;
-            let tiles = t / TILE as u32;
-            let pairs = tiles.div_ceil(2);
-            let plane_count = h * batches;
-            let work_items = pairs * plane_count;
-
-            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            // TMEM columns: S_A 0..64, S_B 64..128, O_A 128..256,
-            // O_B 256..384.
-            let a = Stream::<1>::attach(
-                0, tmem, p_a, votes, restart, vote, s_full, s_free, p_full, o_full,
-            );
-            let b = Stream::<1>::attach(
-                1, tmem, p_a, votes, restart, vote, s_full, s_free, p_full, o_full,
-            );
-
-            let mut job = PersistentForward {
+            let tiles = sequence_length / QUERIES as u32;
+            let planes = heads * batches;
+            let mut job = ForwardStream {
                 q_tma,
                 k_tma,
                 v_tma,
-                t,
-                h,
+                t: sequence_length,
+                h: heads,
                 tiles,
-                pairs,
-                plane_count,
-                tid,
-                warp_id,
-                lane,
-                q_a,
-                q_b,
-                k,
-                v,
-                kv_full: SemaphoreRing::<PERSISTENT_STAGES>::attach(
-                    &raw mut KV_FULL as *mut Barrier,
-                ),
-                kv_free: SemaphoreRing::<PERSISTENT_STAGES>::attach(
-                    &raw mut KV_FREE as *mut Barrier,
-                ),
-                a,
-                b,
-                output: &mut output,
-                logsumexp: &mut logsumexp,
-                correction_counts: &mut correction_counts,
+                planes,
+                leader: thread::threadIdx_x() == 0,
+                warp_id: warp::warp_id(),
+                lane: warp::lane_id(),
+                shared,
+                scores,
+                accumulator,
+                y: GlobalRows::<F32>::from_slice(&mut output, heads as usize * HD),
+                lse: GlobalRows::<F32>::from_slice(&mut logsumexp, heads as usize),
+                corrections: &mut correction_counts,
             };
-            pipeline::run(&mut job, work_items);
-            dealloc_block(tmem, 512);
+            pipeline::run(&mut job, tiles * planes);
+            dealloc_block(tmem, FORWARD_TMEM_COLUMNS);
         }
     }
 }

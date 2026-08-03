@@ -62,8 +62,8 @@ pub use tensor_device::kernels as tensor_kernels;
 
 use flash_device::host as flash_host;
 use flash_device::host::{
-    FLASH_HD, FLASH_TILE, FlashHeadTmaMap, correction_count_len, create_flash_head_tma_map,
-    flash_persistent_config,
+    FLASH_HD, FLASH_QUERIES, FlashHeadTmaMap, correction_count_len, create_flash_head_tma_map,
+    flash_forward_config,
 };
 use gemm_device::fp32_launch_config;
 use gemm_device::host::{
@@ -708,10 +708,11 @@ fn tcgen05_linear_eligible(m: usize, k: usize, n: usize) -> bool {
 }
 
 fn tcgen05_attention_eligible(t: usize, head_dim: usize) -> bool {
-    // Design B (#47 item 2) pairs two 64-row tiles per MMA in the backward
-    // kernels, so `T` must be a multiple of 128 (an even tile count); odd-tile
-    // shapes fall to the per-row oracle. The canonical T=2048 satisfies it.
-    t.is_multiple_of(2 * FLASH_TILE) && head_dim == FLASH_HD
+    // Every MMA in the tcgen05 attention kernels fills 128 real rows — the
+    // forward's query block (#68) and the backward's Design-B tile pair (#47
+    // item 2) — so `T` must be a multiple of 128; other shapes fall to the
+    // per-row oracle. The canonical T=2048 satisfies it.
+    t.is_multiple_of(FLASH_QUERIES) && head_dim == FLASH_HD
 }
 
 /// Staged packed-bf16 attention operands for the tcgen05 forward (issue
@@ -5827,9 +5828,9 @@ fn flash_attention_forward_into<
             )
         })?;
         profiler.measure(stream, "forward.attention.flash", || unsafe {
-            flash_bf16.forward_persistent(
+            flash_bf16.forward(
                 stream,
-                flash_persistent_config(N / T, T, H, flash_bf16.sm_count()),
+                flash_forward_config(N / T, T, H, flash_bf16.sm_count()),
                 scratch.q_tma.as_ptr(),
                 scratch.k_tma.as_ptr(),
                 scratch.v_tma.as_ptr(),

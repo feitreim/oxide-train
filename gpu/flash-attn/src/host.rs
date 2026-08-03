@@ -7,9 +7,12 @@ use std::sync::Arc;
 use cuda_core::{CudaContext, CudaFunction, CudaStream, DeviceBuffer, DriverError, LaunchConfig};
 use cuda_device::tma::TmaDescriptor;
 
-/// Query/key tile edge: `T` must be a multiple of this to use the tcgen05
-/// forward; other shapes stay on the fp32 tiled kernels.
+/// Key tile edge — and half a query block, since the forward's `M128` MMAs
+/// take two stacked tiles of queries.
 pub const FLASH_TILE: usize = 64;
+/// Query rows one forward CTA owns. `T` must be a multiple of this to use the
+/// tcgen05 forward; other shapes stay on the fp32 tiled kernels.
+pub const FLASH_QUERIES: usize = 2 * FLASH_TILE;
 /// The only head width the tcgen05 forward supports.
 pub const FLASH_HD: usize = 128;
 /// SWIZZLE_128B subtile width: a 128-wide operand is two stacked `[TILE, 64]`
@@ -17,38 +20,28 @@ pub const FLASH_HD: usize = 128;
 pub const FLASH_SUBTILE_HD: usize = 64;
 /// Bytes of one full-width `[TILE, HD]` bf16 panel (two stacked subtiles).
 const TILE_BYTES: usize = FLASH_TILE * FLASH_HD * 2;
-/// Bytes of one 64-wide `[TILE, 64]` subtile — half a panel, and the width of
-/// a `[TILE, TILE]` P/dS probability operand.
-const SUBTILE_BYTES: usize = TILE_BYTES / 2;
-/// Phantom-read pad: every MMA uses the `M128` shape over 64-row tiles, so the
-/// tensor core streams a `TILE_BYTES` tail past each operand's base. Mirrors
-/// `PHANTOM_PAD` in `tcgen05.rs`.
-const PHANTOM_PAD: usize = TILE_BYTES;
-/// Dynamic shared bytes of the synchronous forward kernel: Q, K, V panels
-/// plus the single P subtile. Mirrors `FLASH_DYNAMIC_SMEM` in `tcgen05.rs`.
-pub const FLASH_DYNAMIC_SMEM_BYTES: u32 = (3 * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD) as u32;
 /// Dynamic shared bytes of the score_mma probe: A panel plus B panel.
 pub const PROBE_DYNAMIC_SMEM_BYTES: u32 = (2 * TILE_BYTES) as u32;
 /// Dynamic shared bytes of the PAIRED query-parallel backward (kernel A,
 /// Design B): resident stacked `[Q_A;Q_B]`/`[dY_A;dY_B]` (`2 * TILE_BYTES`
-/// each), streamed K/V panels, and the stacked `[128, 64]` dS tile. No
-/// `PHANTOM_PAD`. Mirrors `FLASH_BACKWARD_Q_SMEM` in `tcgen05.rs`.
+/// each), streamed K/V panels, and the stacked `[128, 64]` dS tile. Mirrors
+/// `FLASH_BACKWARD_Q_SMEM` in `tcgen05.rs`.
 pub const FLASH_BACKWARD_Q_SMEM_BYTES: u32 = (7 * TILE_BYTES) as u32;
 /// Dynamic shared bytes of the PAIRED key-parallel backward (kernel B, Design
 /// B): resident stacked `[K_A;K_B]`/`[V_A;V_B]`, streamed Q/dY panels, and the
-/// stacked Pᵀ and dSᵀ tiles. No `PHANTOM_PAD`. Mirrors `FLASH_BACKWARD_KV_SMEM`.
+/// stacked Pᵀ and dSᵀ tiles. Mirrors `FLASH_BACKWARD_KV_SMEM`.
 pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = (8 * TILE_BYTES) as u32;
 /// Dynamic shared allocation for the PIPELINED query-parallel backward: the
 /// resident Q/dY pairs, K/V rings sized for the deepest supported
-/// `BACKWARD_STAGES` (4), and the single stacked dS tile. As with the
-/// pipelined forward, the ceiling is allocated so stage sweeps are a one-const
-/// edit and the flash bin asserts the kernel's actual plan fits. Mirrors
+/// `BACKWARD_STAGES` (4), and the single stacked dS tile. As with the forward,
+/// the ceiling is allocated so stage sweeps are a one-const edit and the flash
+/// bin asserts the kernel's actual plan fits. Mirrors
 /// `FLASH_BACKWARD_Q_PIPELINED_SMEM` in `tcgen05.rs`.
 pub const FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES: u32 = ((5 + 2 * 4) * TILE_BYTES) as u32;
 /// Threads of the pipelined backward: the 128-thread gradient warpgroup plus
 /// the TMA-load and MMA-issue warps. Mirrors
 /// `FLASH_BACKWARD_Q_PIPELINED_BLOCK`.
-pub const FLASH_BACKWARD_Q_PIPELINED_BLOCK_THREADS: u32 = (2 * FLASH_TILE + 64) as u32;
+pub const FLASH_BACKWARD_Q_PIPELINED_BLOCK_THREADS: u32 = (FLASH_QUERIES + 64) as u32;
 /// Dynamic shared allocation for the PIPELINED key-parallel backward: the
 /// resident K/V pairs, Q/dY rings sized for the deepest supported
 /// `BACKWARD_STAGES` (4), and the stacked Pᵀ and dSᵀ tiles. Mirrors
@@ -56,45 +49,19 @@ pub const FLASH_BACKWARD_Q_PIPELINED_BLOCK_THREADS: u32 = (2 * FLASH_TILE + 64) 
 pub const FLASH_BACKWARD_KV_PIPELINED_SMEM_BYTES: u32 = ((6 + 2 * 4) * TILE_BYTES) as u32;
 /// Threads of the pipelined key-parallel backward. Mirrors
 /// `FLASH_BACKWARD_KV_PIPELINED_BLOCK`.
-pub const FLASH_BACKWARD_KV_PIPELINED_BLOCK_THREADS: u32 = (2 * FLASH_TILE + 64) as u32;
-/// Dynamic shared allocation for the pipelined forward: Q + K/V rings sized
-/// for the deepest supported `PIPELINE_STAGES` (4) + the P subtile.
-/// The kernel's actual plan (`FLASH_PIPELINE_SMEM`, a function of the swept
-/// `PIPELINE_STAGES` in `tcgen05.rs`) must stay at or under this; the flash
-/// bin asserts it. Allocating the ceiling keeps stage sweeps a one-const
-/// edit, and costs nothing: TMEM (512 columns per CTA against a 512-column
-/// SM budget) already pins occupancy to one CTA per SM.
-pub const FLASH_PIPELINE_SMEM_BYTES: u32 =
-    ((1 + 2 * 4) * TILE_BYTES + SUBTILE_BYTES + PHANTOM_PAD) as u32;
-/// Threads of the pipelined forward: the TILE-thread softmax warpgroup plus
-/// the TMA-load warp and the MMA-issue warp. Mirrors `FLASH_PIPELINE_BLOCK`.
-pub const FLASH_PIPELINE_BLOCK_THREADS: u32 = (FLASH_TILE + 64) as u32;
-/// Dynamic shared allocation for the persistent ping-pong forward: two Q
-/// panels, K/V rings sized for its 3-stage ceiling (`PERSISTENT_STAGES` caps
-/// there), and one P subtile per workstream. The flash bin asserts the
-/// kernel's `FLASH_PERSISTENT_SMEM` fits.
-pub const FLASH_PERSISTENT_SMEM_BYTES: u32 =
-    ((2 + 2 * 3) * TILE_BYTES + 2 * SUBTILE_BYTES + PHANTOM_PAD) as u32;
-/// Threads of the persistent forward: two softmax warpgroups plus the
-/// TMA-load warp and the MMA-issue warp. Mirrors `FLASH_PERSISTENT_BLOCK`.
-pub const FLASH_PERSISTENT_BLOCK_THREADS: u32 = (2 * FLASH_TILE + 64) as u32;
-
-/// Launch for the synchronous tcgen05 forward over `batches` packed
-/// sequences.
-pub fn flash_forward_config(batches: usize, sequence_length: usize, heads: usize) -> LaunchConfig {
-    assert!(sequence_length.is_multiple_of(FLASH_TILE));
-    assert!(batches <= u16::MAX as usize && heads <= u16::MAX as usize);
-    assert!(sequence_length / FLASH_TILE <= u32::MAX as usize);
-    LaunchConfig {
-        grid_dim: (
-            (sequence_length / FLASH_TILE) as u32,
-            heads as u32,
-            batches as u32,
-        ),
-        block_dim: (FLASH_TILE as u32, 1, 1),
-        shared_mem_bytes: FLASH_DYNAMIC_SMEM_BYTES,
-    }
-}
+pub const FLASH_BACKWARD_KV_PIPELINED_BLOCK_THREADS: u32 = (FLASH_QUERIES + 64) as u32;
+/// Dynamic shared allocation for the forward: the resident `[QUERIES, HD]`
+/// query block (`2 * TILE_BYTES`), K/V rings sized for the deepest supported
+/// `FORWARD_STAGES` (4), the two-deep `[QUERIES, TILE]` probability ring
+/// (`2 * TILE_BYTES`), and a page for the barriers and the vote scratch the
+/// plan carves after them. The kernel's actual plan (`FLASH_FORWARD_SMEM`, a
+/// function of the swept `FORWARD_STAGES`) must stay at or under this; the
+/// flash bin asserts it. Allocating the ceiling keeps stage sweeps a one-const
+/// edit, and costs nothing at 1 CTA/SM.
+pub const FLASH_FORWARD_SMEM_BYTES: u32 = ((4 + 2 * 4) * TILE_BYTES + 1024) as u32;
+/// Threads of the forward: the four warps an `M128` accumulator's 128 TMEM
+/// lanes are drained by, and no others. Mirrors `FLASH_FORWARD_BLOCK`.
+pub const FLASH_FORWARD_BLOCK_THREADS: u32 = FLASH_QUERIES as u32;
 
 /// Launch for both PAIRED tcgen05 backward kernels (Design B): each CTA owns a
 /// tile PAIR, so the grid is `(T/128, H, B)` and the block is 128 threads (the
@@ -173,32 +140,17 @@ pub fn flash_backward_kv_pipelined_config(
     }
 }
 
-/// Launch for the warp-specialized pipelined forward: same grid, the wider
-/// block, the ring-sized dynamic shared allocation.
-pub fn flash_pipelined_config(
-    batches: usize,
-    sequence_length: usize,
-    heads: usize,
-) -> LaunchConfig {
-    let base = flash_forward_config(batches, sequence_length, heads);
-    LaunchConfig {
-        grid_dim: base.grid_dim,
-        block_dim: (FLASH_PIPELINE_BLOCK_THREADS, 1, 1),
-        shared_mem_bytes: FLASH_PIPELINE_SMEM_BYTES,
-    }
-}
-
-/// Work items of the persistent forward — one per (query-tile pair, head,
-/// batch) — and elements of the per-workstream correction-count buffer.
+/// Work items of the forward — one per (query block, head, batch), which is
+/// also the length of the correction-count buffer.
 pub fn flash_work_items(batches: usize, sequence_length: usize, heads: usize) -> usize {
-    assert!(sequence_length.is_multiple_of(FLASH_TILE));
-    (sequence_length / FLASH_TILE).div_ceil(2) * heads * batches
+    assert!(sequence_length.is_multiple_of(FLASH_QUERIES));
+    (sequence_length / FLASH_QUERIES) * heads * batches
 }
 
-/// Elements of the correction-count output shared by all tcgen05 forwards:
-/// one word per (batch, head, query tile) workstream.
+/// Elements of the correction-count output: one word per work item, indexed
+/// `plane * tiles + query_tile`.
 pub fn correction_count_len(batches: usize, sequence_length: usize, heads: usize) -> usize {
-    batches * heads * (sequence_length / FLASH_TILE)
+    flash_work_items(batches, sequence_length, heads)
 }
 
 /// SM count of the device backing `ctx`, for sizing the persistent grid.
@@ -223,21 +175,22 @@ pub fn device_sm_count(ctx: &CudaContext) -> Result<usize, Box<dyn Error>> {
     Ok(count as usize)
 }
 
-/// Launch for the persistent ping-pong forward: a 1-D grid of `cta_count`
-/// CTAs (normally the SM count; clamped to the work-item count, so passing
-/// the item count degenerates to one item per CTA for hang debugging).
-pub fn flash_persistent_config(
+/// Launch for the forward: a 1-D persistent grid of `cta_count` CTAs (normally
+/// the SM count; clamped to the work-item count, so passing the item count
+/// degenerates to one item per CTA for hang debugging).
+pub fn flash_forward_config(
     batches: usize,
     sequence_length: usize,
     heads: usize,
     cta_count: usize,
 ) -> LaunchConfig {
+    assert!(batches <= u16::MAX as usize && heads <= u16::MAX as usize);
     let items = flash_work_items(batches, sequence_length, heads);
     assert!(items > 0 && items <= u32::MAX as usize);
     LaunchConfig {
         grid_dim: (items.min(cta_count.max(1)) as u32, 1, 1),
-        block_dim: (FLASH_PERSISTENT_BLOCK_THREADS, 1, 1),
-        shared_mem_bytes: FLASH_PERSISTENT_SMEM_BYTES,
+        block_dim: (FLASH_FORWARD_BLOCK_THREADS, 1, 1),
+        shared_mem_bytes: FLASH_FORWARD_SMEM_BYTES,
     }
 }
 
@@ -294,8 +247,6 @@ fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dy
 pub struct Tcgen05Flash {
     generated: super::tcgen05::kernels::LoadedModule,
     forward: CudaFunction,
-    forward_pipelined: CudaFunction,
-    forward_persistent: CudaFunction,
     backward_q: CudaFunction,
     backward_q_pipelined: CudaFunction,
     backward_kv: CudaFunction,
@@ -307,17 +258,13 @@ impl Tcgen05Flash {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<Self, Box<dyn Error>> {
         let generated = super::tcgen05::kernels::load(ctx)?;
         let module = generated.as_cuda_module().clone();
-        let forward = module.load_function("flash_forward_tcgen05")?;
-        let forward_pipelined = module.load_function("flash_forward_pipelined")?;
-        let forward_persistent = module.load_function("flash_forward_persistent")?;
+        let forward = module.load_function("flash_forward")?;
         let backward_q = module.load_function("flash_backward_q_tcgen05")?;
         let backward_q_pipelined = module.load_function("flash_backward_q_pipelined")?;
         let backward_kv = module.load_function("flash_backward_kv_tcgen05")?;
         let backward_kv_pipelined = module.load_function("flash_backward_kv_pipelined")?;
         let transpose_probe = module.load_function("transpose_b_probe")?;
-        opt_in_dynamic_smem(&forward, FLASH_DYNAMIC_SMEM_BYTES)?;
-        opt_in_dynamic_smem(&forward_pipelined, FLASH_PIPELINE_SMEM_BYTES)?;
-        opt_in_dynamic_smem(&forward_persistent, FLASH_PERSISTENT_SMEM_BYTES)?;
+        opt_in_dynamic_smem(&forward, FLASH_FORWARD_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_q, FLASH_BACKWARD_Q_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_q_pipelined, FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_kv, FLASH_BACKWARD_KV_SMEM_BYTES)?;
@@ -329,8 +276,6 @@ impl Tcgen05Flash {
         Ok(Self {
             generated,
             forward,
-            forward_pipelined,
-            forward_persistent,
             backward_q,
             backward_q_pipelined,
             backward_kv,
@@ -340,18 +285,16 @@ impl Tcgen05Flash {
     }
 
     /// SM count captured at load time — the natural `cta_count` for
-    /// `flash_persistent_config`.
+    /// `flash_forward_config`.
     pub fn sm_count(&self) -> usize {
         self.sm_count
     }
 
     /// The launched kernels paired with their names, for reporting what ptxas
     /// gave each one.
-    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 7] {
+    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 5] {
         [
-            ("forward sync", &self.forward),
-            ("forward pipelined", &self.forward_pipelined),
-            ("forward persistent", &self.forward_persistent),
+            ("forward", &self.forward),
             ("backward q", &self.backward_q),
             ("backward q pipelined", &self.backward_q_pipelined),
             ("backward kv", &self.backward_kv),
@@ -359,91 +302,17 @@ impl Tcgen05Flash {
         ]
     }
 
-    /// Synchronous tcgen05 causal attention forward over bf16 head-panel
-    /// staging buffers. Launch with `flash_forward_config`.
+    /// tcgen05 causal attention forward over bf16 head-panel staging buffers.
+    /// Launch with `flash_forward_config`.
     ///
     /// # Safety
     ///
-    /// The maps must describe live `[B*H, T, 64]` staging buffers matching
-    /// the launch config, `output` must hold `B*T*H*64` elements,
-    /// `logsumexp` `B*T*H` elements, and `correction_counts`
-    /// `correction_count_len` elements.
+    /// The maps must describe live `[B*H, T, HD]` staging buffers matching the
+    /// launch config, `output` must hold `B*T*H*HD` elements, `logsumexp`
+    /// `B*T*H` elements, and `correction_counts` `correction_count_len`
+    /// elements.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
-        &self,
-        stream: &CudaStream,
-        config: LaunchConfig,
-        q_tma: *const TmaDescriptor,
-        k_tma: *const TmaDescriptor,
-        v_tma: *const TmaDescriptor,
-        sequence_length: u32,
-        heads: u32,
-        output: &mut DeviceBuffer<f32>,
-        logsumexp: &mut DeviceBuffer<f32>,
-        correction_counts: &mut DeviceBuffer<u32>,
-    ) -> Result<(), DriverError> {
-        unsafe {
-            self.generated.flash_forward_tcgen05(
-                stream,
-                config,
-                q_tma,
-                k_tma,
-                v_tma,
-                sequence_length,
-                heads,
-                output,
-                logsumexp,
-                correction_counts,
-            )
-        }
-    }
-
-    /// Warp-specialized pipelined forward (issue #35, phase 2): identical
-    /// contract to `forward`, launched with `flash_pipelined_config`.
-    ///
-    /// # Safety
-    ///
-    /// Same contract as `forward`.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_pipelined(
-        &self,
-        stream: &CudaStream,
-        config: LaunchConfig,
-        q_tma: *const TmaDescriptor,
-        k_tma: *const TmaDescriptor,
-        v_tma: *const TmaDescriptor,
-        sequence_length: u32,
-        heads: u32,
-        output: &mut DeviceBuffer<f32>,
-        logsumexp: &mut DeviceBuffer<f32>,
-        correction_counts: &mut DeviceBuffer<u32>,
-    ) -> Result<(), DriverError> {
-        unsafe {
-            self.generated.flash_forward_pipelined(
-                stream,
-                config,
-                q_tma,
-                k_tma,
-                v_tma,
-                sequence_length,
-                heads,
-                output,
-                logsumexp,
-                correction_counts,
-            )
-        }
-    }
-
-    /// Persistent two-Q-tile ping-pong forward (issue #35, phase 3):
-    /// identical operand/output contract, launched with
-    /// `flash_persistent_config` (which needs `batches` again here for the
-    /// work-item decomposition).
-    ///
-    /// # Safety
-    ///
-    /// Same contract as `forward`.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_persistent(
         &self,
         stream: &CudaStream,
         config: LaunchConfig,
@@ -458,7 +327,7 @@ impl Tcgen05Flash {
         correction_counts: &mut DeviceBuffer<u32>,
     ) -> Result<(), DriverError> {
         unsafe {
-            self.generated.flash_forward_persistent(
+            self.generated.flash_forward(
                 stream,
                 config,
                 q_tma,
