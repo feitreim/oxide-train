@@ -15,6 +15,7 @@ use tensor_cpu::CpuTensor;
 mod device;
 use device::{
     CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS,
+    CLASSIFIER_TILE_BLOCK_ROWS, CLASSIFIER_TILE_CHUNK, CLASSIFIER_TILE_THREADS,
     MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK,
     NORM_TILE_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM,
     ROUTER_GEMM_BN, ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS,
@@ -44,12 +45,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_rms_norm_tile(&stream, &module)?;
     eprintln!("[ops] checking swiglu");
     check_swiglu(&stream, &module)?;
+    eprintln!("[ops] checking swiglu tiles");
+    check_swiglu_tile(&stream, &module)?;
     eprintln!("[ops] checking embedding");
     check_embedding(&stream, &module)?;
     eprintln!("[ops] checking cross_entropy");
     check_cross_entropy(&stream, &module)?;
     eprintln!("[ops] checking classifier_bf16");
     check_classifier_bf16(&stream, &module)?;
+    eprintln!("[ops] checking classifier tiles");
+    check_classifier_tile(&stream, &module)?;
     eprintln!("[ops] checking rope");
     check_rope(&stream, &module)?;
     eprintln!("[ops] checking attention");
@@ -1222,6 +1227,129 @@ fn check_rms_norm_tile(
             "rmsnorm tile inv",
             &inv_dev.to_host_vec(stream)?,
             &inv_reference.to_host_vec(stream)?,
+            1e-6,
+            1e-6,
+        );
+        Ok(())
+    }
+}
+
+/// The tile classifier forward against the shipped bf16 one, which
+/// [`check_classifier_bf16`] has already pinned to the f32 fused oracle.
+///
+/// `C` is deliberately not a multiple of the chunk, so the ragged tail — the
+/// lm-head's padded vocabulary columns, which are read and must not be counted
+/// — is on the path. `CP` is the smallest padded stride that covers the last
+/// chunk at every `CLASSIFIER_TILE_CHUNK` a sweep might set.
+fn check_classifier_tile(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: every buffer and launch below is allocated from N, C and CP, and
+    // N is a multiple of CLASSIFIER_TILE_BLOCK_ROWS.
+    unsafe {
+        const N: usize = 256;
+        const C: usize = 517;
+        const CP: usize = 768;
+        assert_eq!(N % CLASSIFIER_TILE_BLOCK_ROWS, 0);
+        assert!(C.div_ceil(CLASSIFIER_TILE_CHUNK) * CLASSIFIER_TILE_CHUNK <= CP);
+
+        let logits = CpuTensor::<f32, Rank2<N, C>>::uniform(16).scale(5.0);
+        let mut packed = vec![0u32; N * CP / 2];
+        for row in 0..N {
+            for col in 0..C {
+                let bits = bf16::from_f32(logits.as_slice()[row * C + col]).to_bits() as u32;
+                packed[(row * CP + col) / 2] |= bits << (16 * (col % 2));
+            }
+        }
+        let targets: [u32; N] = std::array::from_fn(|row| ((row * 101 + C - 1) % C) as u32);
+        let targets_dev = DeviceBuffer::from_host(stream, &targets)?;
+        let packed_dev = DeviceBuffer::from_host(stream, &packed)?;
+        let mut shipped = DeviceBuffer::<f32>::zeroed(stream, N)?;
+        let mut tiled = DeviceBuffer::<f32>::zeroed(stream, N)?;
+
+        module.fused_classifier_forward_bf16(
+            stream,
+            LaunchConfig {
+                grid_dim: (N as u32, 1, 1),
+                block_dim: (CLASSIFIER_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &packed_dev,
+            &targets_dev,
+            N as u32,
+            C as u32,
+            CP as u32,
+            &mut shipped,
+        )?;
+        module.fused_classifier_forward_tile_bf16(
+            stream,
+            LaunchConfig {
+                grid_dim: ((N / CLASSIFIER_TILE_BLOCK_ROWS) as u32, 1, 1),
+                block_dim: (CLASSIFIER_TILE_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &packed_dev,
+            &targets_dev,
+            C as u32,
+            CP as u32,
+            &mut tiled,
+        )?;
+        assert_close(
+            "classifier tile losses vs shipped bf16",
+            &tiled.to_host_vec(stream)?,
+            &shipped.to_host_vec(stream)?,
+            5e-5,
+            2e-5,
+        );
+        Ok(())
+    }
+}
+
+/// The tile SwiGLU forward against the flat one it would replace.
+fn check_swiglu_tile(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: both launches cover the same ROWS x COLUMNS rectangle, and ROWS
+    // is a multiple of NORM_TILE_BLOCK_ROWS, COLUMNS of NORM_TILE_CHUNK.
+    unsafe {
+        const ROWS: usize = 1024;
+        const COLUMNS: usize = 192;
+        const LEN: usize = ROWS * COLUMNS;
+        assert_eq!(ROWS % NORM_TILE_BLOCK_ROWS, 0);
+        assert_eq!(COLUMNS % NORM_TILE_CHUNK, 0);
+
+        let gate = CpuTensor::<f32, Rank2<ROWS, COLUMNS>>::uniform(20);
+        let up = CpuTensor::<f32, Rank2<ROWS, COLUMNS>>::uniform(21);
+        let gate_dev = DeviceBuffer::from_host(stream, gate.as_slice())?;
+        let up_dev = DeviceBuffer::from_host(stream, up.as_slice())?;
+        let mut shipped = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+        let mut tiled = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+
+        module.swiglu_forward(
+            stream,
+            LaunchConfig::for_num_elems(LEN as u32),
+            &gate_dev,
+            &up_dev,
+            &mut shipped,
+        )?;
+        module.swiglu_forward_tile(
+            stream,
+            LaunchConfig {
+                grid_dim: ((ROWS / NORM_TILE_BLOCK_ROWS) as u32, 1, 1),
+                block_dim: (NORM_TILE_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &gate_dev,
+            &up_dev,
+            COLUMNS as u32,
+            &mut tiled,
+        )?;
+        assert_close(
+            "swiglu tile vs flat",
+            &tiled.to_host_vec(stream)?,
+            &shipped.to_host_vec(stream)?,
             1e-6,
             1e-6,
         );

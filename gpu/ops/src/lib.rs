@@ -17,7 +17,7 @@ use cuda_device::{
 
 use kittens::global::{GlobalRows, load_cols, load_rows, store_rows};
 use kittens::reg::{BaseLdtm, ColVec, RegTile, RegVec};
-use kittens::shared::F32;
+use kittens::shared::{Bf16, F32};
 use kittens::{lane, warp_id};
 
 /// Threads in the row-parallel fused classifier kernels.
@@ -62,6 +62,23 @@ pub const NORM_TILE_THREADS: usize = 32 * NORM_TILE_WARPS;
 
 /// Rows one tile-RMSNorm block owns — the grid's row quantum.
 pub const NORM_TILE_BLOCK_ROWS: usize = NORM_TILE_ROWS * NORM_TILE_WARPS;
+
+/// Logits rows one warp owns in the tile classifier.
+pub const CLASSIFIER_TILE_ROWS: usize = 16;
+
+/// Classes a tile-classifier warp holds in registers at once. The vocabulary
+/// is walked in these, and the running `(max, sum_exp)` crosses them, so the
+/// pass count is one whatever this is.
+pub const CLASSIFIER_TILE_CHUNK: usize = 64;
+
+/// Warps in one tile-classifier block.
+pub const CLASSIFIER_TILE_WARPS: usize = 4;
+
+/// Threads in one tile-classifier block.
+pub const CLASSIFIER_TILE_THREADS: usize = 32 * CLASSIFIER_TILE_WARPS;
+
+/// Logits rows one tile-classifier block owns — the grid's row quantum.
+pub const CLASSIFIER_TILE_BLOCK_ROWS: usize = CLASSIFIER_TILE_ROWS * CLASSIFIER_TILE_WARPS;
 
 /// Threads in one expert's deterministic MoE capacity-assignment block.
 ///
@@ -138,6 +155,12 @@ type NormRows = RegVec<NORM_TILE_ROWS, BaseLdtm>;
 /// The chunk's slice of the `[dim]` weight, one `f32` per column this thread
 /// owns rather than one per (row, column) pair.
 type NormColumns = ColVec<NORM_TILE_CHUNK, BaseLdtm>;
+
+/// One warp's slice of a logits band, [`CLASSIFIER_TILE_CHUNK`] classes wide.
+type ClassChunk = RegTile<CLASSIFIER_TILE_ROWS, CLASSIFIER_TILE_CHUNK, BaseLdtm>;
+
+/// The running `(max, sum_exp)` pair of a [`ClassChunk`]'s rows.
+type ClassRows = RegVec<CLASSIFIER_TILE_ROWS, BaseLdtm>;
 
 #[cuda_module]
 pub mod kernels {
@@ -1339,6 +1362,112 @@ pub mod kernels {
                 *logits.get_unchecked_mut(base + pair) = packed;
             }
             pair += CLASSIFIER_THREADS;
+        }
+    }
+
+    /// Warp-per-band fused classifier forward over packed-bf16 logits.
+    ///
+    /// [`fused_classifier_forward_bf16`] gives a row to a 256-thread block and
+    /// merges its lanes' `(max, sum_exp)` summaries through two shared arrays,
+    /// eight barriers and a branch per round. Here a warp owns
+    /// [`CLASSIFIER_TILE_ROWS`] rows at once, so the merge is `row_max` and
+    /// `row_sum` — shuffles, no shared memory, no barrier and no branch — and
+    /// the running pair crosses chunks in registers, so this is still one pass
+    /// over the vocabulary.
+    ///
+    /// # Safety
+    ///
+    /// Launch with [`CLASSIFIER_TILE_THREADS`] threads and exactly
+    /// `rows / CLASSIFIER_TILE_BLOCK_ROWS` blocks; `rows` must be a multiple of
+    /// [`CLASSIFIER_TILE_BLOCK_ROWS`] and `padded_classes` of
+    /// [`CLASSIFIER_TILE_CHUNK`], both the launcher's to check.
+    #[kernel]
+    pub unsafe fn fused_classifier_forward_tile_bf16(
+        logits: &[u32],
+        targets: &[u32],
+        classes: u32,
+        padded_classes: u32,
+        mut losses: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let row = CLASSIFIER_TILE_BLOCK_ROWS as u32 * thread::blockIdx_x()
+                + CLASSIFIER_TILE_ROWS as u32 * warp_id();
+            let source =
+                GlobalRows::<Bf16>::from_raw(logits.as_ptr() as *mut u8, padded_classes as usize);
+
+            let mut peak = ClassRows::splat(f32::NEG_INFINITY);
+            let mut total = ClassRows::splat(0.0);
+            let mut column = 0u32;
+            while column < classes {
+                let mut x: ClassChunk = load_rows(source, row, column, lane);
+                // The vocabulary's last chunk runs into the lm-head's padding,
+                // which is read but must not be counted.
+                if column + CLASSIFIER_TILE_CHUNK as u32 > classes {
+                    x.right_fill(lane, (classes - column) as i32, f32::NEG_INFINITY);
+                }
+                let next = peak.max(x.row_max());
+                total = total
+                    .mul(peak.sub(next).exp())
+                    .add(x.sub_row(next).exp().row_sum());
+                peak = next;
+                column += CLASSIFIER_TILE_CHUNK as u32;
+            }
+
+            // One lane per row: `row_max` and `row_sum` leave a row's statistic
+            // replicated across its quad, and the target logit is a scalar read
+            // no tile shape reaches.
+            if lane % QUAD_LANES as u32 == 0 {
+                let words = padded_classes as usize / 2;
+                let mut slot = 0usize;
+                while slot < ClassRows::SLOTS {
+                    let r = (row + ClassRows::row(lane, slot)) as usize;
+                    let target = targets[r] as usize;
+                    let word = logits[r * words + target / 2];
+                    let bits = (if target % 2 == 0 { word } else { word >> 16 }) as u16;
+                    *losses.get_unchecked_mut(r) =
+                        peak.get(slot) + total.get(slot).ln() - bf16_bits_to_f32(bits);
+                    slot += 1;
+                }
+            }
+        }
+    }
+
+    /// [`swiglu_forward`] over register tiles, as the elementwise probe #70
+    /// asks for: the same arithmetic, reached through `load_rows`/`store_rows`
+    /// so adjacent columns pair into one access instead of one each.
+    ///
+    /// It borrows the RMSNorm tile shape rather than adding a second set of
+    /// knobs — the two walk the same rectangle and the answer is the same
+    /// answer.
+    ///
+    /// # Safety
+    ///
+    /// As [`rms_norm_forward_tile`], over `rows x columns`.
+    #[kernel]
+    pub unsafe fn swiglu_forward_tile(
+        gate: &[f32],
+        up: &[f32],
+        columns: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let row = NORM_TILE_BLOCK_ROWS as u32 * thread::blockIdx_x()
+                + NORM_TILE_ROWS as u32 * warp_id();
+            let width = columns as usize;
+            let gates = GlobalRows::<F32>::from_raw(gate.as_ptr() as *mut u8, width);
+            let ups = GlobalRows::<F32>::from_raw(up.as_ptr() as *mut u8, width);
+            let destination = GlobalRows::<F32>::from_slice(&mut y, width);
+
+            let mut column = 0u32;
+            while column < columns {
+                let g: NormChunk = load_rows(gates, row, column, lane);
+                let u: NormChunk = load_rows(ups, row, column, lane);
+                let sigmoid = g.neg().exp().shift(1.0).recip();
+                store_rows(destination, row, column, lane, g.mul(sigmoid).mul(u));
+                column += NORM_TILE_CHUNK as u32;
+            }
         }
     }
 

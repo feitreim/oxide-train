@@ -20,12 +20,20 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 #[path = "../lib.rs"]
 #[allow(dead_code)]
 mod device;
-use device::{NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_THREADS, kernels};
+use device::{
+    CLASSIFIER_THREADS, CLASSIFIER_TILE_BLOCK_ROWS, CLASSIFIER_TILE_THREADS, NORM_THREADS,
+    NORM_TILE_BLOCK_ROWS, NORM_TILE_THREADS, kernels,
+};
 
 /// Rows the norms are timed at — the training config's `B * T`.
 const N: usize = 24_576;
 /// Model width, the norms' row length.
 const D: usize = 3_072;
+/// Real vocabulary, and the padded row stride the lm-head writes.
+const VOCAB: usize = 50_257;
+const VP: usize = 50_432;
+/// SwiGLU's row length.
+const FF: usize = 4_096;
 
 const WARMUP: usize = 3;
 const ITERS: usize = 20;
@@ -62,11 +70,154 @@ fn report(family: &str, bytes: f64, shipped_ms: f64, tile_ms: f64) {
     );
 }
 
+/// A family with no tile counterpart: the shipped rate, and nothing to divide
+/// it by.
+fn report_one(family: &str, bytes: f64, ms: f64) {
+    println!("{family}  ({:.0} MB of compulsory traffic)", bytes / 1e6);
+    println!(
+        "  shipped: {ms:8.4} ms  {:8.1} GB/s",
+        bytes / (ms / 1_000.0) / 1e9
+    );
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
     bench_rms_norm(&stream, &module)?;
+    bench_classifier(&stream, &module)?;
+    bench_swiglu(&stream, &module)?;
+    bench_rope(&stream, &module)?;
+    Ok(())
+}
+
+/// The fused classifier forward, packed-bf16 logits, at the lm-head's shape.
+///
+/// Forward only. Both directions share one reduction and one row walk, and the
+/// backward adds a write-back pass that no tile shape changes; if the forward
+/// does not win, nothing downstream of it does.
+fn bench_classifier(
+    stream: &std::sync::Arc<CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let words = N * VP / 2;
+    let logits = DeviceBuffer::<u32>::zeroed(stream, words)?;
+    let targets = DeviceBuffer::from_host(
+        stream,
+        &(0..N).map(|row| (row % VOCAB) as u32).collect::<Vec<_>>(),
+    )?;
+    let mut losses = DeviceBuffer::<f32>::zeroed(stream, N)?;
+
+    let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
+        // SAFETY: the launch shape is the one the kernel documents, over a
+        // N x VP packed buffer whose targets are all inside VOCAB.
+        unsafe {
+            module.fused_classifier_forward_bf16(
+                stream,
+                row_grid(N, CLASSIFIER_THREADS),
+                &logits,
+                &targets,
+                N as u32,
+                VOCAB as u32,
+                VP as u32,
+                &mut losses,
+            )?
+        };
+        Ok(())
+    })?;
+    let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
+        // SAFETY: N divides CLASSIFIER_TILE_BLOCK_ROWS and the last chunk of
+        // VOCAB stays inside VP.
+        unsafe {
+            module.fused_classifier_forward_tile_bf16(
+                stream,
+                LaunchConfig {
+                    grid_dim: ((N / CLASSIFIER_TILE_BLOCK_ROWS) as u32, 1, 1),
+                    block_dim: (CLASSIFIER_TILE_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &logits,
+                &targets,
+                VOCAB as u32,
+                VP as u32,
+                &mut losses,
+            )?
+        };
+        Ok(())
+    })?;
+    // One pass over the packed logits; the losses are N floats and round off.
+    report(
+        "fused_classifier forward bf16",
+        (N * VP) as f64 * 2.0,
+        shipped,
+        tile,
+    );
+    Ok(())
+}
+
+/// SwiGLU forward — the measure-first tier's elementwise case.
+fn bench_swiglu(
+    stream: &std::sync::Arc<CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let len = N * FF;
+    let gate = DeviceBuffer::from_host(stream, &uniform_vec(len, 5))?;
+    let up = DeviceBuffer::from_host(stream, &uniform_vec(len, 6))?;
+    let mut y = DeviceBuffer::<f32>::zeroed(stream, len)?;
+
+    let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
+        module.swiglu_forward(stream, LaunchConfig::for_num_elems(len as u32), &gate, &up, &mut y)?;
+        Ok(())
+    })?;
+    let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
+        // SAFETY: N divides NORM_TILE_BLOCK_ROWS and FF the tile chunk.
+        unsafe {
+            module.swiglu_forward_tile(
+                stream,
+                tile_grid(N),
+                &gate,
+                &up,
+                FF as u32,
+                &mut y,
+            )?
+        };
+        Ok(())
+    })?;
+    report("swiglu forward", 3.0 * len as f64 * 4.0, shipped, tile);
+    Ok(())
+}
+
+/// RoPE forward, shipped only — the diagnosis the measure-first tier wants
+/// before a tile version is written.
+///
+/// A tile pass moves the same bytes with the same arithmetic in it, and the
+/// arithmetic is a `powf`, a `sin` and a `cos` per element. Whether that is
+/// worth writing is decided by how far this rate sits below the elementwise
+/// kernel measured directly above it, which moves comparable traffic with two
+/// `exp`s in it.
+fn bench_rope(
+    stream: &std::sync::Arc<CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const T: usize = 2_048;
+    const H: usize = 24;
+    const HD: usize = 128;
+
+    let x = DeviceBuffer::from_host(stream, &uniform_vec(N * D, 7))?;
+    let mut y = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+    let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
+        module.rope_forward(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &x,
+            T as u32,
+            H as u32,
+            HD as u32,
+            &mut y,
+        )?;
+        Ok(())
+    })?;
+    report_one("rope forward", 2.0 * (N * D) as f64 * 4.0, shipped);
     Ok(())
 }
 
