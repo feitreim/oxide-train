@@ -59,23 +59,25 @@ pub mod optimized_kernels {
         unsafe {
             mma_sem.wait(parity);
             if lane_zero {
-                if leader_cta {
-                    tma_sem.expect_tx((128 * 64 * 2) * 4);
-                }
-                let multicast = tma_sem.multicast_alias();
-                if transposed {
+                // Both ranks aim their halves at rank 0's barrier, and rank 0
+                // alone charges for the whole cluster stage.
+                let leader = tma_sem.at_rank(0);
+                let charge = if transposed {
                     // MN-major operands: the map's fast axis is MN, so the
                     // coordinates swap and each 128-MN stage is one box per
                     // stacked subtile. Same transaction bytes, twice the boxes.
                     let a = MnStage::from_raw(smem_a);
                     let b = MnStage::from_raw(smem_b);
-                    a.tma_load_2d_multicast_cg2(a_tma, m_offset, k_offset, multicast, self_mask);
-                    b.tma_load_2d_multicast_cg2(b_tma, n_offset, k_offset, multicast, self_mask);
+                    a.tma_load_2d_multicast_cg2(a_tma, m_offset, k_offset, leader, self_mask)
+                        + b.tma_load_2d_multicast_cg2(b_tma, n_offset, k_offset, leader, self_mask)
                 } else {
                     let a = KStage::from_raw(smem_a);
                     let b = KStage::from_raw(smem_b);
-                    a.tma_load_2d_multicast_cg2(a_tma, k_offset, m_offset, multicast, self_mask);
-                    b.tma_load_2d_multicast_cg2(b_tma, k_offset, n_offset, multicast, self_mask);
+                    a.tma_load_2d_multicast_cg2(a_tma, k_offset, m_offset, leader, self_mask)
+                        + b.tma_load_2d_multicast_cg2(b_tma, k_offset, n_offset, leader, self_mask)
+                };
+                if leader_cta {
+                    tma_sem.expect_tx(charge.across_ranks(CTA_PAIR_RANKS));
                 }
             }
         }
@@ -90,7 +92,7 @@ pub mod optimized_kernels {
         mma_sem: Semaphore,
         parity: u32,
         tmem: u32,
-        instruction: u32,
+        shape: mma::MmaShape,
         accumulate_stage: bool,
         leader_cta: bool,
         lane_zero: bool,
@@ -114,7 +116,7 @@ pub mod optimized_kernels {
                             KStage::from_raw(smem_b).k_walk(),
                         )
                     };
-                    mma::mma_walk_cg2::<4>(tmem, a, b, instruction, accumulate_stage);
+                    mma::mma_walk_cg2::<Bf16, 4>(tmem, a, b, shape, accumulate_stage);
                     mma::commit_multicast_cg2(mma_sem, CTA_MASK_PAIR);
                 }
             }
@@ -122,6 +124,7 @@ pub mod optimized_kernels {
     }
 
     const CTA_MASK_PAIR: u16 = 0b11;
+    const CTA_PAIR_RANKS: u32 = 2;
 
     /// B200 GEMM: cta_group::2 pair-UMMA + four-stage TMA pipeline.
     ///
@@ -219,14 +222,9 @@ pub mod optimized_kernels {
             thread::sync_threads();
             let tmem = *(&raw const TMEM_ADDR as *const u32);
             let transposed = transposed != 0;
-            let instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M256_N256)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .transpose_a(transposed)
-                .transpose_b(transposed)
-                .build()
-                .raw();
+            // Element, accumulator and the transpose flags are the operand
+            // walks' own; only the shape is still the caller's to state.
+            let shape = mma::MmaShape::M256_N256;
             let k_iters = k as u32 / 64;
             let wide_tiles_n = tiles_n / 2;
             let wide_total = tiles_m * wide_tiles_n;
@@ -388,7 +386,7 @@ pub mod optimized_kernels {
                             mma_ring.sem(0),
                             parity,
                             tmem + tmem_offset,
-                            instruction,
+                            shape,
                             k_idx > 0,
                             leader_cta,
                             lane_zero,
@@ -401,7 +399,7 @@ pub mod optimized_kernels {
                             mma_ring.sem(1),
                             parity,
                             tmem + tmem_offset,
-                            instruction,
+                            shape,
                             true,
                             leader_cta,
                             lane_zero,
@@ -414,7 +412,7 @@ pub mod optimized_kernels {
                             mma_ring.sem(2),
                             parity,
                             tmem + tmem_offset,
-                            instruction,
+                            shape,
                             true,
                             leader_cta,
                             lane_zero,
@@ -427,7 +425,7 @@ pub mod optimized_kernels {
                             mma_ring.sem(3),
                             parity,
                             tmem + tmem_offset,
-                            instruction,
+                            shape,
                             true,
                             leader_cta,
                             lane_zero,

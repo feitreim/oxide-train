@@ -13,21 +13,22 @@ use data::TokenFile;
 
 #[path = "../lib.rs"]
 mod model;
-use model::GpuDenseWorkspace;
+use model::GpuMoeWorkspace;
 
-const B: usize = 32;
-const T: usize = 1_024;
-const N: usize = 32_768;
-const NP: usize = 32_768;
+const B: usize = 12;
+const T: usize = 2_048;
+const N: usize = 24_576;
+const NP: usize = 24_576;
 const VOCAB: usize = 50_257;
 const VP: usize = 50_432;
-const D: usize = 1_536;
+const D: usize = 3_072;
 const H: usize = 24;
-const HD: usize = 64;
-const FF: usize = 2_048;
+const HD: usize = 128;
+const FF: usize = 4_096;
 const E: usize = 8;
 const K: usize = 2;
-const C: usize = 8_192;
+const C: usize = 6_144;
+const L: usize = 12;
 
 const EOT: usize = 50_256;
 const PROMPT_TOKENS: usize = 32;
@@ -83,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flash = model::flash_kernels::load(&cuda)?;
     let dense = model::dense_kernels::load(&cuda)?;
 
-    let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C>(
+    let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>(
         &checkpoint_path,
         &stream,
         &tensor,
@@ -93,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "sampling checkpoint={checkpoint_path} step={} temperature={TEMPERATURE} top_k={TOP_K}",
         checkpoint.optimizer.step()
     );
-    let mut workspace = GpuDenseWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C>::new(&stream)?;
+    let mut workspace = GpuMoeWorkspace::<N, NP, T, VOCAB, VP, D, H, FF, E, K, C, L>::new(&stream)?;
 
     let shard = TokenFile::open(&shard_path)?;
     let mut rng = 0x5EED_5EED_5EED_5EEDu64;
