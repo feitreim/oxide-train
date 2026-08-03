@@ -813,14 +813,14 @@ fn bench(
     let mut dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let backward_flop = visits * 5.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    let backward_flop = pairs * 5.0 * (2.0 * 128.0 * 128.0 * 64.0);
 
     // Kernel A alone on both schedules: the direct measure of what the
     // warp specialization bought. Per key-tile visit kernel A issues two
     // 128x128x64 score GEMMs plus one 128x64x128 gradient GEMM.
-    let q_flop = visits * 3.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    let q_flop = pairs * 3.0 * (2.0 * 128.0 * 128.0 * 64.0);
     // Kernel B issues two score GEMMs plus two gradient GEMMs per visit.
-    let kv_flop = visits * 4.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    let kv_flop = pairs * 4.0 * (2.0 * 128.0 * 128.0 * 64.0);
     for (name, pipelined) in [("sync", false), ("pipelined", true)] {
         let milliseconds = time_gpu_iters(stream, 3, 20, || {
             unsafe {
