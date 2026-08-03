@@ -1670,9 +1670,21 @@ pub mod kernels {
 
                 if leader {
                     tcgen05_fence_after_thread_sync();
-                    let charge = self.shared.q.tma_load(
+                    // The query block is twice the map's box, so it arrives as
+                    // two stacked `TILE`-row loads. `tma_load` would issue the
+                    // right two boxes and charge the barrier for `QUERIES` rows
+                    // of each, which the engine never delivers — a hang, not a
+                    // wrong answer.
+                    let charge = self.shared.q.tma_load_at::<TILE>(
                         self.q_tma,
+                        0,
                         query_base as i32,
+                        plane as i32,
+                        self.shared.q_loaded,
+                    ) + self.shared.q.tma_load_at::<TILE>(
+                        self.q_tma,
+                        TILE,
+                        (query_base + TILE as u32) as i32,
                         plane as i32,
                         self.shared.q_loaded,
                     );
