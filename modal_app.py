@@ -9,6 +9,7 @@ uses the stock upstream backend. Re-add a CUDA_OXIDE_BACKEND layer if needed.)
 Local usage (see also ./run.sh):
     modal run modal_app.py --kernel vecadd               # correctness (main.rs)
     modal run modal_app.py --kernel vecadd --bin bench   # benchmark (src/bin/bench.rs)
+    modal run modal_app.py --kernel gemm --bin bench --features cublas  # + cuBLASLt
     modal run modal_app.py --kernel gemm --sweep "BM=128 BN=128,BM=256 BN=128"
     modal run modal_app.py --kernel gemm --sanitize synccheck   # compute-sanitizer
     modal run modal_app.py::doctor                        # env / GPU sanity check
@@ -204,6 +205,7 @@ def _prepare_flash_ptx(root: str, oxide: list[str] | None = None) -> None:
 def run_kernel(
     kernel: str,
     bin: str | None = None,
+    features: str | None = None,
     shard: str | None = None,
     steps: int | None = None,
     learning_rate: float | None = None,
@@ -218,6 +220,11 @@ def run_kernel(
     cmd = ["cargo", "oxide", "run", kernel]
     if bin:
         cmd += ["--bin", bin]
+    # Cargo features reach the build through cargo-oxide unchanged; gemm's
+    # `cublas` is the only one, and it is what links the benchmark's
+    # denominator.
+    if features:
+        cmd += ["--features", features]
     env = []
     if shard:
         env.append(f"TRAIN_SHARD={shard}")
@@ -485,6 +492,7 @@ def prepare(limit_files: int = 0, limit_articles: int = 0) -> None:
 def main(
     kernel: str = "vecadd",
     bin: str = "",
+    features: str = "",
     gpu: str = "",
     ptx: bool = False,
     sweep: str = "",
@@ -524,6 +532,7 @@ def main(
     fn.remote(
         kernel,
         bin or None,
+        features or None,
         shard or None,
         steps or None,
         learning_rate or None,
