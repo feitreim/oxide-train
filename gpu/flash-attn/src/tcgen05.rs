@@ -43,19 +43,33 @@
 //! `online_rescale` for the flash rescale, and `block_reduce` for the
 //! correction vote all three kernels used to open-code.
 //!
-//! Two synchronous backward kernels share the same idioms —
-//! the swizzle-aware bf16 fragment writes, the transposed-B gradient MMA
-//! shape, and the fp32 TMEM accumulators. `flash_backward_q_tcgen05`
-//! (query-parallel) recomputes `S`/`dP` per key tile and accumulates
-//! `dQ += dS·K`; `flash_backward_kv_tcgen05` (key-parallel) recomputes the
-//! transposed `Sᵀ`/`dPᵀ` per query tile and accumulates `dV += Pᵀ·dY` and
-//! `dK += dSᵀ·Q`. Probabilities are recomputed base-2 from the saved LSE
-//! (`P = exp2(s − lse·log2e)`, no running-max machinery); gradient writes are
-//! disjoint by tile so there are no atomics. The three-kernel split
-//! (`backward_dot` stays fp32 in `lib.rs`, then dQ, then dK/dV) keeps the
-//! gradient outputs disjoint. Both take the packed-bf16 Q/K/V/dY staging
-//! panels plus the read-only `logsumexp` (natural log) and `dot` (`Σ dy·y`)
-//! device slices, and write fp32 `dq`/`dk`/`dv`.
+//! `flash_backward_q` and `flash_backward_kv` are one kernel each where there
+//! were two (#69), and they are the forward's own shape: a CTA owns `QUERIES`
+//! rows of one axis, the four warps of the `M128` accumulator are the whole
+//! block, and the leader issues the next tile's score MMAs before the
+//! warpgroup runs this tile's register pass. `flash_backward_q`
+//! (query-parallel) holds Q and dY resident, streams the causal key tiles,
+//! recomputes `S`/`dP` per tile and accumulates `dQ += dS·K` in TMEM;
+//! `flash_backward_kv` (key-parallel) holds K and V resident, streams the
+//! query tiles at and after them, recomputes the transposed `Sᵀ`/`dPᵀ` and
+//! accumulates `dV += Pᵀ·dY` and `dK += dSᵀ·Q`. The transpose is the MMA's,
+//! not a register one: `mma_abt(K, Q)` produces the key-major band directly,
+//! so nothing here wants the second `FragmentLayout` the library does not
+//! have.
+//!
+//! Probabilities are recomputed base-2 from the saved LSE
+//! (`P = exp2(s − lse·log2e)`, no running-max machinery). **The gradient
+//! accumulators never leave TMEM until the item ends**: a query block owns
+//! every key its rows attend to and a key block owns every query that attends
+//! to it, so each output tile has exactly one writer and the epilogue is a
+//! plain `store_rows`. That is what keeps atomics — and TMA reduction stores,
+//! ferro #42 — out of this module; the price is that `S` is computed twice
+//! across the two kernels, which a fused form would not pay and could not
+//! avoid paying for in gradient traffic instead. The three-kernel split
+//! (`backward_dot` stays fp32 in `lib.rs`, then dQ, then dK/dV) is unchanged.
+//! Both take the packed-bf16 Q/K/V/dY staging panels plus the read-only
+//! `logsumexp` (natural log) and `dot` (`Σ dy·y`) device slices, and write
+//! fp32 `dq`/`dk`/`dv`.
 
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
@@ -63,17 +77,17 @@ use cuda_device::shared::{DynamicSharedArray, SharedArray};
 use cuda_device::tcgen05::{tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync};
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
-use kittens::global::{GlobalRows, store_row_vec, store_rows};
-use kittens::ldst::{store_fragment, store_tile};
+use kittens::global::{GlobalRows, load_col_vec, load_row_vec, store_row_vec, store_rows};
+use kittens::ldst::store_tile;
 use kittens::mma::{self, MmaShape, mma_ab, mma_abt};
 use kittens::pipeline;
 use kittens::plan::SharedPlan;
 use kittens::reg::{
-    BaseLdtm, Exp2Hw, Fragment, Max, RegTile, RegVec, exp2_approx, log2_approx, online_rescale,
+    BaseLdtm, ColVec, Exp2Hw, Max, RegTile, RegVec, exp2_approx, log2_approx, online_rescale,
     warp_reduce,
 };
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, SharedVec, Swizzle128B};
-use kittens::sync::{PhasedSemaphore, Semaphore, SemaphoreRing, block_reduce};
+use kittens::sync::{Semaphore, SemaphoreRing, block_reduce};
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
 
 // Tile contract; `host.rs` mirrors these as FLASH_TILE / FLASH_HD (kept
@@ -211,44 +225,166 @@ const _: () = assert!(
     "tcgen05.alloc takes a power of two in [32, 512] that covers the scores and the output"
 );
 
-/// Dynamic shared plan of the PAIRED query-parallel backward (kernel A, Design
-/// B): the resident stacked `[Q_A;Q_B]` and `[dY_A;dY_B]` operands
-/// (`2 * TILE_BYTES` each), the streamed K and V panels, and the single stacked
-/// `[128, 64]` dS tile (`TILE_BYTES`). Every paired MMA fills 128 real query
-/// rows, so there is no phantom-read pad in any plan here any more — the
-/// forward's 64-query tile was the last thing that needed one.
-pub const FLASH_BACKWARD_Q_SMEM: usize = 7 * TILE_BYTES;
-/// Dynamic shared plan of the PAIRED key-parallel backward (kernel B, Design B):
-/// the resident stacked `[K_A;K_B]` and `[V_A;V_B]` operands (`2 * TILE_BYTES`
-/// each), the streamed Q and dY panels, and the stacked `[128, 64]` Pᵀ and dSᵀ
-/// tiles (`TILE_BYTES` each).
-pub const FLASH_BACKWARD_KV_SMEM: usize = 8 * TILE_BYTES;
-
-/// K/V ring depth of the warp-specialized backward (SWEEP knob). Two is the
-/// floor for the same reason as `FORWARD_STAGES`: the staggered issue order
-/// (`S/dP-MMA(i)` before `dQ-MMA(i-1)`) needs a stage of load-ahead, and the
-/// K stage of tile `i` cannot recycle until `dQ-MMA(i)` — which reads it a
-/// second time — has been observed.
+/// Ring depth of each backward kernel's streamed operand — K/V in the
+/// query-parallel kernel, Q/dY in the key-parallel one (SWEEP knob).
+///
+/// Three where the forward now takes two, and for a reason that is the
+/// forward's own turned around: the forward dropped to two to fit two CTAs on
+/// an SM, and the backward cannot have two at any plan size — both kernels
+/// hold their score segments and their gradient accumulators in tensor memory
+/// and land on `tcgen05.alloc`'s 512 columns, which is the whole of an SM's.
+/// With residency fixed there is nothing to buy by starving the ring, and at
+/// three the stage a score MMA waits for was loaded a whole iteration before
+/// it, rather than by the refill immediately above it.
 pub const BACKWARD_STAGES: usize = 3;
 const _: () = assert!(2 <= BACKWARD_STAGES && BACKWARD_STAGES <= 4);
-/// Dynamic shared plan of the PIPELINED query-parallel backward: the resident
-/// stacked Q and dY pairs (`2 * TILE_BYTES` each), the K and V rings, and the
-/// single stacked `[128, 64]` dS tile. dS stays single-buffered because the
-/// warpgroup's `dq_done(i)` wait proves the gradient MMA finished reading it
-/// before tile `i+1` overwrites it.
-pub const FLASH_BACKWARD_Q_PIPELINED_SMEM: usize = (5 + 2 * BACKWARD_STAGES) * TILE_BYTES;
-/// Threads of the pipelined backward: the 128-thread gradient warpgroup plus
-/// the TMA-load warp and the MMA-issue warp.
-pub const FLASH_BACKWARD_Q_PIPELINED_BLOCK: usize = QUERIES + 64;
+/// Buffers of the bf16 gradient operand a backward kernel hands its gradient
+/// MMA — `dS` in kernel A, `Pᵀ` and `dSᵀ` in kernel B.
+///
+/// Two, unlike the forward's probability tile, because nothing here is
+/// competing for a second CTA's worth of shared memory and the slack is worth
+/// having: at two, the register pass of tile `i` writes the slot the gradient
+/// MMA of tile `i - 2` finished reading, and at one it would open by waiting
+/// on the MMA the previous pass had just issued.
+const GRADIENT_STAGES: usize = 2;
+/// Depth of the gradient-MMA completion ring, which is one more than the
+/// operand ring it recycles: its deepest wait reaches `GRADIENT_STAGES` tiles
+/// back, and a ring cannot be as shallow as its own deepest wait.
+const GRADIENT_LAG: usize = GRADIENT_STAGES + 1;
+const _: () = assert!(GRADIENT_STAGES >= 1);
+
+/// A backward kernel's streamed-operand ring.
+type BackwardPanelRing = PanelRingN<BACKWARD_STAGES>;
+/// The bf16 gradient operand ring both backward kernels hand their gradient
+/// MMAs: `[QUERIES, TILE]` tiles, `GRADIENT_STAGES` deep.
+type GradientRing = SharedTileRing<Bf16, QUERIES, TILE, Swizzle128B, GRADIENT_STAGES>;
+/// A per-column statistic of a `SCORE_CHUNK`-wide slice — the key-parallel
+/// backward's LSE and dot, which its transposed band indexes by column where
+/// the query-parallel one indexes the same numbers by row.
+type Cols = ColVec<SCORE_CHUNK, BaseLdtm>;
+
+/// Tensor-memory columns a backward kernel allocates. Kernel A wants 384 (two
+/// score segments, two gradient segments, one `[QUERIES, HD]` accumulator) and
+/// kernel B wants all 512 (a second accumulator); `tcgen05.alloc` takes a
+/// power of two, so both round to the same number and both pin an SM to one
+/// CTA. That is why neither plan below is written against a shared-memory
+/// budget the way the forward's is.
+pub const BACKWARD_TMEM_COLUMNS: u32 = 512;
+
+/// The query-parallel backward's shared plan: the resident `[QUERIES, HD]`
+/// query and output-gradient blocks, the streamed K and V rings, the dS ring,
+/// every mbarrier and the TMEM staging word.
+struct BackwardQ {
+    q: PairedPanel,
+    dy: PairedPanel,
+    k: BackwardPanelRing,
+    v: BackwardPanelRing,
+    ds: GradientRing,
+    /// One arrival per K/V stage, filled by the TMA engine.
+    kv_loaded: SemaphoreRing<BACKWARD_STAGES>,
+    /// `S = Q·Kᵀ` and `dP = dY·Vᵀ` completion — one arrival for the pair, one
+    /// per double-buffered score segment.
+    scored: SemaphoreRing<2>,
+    /// `dQ += dS·K` completion. It recycles three things at three different
+    /// depths: the dS slot two tiles back, the K/V stage
+    /// `BACKWARD_STAGES - 1` ahead, and the accumulator itself at the end.
+    accumulated: SemaphoreRing<GRADIENT_LAG>,
+    qdy_loaded: Semaphore,
+    tmem_slot: *mut u32,
+    plan: SharedPlan,
+}
+
+#[inline(always)]
+const fn backward_q_plan(at: SharedPlan) -> BackwardQ {
+    let (q, at) = at.tile::<Bf16, QUERIES, HD, Swizzle128B>();
+    let (dy, at) = at.tile::<Bf16, QUERIES, HD, Swizzle128B>();
+    let (k, at) = at.tile_ring::<Bf16, TILE, HD, Swizzle128B, BACKWARD_STAGES>();
+    let (v, at) = at.tile_ring::<Bf16, TILE, HD, Swizzle128B, BACKWARD_STAGES>();
+    let (ds, at) = at.tile_ring::<Bf16, QUERIES, TILE, Swizzle128B, GRADIENT_STAGES>();
+    let (kv_loaded, at) = at.semaphores::<BACKWARD_STAGES>();
+    let (scored, at) = at.semaphores::<2>();
+    let (accumulated, at) = at.semaphores::<GRADIENT_LAG>();
+    let (qdy_loaded, at) = at.semaphore();
+    let (tmem_slot, at) = at.tmem_slot();
+    BackwardQ {
+        q,
+        dy,
+        k,
+        v,
+        ds,
+        kv_loaded,
+        scored,
+        accumulated,
+        qdy_loaded,
+        tmem_slot,
+        plan: at,
+    }
+}
+
+/// The key-parallel backward's shared plan: the resident K and V blocks, the
+/// streamed Q and dY rings, and **two** gradient operand rings, since its
+/// gradient MMA pair reads `Pᵀ` and `dSᵀ` where kernel A's reads only `dS`.
+struct BackwardKv {
+    k: PairedPanel,
+    v: PairedPanel,
+    q: BackwardPanelRing,
+    dy: BackwardPanelRing,
+    p: GradientRing,
+    ds: GradientRing,
+    qdy_loaded: SemaphoreRing<BACKWARD_STAGES>,
+    scored: SemaphoreRing<2>,
+    /// `dV += Pᵀ·dY` and `dK += dSᵀ·Q` completion, one arrival for the pair.
+    accumulated: SemaphoreRing<GRADIENT_LAG>,
+    kv_loaded: Semaphore,
+    tmem_slot: *mut u32,
+    plan: SharedPlan,
+}
+
+#[inline(always)]
+const fn backward_kv_plan(at: SharedPlan) -> BackwardKv {
+    let (k, at) = at.tile::<Bf16, QUERIES, HD, Swizzle128B>();
+    let (v, at) = at.tile::<Bf16, QUERIES, HD, Swizzle128B>();
+    let (q, at) = at.tile_ring::<Bf16, TILE, HD, Swizzle128B, BACKWARD_STAGES>();
+    let (dy, at) = at.tile_ring::<Bf16, TILE, HD, Swizzle128B, BACKWARD_STAGES>();
+    let (p, at) = at.tile_ring::<Bf16, QUERIES, TILE, Swizzle128B, GRADIENT_STAGES>();
+    let (ds, at) = at.tile_ring::<Bf16, QUERIES, TILE, Swizzle128B, GRADIENT_STAGES>();
+    let (qdy_loaded, at) = at.semaphores::<BACKWARD_STAGES>();
+    let (scored, at) = at.semaphores::<2>();
+    let (accumulated, at) = at.semaphores::<GRADIENT_LAG>();
+    let (kv_loaded, at) = at.semaphore();
+    let (tmem_slot, at) = at.tmem_slot();
+    BackwardKv {
+        k,
+        v,
+        q,
+        dy,
+        p,
+        ds,
+        qdy_loaded,
+        scored,
+        accumulated,
+        kv_loaded,
+        tmem_slot,
+        plan: at,
+    }
+}
+
+/// Dynamic shared plan of the query-parallel backward, as the plan computes it.
+pub const FLASH_BACKWARD_Q_SMEM: usize = backward_q_plan(SharedPlan::sizing()).plan.bytes();
+/// Dynamic shared plan of the key-parallel backward.
+pub const FLASH_BACKWARD_KV_SMEM: usize = backward_kv_plan(SharedPlan::sizing()).plan.bytes();
+/// Dynamic shared memory one CTA may opt into on a B200: the SM's 228 KiB less
+/// the KiB the driver keeps. Kernel B's plan is the largest in the repo and
+/// this is the only thing bounding it, since its residency is already one.
+const MAX_DYNAMIC_SMEM: usize = 232_448;
+const _: () = assert!(FLASH_BACKWARD_Q_SMEM <= MAX_DYNAMIC_SMEM);
+const _: () = assert!(FLASH_BACKWARD_KV_SMEM <= MAX_DYNAMIC_SMEM);
+/// Threads of either backward kernel: the four warps an `M128` accumulator's
+/// 128 TMEM lanes are drained by, and no others — the same collapse of the
+/// TMA, MMA and gradient warp roles the forward made.
+pub const FLASH_BACKWARD_BLOCK: usize = QUERIES;
 /// Mirrors the `FLASH_FORWARD_BLOCK` `.maxntid` note.
-const _: () = assert!(FLASH_BACKWARD_Q_PIPELINED_BLOCK == 192);
-/// Dynamic shared plan of the PIPELINED key-parallel backward: the resident
-/// stacked K and V pairs, the Q and dY rings, and the stacked Pᵀ and dSᵀ
-/// tiles (both single-buffered, released by the same `grad_done` wait that
-/// recycles the ring).
-pub const FLASH_BACKWARD_KV_PIPELINED_SMEM: usize = (6 + 2 * BACKWARD_STAGES) * TILE_BYTES;
-/// Threads of the pipelined key-parallel backward; same three roles.
-pub const FLASH_BACKWARD_KV_PIPELINED_BLOCK: usize = QUERIES + 64;
+const _: () = assert!(FLASH_BACKWARD_BLOCK == 128);
 
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
@@ -381,210 +517,6 @@ pub mod kernels {
         k: Panel,
     ) {
         unsafe { mma_abt(s_tmem, q, k, MMA_SHAPE, false) }
-    }
-
-    /// True `dS = P·(dP − D)·scale` for one score element, base-2 domain.
-    /// `s` is the staged pre-scaled score (`scale·log2e·(q·k)`) so the
-    /// probability is `exp2(s − lse2)`; `keep` is false only on masked
-    /// diagonal positions, where the gradient is a literal zero rather than
-    /// `exp2` of `MASKED_SCORE`. `factor` folds the operand scaling the MMA
-    /// leaves for the caller (`scale` for dQ against unscaled K; `ln2` for dK
-    /// against the pre-scaled Q, since `ln2·scale·log2e = scale`).
-    #[inline(always)]
-    fn backward_dscore(s: f32, dp: f32, lse2: f32, dot: f32, factor: f32, keep: bool) -> f32 {
-        if keep {
-            exp2_approx(s - lse2) * (dp - dot) * factor
-        } else {
-            0.0
-        }
-    }
-
-    /// PAIRED query-parallel backward register pass (Design B, #47 item 2): the
-    /// 128-thread warpgroup drains ONE stacked `S`/`dP` — warps 0–1 own
-    /// accumulator rows 0..63 (query tile A), warps 2–3 own 64..127 (query tile
-    /// B) — and forms `dS = P·(dP − dot)·scale` for all 128 rows into ONE
-    /// stacked `[128, 64]` dS tile. `warp_id` is the ACTUAL block warp (0..3).
-    /// The paired tiles are adjacent, so `lse2`/`dot` are the pair's 128
-    /// contiguous query rows and index by the fragment's ROW; the causal edge
-    /// compares against the query row WITHIN the tile (`row & 63`). A future
-    /// tile for the lower stream (`key > tile_b` → `key == tile_a`'s partner) is
-    /// fully masked to `dS = 0`.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn backward_q_tile_paired(
-        s_tmem: STmem,
-        dp_tmem: STmem,
-        key: u32,
-        tile_a: u32,
-        tile_b: u32,
-        warp_id: u32,
-        lane: u32,
-        lse2: *const f32,
-        dot: *const f32,
-        ds: PairedPTile,
-    ) {
-        unsafe {
-            let ds_chunks = ds.chunk_writer();
-            let row_in_16 = lane / 4;
-            let my_tile = if warp_id < 2 { tile_a } else { tile_b };
-            let masked_all = key > my_tile;
-            let diagonal = key == my_tile;
-            let mut row_block = 0u32;
-            while row_block < 2 {
-                let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column = 0u32;
-                while column < TILE as u32 {
-                    let s = s_tmem.fragment_tile(tmem_row, column);
-                    let dp = dp_tmem.fragment_tile(tmem_row, column);
-                    let mut ds_tile = Fragment::zero();
-                    let mut slot = 0usize;
-                    while slot < 2 {
-                        let row = tmem_row + row_in_16 + 8 * slot as u32;
-                        let query_row = row & 63;
-                        let lse_row = *lse2.add(row as usize);
-                        let dot_row = *dot.add(row as usize);
-                        let mut value = 0usize;
-                        while value < 4 {
-                            let key_column = column + BaseLdtm::column(lane, value);
-                            ds_tile.0[slot][value] = backward_dscore(
-                                s.0[slot][value],
-                                dp.0[slot][value],
-                                lse_row,
-                                dot_row,
-                                SCALE,
-                                !masked_all && (!diagonal || key_column <= query_row),
-                            );
-                            value += 1;
-                        }
-                        slot += 1;
-                    }
-                    store_fragment(ds_chunks, tmem_row, column, lane, ds_tile);
-                    column += 16;
-                }
-                row_block += 1;
-            }
-        }
-    }
-
-    /// PAIRED key-parallel backward register pass (Design B, #47 item 2): the
-    /// 128-thread warpgroup drains ONE stacked transposed `Sᵀ`/`dPᵀ` — warps
-    /// 0–1 own accumulator rows 0..63 (key tile A), warps 2–3 own 64..127 (key
-    /// tile B) — and forms `Pᵀ`/`dSᵀ` for all 128 key rows into ONE stacked
-    /// `[128, 64]` tile each. Rows are key rows and columns are query rows, so
-    /// this is the transpose of kernel A's indexing in both directions: the
-    /// per-row statistics become a per-VALUE gather over the streamed query
-    /// tile's 64 rows, and the causal edge compares the key row within the tile
-    /// (`row & 63`) against the query column. A query tile before the higher
-    /// key stream (`query < key_b` → the shared diagonal query `key_a`) fully
-    /// masks that stream to zero.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn backward_kv_tile_paired(
-        st_tmem: STmem,
-        dpt_tmem: STmem,
-        query: u32,
-        key_a: u32,
-        key_b: u32,
-        warp_id: u32,
-        lane: u32,
-        lse2: *const f32,
-        dot: *const f32,
-        p: PairedPTile,
-        ds: PairedPTile,
-    ) {
-        unsafe {
-            let p_chunks = p.chunk_writer();
-            let ds_chunks = ds.chunk_writer();
-            let row_in_16 = lane / 4;
-            let my_key = if warp_id < 2 { key_a } else { key_b };
-            let masked_all = query < my_key;
-            let diagonal = query == my_key;
-            let mut row_block = 0u32;
-            while row_block < 2 {
-                let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column = 0u32;
-                while column < TILE as u32 {
-                    let st = st_tmem.fragment_tile(tmem_row, column);
-                    let dpt = dpt_tmem.fragment_tile(tmem_row, column);
-                    let mut lse_column = [0.0f32; 4];
-                    let mut dot_column = [0.0f32; 4];
-                    let mut value = 0usize;
-                    while value < 4 {
-                        let query_row = (column + BaseLdtm::column(lane, value)) as usize;
-                        lse_column[value] = *lse2.add(query_row);
-                        dot_column[value] = *dot.add(query_row);
-                        value += 1;
-                    }
-                    let mut p_tile = Fragment::zero();
-                    let mut ds_tile = Fragment::zero();
-                    let mut slot = 0usize;
-                    while slot < 2 {
-                        let key_row = (tmem_row + row_in_16 + 8 * slot as u32) & 63;
-                        let mut value = 0usize;
-                        while value < 4 {
-                            let query_column = column + BaseLdtm::column(lane, value);
-                            let keep = !masked_all && (!diagonal || key_row <= query_column);
-                            let probability = if keep {
-                                exp2_approx(st.0[slot][value] - lse_column[value])
-                            } else {
-                                0.0
-                            };
-                            p_tile.0[slot][value] = probability;
-                            ds_tile.0[slot][value] =
-                                probability * (dpt.0[slot][value] - dot_column[value]) * LN2;
-                            value += 1;
-                        }
-                        slot += 1;
-                    }
-                    store_fragment(p_chunks, tmem_row, column, lane, p_tile);
-                    store_fragment(ds_chunks, tmem_row, column, lane, ds_tile);
-                    column += 16;
-                }
-                row_block += 1;
-            }
-        }
-    }
-
-    /// Drain a 128-column gradient accumulator and store fp32 straight to
-    /// global memory through the fragment map, at the block's `tile` rows.
-    /// Like `store_outputs` minus the `1/sum` scale and the LSE write — the
-    /// gradients are already complete sums.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn store_grad_tile(
-        batch: u32,
-        t: u32,
-        h: u32,
-        head: u32,
-        tile: u32,
-        warp_id: u32,
-        lane: u32,
-        grad_acc: &RegTile<32, 128, BaseLdtm>,
-        output: &mut DisjointSlice<f32>,
-    ) {
-        unsafe {
-            let quad = (lane % 4) as usize;
-            let row_in_16 = (lane / 4) as usize;
-            let d_model = (h as usize) * HD;
-            let mut slot = 0usize;
-            while slot < 4 {
-                let local_row =
-                    warp_id as usize * 32 + (slot / 2) * 16 + (slot % 2) * 8 + row_in_16;
-                let global_row = (batch * t) as usize + tile as usize * TILE + local_row;
-                let out_base = global_row * d_model + head as usize * HD;
-                let mut column_block = 0usize;
-                while column_block < 8 {
-                    let column = column_block * 16 + 2 * quad;
-                    let base = column_block * 4;
-                    *output.get_unchecked_mut(out_base + column) = grad_acc.0[slot][base];
-                    *output.get_unchecked_mut(out_base + column + 1) = grad_acc.0[slot][base + 1];
-                    *output.get_unchecked_mut(out_base + column + 8) = grad_acc.0[slot][base + 2];
-                    *output.get_unchecked_mut(out_base + column + 9) = grad_acc.0[slot][base + 3];
-                    column_block += 1;
-                }
-                slot += 1;
-            }
-        }
     }
 
     /// Elementwise `2^x` accuracy oracle for the standalone parity gate.
@@ -750,635 +682,328 @@ pub mod kernels {
         }
     }
 
-    /// PAIRED tcgen05 query-parallel backward (Design B for #47 item 2). Launch
-    /// with `host::flash_backward_q_config`: grid `(T/128, H, B)`, 128 threads,
-    /// `FLASH_BACKWARD_Q_SMEM` dynamic shared bytes (opted in by the loader).
-    ///
-    /// One CTA owns a query-tile PAIR `(2p, 2p+1)` of one `(batch, head)` and
-    /// streams the causal key tiles `0..=tile_b`. The two query tiles are
-    /// STACKED into every MMA: `S = [Q_A;Q_B]·Kᵀ` and `dP = [dY_A;dY_B]·Vᵀ`
-    /// fill all 128 accumulator rows, `dS` is formed for all 128 rows into one
-    /// stacked tile, and `dQ += dS·K` drains 128 real rows (rows 0..63 = tile
-    /// A's dQ, 64..127 = tile B's). Q/dY stay resident; the 128-thread
-    /// warpgroup's warps 0–1 drain rows 0..63 and warps 2–3 drain 64..127.
-    /// Because the paired tiles are adjacent their 128 query rows are
-    /// contiguous, so LSE/dot stage directly and `store_grad_tile` writes the
-    /// pair in one shot. Requires `T % 128 == 0` (host eligibility).
-    #[allow(clippy::too_many_arguments)]
-    #[kernel]
-    pub unsafe fn flash_backward_q_tcgen05(
+    /// The query-parallel backward as a [`pipeline::Job`], the forward's own
+    /// shape: one work item is a (query block, head, batch), the barrier set is
+    /// re-initialized per item by the harness, and the four warps that drain an
+    /// `M128` accumulator are the whole block.
+    struct BackwardQStream {
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
         v_tma: *const TmaDescriptor,
         dy_tma: *const TmaDescriptor,
-        logsumexp: &[f32],
-        dot: &[f32],
-        sequence_length: u32,
-        heads: u32,
-        mut dq: DisjointSlice<f32>,
-    ) {
-        unsafe {
-            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
-            static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
-            static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
-            static mut LSE2: SharedArray<f32, 128> = SharedArray::UNINIT;
-            static mut DOTS: SharedArray<f32, 128> = SharedArray::UNINIT;
+        t: u32,
+        h: u32,
+        tiles: u32,
+        planes: u32,
+        leader: bool,
+        warp_id: u32,
+        lane: u32,
+        shared: BackwardQ,
+        /// Two `[QUERIES, TILE]` score segments, side by side.
+        scores: STmem,
+        /// Two more for `dP`.
+        gradients: STmem,
+        /// `dQ`, resident for the whole key stream.
+        accumulator: AccTmem,
+        lse: GlobalRows<F32>,
+        dot: GlobalRows<F32>,
+        dq: GlobalRows<F32>,
+    }
 
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let q = PairedPanel::from_raw(smem);
-            let dy = PairedPanel::from_raw(smem.add(2 * TILE_BYTES));
-            let k = Panel::from_raw(smem.add(4 * TILE_BYTES));
-            let v = Panel::from_raw(smem.add(5 * TILE_BYTES));
-            let ds = PairedPTile::from_raw(smem.add(6 * TILE_BYTES));
-
-            let tid = thread::threadIdx_x();
-            if thread::blockDim_x() as usize != 2 * TILE {
-                return;
+    impl BackwardQStream {
+        /// The double-buffered half of `segment` that key tile `key_tile` lands
+        /// in — the one the register pass drained two tiles ago.
+        #[inline(always)]
+        fn buffer(&self, segment: STmem, key_tile: u32) -> STmem {
+            if key_tile & 1 == 0 {
+                segment
+            } else {
+                segment.columns_right(TILE as u32)
             }
-            let warp_id = warp::warp_id();
-            let lane = warp::lane_id();
-            let is_leader = tid == 0;
+        }
 
-            let pair = thread::blockIdx_x();
-            let head = thread::blockIdx_y();
-            let batch = thread::blockIdx_z();
-            let t = sequence_length;
-            let h = heads;
-            let plane = (batch * h + head) as i32;
-            let tile_a = pair * 2;
-            let tile_b = tile_a + 1;
-
-            let mut tma = PhasedSemaphore::attach(&raw mut TMA_BARRIER);
-            let mut mma = PhasedSemaphore::attach(&raw mut MMA_BARRIER);
-            if is_leader {
-                tma.sem().init(1);
-                mma.sem().init(1);
-                fence_proxy_async_shared_cta();
+        /// Stage `key_tile`'s K and V panels, charging one barrier for both.
+        #[inline(always)]
+        unsafe fn load_kv(&self, key_tile: u32, plane: i32) {
+            unsafe {
+                let row = (key_tile * TILE as u32) as i32;
+                let full = self.shared.kv_loaded.sem(key_tile);
+                let charge = self
+                    .shared
+                    .k
+                    .tile(key_tile)
+                    .tma_load(self.k_tma, row, plane, full)
+                    + self
+                        .shared
+                        .v
+                        .tile(key_tile)
+                        .tma_load(self.v_tma, row, plane, full);
+                full.expect_tx(charge);
             }
-            thread::sync_threads();
-            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            let s_tmem = STmem::from_raw(tmem);
-            let dp_tmem = STmem::from_raw(tmem + 128);
-            let dq_tmem = AccTmem::from_raw(tmem + 256);
+        }
 
-            // The stacked Q/dY pairs stay operand-A resident for the whole key
-            // stream: tile A's rows land at the operand's row 0, tile B's at
-            // row TILE, one box per HD subtile each.
-            if is_leader {
-                let row_a = (tile_a * TILE as u32) as i32;
-                let row_b = (tile_b * TILE as u32) as i32;
-                let charge = q.tma_load_at::<TILE>(q_tma, 0, row_a, plane, tma.sem())
-                    + q.tma_load_at::<TILE>(q_tma, TILE, row_b, plane, tma.sem())
-                    + dy.tma_load_at::<TILE>(dy_tma, 0, row_a, plane, tma.sem())
-                    + dy.tma_load_at::<TILE>(dy_tma, TILE, row_b, plane, tma.sem());
-                tma.sem().expect_tx(charge);
-            }
-            tma.wait_next();
-
-            // The pair's 128 contiguous query rows' base-2 LSE and softmax dot.
-            let query_row = (batch * t) as usize + tile_a as usize * TILE + tid as usize;
-            let stat_index = query_row * h as usize + head as usize;
-            (*(&raw mut LSE2 as *mut f32).add(tid as usize)) = logsumexp[stat_index] * LOG2E;
-            (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
-            thread::sync_threads();
-
-            let mut dq_acc = RegTile::<32, 128, BaseLdtm>::zero();
-
-            let mut key_tile = 0u32;
-            while key_tile <= tile_b {
-                if is_leader {
-                    let key_row = (key_tile * TILE as u32) as i32;
-                    let charge = k.tma_load(k_tma, key_row, plane, tma.sem())
-                        + v.tma_load(v_tma, key_row, plane, tma.sem());
-                    tma.sem().expect_tx(charge);
-                }
-                tma.wait_next();
-                thread::sync_threads();
-
-                // S = [Q_A;Q_B]·Kᵀ and dP = [dY_A;dY_B]·Vᵀ, both fresh.
-                if is_leader {
-                    tcgen05_fence_after_thread_sync();
-                    mma_abt(s_tmem.raw(), q, k, MMA_SHAPE, false);
-                    mma_abt(dp_tmem.raw(), dy, v, MMA_SHAPE, false);
-                    mma::commit(mma.sem());
-                }
-                mma.wait_next();
-                thread::sync_threads();
-
-                backward_q_tile_paired(
-                    s_tmem,
-                    dp_tmem,
-                    key_tile,
-                    tile_a,
-                    tile_b,
-                    warp_id,
-                    lane,
-                    &raw const LSE2 as *const f32,
-                    &raw const DOTS as *const f32,
-                    ds,
+        /// Issue `S = Q·Kᵀ` and `dP = dY·Vᵀ` for one key tile into its score
+        /// segment, and publish both on one arrival: the register pass reads
+        /// them together and there is nothing it could do with one alone.
+        ///
+        /// `MMA_SHAPE` is the *band* the accumulator gets, which for a
+        /// `[TILE, HD]` B operand read transposed is its `TILE` rows — the one
+        /// argument no operand can supply, and the one ferro #175 found two
+        /// callers reading as the tile's.
+        #[inline(always)]
+        unsafe fn score_mmas(&self, key_tile: u32) {
+            unsafe {
+                mma_abt(
+                    self.buffer(self.scores, key_tile).raw(),
+                    self.shared.q,
+                    self.shared.k.tile(key_tile),
+                    MMA_SHAPE,
+                    false,
                 );
-
-                fence_proxy_async_shared_cta();
-                tcgen05_fence_before_thread_sync();
-                thread::sync_threads();
-
-                // dQ += dS·K, continuing the accumulator (fresh on key 0).
-                if is_leader {
-                    tcgen05_fence_after_thread_sync();
-                    mma_ab(dq_tmem.raw(), ds, k, MMA_SHAPE, key_tile != 0);
-                    mma::commit(mma.sem());
-                }
-                mma.wait_next();
-
-                tcgen05_fence_before_thread_sync();
-                thread::sync_threads();
-                key_tile += 1;
-            }
-
-            merge_output_tile(dq_tmem, warp_id, &mut dq_acc);
-            // The pair's rows are contiguous, so the block's base tile is
-            // `tile_a` and the warp-derived local row (0..127) lands correctly.
-            store_grad_tile(batch, t, h, head, tile_a, warp_id, lane, &dq_acc, &mut dq);
-
-            tcgen05_fence_before_thread_sync();
-            thread::sync_threads();
-            dealloc_block(tmem, 512);
-            if is_leader {
-                tma.sem().inval();
-                mma.sem().inval();
-            }
-        }
-    }
-
-    /// PAIRED tcgen05 key-parallel backward (Design B for #47 item 2). Launch
-    /// with `host::flash_backward_kv_config`: grid `(T/128, H, B)`, 128 threads,
-    /// `FLASH_BACKWARD_KV_SMEM` dynamic shared bytes (opted in by the loader).
-    ///
-    /// One CTA owns a key-tile PAIR `(2p, 2p+1)` and streams the causal query
-    /// tiles `key_a..T/64`. The two key tiles are STACKED into every MMA: the
-    /// transposed `Sᵀ = [K_A;K_B]·Qᵀ` and `dPᵀ = [V_A;V_B]·dYᵀ` fill all 128
-    /// accumulator rows (rows 0..63 = key A, 64..127 = key B), and `dV += Pᵀ·dY`
-    /// / `dK += dSᵀ·Q` drain 128 real key rows. K/V stay resident; the streamed
-    /// Q/dY are a single 64-row tile. The paired key rows are contiguous, so the
-    /// gradients store in one shot at base tile `key_a`. The staged Q carries
-    /// `scale·log2e`, so folding `ln2` into dSᵀ lands `scale` on dK. Requires
-    /// `T % 128 == 0` (host eligibility).
-    #[allow(clippy::too_many_arguments)]
-    #[kernel]
-    pub unsafe fn flash_backward_kv_tcgen05(
-        q_tma: *const TmaDescriptor,
-        k_tma: *const TmaDescriptor,
-        v_tma: *const TmaDescriptor,
-        dy_tma: *const TmaDescriptor,
-        logsumexp: &[f32],
-        dot: &[f32],
-        sequence_length: u32,
-        heads: u32,
-        mut dk: DisjointSlice<f32>,
-        mut dv: DisjointSlice<f32>,
-    ) {
-        unsafe {
-            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
-            static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
-            static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
-            static mut LSE2: SharedArray<f32, 128> = SharedArray::UNINIT;
-            static mut DOTS: SharedArray<f32, 128> = SharedArray::UNINIT;
-
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let k = PairedPanel::from_raw(smem);
-            let v = PairedPanel::from_raw(smem.add(2 * TILE_BYTES));
-            let q = Panel::from_raw(smem.add(4 * TILE_BYTES));
-            let dy = Panel::from_raw(smem.add(5 * TILE_BYTES));
-            let p = PairedPTile::from_raw(smem.add(6 * TILE_BYTES));
-            let ds = PairedPTile::from_raw(smem.add(7 * TILE_BYTES));
-
-            let tid = thread::threadIdx_x();
-            if thread::blockDim_x() as usize != 2 * TILE {
-                return;
-            }
-            let warp_id = warp::warp_id();
-            let lane = warp::lane_id();
-            let is_leader = tid == 0;
-
-            let pair = thread::blockIdx_x();
-            let head = thread::blockIdx_y();
-            let batch = thread::blockIdx_z();
-            let t = sequence_length;
-            let h = heads;
-            let plane = (batch * h + head) as i32;
-            let tiles = t / TILE as u32;
-            let key_a = pair * 2;
-            let key_b = key_a + 1;
-
-            let mut tma = PhasedSemaphore::attach(&raw mut TMA_BARRIER);
-            let mut mma = PhasedSemaphore::attach(&raw mut MMA_BARRIER);
-            if is_leader {
-                tma.sem().init(1);
-                mma.sem().init(1);
-                fence_proxy_async_shared_cta();
-            }
-            thread::sync_threads();
-            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            // Sᵀ/dPᵀ are 64-column segments; the dV/dK gradients are 128
-            // columns, following at tmem+128 and tmem+256.
-            let st_tmem = STmem::from_raw(tmem);
-            let dpt_tmem = STmem::from_raw(tmem + 64);
-            let dv_tmem = AccTmem::from_raw(tmem + 128);
-            let dk_tmem = AccTmem::from_raw(tmem + 256);
-
-            // The stacked K/V pairs stay operand-A resident for the whole query
-            // stream.
-            if is_leader {
-                let row_a = (key_a * TILE as u32) as i32;
-                let row_b = (key_b * TILE as u32) as i32;
-                let charge = k.tma_load_at::<TILE>(k_tma, 0, row_a, plane, tma.sem())
-                    + k.tma_load_at::<TILE>(k_tma, TILE, row_b, plane, tma.sem())
-                    + v.tma_load_at::<TILE>(v_tma, 0, row_a, plane, tma.sem())
-                    + v.tma_load_at::<TILE>(v_tma, TILE, row_b, plane, tma.sem());
-                tma.sem().expect_tx(charge);
-            }
-            tma.wait_next();
-
-            let mut dv_acc = RegTile::<32, 128, BaseLdtm>::zero();
-            let mut dk_acc = RegTile::<32, 128, BaseLdtm>::zero();
-
-            let mut query_tile = key_a;
-            while query_tile < tiles {
-                if is_leader {
-                    let query_row = (query_tile * TILE as u32) as i32;
-                    let charge = q.tma_load(q_tma, query_row, plane, tma.sem())
-                        + dy.tma_load(dy_tma, query_row, plane, tma.sem());
-                    tma.sem().expect_tx(charge);
-                }
-                tma.wait_next();
-                thread::sync_threads();
-
-                // Stage this query tile's 64 rows' base-2 LSE and dot (indexed
-                // by query column in the transposed register pass).
-                if tid < TILE as u32 {
-                    let global_row =
-                        (batch * t) as usize + query_tile as usize * TILE + tid as usize;
-                    let stat_index = global_row * h as usize + head as usize;
-                    (*(&raw mut LSE2 as *mut f32).add(tid as usize)) =
-                        logsumexp[stat_index] * LOG2E;
-                    (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
-                }
-                thread::sync_threads();
-
-                // Sᵀ = [K_A;K_B]·Qᵀ and dPᵀ = [V_A;V_B]·dYᵀ, both fresh.
-                if is_leader {
-                    tcgen05_fence_after_thread_sync();
-                    mma_abt(st_tmem.raw(), k, q, MMA_SHAPE, false);
-                    mma_abt(dpt_tmem.raw(), v, dy, MMA_SHAPE, false);
-                    mma::commit(mma.sem());
-                }
-                mma.wait_next();
-                thread::sync_threads();
-
-                backward_kv_tile_paired(
-                    st_tmem,
-                    dpt_tmem,
-                    query_tile,
-                    key_a,
-                    key_b,
-                    warp_id,
-                    lane,
-                    &raw const LSE2 as *const f32,
-                    &raw const DOTS as *const f32,
-                    p,
-                    ds,
+                mma_abt(
+                    self.buffer(self.gradients, key_tile).raw(),
+                    self.shared.dy,
+                    self.shared.v.tile(key_tile),
+                    MMA_SHAPE,
+                    false,
                 );
+                mma::commit(self.shared.scored.sem(key_tile));
+            }
+        }
+    }
 
-                fence_proxy_async_shared_cta();
-                tcgen05_fence_before_thread_sync();
-                thread::sync_threads();
+    impl pipeline::Job for BackwardQStream {
+        #[inline(always)]
+        unsafe fn init(&self, _item: u32) {
+            unsafe {
+                self.shared.kv_loaded.init_all(1);
+                self.shared.scored.init_all(1);
+                self.shared.accumulated.init_all(1);
+                self.shared.qdy_loaded.init(1);
+            }
+        }
 
-                // dV += Pᵀ·dY and dK += dSᵀ·Q, fresh on the first query tile.
-                if is_leader {
+        #[inline(always)]
+        unsafe fn inval(&self) {
+            unsafe {
+                self.shared.kv_loaded.inval_all();
+                self.shared.scored.inval_all();
+                self.shared.accumulated.inval_all();
+                self.shared.qdy_loaded.inval();
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn work(&mut self, item: u32) {
+            unsafe {
+                // Descending query block, for the forward's reason: block `i`
+                // streams `2i + 2` key tiles, so dealing the long streams first
+                // keeps the tail of a persistent grid short. The imbalance is
+                // steeper here than in the forward only in that there is more
+                // of it per tile.
+                let query_block = self.tiles - 1 - item / self.planes;
+                let plane = item % self.planes;
+                let head = plane % self.h;
+                let batch = plane / self.h;
+                let query_base = query_block * QUERIES as u32;
+                let key_tiles = 2 * query_block + 2;
+                let first_masked = 2 * query_block;
+
+                let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
+                let band = 32 * warp_id;
+
+                if leader {
                     tcgen05_fence_after_thread_sync();
-                    let accumulate = query_tile != key_a;
-                    mma_ab(dv_tmem.raw(), p, dy, MMA_SHAPE, accumulate);
-                    mma_ab(dk_tmem.raw(), ds, q, MMA_SHAPE, accumulate);
-                    mma::commit(mma.sem());
-                }
-                mma.wait_next();
-
-                tcgen05_fence_before_thread_sync();
-                thread::sync_threads();
-                query_tile += 1;
-            }
-
-            merge_output_tile(dv_tmem, warp_id, &mut dv_acc);
-            merge_output_tile(dk_tmem, warp_id, &mut dk_acc);
-            store_grad_tile(batch, t, h, head, key_a, warp_id, lane, &dv_acc, &mut dv);
-            store_grad_tile(batch, t, h, head, key_a, warp_id, lane, &dk_acc, &mut dk);
-
-            tcgen05_fence_before_thread_sync();
-            thread::sync_threads();
-            dealloc_block(tmem, 512);
-            if is_leader {
-                tma.sem().inval();
-                mma.sem().inval();
-            }
-        }
-    }
-
-    /// Issue one tile's `dQ += dS·K` from the MMA warp: wait for the gradient
-    /// warpgroup to publish dS, chain the four K=16 MMAs across K's two HD
-    /// subtiles into the dQ segment (fresh on the first key tile, accumulating
-    /// after), and commit completion into `dq_done`. That commit is what
-    /// releases both the dS tile and the K ring stage — the K panel of tile `i`
-    /// is read twice, once as the score MMA's B operand and once here.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn gradient_mma<const STAGES: usize>(
-        i: u32,
-        ds: PairedPTile,
-        k: PanelRingN<STAGES>,
-        dq_tmem: AccTmem,
-        ds_full: Semaphore,
-        dq_done: Semaphore,
-    ) {
-        unsafe {
-            ds_full.wait(i & 1);
-            mma_ab(dq_tmem.raw(), ds, k.tile(i), MMA_SHAPE, i != 0);
-            mma::commit(dq_done);
-        }
-    }
-
-    /// Warp-specialized pipelined query-parallel backward (issue #61 phase 5:
-    /// the first kernel written kittens-first). Launch with
-    /// `host::flash_backward_q_pipelined_config`: grid `(T/128, H, B)`,
-    /// `FLASH_BACKWARD_Q_PIPELINED_BLOCK` threads,
-    /// `host::FLASH_BACKWARD_Q_PIPELINED_SMEM_BYTES` dynamic shared bytes.
-    /// Identical operand, statistic, and output contract to
-    /// `flash_backward_q_tcgen05` — same PAIRED Design-B math, same causal
-    /// masking, same fragment map — with the synchronous kernel's four
-    /// block-wide `sync_threads` per key tile replaced by the forward's
-    /// three-role warp specialization:
-    ///
-    /// - warp 4's leader streams TMA: the resident Q/dY pairs once (charged
-    ///   onto the first K/V stage), then the K/V ring running `BACKWARD_STAGES`
-    ///   tiles ahead;
-    /// - warp 5's leader issues MMAs, staggered exactly like the forward so
-    ///   `S/dP-MMA(i)` reaches the tensor core before `dQ-MMA(i-1)`: while the
-    ///   warpgroup forms `dS(i)`, the core is already producing `S(i+1)`;
-    /// - warps 0–3 are the gradient warpgroup: wait `s_full`, run
-    ///   `backward_q_tile_paired`, release `s_free`, publish `ds_full`, wait
-    ///   `dq_done`, recycle the K/V stage. The dQ accumulator lives in TMEM
-    ///   for the whole key stream and is drained once at the end, so unlike
-    ///   the forward there is no per-tile correction to fuse in here.
-    ///
-    /// Where the synchronous kernel exposed every stage — TMA, then MMA, then
-    /// the register pass, then the gradient MMA, each behind its own block
-    /// sync — this overlaps all four. The parity argument is the forward's:
-    /// every barrier's completions lead their waiter by at most one phase,
-    /// because each producer's next completion transitively requires the
-    /// previous consumer wait.
-    #[allow(clippy::too_many_arguments)]
-    #[kernel]
-    #[launch_bounds(192, 1)]
-    pub unsafe fn flash_backward_q_pipelined(
-        q_tma: *const TmaDescriptor,
-        k_tma: *const TmaDescriptor,
-        v_tma: *const TmaDescriptor,
-        dy_tma: *const TmaDescriptor,
-        logsumexp: &[f32],
-        dot: &[f32],
-        sequence_length: u32,
-        heads: u32,
-        mut dq: DisjointSlice<f32>,
-    ) {
-        unsafe {
-            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
-            static mut KV_FULL: SharedArray<u64, BACKWARD_STAGES, 8> = SharedArray::UNINIT;
-            static mut KV_FREE: SharedArray<u64, BACKWARD_STAGES, 8> = SharedArray::UNINIT;
-            static mut S_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut S_FREE: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut DS_FULL: Barrier = Barrier::UNINIT;
-            static mut DQ_DONE: Barrier = Barrier::UNINIT;
-            static mut LSE2: SharedArray<f32, 128> = SharedArray::UNINIT;
-            static mut DOTS: SharedArray<f32, 128> = SharedArray::UNINIT;
-
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let q = PairedPanel::from_raw(smem);
-            let dy = PairedPanel::from_raw(smem.add(2 * TILE_BYTES));
-            let k = PanelRingN::<BACKWARD_STAGES>::attach(smem.add(4 * TILE_BYTES));
-            let v =
-                PanelRingN::<BACKWARD_STAGES>::attach(smem.add((4 + BACKWARD_STAGES) * TILE_BYTES));
-            let ds = PairedPTile::from_raw(smem.add((4 + 2 * BACKWARD_STAGES) * TILE_BYTES));
-
-            let tid = thread::threadIdx_x();
-            if thread::blockDim_x() as usize != FLASH_BACKWARD_Q_PIPELINED_BLOCK {
-                return;
-            }
-            let warp_id = warp::warp_id();
-            let lane = warp::lane_id();
-            let group = 2 * TILE as u32;
-
-            let pair = thread::blockIdx_x();
-            let head = thread::blockIdx_y();
-            let batch = thread::blockIdx_z();
-            let t = sequence_length;
-            let h = heads;
-            let plane = (batch * h + head) as i32;
-            let tile_a = pair * 2;
-            let tile_b = tile_a + 1;
-            let key_tiles = tile_b + 1;
-
-            let kv_full =
-                SemaphoreRing::<BACKWARD_STAGES>::attach(&raw mut KV_FULL as *mut Barrier);
-            let kv_free =
-                SemaphoreRing::<BACKWARD_STAGES>::attach(&raw mut KV_FREE as *mut Barrier);
-            let s_full = SemaphoreRing::<2>::attach(&raw mut S_FULL as *mut Barrier);
-            let s_free = SemaphoreRing::<2>::attach(&raw mut S_FREE as *mut Barrier);
-            let ds_full = Semaphore::attach(&raw mut DS_FULL);
-            let dq_done = Semaphore::attach(&raw mut DQ_DONE);
-
-            // Barrier init precedes the TMEM allocation (the validated
-            // ordering — see the ptxas pins in flash.rs).
-            if tid == 0 {
-                kv_full.init_all(1);
-                kv_free.init_all(1);
-                s_full.init_all(1);
-                s_free.init_all(group);
-                ds_full.init(group);
-                dq_done.init(1);
-                fence_proxy_async_shared_cta();
-            }
-            // The pair's 128 contiguous query rows' base-2 LSE and softmax dot,
-            // staged while every warp is still running the prologue together —
-            // after the split there is no block-wide sync left to hide behind.
-            if tid < group {
-                let query_row = (batch * t) as usize + tile_a as usize * TILE + tid as usize;
-                let stat_index = query_row * h as usize + head as usize;
-                (*(&raw mut LSE2 as *mut f32).add(tid as usize)) = logsumexp[stat_index] * LOG2E;
-                (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
-            }
-            thread::sync_threads();
-
-            // Two 64-wide S buffers at columns 0..128, two dP buffers at
-            // 128..256, the 128-column dQ accumulator at 256.
-            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            let s_tmem = STmem::from_raw(tmem);
-            let dp_tmem = STmem::from_raw(tmem + 128);
-            let dq_tmem = AccTmem::from_raw(tmem + 256);
-
-            if tid < group {
-                // Gradient warpgroup.
-                let mut i = 0u32;
-                while i < key_tiles {
-                    s_full.wait(i);
-                    backward_q_tile_paired(
-                        s_tmem.columns_right((i & 1) * 64),
-                        dp_tmem.columns_right((i & 1) * 64),
-                        i,
-                        tile_a,
-                        tile_b,
-                        warp_id,
-                        lane,
-                        &raw const LSE2 as *const f32,
-                        &raw const DOTS as *const f32,
-                        ds,
+                    // Q and dY are operand-A resident for the whole key stream.
+                    // Each block is twice the map's box, so it arrives as two
+                    // stacked `TILE`-row loads — `tma_load` would charge the
+                    // barrier for `QUERIES` rows the engine never delivers.
+                    let full = self.shared.qdy_loaded;
+                    let second = (query_base + TILE as u32) as i32;
+                    let charge = self.shared.q.tma_load_at::<TILE>(
+                        self.q_tma,
+                        0,
+                        query_base as i32,
+                        plane as i32,
+                        full,
+                    ) + self.shared.q.tma_load_at::<TILE>(
+                        self.q_tma,
+                        TILE,
+                        second,
+                        plane as i32,
+                        full,
+                    ) + self.shared.dy.tma_load_at::<TILE>(
+                        self.dy_tma,
+                        0,
+                        query_base as i32,
+                        plane as i32,
+                        full,
+                    ) + self.shared.dy.tma_load_at::<TILE>(
+                        self.dy_tma,
+                        TILE,
+                        second,
+                        plane as i32,
+                        full,
                     );
-                    // dS is fenced into the async proxy before it is published;
-                    // both S buffers are drained, so the score MMA may reuse
-                    // this one.
-                    fence_proxy_async_shared_cta();
-                    s_free.sem(i).arrive();
-                    ds_full.arrive();
-                    dq_done.wait(i & 1);
-                    if tid == 0 {
-                        kv_free.sem(i).arrive();
-                    }
-                    i += 1;
-                }
-                let mut dq_acc = RegTile::<32, 128, BaseLdtm>::zero();
-                merge_output_tile(dq_tmem, warp_id, &mut dq_acc);
-                // The pair's rows are contiguous, so the block's base tile is
-                // `tile_a` and the warp-derived local row (0..127) lands
-                // correctly.
-                store_grad_tile(batch, t, h, head, tile_a, warp_id, lane, &dq_acc, &mut dq);
-            } else if tid == group {
-                // TMA load warp leader. Q/dY ride the first stage's expected
-                // bytes exactly like the forward's Q does.
-                let mut i = 0u32;
-                while i < key_tiles {
-                    kv_free.wait_recycled(i);
-                    let full = kv_full.sem(i);
-                    let key_row = (i * TILE as u32) as i32;
-                    let mut charge = k.tile(i).tma_load(k_tma, key_row, plane, full)
-                        + v.tile(i).tma_load(v_tma, key_row, plane, full);
-                    if i == 0 {
-                        let row_a = (tile_a * TILE as u32) as i32;
-                        let row_b = (tile_b * TILE as u32) as i32;
-                        charge = charge
-                            + q.tma_load_at::<TILE>(q_tma, 0, row_a, plane, full)
-                            + q.tma_load_at::<TILE>(q_tma, TILE, row_b, plane, full)
-                            + dy.tma_load_at::<TILE>(dy_tma, 0, row_a, plane, full)
-                            + dy.tma_load_at::<TILE>(dy_tma, TILE, row_b, plane, full);
-                    }
                     full.expect_tx(charge);
-                    i += 1;
-                }
-            } else if tid == group + 32 {
-                // MMA warp leader.
-                tcgen05_fence_after_thread_sync();
-                let mut i = 0u32;
-                while i < key_tiles {
-                    kv_full.wait(i);
-                    s_free.wait_recycled(i);
-                    let buffer = (i & 1) * 64;
-                    mma_abt(
-                        s_tmem.columns_right(buffer).raw(),
-                        q,
-                        k.tile(i),
-                        MMA_SHAPE,
-                        false,
-                    );
-                    mma_abt(
-                        dp_tmem.columns_right(buffer).raw(),
-                        dy,
-                        v.tile(i),
-                        MMA_SHAPE,
-                        false,
-                    );
-                    mma::commit(s_full.sem(i));
-                    if i > 0 {
-                        gradient_mma(i - 1, ds, k, dq_tmem, ds_full, dq_done);
+                    let mut stage = 0u32;
+                    while stage < BACKWARD_STAGES as u32 && stage < key_tiles {
+                        self.load_kv(stage, plane as i32);
+                        stage += 1;
                     }
-                    i += 1;
+                    // Only the MMA reads these operands, so only the issuing
+                    // thread waits for them.
+                    full.wait(0);
+                    self.shared.kv_loaded.wait(0);
+                    self.score_mmas(0);
                 }
-                gradient_mma(key_tiles - 1, ds, k, dq_tmem, ds_full, dq_done);
-            }
 
-            tcgen05_fence_before_thread_sync();
-            thread::sync_threads();
-            dealloc_block(tmem, 512);
-            if tid == 0 {
-                kv_full.inval_all();
-                kv_free.inval_all();
-                s_full.inval_all();
-                s_free.inval_all();
-                ds_full.inval();
-                dq_done.inval();
+                // The block's 128 query rows are contiguous and each carries one
+                // saved f32 in the head's own column of `[rows, heads]`, which is
+                // a `RegVec`'s shape exactly — the statistic reaches registers
+                // without a staging tile, a scatter or a barrier (ferro #170).
+                let row = batch * self.t + query_base + band;
+                let mut lse2: Rows = load_row_vec(self.lse, row, head, lane);
+                lse2.scale_assign(LOG2E);
+                let dots: Rows = load_row_vec(self.dot, row, head, lane);
+
+                let mut key_tile = 0u32;
+                while key_tile < key_tiles {
+                    if leader {
+                        // Refill before issuing, for the forward's reason: at the
+                        // ring's floor the stage the score MMA below waits for is
+                        // the one this refill loads, and issuing first deadlocks
+                        // the leader against a load it has not made yet. A K/V
+                        // stage is free once the gradient MMA that read its K
+                        // completed — K is read twice, by the score MMA and again
+                        // by `dQ += dS·K`, and the second is the later.
+                        let refill = key_tile + BACKWARD_STAGES as u32 - 1;
+                        if key_tile > 0 && refill < key_tiles {
+                            self.shared.accumulated.wait(key_tile - 1);
+                            self.load_kv(refill, plane as i32);
+                        }
+                        // The next tile's scores are issued before this tile's
+                        // register pass runs, so the tensor core is producing
+                        // `S(i+1)`/`dP(i+1)` while the warpgroup forms `dS(i)`
+                        // and `dQ(i-1)` accumulates behind it.
+                        if key_tile + 1 < key_tiles {
+                            self.shared.kv_loaded.wait(key_tile + 1);
+                            self.score_mmas(key_tile + 1);
+                        }
+                    }
+
+                    self.shared.scored.wait(key_tile);
+                    // The dS slot this tile writes was last read by the gradient
+                    // MMA `GRADIENT_STAGES` tiles back.
+                    if key_tile >= GRADIENT_STAGES as u32 {
+                        self.shared
+                            .accumulated
+                            .wait(key_tile - GRADIENT_STAGES as u32);
+                    }
+
+                    let scores = self.buffer(self.scores, key_tile);
+                    let gradients = self.buffer(self.gradients, key_tile);
+                    let key_base = key_tile * TILE as u32;
+                    let masked = key_tile >= first_masked;
+                    let ds = self.shared.ds.tile(key_tile).chunk_writer();
+
+                    // `dS = exp2(s - lse2)·(dP - D)·scale`, a `SCORE_CHUNK` of
+                    // columns at a time. Never the whole `[32, TILE]` band as a
+                    // value: that is what put the forward's softmax in the LLVM
+                    // local depot and cost it 19.9%, and the two segments read
+                    // here would be twice the band.
+                    let mut column = 0u32;
+                    while column < TILE as u32 {
+                        let mut dscore: ScoreChunk = scores.tile(band, column);
+                        if masked {
+                            // Both origins go in rather than their difference,
+                            // which is negative for a band above the diagonal.
+                            // Masking the *score* rather than the gradient is
+                            // what lets one call replace the `keep` predicate
+                            // the four kernels this replaces each rebuilt: a
+                            // masked score exp2s to a subnormal and multiplies
+                            // the finite `dP - D` to nothing.
+                            dscore.make_causal_at(
+                                lane,
+                                query_base + band,
+                                key_base + column,
+                                MASKED_SCORE,
+                            );
+                        }
+                        dscore.sub_row_assign(lse2);
+                        dscore.unary_map_assign::<Exp2Hw>();
+                        let mut dp: ScoreChunk = gradients.tile(band, column);
+                        dp.sub_row_assign(dots);
+                        dscore.mul_assign(dp);
+                        // The MMA below reads an unscaled K, so `scale` lands
+                        // here; the staged Q already carries `scale·log2e`.
+                        dscore.scale_assign(SCALE);
+                        store_tile(ds, band, column, lane, dscore);
+                        column += SCORE_CHUNK as u32;
+                    }
+
+                    // dS was written through the generic proxy; fence before the
+                    // async-proxy MMA reads it.
+                    fence_proxy_async_shared_cta();
+                    tcgen05_fence_before_thread_sync();
+                    thread::sync_threads();
+                    if leader {
+                        tcgen05_fence_after_thread_sync();
+                        mma_ab(
+                            self.accumulator.raw(),
+                            self.shared.ds.tile(key_tile),
+                            self.shared.k.tile(key_tile),
+                            MMA_SHAPE,
+                            key_tile != 0,
+                        );
+                        mma::commit(self.shared.accumulated.sem(key_tile));
+                    }
+                    key_tile += 1;
+                }
+
+                self.shared.accumulated.wait(key_tiles - 1);
+                // One drain, at the end of the stream: dQ is a complete sum, so
+                // there is no `1/sum` and no correction path, and the band goes
+                // straight out. `.x8` because nothing is added to it on the way.
+                let dq: OutBand = self.accumulator.tile_x8(band, 0);
+                store_rows(self.dq, row, head * HD as u32, lane, dq);
             }
         }
     }
 
-    /// Issue one query tile's `dV += Pᵀ·dY` and `dK += dSᵀ·Q` from the MMA
-    /// warp: wait for the gradient warpgroup to publish both operand tiles,
-    /// chain each gradient MMA across the streamed panel's two HD subtiles,
-    /// and commit into `grad_done`. As in kernel A that commit is what
-    /// releases the operand tiles AND the ring stage — Q and dY are each read
-    /// twice, once by a score MMA and once here.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    unsafe fn gradient_mma_kv<const STAGES: usize>(
-        step: u32,
-        p: PairedPTile,
-        ds: PairedPTile,
-        q: PanelRingN<STAGES>,
-        dy: PanelRingN<STAGES>,
-        dv_tmem: AccTmem,
-        dk_tmem: AccTmem,
-        pds_full: Semaphore,
-        grad_done: Semaphore,
-    ) {
-        unsafe {
-            pds_full.wait(step & 1);
-            let accumulate = step != 0;
-            mma_ab(dv_tmem.raw(), p, dy.tile(step), MMA_SHAPE, accumulate);
-            mma_ab(dk_tmem.raw(), ds, q.tile(step), MMA_SHAPE, accumulate);
-            mma::commit(grad_done);
-        }
-    }
-
-    /// Warp-specialized pipelined key-parallel backward — kernel B's half of
-    /// the phase-5 kittens-first pair. Launch with
-    /// `host::flash_backward_kv_pipelined_config`. Identical operand,
-    /// statistic, and output contract to `flash_backward_kv_tcgen05`, with the
-    /// same three roles as `flash_backward_q_pipelined`.
+    /// tcgen05 causal attention backward, query-parallel half — one kernel,
+    /// replacing the synchronous and warp-specialized generations of issue #47.
     ///
-    /// Two differences from kernel A, both forced by the transposed math:
-    /// - **the loop is relative.** Kernel B streams query tiles `key_a..T/64`,
-    ///   so every ring index and phase parity runs off `step = query - key_a`
-    ///   while the data addressing keeps the absolute tile. A `SemaphoreRing`
-    ///   derives its parity from the visit count, which is the step, not the
-    ///   tile.
-    /// - **the per-tile statistics ride the ring.** Rows are key rows and
-    ///   columns are query rows here, so `lse2`/`dot` index by the *streamed*
-    ///   tile's 64 rows and must be re-staged every step — which the
-    ///   synchronous kernel did behind a block sync that no longer exists.
-    ///   The TMA warp stages them into a `BACKWARD_STAGES`-deep window and
-    ///   publishes them on the stage's own `qdy_full`: a `warp::sync_mask`
-    ///   orders the 32 lanes' stores ahead of the leader's `expect_tx`, and
-    ///   the mbarrier's release makes them visible to the warpgroup exactly
-    ///   like the forward's `restart` flag.
-    #[allow(clippy::too_many_arguments)]
+    /// Launch with `host::flash_backward_q_config`: a 1-D grid of at most
+    /// `(T / QUERIES) * H * B` CTAs, `FLASH_BACKWARD_BLOCK` threads,
+    /// `host::FLASH_BACKWARD_Q_SMEM_BYTES` dynamic shared bytes.
+    ///
+    /// One work item is a (query block, head, batch). A CTA owns `QUERIES = 128`
+    /// query rows, holds their Q and dY resident, and streams the causal
+    /// `TILE`-key tiles beneath them: `S = Q·Kᵀ` and `dP = dY·Vᵀ` land in a
+    /// double-buffered fp32 TMEM segment pair, the warpgroup forms
+    /// `dS = P·(dP − D)·scale` in registers a `SCORE_CHUNK` at a time and packs
+    /// it back to shared memory, and `dQ += dS·K` accumulates in TMEM for the
+    /// whole stream. **dQ never leaves tensor memory until the item ends**: a
+    /// query block owns every key its rows attend to, so its output tile has one
+    /// writer and the epilogue is a `store_rows`.
+    ///
+    /// What made this two kernels was the same thing that made the forward
+    /// three — a synchronous form that exposed TMA, MMA, the register pass and
+    /// the gradient MMA behind four block barriers each key tile, and a
+    /// warp-specialized form that bought them back with a dedicated TMA warp and
+    /// MMA warp over 192 threads. Neither is needed once the leader issues
+    /// `S(i+1)` before the pass of tile `i`: the tensor core is running the next
+    /// tile's scores and the previous tile's `dQ` throughout it, at 128 threads
+    /// and **one** block barrier per key tile, the one that publishes dS.
+    ///
+    /// Operand and output contracts are the extraction's: packed-bf16
+    /// `[B*H, T, HD]` staging panels with Q pre-scaled by
+    /// `softmax_scale * log2(e)` and dY staged raw, `logsumexp[B*T, H]` and
+    /// `dot[B*T, H]` fp32 read-only, fp32 `dq[B*T, H*HD]` written.
     #[kernel]
-    #[launch_bounds(192, 1)]
-    pub unsafe fn flash_backward_kv_pipelined(
+    #[launch_bounds(128, 1)]
+    pub unsafe fn flash_backward_q(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
         v_tma: *const TmaDescriptor,
@@ -1387,211 +1012,395 @@ pub mod kernels {
         dot: &[f32],
         sequence_length: u32,
         heads: u32,
+        batches: u32,
+        mut dq: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            if thread::blockDim_x() as usize != FLASH_BACKWARD_BLOCK {
+                return;
+            }
+            let shared = backward_q_plan(SharedPlan::attach());
+            let tmem = alloc_block(shared.tmem_slot, BACKWARD_TMEM_COLUMNS);
+            // Two score segments at columns 0..128, two dP segments at
+            // 128..256, the 128-column dQ accumulator at 256.
+            let scores = STmem::from_raw(tmem);
+            let gradients = STmem::from_raw(tmem + 2 * TILE as u32);
+            let accumulator = AccTmem::from_raw(tmem + 4 * TILE as u32);
+
+            let tiles = sequence_length / QUERIES as u32;
+            let planes = heads * batches;
+            let stats = heads as usize;
+            let mut job = BackwardQStream {
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                t: sequence_length,
+                h: heads,
+                tiles,
+                planes,
+                leader: thread::threadIdx_x() == 0,
+                warp_id: warp::warp_id(),
+                lane: warp::lane_id(),
+                shared,
+                scores,
+                gradients,
+                accumulator,
+                lse: GlobalRows::<F32>::from_raw(logsumexp.as_ptr().cast_mut().cast(), stats),
+                dot: GlobalRows::<F32>::from_raw(dot.as_ptr().cast_mut().cast(), stats),
+                dq: GlobalRows::<F32>::from_slice(&mut dq, heads as usize * HD),
+            };
+            pipeline::run(&mut job, tiles * planes);
+            dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
+        }
+    }
+
+    /// The key-parallel backward as a [`pipeline::Job`]: one work item is a
+    /// (key block, head, batch), and everything the query-parallel stream does
+    /// by row this does by column.
+    struct BackwardKvStream {
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        t: u32,
+        h: u32,
+        tiles: u32,
+        planes: u32,
+        leader: bool,
+        warp_id: u32,
+        lane: u32,
+        shared: BackwardKv,
+        /// Two `[QUERIES, TILE]` transposed score segments.
+        scores: STmem,
+        /// Two more for `dPᵀ`.
+        gradients: STmem,
+        dv_acc: AccTmem,
+        dk_acc: AccTmem,
+        lse: GlobalRows<F32>,
+        dot: GlobalRows<F32>,
+        dk: GlobalRows<F32>,
+        dv: GlobalRows<F32>,
+    }
+
+    impl BackwardKvStream {
+        #[inline(always)]
+        fn buffer(&self, segment: STmem, step: u32) -> STmem {
+            if step & 1 == 0 {
+                segment
+            } else {
+                segment.columns_right(TILE as u32)
+            }
+        }
+
+        /// Stage the query tile of `step` — Q and dY, one barrier for both.
+        #[inline(always)]
+        unsafe fn load_qdy(&self, step: u32, query_base: u32, plane: i32) {
+            unsafe {
+                let row = query_base as i32;
+                let full = self.shared.qdy_loaded.sem(step);
+                let charge = self
+                    .shared
+                    .q
+                    .tile(step)
+                    .tma_load(self.q_tma, row, plane, full)
+                    + self
+                        .shared
+                        .dy
+                        .tile(step)
+                        .tma_load(self.dy_tma, row, plane, full);
+                full.expect_tx(charge);
+            }
+        }
+
+        /// Issue `Sᵀ = K·Qᵀ` and `dPᵀ = V·dYᵀ` for one streamed query tile.
+        ///
+        /// **The transpose is the MMA's.** `mma_abt` with the resident K as A
+        /// and the streamed Q as B produces the key-major band directly, so
+        /// there is no register transpose here and no second `FragmentLayout`
+        /// wanted for one — the operand-order square covers this site, which is
+        /// the question GAPS §1.3 asks of every backward.
+        #[inline(always)]
+        unsafe fn score_mmas(&self, step: u32) {
+            unsafe {
+                mma_abt(
+                    self.buffer(self.scores, step).raw(),
+                    self.shared.k,
+                    self.shared.q.tile(step),
+                    MMA_SHAPE,
+                    false,
+                );
+                mma_abt(
+                    self.buffer(self.gradients, step).raw(),
+                    self.shared.v,
+                    self.shared.dy.tile(step),
+                    MMA_SHAPE,
+                    false,
+                );
+                mma::commit(self.shared.scored.sem(step));
+            }
+        }
+    }
+
+    impl pipeline::Job for BackwardKvStream {
+        #[inline(always)]
+        unsafe fn init(&self, _item: u32) {
+            unsafe {
+                self.shared.qdy_loaded.init_all(1);
+                self.shared.scored.init_all(1);
+                self.shared.accumulated.init_all(1);
+                self.shared.kv_loaded.init(1);
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn inval(&self) {
+            unsafe {
+                self.shared.qdy_loaded.inval_all();
+                self.shared.scored.inval_all();
+                self.shared.accumulated.inval_all();
+                self.shared.kv_loaded.inval();
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn work(&mut self, item: u32) {
+            unsafe {
+                // ASCENDING key block, which is the same rule as the forward's
+                // descending query tile: key block `i` streams every query at or
+                // after it, so block 0 is the longest stream and goes first.
+                let key_block = item / self.planes;
+                let plane = item % self.planes;
+                let head = plane % self.h;
+                let batch = plane / self.h;
+                let key_base = key_block * QUERIES as u32;
+                let steps = 2 * (self.tiles - key_block);
+
+                let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
+                let band = 32 * warp_id;
+                let row = batch * self.t + key_base + band;
+
+                if leader {
+                    tcgen05_fence_after_thread_sync();
+                    let full = self.shared.kv_loaded;
+                    let second = (key_base + TILE as u32) as i32;
+                    let charge = self.shared.k.tma_load_at::<TILE>(
+                        self.k_tma,
+                        0,
+                        key_base as i32,
+                        plane as i32,
+                        full,
+                    ) + self.shared.k.tma_load_at::<TILE>(
+                        self.k_tma,
+                        TILE,
+                        second,
+                        plane as i32,
+                        full,
+                    ) + self.shared.v.tma_load_at::<TILE>(
+                        self.v_tma,
+                        0,
+                        key_base as i32,
+                        plane as i32,
+                        full,
+                    ) + self.shared.v.tma_load_at::<TILE>(
+                        self.v_tma,
+                        TILE,
+                        second,
+                        plane as i32,
+                        full,
+                    );
+                    full.expect_tx(charge);
+                    let mut stage = 0u32;
+                    while stage < BACKWARD_STAGES as u32 && stage < steps {
+                        self.load_qdy(stage, key_base + stage * TILE as u32, plane as i32);
+                        stage += 1;
+                    }
+                    full.wait(0);
+                    self.shared.qdy_loaded.wait(0);
+                    self.score_mmas(0);
+                }
+
+                let mut step = 0u32;
+                while step < steps {
+                    // The streamed query tile's rows, which are this band's
+                    // COLUMNS. Everything below indexes by column where the
+                    // query-parallel kernel indexes by row.
+                    let query_base = key_base + step * TILE as u32;
+                    if leader {
+                        let refill = step + BACKWARD_STAGES as u32 - 1;
+                        if step > 0 && refill < steps {
+                            self.shared.accumulated.wait(step - 1);
+                            self.load_qdy(refill, key_base + refill * TILE as u32, plane as i32);
+                        }
+                        if step + 1 < steps {
+                            self.shared.qdy_loaded.wait(step + 1);
+                            self.score_mmas(step + 1);
+                        }
+                    }
+
+                    self.shared.scored.wait(step);
+                    if step >= GRADIENT_STAGES as u32 {
+                        self.shared.accumulated.wait(step - GRADIENT_STAGES as u32);
+                    }
+
+                    let scores = self.buffer(self.scores, step);
+                    let gradients = self.buffer(self.gradients, step);
+                    // A 128-key band clears the diagonal once the streamed
+                    // query tile is wholly after its last key, which is two
+                    // 64-row tiles in.
+                    let masked = step < 2;
+                    let p = self.shared.p.tile(step).chunk_writer();
+                    let ds = self.shared.ds.tile(step).chunk_writer();
+
+                    let mut column = 0u32;
+                    while column < TILE as u32 {
+                        let query = batch * self.t + query_base + column;
+                        // The saved statistic, read onto the axis this band
+                        // indexes it by — one element per column, down the
+                        // head's own column of `[rows, heads]` (ferro #178).
+                        let mut lse2: Cols = load_col_vec(self.lse, query, head, lane);
+                        lse2.scale_assign(LOG2E);
+                        let dots: Cols = load_col_vec(self.dot, query, head, lane);
+
+                        let mut probability: ScoreChunk = scores.tile(band, column);
+                        if masked {
+                            // The transposed band's mask: rows are keys and
+                            // columns are queries, so this is the other
+                            // diagonal and `key - query` is negative on every
+                            // step but the first.
+                            probability.make_causal_t_at(
+                                lane,
+                                key_base + band,
+                                query_base + column,
+                                MASKED_SCORE,
+                            );
+                        }
+                        probability.sub_col_assign(lse2);
+                        probability.unary_map_assign::<Exp2Hw>();
+                        store_tile(p, band, column, lane, probability);
+
+                        let mut dpt: ScoreChunk = gradients.tile(band, column);
+                        dpt.sub_col_assign(dots);
+                        probability.mul_assign(dpt);
+                        // `dK += dSᵀ·Q` runs against the *pre-scaled* Q, so the
+                        // factor here is `ln2` and not `scale`:
+                        // `ln2·scale·log2e = scale`.
+                        probability.scale_assign(LN2);
+                        store_tile(ds, band, column, lane, probability);
+                        column += SCORE_CHUNK as u32;
+                    }
+
+                    fence_proxy_async_shared_cta();
+                    tcgen05_fence_before_thread_sync();
+                    thread::sync_threads();
+                    if leader {
+                        tcgen05_fence_after_thread_sync();
+                        let accumulate = step != 0;
+                        mma_ab(
+                            self.dv_acc.raw(),
+                            self.shared.p.tile(step),
+                            self.shared.dy.tile(step),
+                            MMA_SHAPE,
+                            accumulate,
+                        );
+                        mma_ab(
+                            self.dk_acc.raw(),
+                            self.shared.ds.tile(step),
+                            self.shared.q.tile(step),
+                            MMA_SHAPE,
+                            accumulate,
+                        );
+                        mma::commit(self.shared.accumulated.sem(step));
+                    }
+                    step += 1;
+                }
+
+                self.shared.accumulated.wait(steps - 1);
+                let dv: OutBand = self.dv_acc.tile_x8(band, 0);
+                store_rows(self.dv, row, head * HD as u32, lane, dv);
+                let dk: OutBand = self.dk_acc.tile_x8(band, 0);
+                store_rows(self.dk, row, head * HD as u32, lane, dk);
+            }
+        }
+    }
+
+    /// tcgen05 causal attention backward, key-parallel half — one kernel where
+    /// there were two, the mirror of [`flash_backward_q`].
+    ///
+    /// Launch with `host::flash_backward_kv_config`. One work item is a
+    /// (key block, head, batch). A CTA owns `QUERIES = 128` key rows, holds
+    /// their K and V resident, and streams the `TILE`-query tiles at and after
+    /// them: `Sᵀ = K·Qᵀ` and `dPᵀ = V·dYᵀ` fill a double-buffered TMEM segment
+    /// pair, the warpgroup forms `Pᵀ` and `dSᵀ = Pᵀ·(dPᵀ − D)·ln2`, and
+    /// `dV += Pᵀ·dY` / `dK += dSᵀ·Q` accumulate in TMEM for the whole stream.
+    /// Both gradient tiles have one writer, for the reason kernel A's does.
+    ///
+    /// **Everything kernel A indexes by row this indexes by column**, and that
+    /// is the whole of the difference: the band's rows are keys, so the causal
+    /// mask is the other diagonal (`make_causal_t_at`) and the per-query LSE
+    /// and dot are a `ColVec` (`load_col_vec`) rather than a `RegVec`. Neither
+    /// existed in the library before this kernel asked for them
+    /// (ferro-kittens #178); what did *not* need adding is a register
+    /// transpose, because `mma_abt(K, Q)` produces the key-major band itself.
+    ///
+    /// The two accumulators are why this kernel takes all 512 tensor-memory
+    /// columns where kernel A takes 384 — and why neither can reach two CTAs an
+    /// SM at any shared-memory plan.
+    #[kernel]
+    #[launch_bounds(128, 1)]
+    pub unsafe fn flash_backward_kv(
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &[f32],
+        dot: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        batches: u32,
         mut dk: DisjointSlice<f32>,
         mut dv: DisjointSlice<f32>,
     ) {
         unsafe {
-            static mut TMEM_ADDRESS: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
-            static mut QDY_FULL: SharedArray<u64, BACKWARD_STAGES, 8> = SharedArray::UNINIT;
-            static mut QDY_FREE: SharedArray<u64, BACKWARD_STAGES, 8> = SharedArray::UNINIT;
-            static mut S_FULL: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut S_FREE: SharedArray<u64, 2, 8> = SharedArray::UNINIT;
-            static mut PDS_FULL: Barrier = Barrier::UNINIT;
-            static mut GRAD_DONE: Barrier = Barrier::UNINIT;
-            static mut LSE2: SharedArray<f32, { TILE * BACKWARD_STAGES }> = SharedArray::UNINIT;
-            static mut DOTS: SharedArray<f32, { TILE * BACKWARD_STAGES }> = SharedArray::UNINIT;
-
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let k = PairedPanel::from_raw(smem);
-            let v = PairedPanel::from_raw(smem.add(2 * TILE_BYTES));
-            let q = PanelRingN::<BACKWARD_STAGES>::attach(smem.add(4 * TILE_BYTES));
-            let dy =
-                PanelRingN::<BACKWARD_STAGES>::attach(smem.add((4 + BACKWARD_STAGES) * TILE_BYTES));
-            let p = PairedPTile::from_raw(smem.add((4 + 2 * BACKWARD_STAGES) * TILE_BYTES));
-            let ds = PairedPTile::from_raw(smem.add((5 + 2 * BACKWARD_STAGES) * TILE_BYTES));
-
-            let tid = thread::threadIdx_x();
-            if thread::blockDim_x() as usize != FLASH_BACKWARD_KV_PIPELINED_BLOCK {
+            if thread::blockDim_x() as usize != FLASH_BACKWARD_BLOCK {
                 return;
             }
-            let warp_id = warp::warp_id();
-            let lane = warp::lane_id();
-            let group = 2 * TILE as u32;
+            let shared = backward_kv_plan(SharedPlan::attach());
+            let tmem = alloc_block(shared.tmem_slot, BACKWARD_TMEM_COLUMNS);
+            // Two `Sᵀ` segments at 0..128, two `dPᵀ` at 128..256, then the two
+            // 128-column gradient accumulators — all 512 columns.
+            let scores = STmem::from_raw(tmem);
+            let gradients = STmem::from_raw(tmem + 2 * TILE as u32);
+            let dv_acc = AccTmem::from_raw(tmem + 4 * TILE as u32);
+            let dk_acc = AccTmem::from_raw(tmem + 4 * TILE as u32 + HD as u32);
 
-            let pair = thread::blockIdx_x();
-            let head = thread::blockIdx_y();
-            let batch = thread::blockIdx_z();
-            let t = sequence_length;
-            let h = heads;
-            let plane = (batch * h + head) as i32;
-            let tiles = t / TILE as u32;
-            let key_a = pair * 2;
-            let key_b = key_a + 1;
-            let steps = tiles - key_a;
-
-            let qdy_full =
-                SemaphoreRing::<BACKWARD_STAGES>::attach(&raw mut QDY_FULL as *mut Barrier);
-            let qdy_free =
-                SemaphoreRing::<BACKWARD_STAGES>::attach(&raw mut QDY_FREE as *mut Barrier);
-            let s_full = SemaphoreRing::<2>::attach(&raw mut S_FULL as *mut Barrier);
-            let s_free = SemaphoreRing::<2>::attach(&raw mut S_FREE as *mut Barrier);
-            let pds_full = Semaphore::attach(&raw mut PDS_FULL);
-            let grad_done = Semaphore::attach(&raw mut GRAD_DONE);
-            let lse_base = &raw mut LSE2 as *mut f32;
-            let dot_base = &raw mut DOTS as *mut f32;
-
-            if tid == 0 {
-                qdy_full.init_all(1);
-                qdy_free.init_all(1);
-                s_full.init_all(1);
-                s_free.init_all(group);
-                pds_full.init(group);
-                grad_done.init(1);
-                fence_proxy_async_shared_cta();
-            }
-            thread::sync_threads();
-
-            // Sᵀ/dPᵀ take two 64-column buffers each (columns 0..256); the two
-            // 128-column gradient accumulators fill the rest of the 512.
-            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
-            let st_tmem = STmem::from_raw(tmem);
-            let dpt_tmem = STmem::from_raw(tmem + 128);
-            let dv_tmem = AccTmem::from_raw(tmem + 256);
-            let dk_tmem = AccTmem::from_raw(tmem + 384);
-
-            if tid < group {
-                // Gradient warpgroup.
-                let mut step = 0u32;
-                while step < steps {
-                    let stage = (step as usize % BACKWARD_STAGES) * TILE;
-                    s_full.wait(step);
-                    backward_kv_tile_paired(
-                        st_tmem.columns_right((step & 1) * 64),
-                        dpt_tmem.columns_right((step & 1) * 64),
-                        key_a + step,
-                        key_a,
-                        key_b,
-                        warp_id,
-                        lane,
-                        lse_base.add(stage) as *const f32,
-                        dot_base.add(stage) as *const f32,
-                        p,
-                        ds,
-                    );
-                    fence_proxy_async_shared_cta();
-                    s_free.sem(step).arrive();
-                    pds_full.arrive();
-                    grad_done.wait(step & 1);
-                    if tid == 0 {
-                        qdy_free.sem(step).arrive();
-                    }
-                    step += 1;
-                }
-                let mut dv_acc = RegTile::<32, 128, BaseLdtm>::zero();
-                let mut dk_acc = RegTile::<32, 128, BaseLdtm>::zero();
-                merge_output_tile(dv_tmem, warp_id, &mut dv_acc);
-                merge_output_tile(dk_tmem, warp_id, &mut dk_acc);
-                store_grad_tile(batch, t, h, head, key_a, warp_id, lane, &dv_acc, &mut dv);
-                store_grad_tile(batch, t, h, head, key_a, warp_id, lane, &dk_acc, &mut dk);
-            } else if warp_id == group / 32 {
-                // TMA load warp: every lane stages two of the streamed tile's
-                // 64 per-query-row statistics, then the leader issues the
-                // boxes and charges the stage's expected bytes.
-                let mut step = 0u32;
-                while step < steps {
-                    let query_tile = key_a + step;
-                    qdy_free.wait_recycled(step);
-                    let stage = (step as usize % BACKWARD_STAGES) * TILE;
-                    let mut row = lane;
-                    while row < TILE as u32 {
-                        let global_row =
-                            (batch * t) as usize + query_tile as usize * TILE + row as usize;
-                        let stat_index = global_row * h as usize + head as usize;
-                        *lse_base.add(stage + row as usize) = logsumexp[stat_index] * LOG2E;
-                        *dot_base.add(stage + row as usize) = dot[stat_index];
-                        row += 32;
-                    }
-                    warp::sync_mask(u32::MAX);
-                    if lane == 0 {
-                        let full = qdy_full.sem(step);
-                        let query_row = (query_tile * TILE as u32) as i32;
-                        let mut charge = q.tile(step).tma_load(q_tma, query_row, plane, full)
-                            + dy.tile(step).tma_load(dy_tma, query_row, plane, full);
-                        if step == 0 {
-                            let row_a = (key_a * TILE as u32) as i32;
-                            let row_b = (key_b * TILE as u32) as i32;
-                            charge = charge
-                                + k.tma_load_at::<TILE>(k_tma, 0, row_a, plane, full)
-                                + k.tma_load_at::<TILE>(k_tma, TILE, row_b, plane, full)
-                                + v.tma_load_at::<TILE>(v_tma, 0, row_a, plane, full)
-                                + v.tma_load_at::<TILE>(v_tma, TILE, row_b, plane, full);
-                        }
-                        full.expect_tx(charge);
-                    }
-                    step += 1;
-                }
-            } else if tid == group + 32 {
-                // MMA warp leader.
-                tcgen05_fence_after_thread_sync();
-                let mut step = 0u32;
-                while step < steps {
-                    qdy_full.wait(step);
-                    s_free.wait_recycled(step);
-                    let buffer = (step & 1) * 64;
-                    mma_abt(
-                        st_tmem.columns_right(buffer).raw(),
-                        k,
-                        q.tile(step),
-                        MMA_SHAPE,
-                        false,
-                    );
-                    mma_abt(
-                        dpt_tmem.columns_right(buffer).raw(),
-                        v,
-                        dy.tile(step),
-                        MMA_SHAPE,
-                        false,
-                    );
-                    mma::commit(s_full.sem(step));
-                    if step > 0 {
-                        gradient_mma_kv(
-                            step - 1,
-                            p,
-                            ds,
-                            q,
-                            dy,
-                            dv_tmem,
-                            dk_tmem,
-                            pds_full,
-                            grad_done,
-                        );
-                    }
-                    step += 1;
-                }
-                gradient_mma_kv(
-                    steps - 1,
-                    p,
-                    ds,
-                    q,
-                    dy,
-                    dv_tmem,
-                    dk_tmem,
-                    pds_full,
-                    grad_done,
-                );
-            }
-
-            tcgen05_fence_before_thread_sync();
-            thread::sync_threads();
-            dealloc_block(tmem, 512);
-            if tid == 0 {
-                qdy_full.inval_all();
-                qdy_free.inval_all();
-                s_full.inval_all();
-                s_free.inval_all();
-                pds_full.inval();
-                grad_done.inval();
-            }
+            let tiles = sequence_length / QUERIES as u32;
+            let planes = heads * batches;
+            let stats = heads as usize;
+            let mut job = BackwardKvStream {
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                t: sequence_length,
+                h: heads,
+                tiles,
+                planes,
+                leader: thread::threadIdx_x() == 0,
+                warp_id: warp::warp_id(),
+                lane: warp::lane_id(),
+                shared,
+                scores,
+                gradients,
+                dv_acc,
+                dk_acc,
+                lse: GlobalRows::<F32>::from_raw(logsumexp.as_ptr().cast_mut().cast(), stats),
+                dot: GlobalRows::<F32>::from_raw(dot.as_ptr().cast_mut().cast(), stats),
+                dk: GlobalRows::<F32>::from_slice(&mut dk, heads as usize * HD),
+                dv: GlobalRows::<F32>::from_slice(&mut dv, heads as usize * HD),
+            };
+            pipeline::run(&mut job, tiles * planes);
+            dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
         }
     }
 

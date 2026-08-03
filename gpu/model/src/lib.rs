@@ -80,9 +80,12 @@ pub use gemm_device::host::Tcgen05Gemm;
 pub use tensor_device::kernels as tensor_kernels;
 
 use flash_device::host as flash_host;
+// `flash_forward_config` is deliberately NOT imported: this module has its own
+// generic one for the fp32 tiled path (below), and #74 renamed the host
+// function into that collision. The tcgen05 call site qualifies it, which is
+// what the backward configs beside it already did.
 use flash_device::host::{
     FLASH_HD, FLASH_QUERIES, FlashHeadTmaMap, correction_count_len, create_flash_head_tma_map,
-    flash_forward_config,
 };
 use gemm_device::fp32_launch_config;
 use gemm_device::host::{
@@ -5882,7 +5885,7 @@ fn flash_attention_forward_into<
         profiler.measure(stream, "forward.attention.flash", || unsafe {
             flash_bf16.forward(
                 stream,
-                flash_forward_config(N / T, T, H, flash_bf16.sm_count()),
+                flash_host::flash_forward_config(N / T, T, H, flash_bf16.sm_count()),
                 scratch.q_tma.as_ptr(),
                 scratch.k_tma.as_ptr(),
                 scratch.v_tma.as_ptr(),
@@ -6021,9 +6024,9 @@ fn flash_attention_backward_into<
             )
         })?;
         profiler.measure(stream, "backward.attention.flash_q", || unsafe {
-            flash_bf16.backward_q_pipelined(
+            flash_bf16.backward_q(
                 stream,
-                flash_host::flash_backward_q_pipelined_config(N / T, T, H),
+                flash_host::flash_backward_q_config(N / T, T, H, flash_bf16.sm_count()),
                 scratch.q_tma.as_ptr(),
                 scratch.k_tma.as_ptr(),
                 scratch.v_tma.as_ptr(),
@@ -6032,13 +6035,14 @@ fn flash_attention_backward_into<
                 softmax_dot.as_device_buffer(),
                 T as u32,
                 H as u32,
+                (N / T) as u32,
                 dq.as_device_buffer_mut(),
             )
         })?;
         profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
-            flash_bf16.backward_kv_pipelined(
+            flash_bf16.backward_kv(
                 stream,
-                flash_host::flash_backward_kv_pipelined_config(N / T, T, H),
+                flash_host::flash_backward_kv_config(N / T, T, H, flash_bf16.sm_count()),
                 scratch.q_tma.as_ptr(),
                 scratch.k_tma.as_ptr(),
                 scratch.v_tma.as_ptr(),
@@ -6047,6 +6051,7 @@ fn flash_attention_backward_into<
                 softmax_dot.as_device_buffer(),
                 T as u32,
                 H as u32,
+                (N / T) as u32,
                 dk.as_device_buffer_mut(),
                 dv.as_device_buffer_mut(),
             )
