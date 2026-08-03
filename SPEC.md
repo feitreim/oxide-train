@@ -1491,6 +1491,67 @@ Each gated on tests; correctness before speed at every step.
      **5.74 ms** of sync spans. Whoever picks it up starts from a proven
      descriptor route and should first establish whether that overfit gate is
      measuring convergence or launch-order luck.
+   - ✅ **One flash-attention forward, at 128 query rows** (#68): the three
+     generations of #35 — synchronous, pipelined, persistent — collapse into
+     `flash_forward`. What made them three was a 64-query tile against an
+     `M128` accumulator: every MMA filled 64 real rows and 64 phantom ones, so
+     half the tensor core was thrown away and phases 2 and 3 bought it back
+     with structure (a dedicated TMA warp and MMA warp, then two softmax
+     warpgroups ping-ponging adjacent query tiles). At 128 query rows the MMA
+     is whole, the softmax warpgroup is naturally the accumulator's own four
+     warps, and the overlap that took three warp roles is one double-buffered
+     score segment — the leader issues `S(i+1)` before the warpgroup runs the
+     softmax of tile `i`. 128 threads where the persistent kernel had 192, and
+     no `PHANTOM_PAD` left anywhere in the module. The rest is
+     ferro-kittens': `SharedPlan` for the plan, `pipeline::run` for the
+     persistent loop, `make_causal_at` for the coordinate-origin mask (right
+     for *both* diagonal tiles, where the hand-written per-value branch it
+     replaces was right only for the first), `online_rescale`, and
+     `block_reduce` for the correction vote three kernels open-coded as a votes
+     array plus a barrier phase. **Parity** against the staged-bf16 CPU
+     reference at [2,128,3], [1,256,2], [1,384,2], [1,512,2] and [4,256,38]:
+     y ≤ **1.47e-3** (tolerance 5e-3, recorded maximum 1.4e-3), lse ≤
+     **9.54e-7** — 147x under the recorded 1.4e-4, because the SFU `exp2` is
+     the more accurate of the two (~2 ULP against the polynomial's measured
+     7.5e-5 relative), which is the opposite of what an "approx" instruction is
+     usually reached for. **Bench** at [32,1024,24,128]:
+     **1.343 ms** against the persistent kernel's recorded 1.929, **−30.4%**,
+     over four measured steps from a 2.635 ms first flight. It issues **half**
+     the tensor-core work per unit of algorithm, which is why the bench's FLOP
+     count changed from issued to algorithmic in the same commit — the old
+     TFLOP/s figures are 2x this scale and only the milliseconds are
+     comparable. **What each step bought**, one container per row: the softmax
+     walked in 16-column chunks 2.635 → 2.111 (−19.9%, the score band leaves
+     the local depot); the SFU `exp2` 2.111 → **1.845** (−12.6%, and past the
+     baseline); two K/V stages with one probability buffer and a launch that
+     requests the plan rather than a ceiling 1.845 → **1.343** (−27.2%, and the
+     first time this kernel family has run **2 CTAs/SM**). One step measured
+     backwards and was reverted: replacing `block_reduce`'s two `bar.sync` with
+     the votes ring and one mbarrier phase all three extracted kernels used
+     cost **+2.3%**, which says the vote's cost is the *rendezvous* and not the
+     primitive it is spelled with — a 128-arrival mbarrier is not cheaper than
+     a `barrier.sync`, and `block_reduce` throws in the fold. What remains in
+     the gap is inherent: a 128-row query block necessarily reads one
+     fully-masked 64x64 pair per block (8 of 144 at T=1024, **5.9%**). **The measurement that
+     moved most:** holding the whole `[32, 64]` score band as a value beside
+     the 128-register output accumulator put it in the LLVM local depot —
+     1328 B of frame, 3546 `ld/st.local`, the drain block storing what it had
+     just read — and cost **2.635 ms**. Walking it 16 columns at a time is
+     2.111 (−19.9%) with parity unchanged to the digit; #61's risk 1 is real
+     and it is about the *width* the register ops are asked to work at, not
+     about indexed writes. What is left in the depot (1136 B) is the output
+     accumulator itself, address-taken by `online_rescale` and
+     `merge_output_tile` and read inside the key stream only by the correction
+     path — which fires on **0.00%** of visits at every gated shape, including
+     49152 eligible ones at the bench shape. Getting it out means not keeping
+     it in registers: `tcgen05.st` was absent when this correction scheme was
+     designed and is in the library now. Two ferro-kittens issues came out of
+     the port: `RegVec` could not reach memory at all, which is what the LSE
+     epilogue is (ferro #130, fixed in ferro #170, merged), and `mma_ab`'s shape
+     argument is the output *band's* width where the shipped example and the
+     entry point's own doctest both read it as the tile's (ferro #175/#176, merged) —
+     a wrong `O` that faults nothing, in the file this issue said to start
+     from.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 

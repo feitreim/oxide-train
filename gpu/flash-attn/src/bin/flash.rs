@@ -16,10 +16,10 @@ mod tcgen05_device;
 use tcgen05_device as tcgen05;
 
 use host::{
-    FLASH_HD, FLASH_SUBTILE_HD, FLASH_TILE, Tcgen05Flash, correction_count_len,
+    FLASH_HD, FLASH_QUERIES, FLASH_SUBTILE_HD, FLASH_TILE, Tcgen05Flash, correction_count_len,
     create_flash_head_tma_map, device_sm_count, flash_backward_kv_config,
     flash_backward_kv_pipelined_config, flash_backward_q_config, flash_backward_q_pipelined_config,
-    flash_forward_config, flash_persistent_config, flash_pipelined_config,
+    flash_forward_config,
 };
 
 /// Pinned ptxas ceilings (issue #61 phase 0): the B200-measured budgets from
@@ -77,131 +77,98 @@ use host::{
 /// key tile. It costs **one** register over the synchronous kernel (52 → 53,
 /// same 512 B frame) — the tile library's overhead for a whole pipeline is
 /// inside the noise of a single scalar.
-const KERNEL_BUDGETS: [KernelBudget; 7] = [
+const KERNEL_BUDGETS: [KernelBudget; 5] = [
     KernelBudget {
-        name: "forward sync",
-        max_registers: 32,
-        max_spill_bytes: 592,
+        // The unified forward (#68): 244 regs / 1136 B frame, against the
+        // persistent kernel's 236 / 592.
+        //
+        // The 1136 B is `out_acc`, the 128-register output accumulator. Both
+        // things that write it — `online_rescale` and `merge_output_tile` —
+        // take it by `&mut`, so it is address-taken and lands in the LLVM
+        // local depot whole. It is not hot: the only reader inside the key
+        // stream is the correction path, which fires on **0.00%** of visits at
+        // every gated shape.
+        //
+        // The band beside it *was* hot, and that is what `SCORE_CHUNK`
+        // records: holding the whole `[32, 64]` score band as a value put it
+        // in the depot too (1328 B, 3546 local accesses) and cost **2.635 ms**
+        // at the profile shape; walking it 16 columns at a time is 2.125.
+        //
+        // Getting the accumulator out of the depot means not keeping it in
+        // registers at all — `tcgen05.st` (absent when this correction scheme
+        // was designed, present in the library now) lets the rescale happen in
+        // the O segment. See the PR.
+        name: "forward",
+        max_registers: 246,
+        max_spill_bytes: 1072,
     },
     KernelBudget {
-        name: "forward pipelined",
-        max_registers: 216,
-        max_spill_bytes: 592,
-    },
-    KernelBudget {
-        name: "forward persistent",
-        max_registers: 236,
-        max_spill_bytes: 592,
-    },
-    KernelBudget {
+        // 52 → 53 with nothing in this kernel changed. Three kernels left the
+        // shared artifact (#68) and the allocator re-rolled: the same crate
+        // composition effect that moves a GEMM by 68 registers, here worth
+        // one, and in both directions — `backward q pipelined` went the other
+        // way over the same edit.
         name: "backward q",
-        max_registers: 52,
-        max_spill_bytes: 512,
-    },
-    KernelBudget {
-        // The kittens-first pipelined backward, first flight: 53 regs / 512 B
-        // frame, one register over the synchronous kernel it replaces for
-        // three warp roles, two S/dP buffers and six barrier sets.
-        name: "backward q pipelined",
         max_registers: 53,
         max_spill_bytes: 512,
     },
     KernelBudget {
+        // The kittens-first pipelined backward: 53 → 52 over #68, see
+        // `backward q`. Same 512 B frame.
+        name: "backward q pipelined",
+        max_registers: 52,
+        max_spill_bytes: 512,
+    },
+    KernelBudget {
+        // 60 → 59 over #68, see `backward q`.
         name: "backward kv",
-        max_registers: 60,
+        max_registers: 59,
         max_spill_bytes: 1024,
     },
     KernelBudget {
-        // Kernel B's pipelined form, first flight: 72 regs / 1024 B frame.
-        // The +12 over the synchronous kernel (against kernel A's +1) is the
-        // second gradient accumulator's drain — two `RegTile<4, 32>`s live
-        // through the epilogue instead of one. Occupancy is TMEM-pinned at
-        // one CTA/SM (this kernel uses all 512 columns), so it buys nothing
-        // to fight.
+        // Kernel B's pipelined form: 72 → 70 over #68, see `backward q`.
+        // The gap to the synchronous kernel is the second gradient
+        // accumulator's drain — two `RegTile<4, 32>`s live through the
+        // epilogue instead of one. Occupancy is TMEM-pinned at one CTA/SM
+        // (this kernel uses all 512 columns), so it buys nothing to fight.
         name: "backward kv pipelined",
-        max_registers: 72,
+        max_registers: 70,
         max_spill_bytes: 1024,
     },
 ];
 
-/// Which forward kernel a gate or bench exercises; all three share the
-/// operand and output contract, so everything downstream of the launch is
-/// common.
-#[derive(Clone, Copy, PartialEq)]
-enum Forward {
-    Sync,
-    Pipelined,
-    Persistent,
-}
-
-const FORWARDS: [Forward; 3] = [Forward::Sync, Forward::Pipelined, Forward::Persistent];
-
-impl Forward {
-    fn name(self) -> &'static str {
-        match self {
-            Forward::Sync => "sync",
-            Forward::Pipelined => "pipelined",
-            Forward::Persistent => "persistent",
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn launch(
-        self,
-        flash: &Tcgen05Flash,
-        stream: &Arc<CudaStream>,
-        b: usize,
-        t: usize,
-        h: usize,
-        persistent_ctas: usize,
-        q_tma: &host::FlashHeadTmaMap,
-        k_tma: &host::FlashHeadTmaMap,
-        v_tma: &host::FlashHeadTmaMap,
-        y: &mut DeviceBuffer<f32>,
-        lse: &mut DeviceBuffer<f32>,
-        corrections: &mut DeviceBuffer<u32>,
-    ) -> Result<(), cuda_core::DriverError> {
-        unsafe {
-            match self {
-                Forward::Sync => flash.forward(
-                    stream,
-                    flash_forward_config(b, t, h),
-                    q_tma.as_ptr(),
-                    k_tma.as_ptr(),
-                    v_tma.as_ptr(),
-                    t as u32,
-                    h as u32,
-                    y,
-                    lse,
-                    corrections,
-                ),
-                Forward::Pipelined => flash.forward_pipelined(
-                    stream,
-                    flash_pipelined_config(b, t, h),
-                    q_tma.as_ptr(),
-                    k_tma.as_ptr(),
-                    v_tma.as_ptr(),
-                    t as u32,
-                    h as u32,
-                    y,
-                    lse,
-                    corrections,
-                ),
-                Forward::Persistent => flash.forward_persistent(
-                    stream,
-                    flash_persistent_config(b, t, h, persistent_ctas),
-                    q_tma.as_ptr(),
-                    k_tma.as_ptr(),
-                    v_tma.as_ptr(),
-                    t as u32,
-                    h as u32,
-                    b as u32,
-                    y,
-                    lse,
-                    corrections,
-                ),
-            }
-        }
+/// Launch the forward. A free function where there used to be an enum over
+/// three kernels — #68 left one, and its operand and output contract is the
+/// three generations'.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_forward(
+    flash: &Tcgen05Flash,
+    stream: &Arc<CudaStream>,
+    b: usize,
+    t: usize,
+    h: usize,
+    ctas: usize,
+    q_tma: &host::FlashHeadTmaMap,
+    k_tma: &host::FlashHeadTmaMap,
+    v_tma: &host::FlashHeadTmaMap,
+    y: &mut DeviceBuffer<f32>,
+    lse: &mut DeviceBuffer<f32>,
+    corrections: &mut DeviceBuffer<u32>,
+) -> Result<(), cuda_core::DriverError> {
+    unsafe {
+        flash.forward(
+            stream,
+            flash_forward_config(b, t, h, ctas),
+            q_tma.as_ptr(),
+            k_tma.as_ptr(),
+            v_tma.as_ptr(),
+            t as u32,
+            h as u32,
+            b as u32,
+            y,
+            lse,
+            corrections,
+        )
     }
 }
 
@@ -509,53 +476,46 @@ fn check_forward(
     let q_tma = unsafe { create_flash_head_tma_map(stream, &q_device, t, b * h)? };
     let k_tma = unsafe { create_flash_head_tma_map(stream, &k_device, t, b * h)? };
     let v_tma = unsafe { create_flash_head_tma_map(stream, &v_device, t, b * h)? };
-    for kernel in FORWARDS {
-        let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-        let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
-        let mut corrections = DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
-        unsafe {
-            kernel.launch(
-                flash,
-                stream,
-                b,
-                t,
-                h,
-                sm_count,
-                &q_tma,
-                &k_tma,
-                &v_tma,
-                &mut y,
-                &mut lse,
-                &mut corrections,
-            )?;
-        }
-        println!(
-            "tcgen05 {} forward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]",
-            kernel.name()
-        );
-        let y_host = y.to_host_vec(stream)?;
-        let lse_host = lse.to_host_vec(stream)?;
-        // Diagnostic slice (batch 0, head 0): one y feature and the LSE per
-        // sampled row. LSE encodes the kernel's internal row max + sum, so a
-        // matching LSE with a broken y isolates the P·V path, and vice versa.
-        if kernel == Forward::Sync {
-            for row in [0usize, 1, 2, 7, 8, 15, 16, 31, 32, 64, 127] {
-                if row < t {
-                    println!(
-                        "  row {row:>3}: y0 gpu {:>12.6} ref {:>12.6} | lse gpu {:>12.6} ref {:>12.6}",
-                        y_host[row * d],
-                        expected_y[row * d],
-                        lse_host[row * h],
-                        expected_lse[row * h],
-                    );
-                }
-            }
-        }
-        // Measured maxima: y 1.4e-3, lse 1.4e-4 (T=128..512); ~3x headroom.
-        assert_close("y", &y_host, &expected_y, 5.0e-3, 5.0e-3);
-        assert_close("lse", &lse_host, &expected_lse, 1.0e-3, 0.0);
-        print_correction_rate(stream, &corrections, b, t, h)?;
+    let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+    let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+    let mut corrections = DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
+    unsafe {
+        launch_forward(
+            flash,
+            stream,
+            b,
+            t,
+            h,
+            sm_count,
+            &q_tma,
+            &k_tma,
+            &v_tma,
+            &mut y,
+            &mut lse,
+            &mut corrections,
+        )?;
     }
+    println!("tcgen05 forward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]");
+    let y_host = y.to_host_vec(stream)?;
+    let lse_host = lse.to_host_vec(stream)?;
+    // Diagnostic slice (batch 0, head 0): one y feature and the LSE per
+    // sampled row. LSE encodes the kernel's internal row max + sum, so a
+    // matching LSE with a broken y isolates the P·V path, and vice versa.
+    for row in [0usize, 1, 2, 7, 8, 15, 16, 31, 32, 64, 127] {
+        if row < t {
+            println!(
+                "  row {row:>3}: y0 gpu {:>12.6} ref {:>12.6} | lse gpu {:>12.6} ref {:>12.6}",
+                y_host[row * d],
+                expected_y[row * d],
+                lse_host[row * h],
+                expected_lse[row * h],
+            );
+        }
+    }
+    // Measured maxima: y 1.4e-3, lse 1.4e-4 (T=128..512); ~3x headroom.
+    assert_close("y", &y_host, &expected_y, 5.0e-3, 5.0e-3);
+    assert_close("lse", &lse_host, &expected_lse, 1.0e-3, 0.0);
+    print_correction_rate(stream, &corrections, b, t, h)?;
     Ok(())
 }
 
@@ -781,8 +741,12 @@ fn print_correction_rate(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let counts = corrections.to_host_vec(stream)?;
     let total: u64 = counts.iter().map(|&c| c as u64).sum();
-    let tiles = t / FLASH_TILE;
-    let eligible = (b * h * tiles * (tiles - 1) / 2) as u64;
+    // A query block of `FLASH_QUERIES` rows streams `2 * (block + 1)` key
+    // tiles and cannot correct on its first, so the eligible visits are the
+    // key-tile visits less one per work item.
+    let blocks = t / FLASH_QUERIES;
+    let visits = blocks * (blocks + 1);
+    let eligible = (b * h * (visits - blocks)) as u64;
     let rate = if eligible == 0 {
         0.0
     } else {
@@ -818,37 +782,40 @@ fn bench(
     let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
     let mut corrections = DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
 
-    // Issued MMA work: per key-tile visit one 128x128x64 S GEMM and one
-    // 128x64x128 O GEMM; causal tiling visits nt*(nt+1)/2 tiles per (b,h).
+    // ALGORITHMIC work, which is the number that survived #68: one
+    // `[64, 64]` score block and its `[64, 128]` output contribution per
+    // causal `(query tile, key tile)` pair, `nt*(nt+1)/2` pairs per (b, h).
+    //
+    // Through #35 this counted *issued* MMA work instead, and issued was twice
+    // algorithmic because a 64-query tile filled half of every `M128`. The
+    // unified forward issues no phantom rows, so the two counts have converged
+    // and the old TFLOP/s figures are 2x this scale — compare the milliseconds.
     let tiles = t / FLASH_TILE;
-    let visits = (b * h * tiles * (tiles + 1) / 2) as f64;
-    let flop = visits * 2.0 * (2.0 * 128.0 * 128.0 * 64.0);
-    for kernel in FORWARDS {
-        let milliseconds = time_gpu_iters(stream, 3, 20, || {
-            unsafe {
-                kernel.launch(
-                    flash,
-                    stream,
-                    b,
-                    t,
-                    h,
-                    sm_count,
-                    &q_tma,
-                    &k_tma,
-                    &v_tma,
-                    &mut y,
-                    &mut lse,
-                    &mut corrections,
-                )?;
-            }
-            Ok(())
-        })?;
-        println!(
-            "tcgen05 {} forward [{b},{t},{h},{FLASH_HD}]: {milliseconds:.3} ms, {:.1} TFLOP/s",
-            kernel.name(),
-            flop / (milliseconds * 1.0e-3) / 1.0e12
-        );
-    }
+    let pairs = (b * h * tiles * (tiles + 1) / 2) as f64;
+    let flop = pairs * 2.0 * (2.0 * 64.0 * 64.0 * 128.0);
+    let milliseconds = time_gpu_iters(stream, 3, 20, || {
+        unsafe {
+            launch_forward(
+                flash,
+                stream,
+                b,
+                t,
+                h,
+                sm_count,
+                &q_tma,
+                &k_tma,
+                &v_tma,
+                &mut y,
+                &mut lse,
+                &mut corrections,
+            )?;
+        }
+        Ok(())
+    })?;
+    println!(
+        "tcgen05 forward [{b},{t},{h},{FLASH_HD}]: {milliseconds:.3} ms, {:.1} TFLOP/s",
+        flop / (milliseconds * 1.0e-3) / 1.0e12
+    );
     print_correction_rate(stream, &corrections, b, t, h)?;
 
     // Backward kernels at the same shape. Per key-tile visit each kernel
@@ -863,14 +830,14 @@ fn bench(
     let mut dq = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dk = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut dv = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-    let backward_flop = visits * 5.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    let backward_flop = pairs * 5.0 * (2.0 * 128.0 * 128.0 * 64.0);
 
     // Kernel A alone on both schedules: the direct measure of what the
     // warp specialization bought. Per key-tile visit kernel A issues two
     // 128x128x64 score GEMMs plus one 128x64x128 gradient GEMM.
-    let q_flop = visits * 3.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    let q_flop = pairs * 3.0 * (2.0 * 128.0 * 128.0 * 64.0);
     // Kernel B issues two score GEMMs plus two gradient GEMMs per visit.
-    let kv_flop = visits * 4.0 * (2.0 * 128.0 * 128.0 * 64.0);
+    let kv_flop = pairs * 4.0 * (2.0 * 128.0 * 128.0 * 64.0);
     for (name, pipelined) in [("sync", false), ("pipelined", true)] {
         let milliseconds = time_gpu_iters(stream, 3, 20, || {
             unsafe {
@@ -995,27 +962,19 @@ fn bench(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
-        host::FLASH_DYNAMIC_SMEM_BYTES as usize,
-        tcgen05_device::FLASH_DYNAMIC_SMEM,
-        "host.rs and tcgen05.rs disagree on the dynamic shared plan"
+        host::FLASH_FORWARD_SMEM_BYTES as usize,
+        tcgen05_device::FLASH_FORWARD_SMEM,
+        "the launch must request the kernel's own plan, or residency is the request's"
     );
-    assert!(
-        tcgen05_device::FLASH_PIPELINE_SMEM <= host::FLASH_PIPELINE_SMEM_BYTES as usize,
-        "PIPELINE_STAGES overflows the host-side shared-memory ceiling"
-    );
-    assert_eq!(
-        host::FLASH_PIPELINE_BLOCK_THREADS as usize,
-        tcgen05_device::FLASH_PIPELINE_BLOCK,
-        "host.rs and tcgen05.rs disagree on the pipelined block width"
-    );
-    assert!(
-        tcgen05_device::FLASH_PERSISTENT_SMEM <= host::FLASH_PERSISTENT_SMEM_BYTES as usize,
-        "PERSISTENT_STAGES overflows the host-side shared-memory ceiling"
+    println!(
+        "forward plan: {} B, {} CTA/SM",
+        tcgen05_device::FLASH_FORWARD_SMEM,
+        host::FLASH_FORWARD_CTAS_PER_SM
     );
     assert_eq!(
-        host::FLASH_PERSISTENT_BLOCK_THREADS as usize,
-        tcgen05_device::FLASH_PERSISTENT_BLOCK,
-        "host.rs and tcgen05.rs disagree on the persistent block width"
+        host::FLASH_FORWARD_BLOCK_THREADS as usize,
+        tcgen05_device::FLASH_FORWARD_BLOCK,
+        "host.rs and tcgen05.rs disagree on the forward block width"
     );
     assert_eq!(
         host::FLASH_BACKWARD_Q_SMEM_BYTES as usize,
