@@ -15,6 +15,11 @@ use cuda_device::{
     cuda_module, kernel, thread,
 };
 
+use kittens::global::{GlobalRows, load_rows, store_rows};
+use kittens::reg::{BaseLdtm, RegTile, RegVec};
+use kittens::shared::F32;
+use kittens::{lane, warp_id};
+
 /// Threads in the row-parallel fused classifier kernels.
 ///
 /// Each block owns one row and lanes stride over the vocabulary. Keeping this
@@ -32,6 +37,31 @@ pub const NORM_THREADS: usize = 256;
 /// parallelism to saturate the GPU. Each block performs one atomic add per
 /// owned column, rather than one atomic per input element.
 pub const NORM_WEIGHT_ROWS_PER_BLOCK: usize = 256;
+
+/// Rows one warp owns in the tile RMSNorm kernels.
+///
+/// `BaseLdtm` hands a warp its rows in 16-row blocks, so this is the tile's
+/// `M` and the unit the grid is cut in. 32 is the layout's natural band and
+/// what every shipped kittens kernel uses.
+pub const NORM_TILE_ROWS: usize = 32;
+
+/// Columns a tile-RMSNorm warp holds in registers at once.
+///
+/// The row statistic is carried across chunks, so this trades registers for
+/// the number of times the row is walked, exactly as `layernorm`'s `CHUNK`
+/// does. `dim` must be a multiple of it.
+pub const NORM_TILE_CHUNK: usize = 32;
+
+/// Warps in one tile-RMSNorm block. Each owns its own [`NORM_TILE_ROWS`] rows
+/// and never talks to the others, so this only sets how many bands a CTA
+/// carries.
+pub const NORM_TILE_WARPS: usize = 4;
+
+/// Threads in one tile-RMSNorm block.
+pub const NORM_TILE_THREADS: usize = 32 * NORM_TILE_WARPS;
+
+/// Rows one tile-RMSNorm block owns — the grid's row quantum.
+pub const NORM_TILE_BLOCK_ROWS: usize = NORM_TILE_ROWS * NORM_TILE_WARPS;
 
 /// Threads in one expert's deterministic MoE capacity-assignment block.
 ///
@@ -97,6 +127,13 @@ pub const MOE_ZERO_BINS_THREADS: usize = 256;
 /// A row base `row * dim` is 16-byte aligned whenever `dim % QUAD_LANES == 0`,
 /// which is the guard every vectorized row walk below checks.
 pub const QUAD_LANES: usize = 4;
+
+/// One warp's slice of a row band, [`NORM_TILE_CHUNK`] columns wide.
+type NormChunk = RegTile<NORM_TILE_ROWS, NORM_TILE_CHUNK, BaseLdtm>;
+
+/// One `f32` per row of a [`NormChunk`], replicated across each quad — where a
+/// row statistic lives between the passes that produce and consume it.
+type NormRows = RegVec<NORM_TILE_ROWS, BaseLdtm>;
 
 #[cuda_module]
 pub mod kernels {
@@ -469,6 +506,129 @@ pub mod kernels {
         // zero/accumulation state and subsequent optimizer read.
         let slot = unsafe { DeviceAtomicF32::from_ptr(dweight.as_mut_ptr().add(col)) };
         slot.fetch_add(grad, AtomicOrdering::Relaxed);
+    }
+
+    /// Warp-per-band RMSNorm forward on kittens register tiles.
+    ///
+    /// [`rms_norm_forward_fast`] gives a row to a 256-thread block and pays a
+    /// shared-memory tree and eight barriers for its one statistic. Here a warp
+    /// owns [`NORM_TILE_ROWS`] rows at once, so the same statistic is
+    /// `RegTile::row_sum` — two shuffles, no shared memory and no barrier —
+    /// and the row is walked [`NORM_TILE_CHUNK`] columns at a time through
+    /// `load_rows`, which pairs adjacent columns into one access.
+    ///
+    /// # Safety
+    ///
+    /// Launch with [`NORM_TILE_THREADS`] threads and a grid covering exactly
+    /// `rows / NORM_TILE_BLOCK_ROWS` blocks: `rows` must be a multiple of
+    /// [`NORM_TILE_BLOCK_ROWS`] and `dim` of [`NORM_TILE_CHUNK`], both checked
+    /// by the launcher rather than the kernel, which never bounds-checks.
+    #[kernel]
+    pub unsafe fn rms_norm_forward_tile(
+        x: &[f32],
+        weight: &[f32],
+        eps: f32,
+        dim: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let row = NORM_TILE_BLOCK_ROWS as u32 * thread::blockIdx_x()
+                + NORM_TILE_ROWS as u32 * warp_id();
+            let d = dim as usize;
+            let source = GlobalRows::<F32>::from_raw(x.as_ptr() as *mut u8, d);
+            let destination = GlobalRows::<F32>::from_slice(&mut y, d);
+            // Stride zero: every row of this tile is the same `[dim]` weight
+            // vector, so one cursor broadcasts it and the per-column operand
+            // needs no separate staging pass.
+            let parameters = GlobalRows::<F32>::from_raw(weight.as_ptr() as *mut u8, 0);
+
+            let mut total = NormRows::splat(0.0);
+            let mut column = 0u32;
+            while column < dim {
+                let v: NormChunk = load_rows(source, row, column, lane);
+                total.add_assign(v.mul(v).row_sum());
+                column += NORM_TILE_CHUNK as u32;
+            }
+            let inv = total.scale(1.0 / dim as f32).shift(eps).rsqrt();
+
+            column = 0;
+            while column < dim {
+                let v: NormChunk = load_rows(source, row, column, lane);
+                let w: NormChunk = load_rows(parameters, 0, column, lane);
+                store_rows(destination, row, column, lane, v.mul_row(inv).mul(w));
+                column += NORM_TILE_CHUNK as u32;
+            }
+        }
+    }
+
+    /// [`rms_norm_backward_x_fast`] on register tiles, carrying both row
+    /// statistics as [`NormRows`] instead of two shared arrays.
+    ///
+    /// The row inverses go out the same way they do there — one value per row,
+    /// written by the quad's first lane, since `row_sum` leaves each row's
+    /// statistic replicated across its four.
+    ///
+    /// # Safety
+    ///
+    /// As [`rms_norm_forward_tile`], and `inv` is `rows` long.
+    #[kernel]
+    pub unsafe fn rms_norm_backward_x_tile(
+        x: &[f32],
+        weight: &[f32],
+        dy: &[f32],
+        eps: f32,
+        dim: u32,
+        mut dx: DisjointSlice<f32>,
+        mut inv: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let row = NORM_TILE_BLOCK_ROWS as u32 * thread::blockIdx_x()
+                + NORM_TILE_ROWS as u32 * warp_id();
+            let d = dim as usize;
+            let source = GlobalRows::<F32>::from_raw(x.as_ptr() as *mut u8, d);
+            let upstream = GlobalRows::<F32>::from_raw(dy.as_ptr() as *mut u8, d);
+            let destination = GlobalRows::<F32>::from_slice(&mut dx, d);
+            let parameters = GlobalRows::<F32>::from_raw(weight.as_ptr() as *mut u8, 0);
+
+            let mut square = NormRows::splat(0.0);
+            let mut dot = NormRows::splat(0.0);
+            let mut column = 0u32;
+            while column < dim {
+                let v: NormChunk = load_rows(source, row, column, lane);
+                let g: NormChunk = load_rows(upstream, row, column, lane);
+                let w: NormChunk = load_rows(parameters, 0, column, lane);
+                square.add_assign(v.mul(v).row_sum());
+                dot.add_assign(g.mul(w).mul(v).row_sum());
+                column += NORM_TILE_CHUNK as u32;
+            }
+            let row_inv = square.scale(1.0 / dim as f32).shift(eps).rsqrt();
+            let correction = dot
+                .mul(row_inv)
+                .mul(row_inv)
+                .mul(row_inv)
+                .scale(1.0 / dim as f32);
+
+            if lane % QUAD_LANES as u32 == 0 {
+                let mut slot = 0usize;
+                while slot < NormRows::SLOTS {
+                    *inv.get_unchecked_mut((row + NormRows::row(lane, slot)) as usize) =
+                        row_inv.get(slot);
+                    slot += 1;
+                }
+            }
+
+            column = 0;
+            while column < dim {
+                let v: NormChunk = load_rows(source, row, column, lane);
+                let g: NormChunk = load_rows(upstream, row, column, lane);
+                let w: NormChunk = load_rows(parameters, 0, column, lane);
+                let out = g.mul(w).mul_row(row_inv).sub(v.mul_row(correction));
+                store_rows(destination, row, column, lane, out);
+                column += NORM_TILE_CHUNK as u32;
+            }
+        }
     }
 
     #[kernel]

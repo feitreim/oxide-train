@@ -15,7 +15,8 @@ use tensor_cpu::CpuTensor;
 mod device;
 use device::{
     CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS,
-    MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM,
+    MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK,
+    NORM_TILE_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM,
     ROUTER_GEMM_BN, ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS,
     ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, kernels,
 };
@@ -39,6 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[ops] checking rms_norm");
     check_rms_norm(&stream, &module)?;
+    eprintln!("[ops] checking rms_norm tiles");
+    check_rms_norm_tile(&stream, &module)?;
     eprintln!("[ops] checking swiglu");
     check_swiglu(&stream, &module)?;
     eprintln!("[ops] checking embedding");
@@ -1124,6 +1127,103 @@ fn check_rms_norm(
             &dw_dev.to_host_vec(stream)?,
             5e-6,
             2e-5,
+        );
+        Ok(())
+    }
+}
+
+/// The tile RMSNorm kernels against the same CPU oracle the shipped ones use.
+///
+/// A separate shape from [`check_rms_norm`]'s deliberately unaligned one: the
+/// tile kernels take their divisibility from the launcher and do not bounds-
+/// check, so the case that exercises them is an aligned one. `1024` rows cross
+/// several blocks at every `NORM_TILE_WARPS` a sweep might set, and `192`
+/// columns divide by every `NORM_TILE_CHUNK` up to 64.
+fn check_rms_norm_tile(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: every buffer and launch below uses the same N x D shape, and N is
+    // a multiple of NORM_TILE_BLOCK_ROWS and D of NORM_TILE_CHUNK.
+    unsafe {
+        const N: usize = 1024;
+        const D: usize = 192;
+        assert_eq!(N % NORM_TILE_BLOCK_ROWS, 0);
+        assert_eq!(D % NORM_TILE_CHUNK, 0);
+
+        let x = CpuTensor::<f32, Rank2<N, D>>::uniform(1);
+        let weight = CpuTensor::<f32, Rank1<D>>::uniform(2).map(|v| v + 1.25);
+        let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(3);
+        let mut cpu = RmsNorm::<N, D>::new(weight.clone(), 1e-5);
+        let (cpu_y, cpu_ctx) = cpu.forward(x.clone());
+        let cpu_dx = cpu.backward(cpu_ctx, dy.clone());
+
+        let x_dev = DeviceBuffer::from_host(stream, x.as_slice())?;
+        let weight_dev = DeviceBuffer::from_host(stream, weight.as_slice())?;
+        let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+        let mut dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+        let mut inv_dev = DeviceBuffer::<f32>::zeroed(stream, N)?;
+        let mut inv_reference = DeviceBuffer::<f32>::zeroed(stream, N)?;
+
+        let tiles = LaunchConfig {
+            grid_dim: ((N / NORM_TILE_BLOCK_ROWS) as u32, 1, 1),
+            block_dim: (NORM_TILE_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        module.rms_norm_forward_tile(
+            stream,
+            tiles,
+            &x_dev,
+            &weight_dev,
+            1e-5,
+            D as u32,
+            &mut y_dev,
+        )?;
+        module.rms_norm_backward_x_tile(
+            stream,
+            tiles,
+            &x_dev,
+            &weight_dev,
+            &dy_dev,
+            1e-5,
+            D as u32,
+            &mut dx_dev,
+            &mut inv_dev,
+        )?;
+        module.rms_norm_row_inv(
+            stream,
+            LaunchConfig {
+                grid_dim: (N as u32, 1, 1),
+                block_dim: (NORM_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &x_dev,
+            1e-5,
+            D as u32,
+            &mut inv_reference,
+        )?;
+
+        assert_close(
+            "rmsnorm tile y",
+            &y_dev.to_host_vec(stream)?,
+            cpu_y.as_slice(),
+            2e-5,
+            2e-5,
+        );
+        assert_close(
+            "rmsnorm tile dx",
+            &dx_dev.to_host_vec(stream)?,
+            cpu_dx.as_slice(),
+            3e-5,
+            3e-5,
+        );
+        assert_close(
+            "rmsnorm tile inv",
+            &inv_dev.to_host_vec(stream)?,
+            &inv_reference.to_host_vec(stream)?,
+            1e-6,
+            1e-6,
         );
         Ok(())
     }

@@ -18,6 +18,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "bench-util"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "tensor-core",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.71.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -198,6 +206,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "ferro-kittens"
+version = "0.1.0"
+source = "git+https://github.com/feitreim/ferro-kittens?rev=caa60756c4bf96a836a4e42c1a843408d3c7271b#caa60756c4bf96a836a4e42c1a843408d3c7271b"
+dependencies = [
+ "cuda-device",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -350,9 +366,11 @@ dependencies = [
 name = "ops"
 version = "0.1.0"
 dependencies = [
+ "bench-util",
  "cuda-core",
  "cuda-device",
  "cuda-host",
+ "ferro-kittens",
  "nn",
  "tensor-core",
  "tensor-cpu",
