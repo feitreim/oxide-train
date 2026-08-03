@@ -70,12 +70,11 @@ use host::{
 /// persistent 240→236, reproducible across runs. Occupancy is unaffected
 /// (TMEM pins 1 CTA/SM; 216×128 threads ≈ 27.6K of the 64K register file).
 ///
-/// `backward q pipelined` (2026-07-26) is the first kernel written
-/// kittens-first rather than ported: same Design-B math as `backward q`, the
-/// forward's three-role warp specialization instead of four block syncs per
-/// key tile. It costs **one** register over the synchronous kernel (52 → 53,
-/// same 512 B frame) — the tile library's overhead for a whole pipeline is
-/// inside the noise of a single scalar.
+/// `backward q pipelined` (2026-07-26) was the first kernel written
+/// kittens-first rather than ported, and cost **one** register over the
+/// synchronous kernel for a whole pipeline. #69 retired both: the two backward
+/// kernels below are the only ones now, and their pins are re-set to what
+/// ptxas gives a 128-thread `.maxntid` rather than a 192- or 1024-thread one.
 const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
         // The unified forward (#68): 244 regs / 1136 B frame, against the
@@ -102,32 +101,36 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         max_spill_bytes: 1072,
     },
     KernelBudget {
-        // The unified query-parallel backward (#69), replacing a synchronous
-        // kernel at 53 registers / 512 B and a warp-specialized one at 52/512.
+        // The unified query-parallel backward (#69): 244 regs / 528 B frame,
+        // against the warp-specialized kernel's 52 / 512 and the synchronous
+        // one's 53 / 512.
         //
-        // It is allowed more than either because it *is* both: one warpgroup
-        // now holds the TMA cursor, the MMA issue and the register pass that
-        // used to be three warp roles over 192 threads, and the pass itself
-        // holds two `SCORE_CHUNK` bands (the score and the gradient) where the
-        // kernels it replaces held one 8-register `Fragment` at a time. The
-        // ceiling that matters is the frame: dQ lives in tensor memory for the
-        // whole key stream, so unlike the forward there is no 128-register
-        // accumulator to land in the local depot, and this number is expected
-        // to be small.
+        // **The jump is `.maxntid`, not the code.** Those kernels declared 192
+        // and 1024 threads; this one declares 128, so ptxas' per-thread budget
+        // went from 65536/1024 to 65536/128 and it spent what it was given.
+        // 244 × 128 threads is 31.2K of the 64K register file — two blocks'
+        // worth — and residency is pinned at one CTA an SM by tensor memory
+        // regardless, so there is nothing here to reclaim.
+        //
+        // The frame is 528 B and flat: dQ lives in tensor memory for the whole
+        // key stream, so unlike the forward there is no 128-register
+        // accumulator taken by `&mut` to land in the LLVM local depot. What is
+        // there is the `pipeline::Job` struct itself, which `pipeline::run`
+        // takes by `&mut` for the same reason.
         name: "backward q",
-        max_registers: 255,
-        max_spill_bytes: 4096,
+        max_registers: 244,
+        max_spill_bytes: 528,
     },
     KernelBudget {
-        // The unified key-parallel backward. Above kernel A's for the reason
-        // its predecessors were: two gradient accumulators drain at the
-        // epilogue instead of one, and the register pass holds `Pᵀ` live
-        // across forming `dSᵀ` from it. Occupancy is TMEM-pinned at one CTA an
-        // SM (this kernel takes all 512 columns), so there is nothing to buy
-        // by fighting it.
+        // The unified key-parallel backward, at exactly kernel A's 244 / 528
+        // despite carrying a second gradient accumulator and holding `Pᵀ` live
+        // across forming `dSᵀ` from it — the two kernels' pressure is the same
+        // `.maxntid` ceiling and neither is near what it would need to spill.
+        // Its predecessors differed (59/1024 sync, 70/1024 pipelined) because
+        // they were near theirs.
         name: "backward kv",
-        max_registers: 255,
-        max_spill_bytes: 4096,
+        max_registers: 244,
+        max_spill_bytes: 528,
     },
 ];
 

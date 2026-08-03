@@ -1552,6 +1552,77 @@ Each gated on tests; correctness before speed at every step.
      entry point's own doctest both read it as the tile's (ferro #175/#176, merged) —
      a wrong `O` that faults nothing, in the file this issue said to start
      from.
+   - ✅ **One flash-attention backward per direction, on the forward's shape**
+     (#69): `flash_backward_q_tcgen05`/`_pipelined` and
+     `flash_backward_kv_tcgen05`/`_pipelined` collapse into `flash_backward_q`
+     and `flash_backward_kv`. The synchronous pair exposed TMA → MMA →
+     register pass → gradient MMA behind **four** block barriers per key tile;
+     the warp-specialized pair bought those back with a dedicated TMA warp and
+     MMA warp over 192 threads. Neither is needed once the leader issues
+     `S(i+1)`/`dP(i+1)` before the register pass of tile `i`, which is #68's
+     move applied to a kernel that already owned 128 rows: 128 threads, **one**
+     block barrier per key tile (the one that publishes dS), and both kernels
+     on `pipeline::run` with the item order that deals the longest streams
+     first — descending query block in kernel A, **ascending** key block in
+     kernel B, since a key block streams every query at or after it.
+     **Bench** at [32,1024,24,128], same container as the baseline
+     (forward 1.339 against its 1.338, so the container is the same machine):
+
+     | | pipelined baseline | #69 | |
+     | --- | ---: | ---: | ---: |
+     | kernel A (dQ) | 2.125 ms | **1.298 ms** | −38.9% |
+     | kernel B (dK/dV) | 2.631 ms | **1.990 ms** | −24.4% |
+     | both | 4.756 ms | **3.285 ms** | **−30.9%** |
+
+     **Parity** against the staged-bf16 CPU reference at [2,128,3], [1,256,2]
+     and [1,1024,4]: dq ≤ **7.30e-4**, dk ≤ **7.44e-4**, dv ≤ **2.93e-3**,
+     against a 5e-3 tolerance and baseline maxima of 7.66e-4 / 7.32e-4 /
+     2.93e-3 — the same numbers, which is the point: the masking moved from a
+     per-value `keep` predicate to `make_causal_at` on the *score* (a masked
+     score exp2s to zero and multiplies the finite `dP − D` to nothing), the
+     `exp2` moved to the SFU with the forward's, and neither shifted a digit.
+     The ops-oracle gate is unchanged too. What is *not* gated any more is
+     `assert_identical` between the two schedules, which had no meaning once
+     there is one of each.
+     **What the library did.** The register pass is `RegTile` ops on
+     `SCORE_CHUNK`-wide chunks rather than a hand-written `Fragment` loop:
+     `make_causal_at`/`make_causal_t_at`, `sub_row_assign`/`sub_col_assign`,
+     `Exp2Hw`, `mul_assign`, `store_tile`. The per-query statistics reach
+     registers with no staging tile, no scatter and no barrier —
+     `global::load_row_vec` in kernel A (ferro #170) and `load_col_vec` in
+     kernel B. The epilogue is `store_rows` off a `tile_x8` drain. ptxas gives
+     both kernels **244 regs / 528 B**, against 52–70 / 512–1024 before, and
+     that is `.maxntid` and not the code: 192 and 1024 threads became 128, so
+     the per-thread budget went from 65536/1024 to 65536/128. Residency is
+     pinned at **1 CTA/SM** by tensor memory either way — kernel A takes 384 of
+     `tcgen05.alloc`'s 512 columns and kernel B all 512 — which is why the
+     backward's shared plans are sized for the ring and not, like the
+     forward's, against a two-CTA budget.
+     **The transposed band was the library gap, and it was not the one
+     expected.** #69 pre-listed a register transpose as the likely one; it is
+     not needed, because `mma_abt(K, Q)` produces the key-major band directly
+     and the operand-order square covers every site — nothing here wants the
+     second `FragmentLayout` GAPS §1.3 has open. What kernel B did want was the
+     two things that existed on the query-major diagonal only: the
+     block-origin form of the transposed causal mask (`make_causal_t` had no
+     `_at`, and `key_base − query_base` is negative on every visit but the
+     first, which is exactly the `u32` wrap `make_causal_at` was written to
+     prevent), and the saved row statistic delivered onto the **column** axis.
+     Both are ferro-kittens #178, fixed in ferro #179.
+     **What is left.** (1) **The split costs 40% of the tensor-core work.**
+     Each kernel recomputes `S`, so the pair issues 5 GEMM-equivalents per
+     causal (query tile, key tile) pair where a fused kernel would issue 3.
+     Fusing needs cross-CTA gradient accumulation — atomics, or TMA reduction
+     stores (ferro #42) — and would pay ~4.5x the dK/dV write traffic at
+     T=1024 and give up determinism, so it is a measurement nobody can make
+     until that surface exists. It is the largest single lever left on the
+     backward. (2) **2 CTAs/SM** is one `const` away in kernel A only, and an
+     expensive one: single-buffering the score and gradient segments lands
+     exactly on 256 TMEM columns and deletes the overlap that is the whole
+     design. Worth a sweep, not a guess. (3) The gradient epilogue writes three
+     fp32 `[128, 128]` tiles through `store_rows`' scattered per-value stores,
+     which ferro #174 measured at 3x a staged drain — once per work item here,
+     so it is small, but it is the same hole.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 
