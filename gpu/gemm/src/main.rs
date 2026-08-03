@@ -93,20 +93,39 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
         .collect()
 }
 
-/// ptxas allocation pins for the production kernel (SPEC §13, 7e17): hard
-/// ceiling on regression, ratchet hint on improvement. Pinned at the kittens
-/// port's gated measurement (2026-07-26, B200): 48 regs, no spill — identical
-/// to the pre-port allocation, measured the same day.
+/// ptxas allocation pins for the production kernels (SPEC §13, 7e17): hard
+/// ceiling on regression, ratchet hint on improvement. Re-pinned at #67's gated
+/// measurement on a B200.
+///
+/// They went **up** from the 48 the exact-cover kernel held, and that is the
+/// rewrite working rather than regressing. That kernel's four epilogue warps
+/// read TMEM one `[16, 16]` fragment at a time — an `.x1` LDTM whose registers
+/// are the load's return value, so the compiler could fuse each fragment
+/// straight through to its store and never hold a band. The `.x8` drain lands
+/// 32 fp32 at once and keeps four blocks live, which is what ferro-kittens #117
+/// measured at **+23.1% / +8.8% / +5.1%** and priced at +52 registers. The
+/// ceiling is 255: two CTAs of 128 threads admit the whole file, so the
+/// headroom is what matters and there is a great deal of it.
+///
+/// The fp32 entry point is higher because its drain has no staging tile to hand
+/// values off to (GAPS.md §2.6): its `store_rows` walk holds the band, and the
+/// accumulating mode holds `C` beside it.
+///
+/// `max_spill_bytes` here is the **local-memory frame**, not spill stores —
+/// `bench_util` reads `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES`. 256 B is what
+/// ferro-kittens' own `gemm_cg2_staged_x8x4` carries at these same 80
+/// registers, with `ptxas -v` reporting zero spill stores beside it; the frame
+/// is the `Job`'s state, not values that failed to fit.
 const KERNEL_BUDGETS: [KernelBudget; 2] = [
     KernelBudget {
         name: "gemm_tcgen05_bf16_optimized",
-        max_registers: 48,
-        max_spill_bytes: 0,
+        max_registers: 80,
+        max_spill_bytes: 256,
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_optimized",
-        max_registers: 48,
-        max_spill_bytes: 0,
+        max_registers: 126,
+        max_spill_bytes: 528,
     },
 ];
 
@@ -120,7 +139,165 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_fp32(&stream, &fp32_module)?;
     check_tcgen05_bf16(&stream, &module)?;
     check_tcgen05_bf16_transposed(&stream, &module)?;
+    check_tcgen05_many_items(&stream, &module)?;
     println!("✓ fp32 and tcgen05 bf16 GEMM store/accumulate parity passed");
+    Ok(())
+}
+
+/// Does a **cluster taking a second work item** still compute the right `C`?
+///
+/// Every failure mode the persistent grid has that the exact-cover kernel did
+/// not is at that boundary, and no shape above reaches it: the two 256³ gates
+/// launch one cluster with one item each. What has to survive a second item is
+/// the whole barrier lifecycle — `inval` then `init` per item, the pair of
+/// cluster boundaries around `work`, the accumulator starting fresh on the new
+/// item's first K block rather than adding to the last item's — and every one
+/// of those is silent when it is wrong, in the sense that the phase simply
+/// never completes or a tile comes back doubled.
+///
+/// Both shapes are past [`gemm::MAX_CLUSTERS`] tiles so that some clusters take
+/// two. `4096x2560` divides the [`gemm::GROUP`] traversal width exactly;
+/// `2816x3584` does not — 11 tile-rows against a group of 8 — which is what
+/// executes `pipeline::grouped`'s short last group, whose failure is an
+/// *aliased* tile rather than a missing one.
+///
+/// The operands make the whole of `C` a 7x21 table: `A`'s values depend on the
+/// row only through `row % 7` and `B`'s on the column only through
+/// `column % 21`, so the host reference is `7 * 21 * K` products instead of
+/// `M * N * K`, and a 10-megaelement `C` is checkable at all. They are small
+/// integers, so every product and every partial sum is exact in fp32 whatever
+/// order the hardware reduces in — which is what lets the comparison be `==` on
+/// the bf16 words, with no tolerance to hide a misplaced tile behind.
+fn check_tcgen05_many_items(
+    stream: &cuda_core::CudaStream,
+    module: &Tcgen05Gemm,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const K: usize = 256;
+    const SHAPES: [(usize, usize); 2] = [(4096, 2560), (2816, 3584)];
+
+    for (m, n) in SHAPES {
+        let a_bits = periodic_operand(m, K, a_value);
+        let b_bits = periodic_operand(n, K, b_value);
+        let device_a = DeviceBuffer::from_host(stream, &a_bits)?;
+        let device_b = DeviceBuffer::from_host(stream, &b_bits)?;
+        let a_tma = create_bf16_tma_map(stream, &device_a, K, m, TmaLayout::KMajor)?;
+        let b_tma = create_bf16_tma_map(stream, &device_b, K, n, TmaLayout::KMajor)?;
+        let config = tcgen05_launch_config(m, n, K);
+
+        let mut store = DeviceBuffer::<u32>::zeroed(stream, m * n / 2)?;
+        unsafe {
+            module.store(
+                stream,
+                config,
+                a_tma.as_ptr(),
+                b_tma.as_ptr(),
+                &mut store,
+                n as u32,
+                K as u32,
+            )
+        }?;
+        compare_periodic(
+            &format!("tcgen05 bf16 store {m}x{n}x{K}"),
+            &unpack_bf16(&store.to_host_vec(stream)?),
+            m,
+            n,
+            K,
+        )?;
+
+        // The same tiles again, folded into a `C` that already holds them: an
+        // item boundary that leaked would double one tile and not another.
+        unsafe {
+            module.accumulate(
+                stream,
+                config,
+                a_tma.as_ptr(),
+                b_tma.as_ptr(),
+                &mut store,
+                n as u32,
+                K as u32,
+            )
+        }?;
+        let folded = unpack_bf16(&store.to_host_vec(stream)?);
+        let halved: Vec<f32> = folded.iter().map(|value| value / 2.0).collect();
+        compare_periodic(
+            &format!("tcgen05 bf16 accumulate {m}x{n}x{K}"),
+            &halved,
+            m,
+            n,
+            K,
+        )?;
+    }
+    Ok(())
+}
+
+/// `A[row, depth]`: integers exact in bf16, periodic in `row` with period 7.
+fn a_value(row: usize, depth: usize) -> f32 {
+    ((row * 5 + depth * 3) % 7) as f32 - 3.0
+}
+
+/// `B[column, depth]`: period 21, which shares a factor of 7 with `A`'s so that
+/// no K walk can make two different `(row, column)` cells collide by accident.
+fn b_value(column: usize, depth: usize) -> f32 {
+    ((column * 4 + depth * 5) % 21) as f32 - 10.0
+}
+
+/// A `[lines, depth]` K-major bf16 operand, as the `u16` words a device buffer
+/// holds.
+fn periodic_operand(lines: usize, depth: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u16> {
+    let mut staged = Vec::with_capacity(lines * depth);
+    for line in 0..lines {
+        for step in 0..depth {
+            staged.push(bf16::from_f32(value(line, step)).to_bits());
+        }
+    }
+    staged
+}
+
+/// Compare an observed `C` against the 7x21 table the operands make it.
+///
+/// `==` on the bf16 words: the reference carries the same single rounding the
+/// kernel does, from an fp32 sum that is exact on both sides, so a tolerance
+/// would only be somewhere for a wrong tile to hide.
+fn compare_periodic(
+    name: &str,
+    observed: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let exact: Vec<f32> = (0..7 * 21)
+        .map(|cell| {
+            (0..k)
+                .map(|depth| a_value(cell / 21, depth) * b_value(cell % 21, depth))
+                .sum()
+        })
+        .collect();
+    let reference: Vec<f32> = exact
+        .iter()
+        .map(|&value| bf16::from_f32(value).to_f32())
+        .collect();
+    let mut wrong = 0usize;
+    let mut sample = Vec::new();
+    for row in 0..m {
+        for column in 0..n {
+            let want = reference[(row % 7) * 21 + column % 21];
+            let got = observed[row * n + column];
+            if got != want {
+                wrong += 1;
+                if sample.len() < 8 {
+                    sample.push(format!("C[{row}, {column}] = {got}, want {want}"));
+                }
+            }
+        }
+    }
+    if wrong > 0 {
+        return Err(format!(
+            "{name}: {wrong} of {} elements wrong: {}",
+            m * n,
+            sample.join("; ")
+        )
+        .into());
+    }
     Ok(())
 }
 

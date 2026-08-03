@@ -16,32 +16,56 @@ pub const TC_BK: usize = 64;
 pub const TC_M_TILE: usize = 256;
 /// Optimized CTA-pair output columns.
 pub const TC_N_TILE: usize = 256;
-/// Four K64 stages form one complete shared-memory pipeline cycle.
+/// The K unit callers still test shapes for eligibility against.
+///
+/// It was a hard requirement when the pipeline was four hand-unrolled stages
+/// and `k` had to fill a whole cycle; the three-deep ring does not care, and
+/// [`tcgen05_launch_config`] asks only for a whole number of [`TC_BK`]. Kept as
+/// a caller-facing constant because `gpu/model` gates on it, where it is now a
+/// conservative test rather than a necessary one.
 pub const TC_K_PIPELINE: usize = 256;
 
-/// Exact-cover launch grid: one CTA pair (cluster) per M256xN256 output tile.
+/// Persistent launch grid: [`gemm::MAX_CLUSTERS`](super::MAX_CLUSTERS) CTA
+/// pairs, or fewer where the problem has fewer tiles.
 ///
-/// `host_work_ids = (m/256) * (n/128)` is expressed in N128 units, so it is
-/// already twice the logical tile count — with `cluster_launch(2,1,1)` that is
-/// exactly one two-CTA cluster per N256 tile. Every cluster owns the single
-/// tile at its block index; none is over- or under-provisioned. The kernel
-/// therefore does not work-steal (see the note in `optimized.rs`), which
-/// removes the cross-cluster CLC cancel/steal handshake that deadlocked a
-/// fraction of launches at small grids.
+/// The kernel is a work-item loop, not an exact cover, so the grid is a
+/// property of the *device* and only capped by the problem: past
+/// `MAX_CLUSTERS`, extra tiles arrive as extra items on clusters that already
+/// exist. That is what stops a 16384³ launch paying 37 waves of cluster
+/// start-up and lets one operand panel stay resident across the columns that
+/// re-read it (`pipeline::grouped`, `GROUP = 8`).
+///
+/// `cluster_launch(2, 1, 1)` requires a whole number of clusters, which
+/// `TC_RANKS *` guarantees.
+///
+/// `k` needs only to be a whole number of `TC_BK` stages — a three-deep ring
+/// does not care how the block count divides. `TC_K_PIPELINE` survives as the
+/// *caller-facing* eligibility unit some model shapes are still tested against;
+/// nothing here requires it.
 pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
     assert!(m.is_multiple_of(TC_M_TILE));
     assert!(n.is_multiple_of(TC_N_TILE));
-    assert!(k.is_multiple_of(TC_K_PIPELINE));
+    assert!(k.is_multiple_of(TC_BK));
     assert!(m <= u32::MAX as usize && n <= u32::MAX as usize && k <= u32::MAX as usize);
-    let host_work_ids = (m / TC_M_TILE)
-        .checked_mul(n / TC_TILE)
+    let tiles = (m / TC_M_TILE)
+        .checked_mul(n / TC_N_TILE)
         .expect("tcgen05 work grid overflow");
     LaunchConfig {
-        grid_dim: (host_work_ids as u32, 1, 1),
-        block_dim: (192, 1, 1),
-        shared_mem_bytes: 0,
+        grid_dim: (
+            TC_RANKS * tiles.min(super::MAX_CLUSTERS as usize) as u32,
+            1,
+            1,
+        ),
+        block_dim: (TC_THREADS, 1, 1),
+        shared_mem_bytes: super::SHARED_BYTES as u32,
     }
 }
+
+/// CTAs of a cluster — the `cluster_launch` dimension, said once.
+const TC_RANKS: u32 = 2;
+/// Threads a CTA launches with: one warp per 32 accumulator rows, and every one
+/// of them drains.
+const TC_THREADS: u32 = super::optimized::THREADS;
 
 /// Operand orientation, which fixes the TMA box.
 ///
@@ -270,20 +294,45 @@ pub unsafe fn create_bf16_pairs_tma_map_region(
 /// The optimized tcgen05 bf16 GEMM loaded from the calling binary's single
 /// embedded device artifact.
 pub struct Tcgen05Gemm {
-    generated: super::optimized_kernels::LoadedModule,
+    generated: super::optimized::kernels::LoadedModule,
     optimized: CudaFunction,
     optimized_f32: CudaFunction,
 }
 
+/// Raise a kernel's dynamic-shared-memory ceiling above the 48 KiB default.
+///
+/// Both entry points plan 114 816 B, so neither can be launched without this.
+fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dyn Error>> {
+    use cuda_core::sys::{
+        CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        cuFuncSetAttribute, cudaError_enum_CUDA_SUCCESS,
+    };
+    // SAFETY: `function` is a live entry point of a loaded module, and the
+    // attribute takes an `int`.
+    let status = unsafe {
+        cuFuncSetAttribute(
+            function.cu_function(),
+            CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            bytes as i32,
+        )
+    };
+    if status != cudaError_enum_CUDA_SUCCESS {
+        return Err(format!("cuFuncSetAttribute(dynamic smem {bytes}) failed: {status:?}").into());
+    }
+    Ok(())
+}
+
 impl Tcgen05Gemm {
     pub fn load(ctx: &std::sync::Arc<CudaContext>) -> Result<Self, Box<dyn Error>> {
-        let generated = super::optimized_kernels::load(ctx)?;
+        let generated = super::optimized::kernels::load(ctx)?;
         let optimized = generated
             .as_cuda_module()
             .load_function("gemm_tcgen05_bf16_optimized")?;
         let optimized_f32 = generated
             .as_cuda_module()
             .load_function("gemm_tcgen05_f32_optimized")?;
+        opt_in_dynamic_smem(&optimized, super::SHARED_BYTES as u32)?;
+        opt_in_dynamic_smem(&optimized_f32, super::SHARED_BYTES as u32)?;
         Ok(Self {
             generated,
             optimized,
@@ -623,7 +672,7 @@ impl Tcgen05Gemm {
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_tcgen05(
-    module: &super::optimized_kernels::LoadedModule,
+    module: &super::optimized::kernels::LoadedModule,
     stream: &CudaStream,
     config: LaunchConfig,
     a_tma: *const TmaDescriptor,
@@ -649,7 +698,7 @@ unsafe fn launch_tcgen05(
             n as i32,
             k as i32,
             (m / TC_M_TILE) as u32,
-            (n as usize / TC_TILE) as u32,
+            (n as usize / TC_N_TILE) as u32,
             mode,
             u32::from(layout == TmaLayout::MnMajor),
         )
@@ -658,7 +707,7 @@ unsafe fn launch_tcgen05(
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_tcgen05_f32(
-    module: &super::optimized_kernels::LoadedModule,
+    module: &super::optimized::kernels::LoadedModule,
     stream: &CudaStream,
     config: LaunchConfig,
     a_tma: *const TmaDescriptor,
@@ -687,7 +736,7 @@ unsafe fn launch_tcgen05_f32(
             n as i32,
             k as i32,
             (m / TC_M_TILE) as u32,
-            (n as usize / TC_TILE) as u32,
+            (n as usize / TC_N_TILE) as u32,
             mode,
             u32::from(layout == TmaLayout::MnMajor),
         )
