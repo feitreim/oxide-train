@@ -40,8 +40,8 @@
 //! double-buffered score segment is the whole of the overlap. What is left is
 //! the library's: `SharedPlan` for the plan, `pipeline::run` for the persistent
 //! work-item loop, `make_causal_at` for the coordinate-origin mask,
-//! `online_rescale` for the flash rescale, and `block_reduce` for the
-//! correction vote all three kernels used to open-code.
+//! `online_rescale` for the flash rescale, and one mbarrier phase for the
+//! correction vote.
 //!
 //! Two synchronous backward kernels share the same idioms —
 //! the swizzle-aware bf16 fragment writes, the transposed-B gradient MMA
@@ -69,11 +69,10 @@ use kittens::mma::{self, MmaShape, mma_ab, mma_abt};
 use kittens::pipeline;
 use kittens::plan::SharedPlan;
 use kittens::reg::{
-    BaseLdtm, Exp2Hw, Fragment, Max, RegTile, RegVec, exp2_approx, log2_approx, online_rescale,
-    warp_reduce,
+    BaseLdtm, Exp2Hw, Fragment, RegTile, RegVec, exp2_approx, log2_approx, online_rescale,
 };
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, SharedVec, Swizzle128B};
-use kittens::sync::{PhasedSemaphore, Semaphore, SemaphoreRing, block_reduce};
+use kittens::sync::{PhasedSemaphore, Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
 
 // Tile contract; `host.rs` mirrors these as FLASH_TILE / FLASH_HD (kept
@@ -181,6 +180,8 @@ const OUTPUT_LAG: usize = 3;
 /// Warps of the forward: exactly the four an `M128` accumulator's 128 TMEM
 /// lanes are drained by, which is why there is no separate MMA or TMA warp.
 const FORWARD_WARPS: usize = QUERIES / 32;
+/// Correction-vote words: one per warp, for each of two tile parities.
+const VOTE_WORDS: usize = 2 * FORWARD_WARPS;
 /// Threads of the forward.
 pub const FLASH_FORWARD_BLOCK: usize = QUERIES;
 /// `#[launch_bounds]` only accepts integer literals, so the kernel's
@@ -266,8 +267,13 @@ struct Forward {
     /// on it reaches two tiles back.
     accumulated: SemaphoreRing<OUTPUT_LAG>,
     q_loaded: Semaphore,
-    /// `block_reduce`'s per-warp partials — the correction vote.
-    votes: SharedVec<F32, FORWARD_WARPS>,
+    /// The correction vote: one word per warp per tile parity. Two parities
+    /// because `vote` rendezvouses the warpgroup every tile, so a warp is at
+    /// most one tile ahead of another and cannot reach a third parity.
+    votes: SharedVec<F32, VOTE_WORDS>,
+    /// The one barrier the vote costs. `block_reduce` is two — a publish sync
+    /// and a read sync — and this loop is barrier-bound, not reduction-bound.
+    vote: Semaphore,
     tmem_slot: *mut u32,
     plan: SharedPlan,
 }
@@ -282,7 +288,8 @@ const fn forward_plan(at: SharedPlan) -> Forward {
     let (scored, at) = at.semaphores::<2>();
     let (accumulated, at) = at.semaphores::<OUTPUT_LAG>();
     let (q_loaded, at) = at.semaphore();
-    let (votes, at) = at.vec::<F32, FORWARD_WARPS>();
+    let (votes, at) = at.vec::<F32, VOTE_WORDS>();
+    let (vote, at) = at.semaphore();
     let (tmem_slot, at) = at.tmem_slot();
     Forward {
         q,
@@ -294,6 +301,7 @@ const fn forward_plan(at: SharedPlan) -> Forward {
         accumulated,
         q_loaded,
         votes,
+        vote,
         tmem_slot,
         plan: at,
     }
@@ -1658,6 +1666,7 @@ pub mod kernels {
                 self.shared.scored.init_all(1);
                 self.shared.accumulated.init_all(1);
                 self.shared.q_loaded.init(1);
+                self.shared.vote.init(FLASH_FORWARD_BLOCK as u32);
             }
         }
 
@@ -1668,6 +1677,7 @@ pub mod kernels {
                 self.shared.scored.inval_all();
                 self.shared.accumulated.inval_all();
                 self.shared.q_loaded.inval();
+                self.shared.vote.inval();
             }
         }
 
@@ -1795,11 +1805,23 @@ pub mod kernels {
                     // value and then to a block one. Tile 0 always trips it —
                     // `m_ref` is still the sentinel — and starts the first
                     // segment without a drain.
-                    let exceeded = row_max.any_exceeds(m_ref, CORRECTION_THRESHOLD);
-                    let restart = block_reduce::<Max, FORWARD_WARPS>(
-                        self.shared.votes,
-                        warp_reduce::<Max>(if exceeded { 1.0 } else { 0.0 }),
-                    ) != 0.0;
+                    let parity = key_tile & 1;
+                    let base = (parity * FORWARD_WARPS as u32) as usize;
+                    let warp_vote = warp::any(row_max.any_exceeds(m_ref, CORRECTION_THRESHOLD));
+                    if lane == 0 {
+                        self.shared
+                            .votes
+                            .set(base + warp_id as usize, if warp_vote { 1.0 } else { 0.0 });
+                    }
+                    self.shared.vote.arrive();
+                    self.shared.vote.wait(parity);
+                    let mut ballot = 0.0f32;
+                    let mut warp = 0usize;
+                    while warp < FORWARD_WARPS {
+                        ballot += self.shared.votes.get(base + warp);
+                        warp += 1;
+                    }
+                    let restart = ballot != 0.0;
                     if restart {
                         if key_tile > 0 {
                             self.shared.accumulated.wait(key_tile - 1);
@@ -1918,8 +1940,9 @@ pub mod kernels {
     /// `pipeline::run` is the persistent work-item loop (items dealt by
     /// descending query tile, longest key streams first), `make_causal_at`
     /// masks against the *pair* of block origins, `online_rescale` is the flash
-    /// rescale, and `block_reduce` is the correction vote three kernels used to
-    /// open-code as a votes array and a barrier phase.
+    /// rescale, and the correction vote is one mbarrier phase over a per-warp
+    /// votes ring — the shape all three kernels used, which `block_reduce`'s
+    /// two block syncs replaced and then cost more than.
     ///
     /// Operand and output contracts are the extraction's: packed-bf16
     /// `[B*H, T, HD]` staging panels with Q pre-scaled by
