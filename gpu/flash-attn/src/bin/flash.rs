@@ -79,43 +79,60 @@ use host::{
 /// inside the noise of a single scalar.
 const KERNEL_BUDGETS: [KernelBudget; 5] = [
     KernelBudget {
-        // The unified forward (#68), first flight. Pinned at what the three
-        // kernels it replaces cost at their widest: the accumulator is the
-        // same `RegTile<32, 128>`, and the score band is the same
-        // `RegTile<32, 64>` — 128 query rows instead of 64 buys twice the MMA
-        // per drain without widening either. Ratchet this down when a run
-        // reports lower.
+        // The unified forward (#68), first flight: 238 regs / 1328 B frame,
+        // against the persistent kernel's 236 / 592.
+        //
+        // The registers are the same and the frame is not. Both come from the
+        // same place: the whole `[32, 64]` score band is now a value — drained
+        // by `tile_x8`, masked, reduced, exponentiated and stored as one tile
+        // — where `softmax_tile` walked it a `Fragment` at a time and kept
+        // eight scores live. So peak liveness is the 128-register output
+        // accumulator plus 64 score registers instead of plus 8, ptxas hits
+        // the 255 cap, and 736 B of what it cannot hold goes to the frame.
+        //
+        // Pinned at the measurement rather than fought, because the fix is not
+        // a smaller band: it is not keeping the output accumulator in
+        // registers at all. `tcgen05.st` — absent when this kernel's
+        // correction scheme was designed, present in the library now
+        // (`TmemTile::store_fragment`) — lets the correction rescale the O
+        // segment in place, and then the 128 registers are the epilogue's
+        // transient rather than the loop's resident. See the PR for why that
+        // is not in this change.
         name: "forward",
         max_registers: 240,
-        max_spill_bytes: 592,
+        max_spill_bytes: 1328,
     },
     KernelBudget {
+        // 52 → 53 with nothing in this kernel changed. Three kernels left the
+        // shared artifact (#68) and the allocator re-rolled: the same crate
+        // composition effect that moves a GEMM by 68 registers, here worth
+        // one, and in both directions — `backward q pipelined` went the other
+        // way over the same edit.
         name: "backward q",
-        max_registers: 52,
-        max_spill_bytes: 512,
-    },
-    KernelBudget {
-        // The kittens-first pipelined backward, first flight: 53 regs / 512 B
-        // frame, one register over the synchronous kernel it replaces for
-        // three warp roles, two S/dP buffers and six barrier sets.
-        name: "backward q pipelined",
         max_registers: 53,
         max_spill_bytes: 512,
     },
     KernelBudget {
+        // The kittens-first pipelined backward: 53 → 52 over #68, see
+        // `backward q`. Same 512 B frame.
+        name: "backward q pipelined",
+        max_registers: 52,
+        max_spill_bytes: 512,
+    },
+    KernelBudget {
+        // 60 → 59 over #68, see `backward q`.
         name: "backward kv",
-        max_registers: 60,
+        max_registers: 59,
         max_spill_bytes: 1024,
     },
     KernelBudget {
-        // Kernel B's pipelined form, first flight: 72 regs / 1024 B frame.
-        // The +12 over the synchronous kernel (against kernel A's +1) is the
-        // second gradient accumulator's drain — two `RegTile<4, 32>`s live
-        // through the epilogue instead of one. Occupancy is TMEM-pinned at
-        // one CTA/SM (this kernel uses all 512 columns), so it buys nothing
-        // to fight.
+        // Kernel B's pipelined form: 72 → 70 over #68, see `backward q`.
+        // The gap to the synchronous kernel is the second gradient
+        // accumulator's drain — two `RegTile<4, 32>`s live through the
+        // epilogue instead of one. Occupancy is TMEM-pinned at one CTA/SM
+        // (this kernel uses all 512 columns), so it buys nothing to fight.
         name: "backward kv pipelined",
-        max_registers: 72,
+        max_registers: 70,
         max_spill_bytes: 1024,
     },
 ];
