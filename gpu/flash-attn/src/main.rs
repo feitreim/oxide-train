@@ -332,7 +332,7 @@ fn check_tcgen05_backward_shape(
         unsafe {
             tcgen05.backward_q(
                 stream,
-                flash_backward_q_config(b, t, h),
+                flash_backward_q_config(b, t, h, sm_count),
                 q_tma.as_ptr(),
                 k_tma.as_ptr(),
                 v_tma.as_ptr(),
@@ -341,11 +341,12 @@ fn check_tcgen05_backward_shape(
                 &dot,
                 t as u32,
                 h as u32,
+                b as u32,
                 &mut dq,
             )?;
             tcgen05.backward_kv(
                 stream,
-                flash_backward_kv_config(b, t, h),
+                flash_backward_kv_config(b, t, h, sm_count),
                 q_tma.as_ptr(),
                 k_tma.as_ptr(),
                 v_tma.as_ptr(),
@@ -354,6 +355,7 @@ fn check_tcgen05_backward_shape(
                 &dot,
                 t as u32,
                 h as u32,
+                b as u32,
                 &mut dk,
                 &mut dv,
             )?;
