@@ -22,7 +22,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 mod device;
 use device::{
     CLASSIFIER_THREADS, CLASSIFIER_TILE_BLOCK_ROWS, CLASSIFIER_TILE_THREADS, NORM_THREADS,
-    NORM_TILE_BLOCK_ROWS, NORM_TILE_THREADS, kernels,
+    NORM_TILE_BLOCK_ROWS, NORM_TILE_THREADS, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_THREADS, kernels,
 };
 
 /// Rows the norms are timed at — the training config's `B * T`.
@@ -50,6 +50,14 @@ fn tile_grid(rows: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: ((rows / NORM_TILE_BLOCK_ROWS) as u32, 1, 1),
         block_dim: (NORM_TILE_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn swiglu_tile_grid(rows: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((rows / SWIGLU_TILE_BLOCK_ROWS) as u32, 1, 1),
+        block_dim: (SWIGLU_TILE_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -155,35 +163,112 @@ fn bench_classifier(
     Ok(())
 }
 
-/// SwiGLU forward — the measure-first tier's elementwise case.
+/// The SwiGLU family — the measure-first tier's elementwise case, at the dense
+/// FFN's shape.
+///
+/// The bf16 forward is the MoE panel's arm and rounds on the way out, so it
+/// moves half the bytes the fp32 one does; the two backwards read three and two
+/// operands respectively. All four are the same walk over the same rectangle.
 fn bench_swiglu(
     stream: &std::sync::Arc<CudaStream>,
     module: &kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let len = N * FF;
+    let element = 4.0;
+    let operand = len as f64 * element;
     let gate = DeviceBuffer::from_host(stream, &uniform_vec(len, 5))?;
     let up = DeviceBuffer::from_host(stream, &uniform_vec(len, 6))?;
+    let dy = DeviceBuffer::from_host(stream, &uniform_vec(len, 7))?;
     let mut y = DeviceBuffer::<f32>::zeroed(stream, len)?;
+    let mut words = DeviceBuffer::<u32>::zeroed(stream, len / 2)?;
 
+    let flat = LaunchConfig::for_num_elems(len as u32);
     let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
-        module.swiglu_forward(stream, LaunchConfig::for_num_elems(len as u32), &gate, &up, &mut y)?;
+        // SAFETY: all three buffers are `len` long and the launch covers
+        // exactly that many elements.
+        unsafe { module.swiglu_forward(stream, flat, &gate, &up, &mut y)? };
         Ok(())
     })?;
     let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
-        // SAFETY: N divides NORM_TILE_BLOCK_ROWS and FF the tile chunk.
+        // SAFETY: N divides SWIGLU_TILE_BLOCK_ROWS and FF the tile chunk.
         unsafe {
-            module.swiglu_forward_tile(
+            module.swiglu_forward_tile(stream, swiglu_tile_grid(N), &gate, &up, FF as u32, &mut y)?
+        };
+        Ok(())
+    })?;
+    report("swiglu forward", 3.0 * operand, shipped, tile);
+
+    let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
+        // SAFETY: the packed output is one word per input pair.
+        unsafe {
+            module.swiglu_forward_bf16(
                 stream,
-                tile_grid(N),
+                LaunchConfig::for_num_elems((len / 2) as u32),
                 &gate,
                 &up,
+                &mut words,
+            )?
+        };
+        Ok(())
+    })?;
+    let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
+        // SAFETY: as the fp32 forward, with `words` holding `len / 2` words.
+        unsafe {
+            module.swiglu_forward_tile_bf16(
+                stream,
+                swiglu_tile_grid(N),
+                &gate,
+                &up,
+                FF as u32,
+                &mut words,
+            )?
+        };
+        Ok(())
+    })?;
+    report("swiglu forward bf16", 2.5 * operand, shipped, tile);
+
+    let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
+        // SAFETY: all four buffers are `len` long.
+        unsafe { module.swiglu_backward_gate(stream, flat, &gate, &up, &dy, &mut y)? };
+        Ok(())
+    })?;
+    let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
+        // SAFETY: as the fp32 forward, with `dy` the third operand.
+        unsafe {
+            module.swiglu_backward_gate_tile(
+                stream,
+                swiglu_tile_grid(N),
+                &gate,
+                &up,
+                &dy,
                 FF as u32,
                 &mut y,
             )?
         };
         Ok(())
     })?;
-    report("swiglu forward", 3.0 * len as f64 * 4.0, shipped, tile);
+    report("swiglu backward_gate", 4.0 * operand, shipped, tile);
+
+    let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
+        // SAFETY: all three buffers are `len` long.
+        unsafe { module.swiglu_backward_up(stream, flat, &gate, &dy, &mut y)? };
+        Ok(())
+    })?;
+    let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
+        // SAFETY: as the fp32 forward, over two operands.
+        unsafe {
+            module.swiglu_backward_up_tile(
+                stream,
+                swiglu_tile_grid(N),
+                &gate,
+                &dy,
+                FF as u32,
+                &mut y,
+            )?
+        };
+        Ok(())
+    })?;
+    report("swiglu backward_up", 3.0 * operand, shipped, tile);
     Ok(())
 }
 
@@ -206,15 +291,18 @@ fn bench_rope(
     let x = DeviceBuffer::from_host(stream, &uniform_vec(N * D, 7))?;
     let mut y = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
-        module.rope_forward(
-            stream,
-            LaunchConfig::for_num_elems((N * D) as u32),
-            &x,
-            T as u32,
-            H as u32,
-            HD as u32,
-            &mut y,
-        )?;
+        // SAFETY: both buffers are N x D and D is H * HD.
+        unsafe {
+            module.rope_forward(
+                stream,
+                LaunchConfig::for_num_elems((N * D) as u32),
+                &x,
+                T as u32,
+                H as u32,
+                HD as u32,
+                &mut y,
+            )?
+        };
         Ok(())
     })?;
     report_one("rope forward", 2.0 * (N * D) as f64 * 4.0, shipped);
