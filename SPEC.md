@@ -1512,7 +1512,7 @@ Each gated on tests; correctness before speed at every step.
      reference at [2,128,3], [1,256,2], [1,384,2], [1,512,2] and [4,256,38]:
      y ≤ **1.47e-3** (tolerance 5e-3, recorded maximum 1.4e-3), lse ≤
      **7.33e-5** — half the recorded 1.4e-4. **Bench** at [32,1024,24,128]:
-     **2.125 ms** against the persistent kernel's recorded 1.929, **+10.2%**.
+     **2.111 ms** against the persistent kernel's recorded 1.929, **+9.4%**.
      Two things are known to be in that gap and one is inherent: a 128-row
      query block necessarily reads one fully-masked 64x64 pair per block
      (8 of 144 at T=1024, **5.9%**), and the kernel takes three block-wide
@@ -1526,7 +1526,7 @@ Each gated on tests; correctness before speed at every step.
      the 128-register output accumulator put it in the LLVM local depot —
      1328 B of frame, 3546 `ld/st.local`, the drain block storing what it had
      just read — and cost **2.635 ms**. Walking it 16 columns at a time is
-     2.125 (−19.4%) with parity unchanged to the digit; #61's risk 1 is real
+     2.111 (−19.9%) with parity unchanged to the digit; #61's risk 1 is real
      and it is about the *width* the register ops are asked to work at, not
      about indexed writes. What is left in the depot (1136 B) is the output
      accumulator itself, address-taken by `online_rescale` and
@@ -1536,9 +1536,9 @@ Each gated on tests; correctness before speed at every step.
      it in registers: `tcgen05.st` was absent when this correction scheme was
      designed and is in the library now. Two ferro-kittens issues came out of
      the port: `RegVec` could not reach memory at all, which is what the LSE
-     epilogue is (ferro #130, fixed in ferro #170), and `mma_ab`'s shape
+     epilogue is (ferro #130, fixed in ferro #170, merged), and `mma_ab`'s shape
      argument is the output *band's* width where the shipped example and the
-     entry point's own doctest both read it as the tile's (ferro #175/#176) —
+     entry point's own doctest both read it as the tile's (ferro #175/#176, merged) —
      a wrong `O` that faults nothing, in the file this issue said to start
      from.
    - Then: activation checkpointing if B wants to grow past memory,
