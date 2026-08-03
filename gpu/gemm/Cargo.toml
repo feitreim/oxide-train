@@ -13,7 +13,7 @@ cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "20a5616
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "20a56163f258e09f2c51e4c27ae4e4ff17582443" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "20a56163f258e09f2c51e4c27ae4e4ff17582443" }
 bench-util = { path = "../bench-util" }
-kittens = { package = "ferro-kittens", git = "https://github.com/feitreim/ferro-kittens", rev = "caa60756c4bf96a836a4e42c1a843408d3c7271b" }
+kittens = { package = "ferro-kittens", git = "https://github.com/feitreim/ferro-kittens", rev = "37ea9e753b8dd555cb2062ca397fb0981e2b1060" }
 half = "2.4"
 
 [profile.release]
