@@ -21,7 +21,7 @@ import modal
 
 # Keep this revision in sync with the git deps in gpu/*/Cargo.toml: the codegen
 # backend and the device/host/core crates must come from the same revision.
-CUDA_OXIDE_REF = "b099f64c1a32869b74be99f4f88242fb68655b51"
+CUDA_OXIDE_REF = "20a56163f258e09f2c51e4c27ae4e4ff17582443"
 RUST_TOOLCHAIN = "nightly-2026-04-03"
 GIT_REPO = "https://github.com/NVlabs/cuda-oxide.git"
 TRAINER_REPO = "https://github.com/feitreim/oxide-train.git"

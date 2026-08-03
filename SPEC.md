@@ -18,7 +18,7 @@ bindings.
 ## 2. Toolchain & dev environment
 
 - **cuda-oxide** (pinned upstream revision
-  `b099f64c1a32869b74be99f4f88242fb68655b51`) compiles `#[kernel]`
+  `20a56163f258e09f2c51e4c27ae4e4ff17582443`) compiles `#[kernel]`
   Rust to PTX through a real rustc codegen backend. Kernels monomorphize like
   host Rust — const generics included — which is what makes the static-shape
   design (§3) real.
@@ -799,7 +799,9 @@ Each gated on tests; correctness before speed at every step.
        `_prepare_flash_ptx`) and emits every `.ptx` it finds, not just the
        first.
      - ✅ **7e17 kittens phases 0–5 (flash side)** (#61): `gpu/kittens`, the
-       ThunderKittens-style tile library — tcgen05/sm_100a only, no arch
+       ThunderKittens-style tile library (extracted to
+       [ferro-kittens](https://github.com/feitreim/ferro-kittens) and consumed
+       as a pinned git dependency since #66) — tcgen05/sm_100a only, no arch
        dispatch — with every flash-attn and gemm kernel ported onto it, plus
        the phase-0 ptxas budget gate. Phase 5's remaining scope is
        kittens-first NEW kernels (fused `gpu/ops`, router/scatter #54/#55,
@@ -1413,7 +1415,9 @@ Each gated on tests; correctness before speed at every step.
      delta is a little under the sum of the two individual measurements
      (−55.3 vs −61.9 ms), which is the expected small overlap plus
      container-to-container spread.
-   - ✅ **cuda-oxide pinned to `b099f64`** (#56): the codegen-backend bump is a
+   - ✅ **cuda-oxide pinned to `b099f64`** (#56; the pin has since moved to
+     `20a5616` with #66 — the numbers below are the b099f64 epoch's): the
+     codegen-backend bump is a
      toolchain change, not a kernel change, so it is measured here rather than
      claimed to be free. **No same-container A/B exists and none can:** the
      baseline's own `v0.2.1` CLI, reinstalled beside the new one, emits a
@@ -1512,7 +1516,7 @@ Each gated on tests; correctness before speed at every step.
 | 16 | Perf claims need same-container before/after | ~3× variance observed across Modal containers on identical code; sweeps already share one container for exactly this reason |
 | 17 | Optimization backlog is profile-ordered | First real-scale profile contradicted intuition (naive loss softmax 60%+ of step, tcgen05 GEMM integration nowhere near top); 7e sub-milestones follow measured step share and get re-ordered after each landing |
 | 18 | bf16 adopted head-first via padded NP/VP dims | lm-head ≈70% of the one-block model's GEMM FLOPs and the measured rock; zero-padding tokens→NP and vocab→VP keeps the tuned tcgen05 kernel's tile contract with provably inert padding (zero rows/columns never move), so no boundary-guard variants and byte-compatible checkpoints |
-| 19 | **Retired by #62:** tcgen05 kernels ship as a second artifact | This was correct at cuda-oxide v0.2.1, but false at pinned b099f64: a B200 regression probe now carries tcgen05, libdevice `sqrt`/`exp`/`ln`/`max`, and contended `DeviceAtomicF32` in one pure-PTX artifact. Model includes the canonical GEMM/flash device modules and uses generated typed launchers; `gemm.ptx`/`flash.ptx` staging and foreign-module marshalling are gone. One device artifact per binary remains the invariant. |
+| 19 | **Retired by #62:** tcgen05 kernels ship as a second artifact | This was correct at cuda-oxide v0.2.1, but false from pinned b099f64 onward (the pin is `20a5616` since #66): a B200 regression probe now carries tcgen05, libdevice `sqrt`/`exp`/`ln`/`max`, and contended `DeviceAtomicF32` in one pure-PTX artifact. Model includes the canonical GEMM/flash device modules and uses generated typed launchers; `gemm.ptx`/`flash.ptx` staging and foreign-module marshalling are gone. One device artifact per binary remains the invariant. |
 | 20 | Block tcgen05 keeps fp32 model tensors | Quantize operands into persistent scratch and use concrete fp32-output store/accumulate epilogues; buffers, optimizer/checkpoint layout, and the naive fp32 fallback stay fp32, though epilogue values are bf16-rounded (the drain reuses the packed-bf16 shared-memory staging, so each GEMM result carries bf16 mantissa precision after full-K fp32 accumulation — doubling SMEM_OUT for true fp32 staging wasn't warranted) |
 | 21 | MoE aux-loss coefficient is runtime config, not const | Const generics are reserved for values the compiler specializes on — `E`/`K`/`C` size buffers, bins, and launch grids; the coefficient is one scalar FMA that shapes nothing, needs a step schedule, and must be sweepable without a Modal rebuild (stable Rust also forbids f32 const generics). It flows host→kernel per step like `learning_rate` and is recorded in the checkpoint header like `AdamWConfig` |
 | 22 | MoE router is fp32 over bf16 experts | Routing is discrete: bf16 rounding near a top-k boundary doesn't perturb the output, it reassigns the token (the 7e7 bf16 two-logit tie showed how violently trajectories react to that). The router GEMM is `[N,D]×[D,E]` — skinny, off the tcgen05 tile contract, and a rounding-error share of step FLOPs — so fp32 costs nothing measurable while keeping gate weights and the aux loss in the precision gradcheck trusts |

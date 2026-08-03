@@ -66,17 +66,14 @@
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::{DynamicSharedArray, SharedArray};
-use cuda_device::tcgen05::{
-    Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync,
-};
+use cuda_device::tcgen05::{tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync};
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
-use kittens::ldst::store_fragment_bf16;
-use kittens::mma::{self, mma_ab, mma_abt};
+use kittens::ldst::store_fragment;
+use kittens::mma::{self, MmaShape, mma_ab, mma_abt};
 use kittens::pipeline;
 use kittens::reg::{
-    Fragment, RegTile, RegVec, exp2_approx, fmax, log2_approx, online_rescale, value_column,
+    Add, BaseLdtm, Fragment, RegTile, RegVec, exp2_approx, fmax, log2_approx, online_rescale,
 };
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{PhasedSemaphore, Semaphore, SemaphoreRing};
@@ -95,6 +92,11 @@ use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
 // subtile.
 const TILE: usize = 64;
 const HD: usize = 128;
+
+/// Every MMA here is one warpgroup's `M128_N64`. The element type, the fp32
+/// accumulator and the transpose flags are the operand tiles' and the entry
+/// point's own now, so a call states only the shape.
+const MMA_SHAPE: MmaShape = MmaShape::M128_N64;
 
 /// One `[TILE, HD]` bf16 operand panel as a kittens tile — two stacked
 /// SWIZZLE_128B subtiles, the layout described above. Phase 1 of issue #61
@@ -117,7 +119,7 @@ type PTile = SharedTile<Bf16, TILE, TILE, Swizzle128B>;
 /// K/V for backward dK/dV).
 type PairedPanel = SharedTile<Bf16, { 2 * TILE }, HD, Swizzle128B>;
 /// The paired single-subtile `[2·TILE, TILE]` bf16 operand the backward
-/// kernels store through `store_fragment_bf16` (dS, Pᵀ, dSᵀ): 128 swizzled
+/// kernels store through `store_fragment` (dS, Pᵀ, dSᵀ): 128 swizzled
 /// 128-byte rows feeding the gradient MMAs' A side.
 type PairedPTile = SharedTile<Bf16, { 2 * TILE }, TILE, Swizzle128B>;
 const _: () = assert!(Panel::BYTES == TILE_BYTES && Panel::SUBTILE_BYTES == SUBTILE_BYTES);
@@ -316,9 +318,9 @@ pub mod kernels {
         p: PTile,
         votes: *mut u32,
         vote: Semaphore,
-        m_ref: &mut RegVec<4>,
-        running_sum: &mut RegVec<4>,
-        out_acc: &mut RegTile<4, 32>,
+        m_ref: &mut RegVec<32, BaseLdtm>,
+        running_sum: &mut RegVec<32, BaseLdtm>,
+        out_acc: &mut RegTile<32, 128, BaseLdtm>,
     ) -> bool {
         unsafe {
             let lane_column = 2 * (lane % 4);
@@ -327,7 +329,7 @@ pub mod kernels {
             // Pass 1: tile row maxima (masked, base-2 domain). The two-branch
             // shape is load-bearing: off the diagonal the four values reduce as
             // a TREE, which a uniform masked loop would flatten into a chain.
-            let mut tile_max = RegVec::<4>::splat(MASKED_SCORE);
+            let mut tile_max = RegVec::<32, BaseLdtm>::splat(MASKED_SCORE);
             let mut row_block = 0u32;
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
@@ -439,7 +441,7 @@ pub mod kernels {
             // fragment through the library's swizzled `stmatrix` path (base
             // phase hoisted once, like the old `p_phase`).
             let p_chunks = p.chunk_writer();
-            let mut tile_sum = RegVec::<4>::splat(0.0);
+            let mut tile_sum = RegVec::<32, BaseLdtm>::splat(0.0);
             let mut row_block = 0u32;
             while row_block < 2 {
                 let tmem_row = warp_id * 32 + row_block * 16;
@@ -476,12 +478,12 @@ pub mod kernels {
                     let b = probabilities.0[1];
                     tile_sum.0[slot_a] += a[0] + a[1] + a[2] + a[3];
                     tile_sum.0[slot_b] += b[0] + b[1] + b[2] + b[3];
-                    store_fragment_bf16(p_chunks, tmem_row, column, lane, probabilities);
+                    store_fragment(p_chunks, tmem_row, column, lane, probabilities);
                     column += 16;
                 }
                 row_block += 1;
             }
-            running_sum.add_assign(tile_sum.quad_sum());
+            running_sum.bin_map_assign::<Add>(tile_sum.quad_sum());
             correction
         }
     }
@@ -491,7 +493,11 @@ pub mod kernels {
     /// then rescales the merged accumulator to the new reference) and by
     /// the epilogue for the final segment. `warp_id` is warpgroup-local.
     #[inline(always)]
-    unsafe fn merge_output_tile(o_tmem: AccTmem, warp_id: u32, out_acc: &mut RegTile<4, 32>) {
+    unsafe fn merge_output_tile(
+        o_tmem: AccTmem,
+        warp_id: u32,
+        out_acc: &mut RegTile<32, 128, BaseLdtm>,
+    ) {
         unsafe {
             let mut row_block = 0u32;
             while row_block < 2 {
@@ -534,9 +540,9 @@ pub mod kernels {
         query_tile: u32,
         warp_id: u32,
         lane: u32,
-        max_ref: &RegVec<4>,
-        running_sum: &RegVec<4>,
-        out_acc: &RegTile<4, 32>,
+        max_ref: &RegVec<32, BaseLdtm>,
+        running_sum: &RegVec<32, BaseLdtm>,
+        out_acc: &RegTile<32, 128, BaseLdtm>,
         output: &mut DisjointSlice<f32>,
         logsumexp: &mut DisjointSlice<f32>,
     ) {
@@ -579,8 +585,8 @@ pub mod kernels {
     /// phantom rows 64..128 read the operand's `TILE_BYTES` tail and land in
     /// accumulator rows the drain never touches.
     #[inline(always)]
-    unsafe fn score_mma(s_tmem: u32, q: Panel, k: Panel, s_instruction: u32) {
-        unsafe { mma_abt(s_tmem, q, k, s_instruction, false) }
+    unsafe fn score_mma(s_tmem: u32, q: Panel, k: Panel) {
+        unsafe { mma_abt(s_tmem, q, k, MMA_SHAPE, false) }
     }
 
     /// One score element's probability against a segment reference:
@@ -640,7 +646,6 @@ pub mod kernels {
     ) {
         unsafe {
             let ds_chunks = ds.chunk_writer();
-            let lane_column = 2 * (lane % 4);
             let row_in_16 = lane / 4;
             let my_tile = if warp_id < 2 { tile_a } else { tile_b };
             let masked_all = key > my_tile;
@@ -661,7 +666,7 @@ pub mod kernels {
                         let dot_row = *dot.add(row as usize);
                         let mut value = 0usize;
                         while value < 4 {
-                            let key_column = column + lane_column + value_column(value) as u32;
+                            let key_column = column + BaseLdtm::column(lane, value);
                             ds_tile.0[slot][value] = backward_dscore(
                                 s.0[slot][value],
                                 dp.0[slot][value],
@@ -674,7 +679,7 @@ pub mod kernels {
                         }
                         slot += 1;
                     }
-                    store_fragment_bf16(ds_chunks, tmem_row, column, lane, ds_tile);
+                    store_fragment(ds_chunks, tmem_row, column, lane, ds_tile);
                     column += 16;
                 }
                 row_block += 1;
@@ -711,7 +716,6 @@ pub mod kernels {
         unsafe {
             let p_chunks = p.chunk_writer();
             let ds_chunks = ds.chunk_writer();
-            let lane_column = 2 * (lane % 4);
             let row_in_16 = lane / 4;
             let my_key = if warp_id < 2 { key_a } else { key_b };
             let masked_all = query < my_key;
@@ -727,7 +731,7 @@ pub mod kernels {
                     let mut dot_column = [0.0f32; 4];
                     let mut value = 0usize;
                     while value < 4 {
-                        let query_row = (column + lane_column) as usize + value_column(value);
+                        let query_row = (column + BaseLdtm::column(lane, value)) as usize;
                         lse_column[value] = *lse2.add(query_row);
                         dot_column[value] = *dot.add(query_row);
                         value += 1;
@@ -739,7 +743,7 @@ pub mod kernels {
                         let key_row = (tmem_row + row_in_16 + 8 * slot as u32) & 63;
                         let mut value = 0usize;
                         while value < 4 {
-                            let query_column = column + lane_column + value_column(value) as u32;
+                            let query_column = column + BaseLdtm::column(lane, value);
                             let keep = !masked_all && (!diagonal || key_row <= query_column);
                             let probability = if keep {
                                 exp2_approx(st.0[slot][value] - lse_column[value])
@@ -753,8 +757,8 @@ pub mod kernels {
                         }
                         slot += 1;
                     }
-                    store_fragment_bf16(p_chunks, tmem_row, column, lane, p_tile);
-                    store_fragment_bf16(ds_chunks, tmem_row, column, lane, ds_tile);
+                    store_fragment(p_chunks, tmem_row, column, lane, p_tile);
+                    store_fragment(ds_chunks, tmem_row, column, lane, ds_tile);
                     column += 16;
                 }
                 row_block += 1;
@@ -776,7 +780,7 @@ pub mod kernels {
         tile: u32,
         warp_id: u32,
         lane: u32,
-        grad_acc: &RegTile<4, 32>,
+        grad_acc: &RegTile<32, 128, BaseLdtm>,
         output: &mut DisjointSlice<f32>,
     ) {
         unsafe {
@@ -845,8 +849,8 @@ pub mod kernels {
             }
             thread::sync_threads();
             if tid == 0 {
-                tile.tma_load(src_tma, 0, 0, tma);
-                tma.expect_tx(PTile::BYTES as u32);
+                let charge = tile.tma_load(src_tma, 0, 0, tma);
+                tma.expect_tx(charge);
             }
             tma.wait(0);
             thread::sync_threads();
@@ -914,27 +918,19 @@ pub mod kernels {
             let c_tmem = STmem::from_raw(tmem);
 
             if is_leader {
-                a.tma_load(a_tma, 0, 0, tma);
-                b.tma_load(b_tma, 0, 0, tma);
-                tma.expect_tx((2 * TILE_BYTES) as u32);
+                let charge = a.tma_load(a_tma, 0, 0, tma) + b.tma_load(b_tma, 0, 0, tma);
+                tma.expect_tx(charge);
             }
             tma.wait(0);
             thread::sync_threads();
 
-            let instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N64)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .build()
-                .raw();
             if is_leader {
-                score_mma(c_tmem.raw(), a, b, instruction);
+                score_mma(c_tmem.raw(), a, b);
                 mma::commit(mma);
             }
             mma.wait(0);
             thread::sync_threads();
 
-            let lane_column = 2 * (lane % 4) as usize;
             let row_in_16 = (lane / 4) as usize;
             let mut row_block = 0u32;
             while row_block < 2 {
@@ -947,7 +943,8 @@ pub mod kernels {
                         let row = tmem_row as usize + row_in_16 + 8 * slot;
                         let mut value = 0usize;
                         while value < 4 {
-                            let out_column = column as usize + lane_column + value_column(value);
+                            let out_column =
+                                column as usize + BaseLdtm::column(lane, value) as usize;
                             *output.get_unchecked_mut(row * TILE + out_column) = c.0[slot][value];
                             value += 1;
                         }
@@ -1030,31 +1027,17 @@ pub mod kernels {
             let s_tmem = STmem::from_raw(tmem);
             let o_tmem = AccTmem::from_raw(tmem + 256);
 
-            let s_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N64)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .build()
-                .raw();
-            let o_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N64)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .transpose_b(true)
-                .build()
-                .raw();
-
             // Q stays operand-A resident for the whole key stream.
             if is_leader {
-                q.tma_load(q_tma, (query_tile * TILE as u32) as i32, plane, tma_sem);
-                tma_sem.expect_tx(TILE_BYTES as u32);
+                let charge = q.tma_load(q_tma, (query_tile * TILE as u32) as i32, plane, tma_sem);
+                tma_sem.expect_tx(charge);
             }
             tma_sem.wait(0);
             thread::sync_threads();
 
-            let mut m_ref = RegVec::<4>::splat(MASKED_SCORE);
-            let mut running_sum = RegVec::<4>::splat(0.0);
-            let mut out_acc = RegTile::<4, 32>::zero();
+            let mut m_ref = RegVec::<32, BaseLdtm>::splat(MASKED_SCORE);
+            let mut running_sum = RegVec::<32, BaseLdtm>::splat(0.0);
+            let mut out_acc = RegTile::<32, 128, BaseLdtm>::zero();
             let mut corrections = 0u32;
 
             let mut tma_phase = 1u32;
@@ -1063,9 +1046,9 @@ pub mod kernels {
             while key_tile <= query_tile {
                 if is_leader {
                     let key_row = (key_tile * TILE as u32) as i32;
-                    k.tma_load(k_tma, key_row, plane, tma_sem);
-                    v.tma_load(v_tma, key_row, plane, tma_sem);
-                    tma_sem.expect_tx(2 * TILE_BYTES as u32);
+                    let charge = k.tma_load(k_tma, key_row, plane, tma_sem)
+                        + v.tma_load(v_tma, key_row, plane, tma_sem);
+                    tma_sem.expect_tx(charge);
                 }
                 tma_sem.wait(tma_phase & 1);
                 tma_phase += 1;
@@ -1074,7 +1057,7 @@ pub mod kernels {
                 // S = Q·Kᵀ, fresh accumulation each tile.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    score_mma(s_tmem.raw(), q, k, s_instruction);
+                    score_mma(s_tmem.raw(), q, k);
                     mma::commit(mma_sem);
                 }
                 mma_sem.wait(mma_phase & 1);
@@ -1110,7 +1093,7 @@ pub mod kernels {
                 // across the block, so the leader's copy is the vote).
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    mma_ab(o_tmem.raw(), p, v, o_instruction, !correction);
+                    mma_ab(o_tmem.raw(), p, v, MMA_SHAPE, !correction);
                     mma::commit(mma_sem);
                 }
                 mma_sem.wait(mma_phase & 1);
@@ -1225,35 +1208,17 @@ pub mod kernels {
             let dp_tmem = STmem::from_raw(tmem + 128);
             let dq_tmem = AccTmem::from_raw(tmem + 256);
 
-            let s_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N64)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .build()
-                .raw();
-            let grad_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N64)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .transpose_b(true)
-                .build()
-                .raw();
-
             // The stacked Q/dY pairs stay operand-A resident for the whole key
             // stream: tile A's rows land at the operand's row 0, tile B's at
             // row TILE, one box per HD subtile each.
             if is_leader {
-                q.tma_load_at(q_tma, 0, (tile_a * TILE as u32) as i32, plane, tma.sem());
-                q.tma_load_at(q_tma, TILE, (tile_b * TILE as u32) as i32, plane, tma.sem());
-                dy.tma_load_at(dy_tma, 0, (tile_a * TILE as u32) as i32, plane, tma.sem());
-                dy.tma_load_at(
-                    dy_tma,
-                    TILE,
-                    (tile_b * TILE as u32) as i32,
-                    plane,
-                    tma.sem(),
-                );
-                tma.sem().expect_tx(4 * TILE_BYTES as u32);
+                let row_a = (tile_a * TILE as u32) as i32;
+                let row_b = (tile_b * TILE as u32) as i32;
+                let charge = q.tma_load_at::<TILE>(q_tma, 0, row_a, plane, tma.sem())
+                    + q.tma_load_at::<TILE>(q_tma, TILE, row_b, plane, tma.sem())
+                    + dy.tma_load_at::<TILE>(dy_tma, 0, row_a, plane, tma.sem())
+                    + dy.tma_load_at::<TILE>(dy_tma, TILE, row_b, plane, tma.sem());
+                tma.sem().expect_tx(charge);
             }
             tma.wait_next();
 
@@ -1264,15 +1229,15 @@ pub mod kernels {
             (*(&raw mut DOTS as *mut f32).add(tid as usize)) = dot[stat_index];
             thread::sync_threads();
 
-            let mut dq_acc = RegTile::<4, 32>::zero();
+            let mut dq_acc = RegTile::<32, 128, BaseLdtm>::zero();
 
             let mut key_tile = 0u32;
             while key_tile <= tile_b {
                 if is_leader {
                     let key_row = (key_tile * TILE as u32) as i32;
-                    k.tma_load(k_tma, key_row, plane, tma.sem());
-                    v.tma_load(v_tma, key_row, plane, tma.sem());
-                    tma.sem().expect_tx(2 * TILE_BYTES as u32);
+                    let charge = k.tma_load(k_tma, key_row, plane, tma.sem())
+                        + v.tma_load(v_tma, key_row, plane, tma.sem());
+                    tma.sem().expect_tx(charge);
                 }
                 tma.wait_next();
                 thread::sync_threads();
@@ -1280,8 +1245,8 @@ pub mod kernels {
                 // S = [Q_A;Q_B]·Kᵀ and dP = [dY_A;dY_B]·Vᵀ, both fresh.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    mma_abt(s_tmem.raw(), q, k, s_instruction, false);
-                    mma_abt(dp_tmem.raw(), dy, v, s_instruction, false);
+                    mma_abt(s_tmem.raw(), q, k, MMA_SHAPE, false);
+                    mma_abt(dp_tmem.raw(), dy, v, MMA_SHAPE, false);
                     mma::commit(mma.sem());
                 }
                 mma.wait_next();
@@ -1307,7 +1272,7 @@ pub mod kernels {
                 // dQ += dS·K, continuing the accumulator (fresh on key 0).
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    mma_ab(dq_tmem.raw(), ds, k, grad_instruction, key_tile != 0);
+                    mma_ab(dq_tmem.raw(), ds, k, MMA_SHAPE, key_tile != 0);
                     mma::commit(mma.sem());
                 }
                 mma.wait_next();
@@ -1408,41 +1373,29 @@ pub mod kernels {
             let dv_tmem = AccTmem::from_raw(tmem + 128);
             let dk_tmem = AccTmem::from_raw(tmem + 256);
 
-            let s_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N64)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .build()
-                .raw();
-            let grad_instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N64)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .transpose_b(true)
-                .build()
-                .raw();
-
             // The stacked K/V pairs stay operand-A resident for the whole query
             // stream.
             if is_leader {
-                k.tma_load_at(k_tma, 0, (key_a * TILE as u32) as i32, plane, tma.sem());
-                k.tma_load_at(k_tma, TILE, (key_b * TILE as u32) as i32, plane, tma.sem());
-                v.tma_load_at(v_tma, 0, (key_a * TILE as u32) as i32, plane, tma.sem());
-                v.tma_load_at(v_tma, TILE, (key_b * TILE as u32) as i32, plane, tma.sem());
-                tma.sem().expect_tx(4 * TILE_BYTES as u32);
+                let row_a = (key_a * TILE as u32) as i32;
+                let row_b = (key_b * TILE as u32) as i32;
+                let charge = k.tma_load_at::<TILE>(k_tma, 0, row_a, plane, tma.sem())
+                    + k.tma_load_at::<TILE>(k_tma, TILE, row_b, plane, tma.sem())
+                    + v.tma_load_at::<TILE>(v_tma, 0, row_a, plane, tma.sem())
+                    + v.tma_load_at::<TILE>(v_tma, TILE, row_b, plane, tma.sem());
+                tma.sem().expect_tx(charge);
             }
             tma.wait_next();
 
-            let mut dv_acc = RegTile::<4, 32>::zero();
-            let mut dk_acc = RegTile::<4, 32>::zero();
+            let mut dv_acc = RegTile::<32, 128, BaseLdtm>::zero();
+            let mut dk_acc = RegTile::<32, 128, BaseLdtm>::zero();
 
             let mut query_tile = key_a;
             while query_tile < tiles {
                 if is_leader {
                     let query_row = (query_tile * TILE as u32) as i32;
-                    q.tma_load(q_tma, query_row, plane, tma.sem());
-                    dy.tma_load(dy_tma, query_row, plane, tma.sem());
-                    tma.sem().expect_tx(2 * TILE_BYTES as u32);
+                    let charge = q.tma_load(q_tma, query_row, plane, tma.sem())
+                        + dy.tma_load(dy_tma, query_row, plane, tma.sem());
+                    tma.sem().expect_tx(charge);
                 }
                 tma.wait_next();
                 thread::sync_threads();
@@ -1462,8 +1415,8 @@ pub mod kernels {
                 // Sᵀ = [K_A;K_B]·Qᵀ and dPᵀ = [V_A;V_B]·dYᵀ, both fresh.
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
-                    mma_abt(st_tmem.raw(), k, q, s_instruction, false);
-                    mma_abt(dpt_tmem.raw(), v, dy, s_instruction, false);
+                    mma_abt(st_tmem.raw(), k, q, MMA_SHAPE, false);
+                    mma_abt(dpt_tmem.raw(), v, dy, MMA_SHAPE, false);
                     mma::commit(mma.sem());
                 }
                 mma.wait_next();
@@ -1491,8 +1444,8 @@ pub mod kernels {
                 if is_leader {
                     tcgen05_fence_after_thread_sync();
                     let accumulate = query_tile != key_a;
-                    mma_ab(dv_tmem.raw(), p, dy, grad_instruction, accumulate);
-                    mma_ab(dk_tmem.raw(), ds, q, grad_instruction, accumulate);
+                    mma_ab(dv_tmem.raw(), p, dy, MMA_SHAPE, accumulate);
+                    mma_ab(dk_tmem.raw(), ds, q, MMA_SHAPE, accumulate);
                     mma::commit(mma.sem());
                 }
                 mma.wait_next();
@@ -1532,11 +1485,10 @@ pub mod kernels {
         dq_tmem: AccTmem,
         ds_full: Semaphore,
         dq_done: Semaphore,
-        instruction: u32,
     ) {
         unsafe {
             ds_full.wait(i & 1);
-            mma_ab(dq_tmem.raw(), ds, k.tile(i), instruction, i != 0);
+            mma_ab(dq_tmem.raw(), ds, k.tile(i), MMA_SHAPE, i != 0);
             mma::commit(dq_done);
         }
     }
@@ -1688,7 +1640,7 @@ pub mod kernels {
                     }
                     i += 1;
                 }
-                let mut dq_acc = RegTile::<4, 32>::zero();
+                let mut dq_acc = RegTile::<32, 128, BaseLdtm>::zero();
                 merge_output_tile(dq_tmem, warp_id, &mut dq_acc);
                 // The pair's rows are contiguous, so the block's base tile is
                 // `tile_a` and the warp-derived local row (0..127) lands
@@ -1702,36 +1654,22 @@ pub mod kernels {
                     kv_free.wait_recycled(i);
                     let full = kv_full.sem(i);
                     let key_row = (i * TILE as u32) as i32;
-                    k.tile(i).tma_load(k_tma, key_row, plane, full);
-                    v.tile(i).tma_load(v_tma, key_row, plane, full);
+                    let mut charge = k.tile(i).tma_load(k_tma, key_row, plane, full)
+                        + v.tile(i).tma_load(v_tma, key_row, plane, full);
                     if i == 0 {
                         let row_a = (tile_a * TILE as u32) as i32;
                         let row_b = (tile_b * TILE as u32) as i32;
-                        q.tma_load_at(q_tma, 0, row_a, plane, full);
-                        q.tma_load_at(q_tma, TILE, row_b, plane, full);
-                        dy.tma_load_at(dy_tma, 0, row_a, plane, full);
-                        dy.tma_load_at(dy_tma, TILE, row_b, plane, full);
-                        full.expect_tx((2 * Panel::BYTES + 2 * PairedPanel::BYTES) as u32);
-                    } else {
-                        full.expect_tx(2 * Panel::BYTES as u32);
+                        charge = charge
+                            + q.tma_load_at::<TILE>(q_tma, 0, row_a, plane, full)
+                            + q.tma_load_at::<TILE>(q_tma, TILE, row_b, plane, full)
+                            + dy.tma_load_at::<TILE>(dy_tma, 0, row_a, plane, full)
+                            + dy.tma_load_at::<TILE>(dy_tma, TILE, row_b, plane, full);
                     }
+                    full.expect_tx(charge);
                     i += 1;
                 }
             } else if tid == group + 32 {
                 // MMA warp leader.
-                let s_instruction = Tcgen05InstructionDescriptor::builder()
-                    .shape(Tcgen05MmaShape::M128_N64)
-                    .element_type(Tcgen05ElementType::BF16)
-                    .accumulator_type(Tcgen05AccumulatorType::F32)
-                    .build()
-                    .raw();
-                let grad_instruction = Tcgen05InstructionDescriptor::builder()
-                    .shape(Tcgen05MmaShape::M128_N64)
-                    .element_type(Tcgen05ElementType::BF16)
-                    .accumulator_type(Tcgen05AccumulatorType::F32)
-                    .transpose_b(true)
-                    .build()
-                    .raw();
                 tcgen05_fence_after_thread_sync();
                 let mut i = 0u32;
                 while i < key_tiles {
@@ -1742,31 +1680,23 @@ pub mod kernels {
                         s_tmem.columns_right(buffer).raw(),
                         q,
                         k.tile(i),
-                        s_instruction,
+                        MMA_SHAPE,
                         false,
                     );
                     mma_abt(
                         dp_tmem.columns_right(buffer).raw(),
                         dy,
                         v.tile(i),
-                        s_instruction,
+                        MMA_SHAPE,
                         false,
                     );
                     mma::commit(s_full.sem(i));
                     if i > 0 {
-                        gradient_mma(i - 1, ds, k, dq_tmem, ds_full, dq_done, grad_instruction);
+                        gradient_mma(i - 1, ds, k, dq_tmem, ds_full, dq_done);
                     }
                     i += 1;
                 }
-                gradient_mma(
-                    key_tiles - 1,
-                    ds,
-                    k,
-                    dq_tmem,
-                    ds_full,
-                    dq_done,
-                    grad_instruction,
-                );
+                gradient_mma(key_tiles - 1, ds, k, dq_tmem, ds_full, dq_done);
             }
 
             tcgen05_fence_before_thread_sync();
@@ -1801,13 +1731,12 @@ pub mod kernels {
         dk_tmem: AccTmem,
         pds_full: Semaphore,
         grad_done: Semaphore,
-        instruction: u32,
     ) {
         unsafe {
             pds_full.wait(step & 1);
             let accumulate = step != 0;
-            mma_ab(dv_tmem.raw(), p, dy.tile(step), instruction, accumulate);
-            mma_ab(dk_tmem.raw(), ds, q.tile(step), instruction, accumulate);
+            mma_ab(dv_tmem.raw(), p, dy.tile(step), MMA_SHAPE, accumulate);
+            mma_ab(dk_tmem.raw(), ds, q.tile(step), MMA_SHAPE, accumulate);
             mma::commit(grad_done);
         }
     }
@@ -1945,8 +1874,8 @@ pub mod kernels {
                     }
                     step += 1;
                 }
-                let mut dv_acc = RegTile::<4, 32>::zero();
-                let mut dk_acc = RegTile::<4, 32>::zero();
+                let mut dv_acc = RegTile::<32, 128, BaseLdtm>::zero();
+                let mut dk_acc = RegTile::<32, 128, BaseLdtm>::zero();
                 merge_output_tile(dv_tmem, warp_id, &mut dv_acc);
                 merge_output_tile(dk_tmem, warp_id, &mut dk_acc);
                 store_grad_tile(batch, t, h, head, key_a, warp_id, lane, &dv_acc, &mut dv);
@@ -1973,37 +1902,23 @@ pub mod kernels {
                     if lane == 0 {
                         let full = qdy_full.sem(step);
                         let query_row = (query_tile * TILE as u32) as i32;
-                        q.tile(step).tma_load(q_tma, query_row, plane, full);
-                        dy.tile(step).tma_load(dy_tma, query_row, plane, full);
+                        let mut charge = q.tile(step).tma_load(q_tma, query_row, plane, full)
+                            + dy.tile(step).tma_load(dy_tma, query_row, plane, full);
                         if step == 0 {
                             let row_a = (key_a * TILE as u32) as i32;
                             let row_b = (key_b * TILE as u32) as i32;
-                            k.tma_load_at(k_tma, 0, row_a, plane, full);
-                            k.tma_load_at(k_tma, TILE, row_b, plane, full);
-                            v.tma_load_at(v_tma, 0, row_a, plane, full);
-                            v.tma_load_at(v_tma, TILE, row_b, plane, full);
-                            full.expect_tx((2 * Panel::BYTES + 2 * PairedPanel::BYTES) as u32);
-                        } else {
-                            full.expect_tx(2 * Panel::BYTES as u32);
+                            charge = charge
+                                + k.tma_load_at::<TILE>(k_tma, 0, row_a, plane, full)
+                                + k.tma_load_at::<TILE>(k_tma, TILE, row_b, plane, full)
+                                + v.tma_load_at::<TILE>(v_tma, 0, row_a, plane, full)
+                                + v.tma_load_at::<TILE>(v_tma, TILE, row_b, plane, full);
                         }
+                        full.expect_tx(charge);
                     }
                     step += 1;
                 }
             } else if tid == group + 32 {
                 // MMA warp leader.
-                let s_instruction = Tcgen05InstructionDescriptor::builder()
-                    .shape(Tcgen05MmaShape::M128_N64)
-                    .element_type(Tcgen05ElementType::BF16)
-                    .accumulator_type(Tcgen05AccumulatorType::F32)
-                    .build()
-                    .raw();
-                let grad_instruction = Tcgen05InstructionDescriptor::builder()
-                    .shape(Tcgen05MmaShape::M128_N64)
-                    .element_type(Tcgen05ElementType::BF16)
-                    .accumulator_type(Tcgen05AccumulatorType::F32)
-                    .transpose_b(true)
-                    .build()
-                    .raw();
                 tcgen05_fence_after_thread_sync();
                 let mut step = 0u32;
                 while step < steps {
@@ -2014,14 +1929,14 @@ pub mod kernels {
                         st_tmem.columns_right(buffer).raw(),
                         k,
                         q.tile(step),
-                        s_instruction,
+                        MMA_SHAPE,
                         false,
                     );
                     mma_abt(
                         dpt_tmem.columns_right(buffer).raw(),
                         v,
                         dy.tile(step),
-                        s_instruction,
+                        MMA_SHAPE,
                         false,
                     );
                     mma::commit(s_full.sem(step));
@@ -2036,7 +1951,6 @@ pub mod kernels {
                             dk_tmem,
                             pds_full,
                             grad_done,
-                            grad_instruction,
                         );
                     }
                     step += 1;
@@ -2051,7 +1965,6 @@ pub mod kernels {
                     dk_tmem,
                     pds_full,
                     grad_done,
-                    grad_instruction,
                 );
             }
 
@@ -2080,7 +1993,6 @@ pub mod kernels {
         tile: u32,
         stream: Stream<S_BUFFERS>,
         v: PanelRingN<STAGES>,
-        o_instruction: u32,
     ) {
         unsafe {
             stream.p_full.wait(tile & 1);
@@ -2089,7 +2001,7 @@ pub mod kernels {
                 stream.o_tmem.raw(),
                 stream.p,
                 v.tile(tile),
-                o_instruction,
+                MMA_SHAPE,
                 !fresh,
             );
             mma::commit(stream.o_full);
@@ -2115,9 +2027,9 @@ pub mod kernels {
         lane: u32,
         stream: Stream<S_BUFFERS>,
         kv_free: SemaphoreRing<STAGES>,
-        m_ref: &mut RegVec<4>,
-        running_sum: &mut RegVec<4>,
-        out_acc: &mut RegTile<4, 32>,
+        m_ref: &mut RegVec<32, BaseLdtm>,
+        running_sum: &mut RegVec<32, BaseLdtm>,
+        out_acc: &mut RegTile<32, 128, BaseLdtm>,
         corrections: &mut u32,
     ) {
         unsafe {
@@ -2275,9 +2187,9 @@ pub mod kernels {
                 // Softmax / correction / epilogue warpgroup. The key loop
                 // is split so the diagonal tile is the only one paying for
                 // mask logic (the full-tile calls fold `diagonal = false`).
-                let mut m_ref = RegVec::<4>::splat(MASKED_SCORE);
-                let mut running_sum = RegVec::<4>::splat(0.0);
-                let mut out_acc = RegTile::<4, 32>::zero();
+                let mut m_ref = RegVec::<32, BaseLdtm>::splat(MASKED_SCORE);
+                let mut running_sum = RegVec::<32, BaseLdtm>::splat(0.0);
+                let mut out_acc = RegTile::<32, 128, BaseLdtm>::zero();
                 let mut corrections = 0u32;
                 let mut i = 0u32;
                 while i + 1 < key_tiles {
@@ -2339,31 +2251,17 @@ pub mod kernels {
                     kv_free.wait_recycled(i);
                     let full = kv_full.sem(i);
                     let key_row = (i * TILE as u32) as i32;
-                    k.tile(i).tma_load(k_tma, key_row, plane, full);
-                    v.tile(i).tma_load(v_tma, key_row, plane, full);
+                    let mut charge = k.tile(i).tma_load(k_tma, key_row, plane, full)
+                        + v.tile(i).tma_load(v_tma, key_row, plane, full);
                     if i == 0 {
-                        q.tma_load(q_tma, (query_tile * TILE as u32) as i32, plane, full);
-                        full.expect_tx(3 * Panel::BYTES as u32);
-                    } else {
-                        full.expect_tx(2 * Panel::BYTES as u32);
+                        charge = charge
+                            + q.tma_load(q_tma, (query_tile * TILE as u32) as i32, plane, full);
                     }
+                    full.expect_tx(charge);
                     i += 1;
                 }
             } else if tid == (TILE + 32) as u32 {
                 // MMA warp leader.
-                let s_instruction = Tcgen05InstructionDescriptor::builder()
-                    .shape(Tcgen05MmaShape::M128_N64)
-                    .element_type(Tcgen05ElementType::BF16)
-                    .accumulator_type(Tcgen05AccumulatorType::F32)
-                    .build()
-                    .raw();
-                let o_instruction = Tcgen05InstructionDescriptor::builder()
-                    .shape(Tcgen05MmaShape::M128_N64)
-                    .element_type(Tcgen05ElementType::BF16)
-                    .accumulator_type(Tcgen05AccumulatorType::F32)
-                    .transpose_b(true)
-                    .build()
-                    .raw();
                 tcgen05_fence_after_thread_sync();
                 let mut i = 0u32;
                 while i < key_tiles {
@@ -2373,15 +2271,14 @@ pub mod kernels {
                         stream.s_tmem.columns_right((i & 1) * 64).raw(),
                         q,
                         k.tile(i),
-                        s_instruction,
                     );
                     mma::commit(stream.s_full.sem(i));
                     if i > 0 {
-                        output_mma(i - 1, stream, v, o_instruction);
+                        output_mma(i - 1, stream, v);
                     }
                     i += 1;
                 }
-                output_mma(key_tiles - 1, stream, v, o_instruction);
+                output_mma(key_tiles - 1, stream, v);
             }
 
             tcgen05_fence_before_thread_sync();
@@ -2502,9 +2399,9 @@ pub mod kernels {
     ) {
         unsafe {
             let key_tiles = query_tile + 1;
-            let mut m_ref = RegVec::<4>::splat(MASKED_SCORE);
-            let mut running_sum = RegVec::<4>::splat(0.0);
-            let mut out_acc = RegTile::<4, 32>::zero();
+            let mut m_ref = RegVec::<32, BaseLdtm>::splat(MASKED_SCORE);
+            let mut running_sum = RegVec::<32, BaseLdtm>::splat(0.0);
+            let mut out_acc = RegTile::<32, 128, BaseLdtm>::zero();
             let mut corrections = 0u32;
             let mut i = 0u32;
             while i + 1 < key_tiles {
@@ -2690,28 +2587,27 @@ pub mod kernels {
                         self.kv_free.wait_recycled(i);
                         let full = self.kv_full.sem(i);
                         let key_row = (i * TILE as u32) as i32;
-                        self.k.tile(i).tma_load(self.k_tma, key_row, plane, full);
-                        self.v.tile(i).tma_load(self.v_tma, key_row, plane, full);
+                        let mut charge = self.k.tile(i).tma_load(self.k_tma, key_row, plane, full)
+                            + self.v.tile(i).tma_load(self.v_tma, key_row, plane, full);
                         if i == 0 {
-                            self.q_a.tma_load(
-                                self.q_tma,
-                                (tile_a * TILE as u32) as i32,
-                                plane,
-                                full,
-                            );
-                            if b_active {
-                                self.q_b.tma_load(
+                            charge = charge
+                                + self.q_a.tma_load(
                                     self.q_tma,
-                                    (tile_b * TILE as u32) as i32,
+                                    (tile_a * TILE as u32) as i32,
                                     plane,
                                     full,
                                 );
+                            if b_active {
+                                charge = charge
+                                    + self.q_b.tma_load(
+                                        self.q_tma,
+                                        (tile_b * TILE as u32) as i32,
+                                        plane,
+                                        full,
+                                    );
                             }
-                            let q_tiles = 1 + b_active as u32;
-                            full.expect_tx((2 + q_tiles) * TILE_BYTES as u32);
-                        } else {
-                            full.expect_tx(2 * TILE_BYTES as u32);
                         }
+                        full.expect_tx(charge);
                         i += 1;
                     }
                 } else if self.tid == (TILE + 32) as u32 {
@@ -2719,19 +2615,6 @@ pub mod kernels {
                     // both streams (each gated by its own single-buffered S
                     // being free), then the previous tile's O-MMAs — the
                     // same stagger as the pipelined kernel, per stream.
-                    let s_instruction = Tcgen05InstructionDescriptor::builder()
-                        .shape(Tcgen05MmaShape::M128_N64)
-                        .element_type(Tcgen05ElementType::BF16)
-                        .accumulator_type(Tcgen05AccumulatorType::F32)
-                        .build()
-                        .raw();
-                    let o_instruction = Tcgen05InstructionDescriptor::builder()
-                        .shape(Tcgen05MmaShape::M128_N64)
-                        .element_type(Tcgen05ElementType::BF16)
-                        .accumulator_type(Tcgen05AccumulatorType::F32)
-                        .transpose_b(true)
-                        .build()
-                        .raw();
                     tcgen05_fence_after_thread_sync();
                     let mut i = 0u32;
                     while i < stream_tiles {
@@ -2739,26 +2622,26 @@ pub mod kernels {
                         let k_tile = self.k.tile(i);
                         if i < tiles_a {
                             self.a.s_free.wait_recycled(i);
-                            score_mma(self.a.s_tmem.raw(), self.q_a, k_tile, s_instruction);
+                            score_mma(self.a.s_tmem.raw(), self.q_a, k_tile);
                             mma::commit(self.a.s_full.sem(i));
                         }
                         if b_active {
                             self.b.s_free.wait_recycled(i);
-                            score_mma(self.b.s_tmem.raw(), self.q_b, k_tile, s_instruction);
+                            score_mma(self.b.s_tmem.raw(), self.q_b, k_tile);
                             mma::commit(self.b.s_full.sem(i));
                         }
                         if i > 0 {
-                            output_mma(i - 1, self.a, self.v, o_instruction);
+                            output_mma(i - 1, self.a, self.v);
                             if b_active {
-                                output_mma(i - 1, self.b, self.v, o_instruction);
+                                output_mma(i - 1, self.b, self.v);
                             }
                         }
                         i += 1;
                     }
                     if b_active {
-                        output_mma(tiles_b - 1, self.b, self.v, o_instruction);
+                        output_mma(tiles_b - 1, self.b, self.v);
                     } else {
-                        output_mma(tiles_a - 1, self.a, self.v, o_instruction);
+                        output_mma(tiles_a - 1, self.a, self.v);
                     }
                 }
             }
@@ -2788,7 +2671,10 @@ pub mod kernels {
     /// The strided work-item loop and its per-item barrier lifecycle are
     /// `kittens::pipeline::run` (extracted from this kernel); the
     /// [`PersistentForward`] job orders items by *descending* pair index, so
-    /// the causally long pairs are dealt out before the cheap ones.
+    /// the causally long pairs are dealt out before the cheap ones. `run`
+    /// deals items by `%clusterid` and takes the item boundary at `Job::RANKS`
+    /// scope; this kernel is not `#[cluster_launch]`, so its cluster is one CTA
+    /// and both degenerate to the `blockIdx.x`/`sync_threads` loop written here.
     /// Launching with grid = the full item count degenerates to one item
     /// per CTA — the non-persistent config kept for hang debugging. The
     /// per-item re-initialization means each item's phase arithmetic starts

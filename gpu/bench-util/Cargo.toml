@@ -7,7 +7,7 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "20a56163f258e09f2c51e4c27ae4e4ff17582443" }
 # Same RNG as the CPU reference tensors, so parity tests reproduce identical
 # inputs on both sides from a seed.
 tensor-core = { path = "../../crates/tensor-core" }

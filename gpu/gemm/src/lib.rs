@@ -22,7 +22,6 @@ use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta, mbarrier_arriv
 use cuda_device::cluster;
 use cuda_device::shared::SharedArray;
 use cuda_device::tcgen05::{
-    Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
     cvt_f32x2_bf16x2, tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_dealloc, tcgen05_dealloc_cg2,
     tcgen05_relinquish_alloc_permit_cg2,
 };
@@ -95,8 +94,6 @@ pub mod kernels {
             static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
             static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
 
-            const TILE_BYTES: u32 = (TC_TILE * TC_BK * 2) as u32;
-
             let tid = thread::threadIdx_x();
             let warp_id = warp::warp_id();
             let lane_id = tid % 32;
@@ -123,21 +120,23 @@ pub mod kernels {
             let accumulator =
                 TmemTile::<TC_TILE, TC_TILE>::from_raw(*(&raw const TMEM_ADDRESS as *const u32));
 
-            let instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N128)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .build()
-                .raw();
-
             let mut k_tile = 0u32;
             while k_tile < k / TC_BK as u32 {
                 let phase = k_tile & 1;
                 if is_leader {
                     let k_offset = (k_tile * TC_BK as u32) as i32;
-                    a_tile.tma_load_2d(a_tma, k_offset, (tile_m * TC_TILE as u32) as i32, tma_sem);
-                    b_tile.tma_load_2d(b_tma, k_offset, (tile_n * TC_TILE as u32) as i32, tma_sem);
-                    tma_sem.expect_tx(TILE_BYTES * 2);
+                    let charge = a_tile.tma_load_2d(
+                        a_tma,
+                        k_offset,
+                        (tile_m * TC_TILE as u32) as i32,
+                        tma_sem,
+                    ) + b_tile.tma_load_2d(
+                        b_tma,
+                        k_offset,
+                        (tile_n * TC_TILE as u32) as i32,
+                        tma_sem,
+                    );
+                    tma_sem.expect_tx(charge);
                 }
 
                 tma_sem.wait(phase);
@@ -145,8 +144,14 @@ pub mod kernels {
 
                 if is_leader {
                     // PTX names this the 16-bit floating-point MMA family;
-                    // the instruction descriptor selects bf16 inputs.
-                    mma::mma_abt(accumulator.raw(), a_tile, b_tile, instruction, k_tile > 0);
+                    // the operand tiles' `Bf16` selects bf16 inputs.
+                    mma::mma_abt(
+                        accumulator.raw(),
+                        a_tile,
+                        b_tile,
+                        mma::MmaShape::M128_N128,
+                        k_tile > 0,
+                    );
                     mma::commit(mma_sem);
                 }
 
@@ -242,8 +247,6 @@ pub mod kernels {
             static mut TMA_BARRIER: Barrier = Barrier::UNINIT;
             static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
 
-            const TILE_BYTES: u32 = (TC_TILE * TC_BK * 2) as u32;
-
             let tid = thread::threadIdx_x();
             let warp_id = warp::warp_id();
             let lane_id = tid % 32;
@@ -270,28 +273,36 @@ pub mod kernels {
             let accumulator =
                 TmemTile::<TC_TILE, TC_TILE>::from_raw(*(&raw const TMEM_ADDRESS as *const u32));
 
-            let instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N128)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .build()
-                .raw();
-
             let mut k_tile = 0u32;
             while k_tile < k / TC_BK as u32 {
                 let phase = k_tile & 1;
                 if is_leader {
                     let k_offset = (k_tile * TC_BK as u32) as i32;
-                    a_tile.tma_load_2d(a_tma, k_offset, (tile_m * TC_TILE as u32) as i32, tma_sem);
-                    b_tile.tma_load_2d(b_tma, k_offset, (tile_n * TC_TILE as u32) as i32, tma_sem);
-                    tma_sem.expect_tx(TILE_BYTES * 2);
+                    let charge = a_tile.tma_load_2d(
+                        a_tma,
+                        k_offset,
+                        (tile_m * TC_TILE as u32) as i32,
+                        tma_sem,
+                    ) + b_tile.tma_load_2d(
+                        b_tma,
+                        k_offset,
+                        (tile_n * TC_TILE as u32) as i32,
+                        tma_sem,
+                    );
+                    tma_sem.expect_tx(charge);
                 }
 
                 tma_sem.wait(phase);
                 thread::sync_threads();
 
                 if is_leader {
-                    mma::mma_abt(accumulator.raw(), a_tile, b_tile, instruction, k_tile > 0);
+                    mma::mma_abt(
+                        accumulator.raw(),
+                        a_tile,
+                        b_tile,
+                        mma::MmaShape::M128_N128,
+                        k_tile > 0,
+                    );
                     mma::commit(mma_sem);
                 }
 
