@@ -15,8 +15,8 @@ use cuda_device::{
     cuda_module, kernel, thread,
 };
 
-use kittens::global::{GlobalRows, load_rows, store_rows};
-use kittens::reg::{BaseLdtm, RegTile, RegVec};
+use kittens::global::{GlobalRows, load_cols, load_rows, store_rows};
+use kittens::reg::{BaseLdtm, ColVec, RegTile, RegVec};
 use kittens::shared::F32;
 use kittens::{lane, warp_id};
 
@@ -134,6 +134,10 @@ type NormChunk = RegTile<NORM_TILE_ROWS, NORM_TILE_CHUNK, BaseLdtm>;
 /// One `f32` per row of a [`NormChunk`], replicated across each quad — where a
 /// row statistic lives between the passes that produce and consume it.
 type NormRows = RegVec<NORM_TILE_ROWS, BaseLdtm>;
+
+/// The chunk's slice of the `[dim]` weight, one `f32` per column this thread
+/// owns rather than one per (row, column) pair.
+type NormColumns = ColVec<NORM_TILE_CHUNK, BaseLdtm>;
 
 #[cuda_module]
 pub mod kernels {
@@ -538,9 +542,10 @@ pub mod kernels {
             let d = dim as usize;
             let source = GlobalRows::<F32>::from_raw(x.as_ptr() as *mut u8, d);
             let destination = GlobalRows::<F32>::from_slice(&mut y, d);
-            // Stride zero: every row of this tile is the same `[dim]` weight
-            // vector, so one cursor broadcasts it and the per-column operand
-            // needs no separate staging pass.
+            // A one-row cursor: the weight is a per-column operand, and
+            // `load_cols` reads it as one. Reading it through `load_rows`
+            // instead would hold every value once per row the thread owns and
+            // put the chunk width on a spill cliff (ferro-kittens#172).
             let parameters = GlobalRows::<F32>::from_raw(weight.as_ptr() as *mut u8, 0);
 
             let mut total = NormRows::splat(0.0);
@@ -555,8 +560,8 @@ pub mod kernels {
             column = 0;
             while column < dim {
                 let v: NormChunk = load_rows(source, row, column, lane);
-                let w: NormChunk = load_rows(parameters, 0, column, lane);
-                store_rows(destination, row, column, lane, v.mul_row(inv).mul(w));
+                let w: NormColumns = load_cols(parameters, 0, column, lane);
+                store_rows(destination, row, column, lane, v.mul_row(inv).mul_col(w));
                 column += NORM_TILE_CHUNK as u32;
             }
         }
@@ -598,9 +603,9 @@ pub mod kernels {
             while column < dim {
                 let v: NormChunk = load_rows(source, row, column, lane);
                 let g: NormChunk = load_rows(upstream, row, column, lane);
-                let w: NormChunk = load_rows(parameters, 0, column, lane);
+                let w: NormColumns = load_cols(parameters, 0, column, lane);
                 square.add_assign(v.mul(v).row_sum());
-                dot.add_assign(g.mul(w).mul(v).row_sum());
+                dot.add_assign(g.mul_col(w).mul(v).row_sum());
                 column += NORM_TILE_CHUNK as u32;
             }
             let row_inv = square.scale(1.0 / dim as f32).shift(eps).rsqrt();
@@ -623,8 +628,8 @@ pub mod kernels {
             while column < dim {
                 let v: NormChunk = load_rows(source, row, column, lane);
                 let g: NormChunk = load_rows(upstream, row, column, lane);
-                let w: NormChunk = load_rows(parameters, 0, column, lane);
-                let out = g.mul(w).mul_row(row_inv).sub(v.mul_row(correction));
+                let w: NormColumns = load_cols(parameters, 0, column, lane);
+                let out = g.mul_col(w).mul_row(row_inv).sub(v.mul_row(correction));
                 store_rows(destination, row, column, lane, out);
                 column += NORM_TILE_CHUNK as u32;
             }
