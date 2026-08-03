@@ -1358,46 +1358,37 @@ fn check_swiglu_tile(
             COLUMNS as u32,
             &mut tiled,
         )?;
+        let tile_f32 = tiled.to_host_vec(stream)?;
         assert_close(
             "swiglu tile vs flat",
-            &tiled.to_host_vec(stream)?,
+            &tile_f32,
             &shipped.to_host_vec(stream)?,
             atol,
             rtol,
         );
 
-        let mut shipped_words = DeviceBuffer::<u32>::zeroed(stream, LEN / 2)?;
-        let mut tiled_words = DeviceBuffer::<u32>::zeroed(stream, LEN / 2)?;
-        module.swiglu_forward_bf16(
-            stream,
-            LaunchConfig::for_num_elems((LEN / 2) as u32),
-            &gate_dev,
-            &up_dev,
-            &mut shipped_words,
-        )?;
+        // The bf16 arm is checked against the fp32 tile and not against the
+        // flat bf16 kernel: what it changes is the *store*, and two f32 values
+        // a relative 2e-5 apart straddle a bf16 boundary often enough that a
+        // comparison of two roundings prices the `exp` difference instead. One
+        // bf16 ULP is 2^-8 relative, and that is the claim.
+        let mut words = DeviceBuffer::<u32>::zeroed(stream, LEN / 2)?;
         module.swiglu_forward_tile_bf16(
             stream,
             tiles,
             &gate_dev,
             &up_dev,
             COLUMNS as u32,
-            &mut tiled_words,
+            &mut words,
         )?;
-        let unpack = |words: Vec<u32>| -> Vec<f32> {
-            words
-                .iter()
-                .flat_map(|&word| {
-                    [word as u16, (word >> 16) as u16].map(|bits| bf16::from_bits(bits).to_f32())
-                })
-                .collect()
-        };
-        assert_close(
-            "swiglu bf16 tile vs flat",
-            &unpack(tiled_words.to_host_vec(stream)?),
-            &unpack(shipped_words.to_host_vec(stream)?),
-            atol,
-            4e-3,
-        );
+        let rounded: Vec<f32> = words
+            .to_host_vec(stream)?
+            .iter()
+            .flat_map(|&word| {
+                [word as u16, (word >> 16) as u16].map(|bits| bf16::from_bits(bits).to_f32())
+            })
+            .collect();
+        assert_close("swiglu bf16 tile vs fp32 tile", &rounded, &tile_f32, atol, 4e-3);
 
         module.swiglu_backward_gate(stream, flat, &gate_dev, &up_dev, &dy_dev, &mut shipped)?;
         module.swiglu_backward_gate_tile(

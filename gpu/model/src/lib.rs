@@ -54,6 +54,25 @@ mod gemm_device;
 pub mod tensor_device;
 
 pub use dense_device::kernels as dense_kernels;
+use dense_device::{SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS};
+
+/// The tile-SwiGLU launch for a `rows x columns` rectangle, or `None` when the
+/// shape does not divide the tile the way the kernels require.
+///
+/// The tile kernels bounds-check nothing, so this is where the divisibility is
+/// decided; every training shape in `bin/train.rs` divides, and the flat
+/// kernels stay as the arm anything else takes. The bf16 forward has no tile
+/// arm on purpose — it measured 0.70x of the flat one, which already stores a
+/// packed pair per thread (#70).
+fn swiglu_tiles(rows: usize, columns: usize) -> Option<LaunchConfig> {
+    (rows.is_multiple_of(SWIGLU_TILE_BLOCK_ROWS) && columns.is_multiple_of(SWIGLU_TILE_CHUNK)).then(
+        || LaunchConfig {
+            grid_dim: ((rows / SWIGLU_TILE_BLOCK_ROWS) as u32, 1, 1),
+            block_dim: (SWIGLU_TILE_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        },
+    )
+}
 pub use flash_device::host::Tcgen05Flash;
 pub use flash_device::kernels as flash_kernels;
 pub use gemm_device::fp32::kernels as gemm_kernels;
@@ -1776,13 +1795,23 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
                     up.as_device_buffer(),
                     &mut panel.words,
                 ),
-                ExpertPanel::Wide(values) => dense.swiglu_forward(
-                    stream,
-                    LaunchConfig::for_num_elems((E * C * FF) as u32),
-                    gate.as_device_buffer(),
-                    up.as_device_buffer(),
-                    values,
-                ),
+                ExpertPanel::Wide(values) => match swiglu_tiles(E * C, FF) {
+                    Some(tiles) => dense.swiglu_forward_tile(
+                        stream,
+                        tiles,
+                        gate.as_device_buffer(),
+                        up.as_device_buffer(),
+                        FF as u32,
+                        values,
+                    ),
+                    None => dense.swiglu_forward(
+                        stream,
+                        LaunchConfig::for_num_elems((E * C * FF) as u32),
+                        gate.as_device_buffer(),
+                        up.as_device_buffer(),
+                        values,
+                    ),
+                },
             }
         })?;
         expert_linear_forward::<E, C, P>(
@@ -1858,26 +1887,49 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             ],
         )?;
         let elementwise = LaunchConfig::for_num_elems((E * C * FF) as u32);
-        // SAFETY: all elementwise buffers contain E * C * FF elements.
+        let tiles = swiglu_tiles(E * C, FF);
+        // SAFETY: all elementwise buffers contain E * C * FF elements, and the
+        // tile arms are only taken at a shape `swiglu_tiles` accepted.
         profiler.measure(stream, "backward.experts.swiglu_gate", || unsafe {
-            dense.swiglu_backward_gate(
-                stream,
-                elementwise,
-                acts.gate.as_device_buffer(),
-                acts.up.as_device_buffer(),
-                scratch.d_activated.as_device_buffer(),
-                scratch.d_gate.as_device_buffer_mut(),
-            )
+            match tiles {
+                Some(tiles) => dense.swiglu_backward_gate_tile(
+                    stream,
+                    tiles,
+                    acts.gate.as_device_buffer(),
+                    acts.up.as_device_buffer(),
+                    scratch.d_activated.as_device_buffer(),
+                    FF as u32,
+                    scratch.d_gate.as_device_buffer_mut(),
+                ),
+                None => dense.swiglu_backward_gate(
+                    stream,
+                    elementwise,
+                    acts.gate.as_device_buffer(),
+                    acts.up.as_device_buffer(),
+                    scratch.d_activated.as_device_buffer(),
+                    scratch.d_gate.as_device_buffer_mut(),
+                ),
+            }
         })?;
-        // SAFETY: all elementwise buffers contain E * C * FF elements.
+        // SAFETY: as above.
         profiler.measure(stream, "backward.experts.swiglu_up", || unsafe {
-            dense.swiglu_backward_up(
-                stream,
-                elementwise,
-                acts.gate.as_device_buffer(),
-                scratch.d_activated.as_device_buffer(),
-                scratch.d_up.as_device_buffer_mut(),
-            )
+            match tiles {
+                Some(tiles) => dense.swiglu_backward_up_tile(
+                    stream,
+                    tiles,
+                    acts.gate.as_device_buffer(),
+                    scratch.d_activated.as_device_buffer(),
+                    FF as u32,
+                    scratch.d_up.as_device_buffer_mut(),
+                ),
+                None => dense.swiglu_backward_up(
+                    stream,
+                    elementwise,
+                    acts.gate.as_device_buffer(),
+                    scratch.d_activated.as_device_buffer(),
+                    scratch.d_up.as_device_buffer_mut(),
+                ),
+            }
         })?;
         let GpuExpertScratch {
             d_gate,
@@ -6084,15 +6136,26 @@ fn swiglu_into<const N: usize, const FF: usize, P: KernelProfiler>(
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    // SAFETY: all elementwise buffers contain N * FF elements.
+    // SAFETY: all elementwise buffers contain N * FF elements, and the tile
+    // arm is only taken at a shape `swiglu_tiles` accepted.
     profiler.measure(stream, name, || unsafe {
-        kernels.swiglu_forward(
-            stream,
-            LaunchConfig::for_num_elems((N * FF) as u32),
-            gate.as_device_buffer(),
-            up.as_device_buffer(),
-            output.as_device_buffer_mut(),
-        )
+        match swiglu_tiles(N, FF) {
+            Some(tiles) => kernels.swiglu_forward_tile(
+                stream,
+                tiles,
+                gate.as_device_buffer(),
+                up.as_device_buffer(),
+                FF as u32,
+                output.as_device_buffer_mut(),
+            ),
+            None => kernels.swiglu_forward(
+                stream,
+                LaunchConfig::for_num_elems((N * FF) as u32),
+                gate.as_device_buffer(),
+                up.as_device_buffer(),
+                output.as_device_buffer_mut(),
+            ),
+        }
     })?;
     Ok(())
 }
@@ -6108,26 +6171,49 @@ fn swiglu_backward_into<const N: usize, const FF: usize, P: KernelProfiler>(
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     let config = LaunchConfig::for_num_elems((N * FF) as u32);
-    // SAFETY: all elementwise buffers contain N * FF elements.
+    let tiles = swiglu_tiles(N, FF);
+    // SAFETY: all elementwise buffers contain N * FF elements, and the tile
+    // arms are only taken at a shape `swiglu_tiles` accepted.
     profiler.measure(stream, "backward.swiglu.gate", || unsafe {
-        kernels.swiglu_backward_gate(
-            stream,
-            config,
-            gate.as_device_buffer(),
-            up.as_device_buffer(),
-            dy.as_device_buffer(),
-            dgate.as_device_buffer_mut(),
-        )
+        match tiles {
+            Some(tiles) => kernels.swiglu_backward_gate_tile(
+                stream,
+                tiles,
+                gate.as_device_buffer(),
+                up.as_device_buffer(),
+                dy.as_device_buffer(),
+                FF as u32,
+                dgate.as_device_buffer_mut(),
+            ),
+            None => kernels.swiglu_backward_gate(
+                stream,
+                config,
+                gate.as_device_buffer(),
+                up.as_device_buffer(),
+                dy.as_device_buffer(),
+                dgate.as_device_buffer_mut(),
+            ),
+        }
     })?;
-    // SAFETY: all elementwise buffers contain N * FF elements.
+    // SAFETY: as above.
     profiler.measure(stream, "backward.swiglu.up", || unsafe {
-        kernels.swiglu_backward_up(
-            stream,
-            config,
-            gate.as_device_buffer(),
-            dy.as_device_buffer(),
-            dup.as_device_buffer_mut(),
-        )
+        match tiles {
+            Some(tiles) => kernels.swiglu_backward_up_tile(
+                stream,
+                tiles,
+                gate.as_device_buffer(),
+                dy.as_device_buffer(),
+                FF as u32,
+                dup.as_device_buffer_mut(),
+            ),
+            None => kernels.swiglu_backward_up(
+                stream,
+                config,
+                gate.as_device_buffer(),
+                dy.as_device_buffer(),
+                dup.as_device_buffer_mut(),
+            ),
+        }
     })?;
     Ok(())
 }
