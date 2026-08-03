@@ -961,9 +961,15 @@ fn bench(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    assert!(
-        tcgen05_device::FLASH_FORWARD_SMEM <= host::FLASH_FORWARD_SMEM_BYTES as usize,
-        "FORWARD_STAGES overflows the host-side shared-memory ceiling"
+    assert_eq!(
+        host::FLASH_FORWARD_SMEM_BYTES as usize,
+        tcgen05_device::FLASH_FORWARD_SMEM,
+        "the launch must request the kernel's own plan, or residency is the request's"
+    );
+    println!(
+        "forward plan: {} B, {} CTA/SM",
+        tcgen05_device::FLASH_FORWARD_SMEM,
+        host::FLASH_FORWARD_CTAS_PER_SM
     );
     assert_eq!(
         host::FLASH_FORWARD_BLOCK_THREADS as usize,

@@ -50,15 +50,35 @@ pub const FLASH_BACKWARD_KV_PIPELINED_SMEM_BYTES: u32 = ((6 + 2 * 4) * TILE_BYTE
 /// Threads of the pipelined key-parallel backward. Mirrors
 /// `FLASH_BACKWARD_KV_PIPELINED_BLOCK`.
 pub const FLASH_BACKWARD_KV_PIPELINED_BLOCK_THREADS: u32 = (FLASH_QUERIES + 64) as u32;
-/// Dynamic shared allocation for the forward: the resident `[QUERIES, HD]`
-/// query block (`2 * TILE_BYTES`), K/V rings sized for the deepest supported
-/// `FORWARD_STAGES` (4), the two-deep `[QUERIES, TILE]` probability ring
-/// (`2 * TILE_BYTES`), and a page for the barriers and the vote scratch the
-/// plan carves after them. The kernel's actual plan (`FLASH_FORWARD_SMEM`, a
-/// function of the swept `FORWARD_STAGES`) must stay at or under this; the
-/// flash bin asserts it. Allocating the ceiling keeps stage sweeps a one-const
-/// edit, and costs nothing at 1 CTA/SM.
-pub const FLASH_FORWARD_SMEM_BYTES: u32 = ((4 + 2 * 4) * TILE_BYTES + 1024) as u32;
+/// Dynamic shared allocation for the forward: **exactly** the kernel's own
+/// plan, not a ceiling sized for the deepest supported `FORWARD_STAGES`.
+///
+/// The launch's request is what the driver charges an SM, so a ceiling is not
+/// free the moment the plan is small enough to admit a second CTA — it pins
+/// residency at the ceiling's. That was invisible while the plan was 164 KiB
+/// and is the whole point at 112.
+pub const FLASH_FORWARD_SMEM_BYTES: u32 = super::tcgen05::FLASH_FORWARD_SMEM as u32;
+/// Shared memory an SM gives its CTAs, and tensor-memory columns it has.
+/// B200 numbers, which is the only target (decision #14); ferro-kittens #84
+/// measured residency as exactly the `min` of what the two admit, at every
+/// rung it tried.
+const SM_SHARED_BYTES: usize = 233_472;
+const SM_TMEM_COLUMNS: usize = 512;
+/// CTAs of the forward an SM admits, and so the multiplier the persistent grid
+/// takes over the SM count. Two at `FORWARD_STAGES = 2`, one above it.
+pub const FLASH_FORWARD_CTAS_PER_SM: usize = {
+    let by_shared = SM_SHARED_BYTES / FLASH_FORWARD_SMEM_BYTES as usize;
+    let by_tmem = SM_TMEM_COLUMNS / super::tcgen05::FORWARD_TMEM_COLUMNS as usize;
+    if by_shared < by_tmem {
+        by_shared
+    } else {
+        by_tmem
+    }
+};
+const _: () = assert!(
+    FLASH_FORWARD_CTAS_PER_SM >= 1,
+    "the forward's plan does not fit one CTA on an SM"
+);
 /// Threads of the forward: the four warps an `M128` accumulator's 128 TMEM
 /// lanes are drained by, and no others. Mirrors `FLASH_FORWARD_BLOCK`.
 pub const FLASH_FORWARD_BLOCK_THREADS: u32 = FLASH_QUERIES as u32;
@@ -175,9 +195,14 @@ pub fn device_sm_count(ctx: &CudaContext) -> Result<usize, Box<dyn Error>> {
     Ok(count as usize)
 }
 
-/// Launch for the forward: a 1-D persistent grid of `cta_count` CTAs (normally
-/// the SM count; clamped to the work-item count, so passing the item count
-/// degenerates to one item per CTA for hang debugging).
+/// Launch for the forward: a 1-D persistent grid of
+/// `cta_count * FLASH_FORWARD_CTAS_PER_SM` CTAs (`cta_count` is normally the SM
+/// count; clamped to the work-item count, so passing the item count degenerates
+/// to one item per CTA for hang debugging).
+///
+/// The residency multiplier is the caller's business only in that it must not
+/// have to know it: a grid of one CTA per SM would leave half the SM idle at a
+/// plan that admits two.
 pub fn flash_forward_config(
     batches: usize,
     sequence_length: usize,
@@ -187,8 +212,9 @@ pub fn flash_forward_config(
     assert!(batches <= u16::MAX as usize && heads <= u16::MAX as usize);
     let items = flash_work_items(batches, sequence_length, heads);
     assert!(items > 0 && items <= u32::MAX as usize);
+    let ctas = cta_count.max(1) * FLASH_FORWARD_CTAS_PER_SM;
     LaunchConfig {
-        grid_dim: (items.min(cta_count.max(1)) as u32, 1, 1),
+        grid_dim: (items.min(ctas) as u32, 1, 1),
         block_dim: (FLASH_FORWARD_BLOCK_THREADS, 1, 1),
         shared_mem_bytes: FLASH_FORWARD_SMEM_BYTES,
     }

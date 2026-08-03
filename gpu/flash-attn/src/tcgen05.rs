@@ -122,9 +122,9 @@ type PairedPanel = SharedTile<Bf16, QUERIES, HD, Swizzle128B>;
 /// operand: 128 swizzled 128-byte rows feeding an MMA's A side. The forward's
 /// P, and the backward's dS / Pᵀ / dSᵀ.
 type PairedPTile = SharedTile<Bf16, QUERIES, TILE, Swizzle128B>;
-/// The forward's two-deep P ring: tile `i` writes the slot the output MMA of
-/// tile `i - 2` finished reading.
-type ProbabilityRing = SharedTileRing<Bf16, QUERIES, TILE, Swizzle128B, 2>;
+/// The forward's P ring: tile `i` writes the slot the output MMA of tile
+/// `i - PROBABILITY_STAGES` finished reading.
+type ProbabilityRing = SharedTileRing<Bf16, QUERIES, TILE, Swizzle128B, PROBABILITY_STAGES>;
 const _: () = assert!(Panel::BYTES == TILE_BYTES && Panel::SUBTILE_BYTES == SUBTILE_BYTES);
 const _: () = assert!(PTile::BYTES == SUBTILE_BYTES);
 const _: () = assert!(PairedPanel::SUBTILE_BYTES == TILE_BYTES);
@@ -171,8 +171,15 @@ const SUBTILE_BYTES: usize = TILE_BYTES / 2;
 /// issue order (`S-MMA(i+1)` before `O-MMA(i)`) needs a stage of load-ahead to
 /// make progress. Four is the ceiling the host-side launch allocation
 /// (`host::FLASH_FORWARD_SMEM_BYTES`) is sized for.
-pub const FORWARD_STAGES: usize = 3;
+pub const FORWARD_STAGES: usize = 2;
 const _: () = assert!(2 <= FORWARD_STAGES && FORWARD_STAGES <= 4);
+/// Buffers of the probability tile. One, which is the floor: the output MMA of
+/// tile `i - 1` has to have finished reading P before tile `i` overwrites it,
+/// and at one buffer that wait is a tile closer than at two. It is one because
+/// the whole plan has to fit under half an SM's shared memory to get a second
+/// CTA on it, and this tile is 16 KiB of the 114688 that does.
+pub const PROBABILITY_STAGES: usize = 1;
+const _: () = assert!(PROBABILITY_STAGES >= 1 && PROBABILITY_STAGES < OUTPUT_LAG);
 /// Depth of the `O = P·V` completion ring. Three rather than two because the
 /// deepest wait on it reaches *two* tiles back — the probability slot tile `i`
 /// overwrites was last read by the output MMA of tile `i - 2` — and a ring
@@ -195,7 +202,7 @@ pub const FLASH_FORWARD_SMEM: usize = forward_plan(SharedPlan::sizing()).plan.by
 /// Columns of tensor memory the forward allocates: two `[QUERIES, TILE]` score
 /// segments plus the `[QUERIES, HD]` output beside them. `tcgen05.alloc` takes a
 /// power of two in `[32, 512]`, and 256 is exactly the sum.
-const FORWARD_TMEM_COLUMNS: u32 = 256;
+pub const FORWARD_TMEM_COLUMNS: u32 = 256;
 const _: () = assert!(
     FORWARD_TMEM_COLUMNS as usize == 2 * TILE + HD
         && FORWARD_TMEM_COLUMNS.is_power_of_two()
@@ -277,7 +284,7 @@ const fn forward_plan(at: SharedPlan) -> Forward {
     let (q, at) = at.tile::<Bf16, QUERIES, HD, Swizzle128B>();
     let (k, at) = at.tile_ring::<Bf16, TILE, HD, Swizzle128B, FORWARD_STAGES>();
     let (v, at) = at.tile_ring::<Bf16, TILE, HD, Swizzle128B, FORWARD_STAGES>();
-    let (p, at) = at.tile_ring::<Bf16, QUERIES, TILE, Swizzle128B, 2>();
+    let (p, at) = at.tile_ring::<Bf16, QUERIES, TILE, Swizzle128B, PROBABILITY_STAGES>();
     let (kv_loaded, at) = at.semaphores::<FORWARD_STAGES>();
     let (scored, at) = at.semaphores::<2>();
     let (accumulated, at) = at.semaphores::<OUTPUT_LAG>();
@@ -1809,10 +1816,12 @@ pub mod kernels {
                         online_rescale(&mut m_ref, row_max, &mut running_sum, &mut out_acc);
                     }
 
-                    // The probability ring is two deep, so this slot was last
-                    // read by the output MMA two tiles back.
-                    if key_tile >= 2 {
-                        self.shared.accumulated.wait(key_tile - 2);
+                    // This slot was last read by the output MMA
+                    // `PROBABILITY_STAGES` tiles back.
+                    if key_tile >= PROBABILITY_STAGES as u32 {
+                        self.shared
+                            .accumulated
+                            .wait(key_tile - PROBABILITY_STAGES as u32);
                     }
 
                     // Pass 2: probabilities against the segment reference,
