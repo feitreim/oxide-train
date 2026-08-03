@@ -79,28 +79,28 @@ use host::{
 /// inside the noise of a single scalar.
 const KERNEL_BUDGETS: [KernelBudget; 5] = [
     KernelBudget {
-        // The unified forward (#68), first flight: 238 regs / 1328 B frame,
-        // against the persistent kernel's 236 / 592.
+        // The unified forward (#68): 244 regs / 1136 B frame, against the
+        // persistent kernel's 236 / 592.
         //
-        // The registers are the same and the frame is not. Both come from the
-        // same place: the whole `[32, 64]` score band is now a value — drained
-        // by `tile_x8`, masked, reduced, exponentiated and stored as one tile
-        // — where `softmax_tile` walked it a `Fragment` at a time and kept
-        // eight scores live. So peak liveness is the 128-register output
-        // accumulator plus 64 score registers instead of plus 8, ptxas hits
-        // the 255 cap, and 736 B of what it cannot hold goes to the frame.
+        // The 1136 B is `out_acc`, the 128-register output accumulator. Both
+        // things that write it — `online_rescale` and `merge_output_tile` —
+        // take it by `&mut`, so it is address-taken and lands in the LLVM
+        // local depot whole. It is not hot: the only reader inside the key
+        // stream is the correction path, which fires on **0.00%** of visits at
+        // every gated shape.
         //
-        // Pinned at the measurement rather than fought, because the fix is not
-        // a smaller band: it is not keeping the output accumulator in
-        // registers at all. `tcgen05.st` — absent when this kernel's
-        // correction scheme was designed, present in the library now
-        // (`TmemTile::store_fragment`) — lets the correction rescale the O
-        // segment in place, and then the 128 registers are the epilogue's
-        // transient rather than the loop's resident. See the PR for why that
-        // is not in this change.
+        // The band beside it *was* hot, and that is what `SCORE_CHUNK`
+        // records: holding the whole `[32, 64]` score band as a value put it
+        // in the depot too (1328 B, 3546 local accesses) and cost **2.635 ms**
+        // at the profile shape; walking it 16 columns at a time is 2.125.
+        //
+        // Getting the accumulator out of the depot means not keeping it in
+        // registers at all — `tcgen05.st` (absent when this correction scheme
+        // was designed, present in the library now) lets the rescale happen in
+        // the O segment. See the PR.
         name: "forward",
-        max_registers: 240,
-        max_spill_bytes: 1328,
+        max_registers: 244,
+        max_spill_bytes: 1136,
     },
     KernelBudget {
         // 52 → 53 with nothing in this kernel changed. Three kernels left the

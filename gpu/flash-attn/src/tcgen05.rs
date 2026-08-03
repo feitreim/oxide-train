@@ -136,9 +136,25 @@ type STmem = TmemTile<QUERIES, TILE>;
 /// two 64-column MMA bands side by side.
 type AccTmem = TmemTile<QUERIES, HD>;
 
-/// One warp's band of a score segment, and of the output accumulator: the
-/// four warps of a `M128` drain own 32 TMEM lanes each.
-type ScoreBand = RegTile<32, TILE, BaseLdtm>;
+/// Columns of a warp's score band that one pass of the softmax holds.
+///
+/// **Not the whole `[32, TILE]` band.** The output accumulator is 128
+/// registers and resident for the whole key stream; a 64-wide score band
+/// beside it is 64 more, and at that width the register ops' generic
+/// `SLOTS x VALUES` loops stop scalarizing — the band lands in the LLVM local
+/// depot and the drain, the mask, the reduction and the `exp2` all become
+/// `ld.local`/`st.local` in the one loop this kernel cannot afford traffic in.
+/// Measured: 1328 B of frame and 3546 local accesses at 64 columns, and
+/// **2.635 ms** at the profile shape against the persistent kernel's 1.937.
+/// At 16 the chunk is 16 registers, every pass stays in them, and the price is
+/// a second drain of the segment — which is what `softmax_tile` paid too.
+const SCORE_CHUNK: usize = 16;
+const _: () = assert!(TILE.is_multiple_of(SCORE_CHUNK));
+
+/// One `SCORE_CHUNK`-wide slice of a warp's score band, and the whole of its
+/// output accumulator: the four warps of an `M128` drain own 32 TMEM lanes
+/// each.
+type ScoreChunk = RegTile<32, SCORE_CHUNK, BaseLdtm>;
 type OutBand = RegTile<32, HD, BaseLdtm>;
 /// A per-row statistic of one of those bands — the running max, the running
 /// sum, the LSE.
@@ -1596,6 +1612,12 @@ pub mod kernels {
     }
 
     impl ForwardStream<'_, '_> {
+        /// One `SCORE_CHUNK`-wide slice of this warp's score band.
+        #[inline(always)]
+        unsafe fn chunk(&self, segment: STmem, band: u32, column: u32) -> ScoreChunk {
+            unsafe { segment.tile(band, column) }
+        }
+
         /// The double-buffered score segment tile `key_tile` lands in.
         #[inline(always)]
         fn score_segment(&self, key_tile: u32) -> STmem {
@@ -1737,17 +1759,31 @@ pub mod kernels {
                     }
 
                     self.shared.scored.wait(key_tile);
-                    let mut scores: ScoreBand = self.score_segment(key_tile).tile_x8(band, 0);
-                    if key_tile >= first_masked {
-                        // Both origins go in rather than their difference: that
-                        // is negative for a band above the diagonal, and a `u32`
-                        // subtraction there would wrap and mask nothing.
-                        scores.make_causal_at(
-                            lane,
-                            query_base + band,
-                            key_tile * TILE as u32,
-                            MASKED_SCORE,
-                        );
+                    let segment = self.score_segment(key_tile);
+                    let key_base = key_tile * TILE as u32;
+                    let masked = key_tile >= first_masked;
+
+                    // Pass 1: this tile's row maxima. The band is walked a
+                    // `SCORE_CHUNK` at a time and never held whole — see
+                    // `SCORE_CHUNK` for what holding it whole costs.
+                    let mut row_max = Rows::splat(MASKED_SCORE);
+                    let mut column = 0u32;
+                    while column < TILE as u32 {
+                        let mut chunk = self.chunk(segment, band, column);
+                        if masked {
+                            // Both origins go in rather than their difference:
+                            // that is negative for a band above the diagonal,
+                            // and a `u32` subtraction there would wrap and mask
+                            // nothing.
+                            chunk.make_causal_at(
+                                lane,
+                                query_base + band,
+                                key_base + column,
+                                MASKED_SCORE,
+                            );
+                        }
+                        row_max.max_assign(chunk.row_max());
+                        column += SCORE_CHUNK as u32;
                     }
 
                     // FA4's conditional correction. The output segment keeps
@@ -1758,7 +1794,6 @@ pub mod kernels {
                     // value and then to a block one. Tile 0 always trips it —
                     // `m_ref` is still the sentinel — and starts the first
                     // segment without a drain.
-                    let row_max = scores.row_max();
                     let exceeded = row_max.any_exceeds(m_ref, CORRECTION_THRESHOLD);
                     let restart = block_reduce::<Max, FORWARD_WARPS>(
                         self.shared.votes,
@@ -1773,22 +1808,35 @@ pub mod kernels {
                         online_rescale(&mut m_ref, row_max, &mut running_sum, &mut out_acc);
                     }
 
-                    scores.sub_row_assign(m_ref);
-                    scores.unary_map_assign::<Exp2Approx>();
-                    running_sum.add_assign(scores.row_sum());
-
                     // The probability ring is two deep, so this slot was last
                     // read by the output MMA two tiles back.
                     if key_tile >= 2 {
                         self.shared.accumulated.wait(key_tile - 2);
                     }
-                    store_tile(
-                        self.shared.p.tile(key_tile).chunk_writer(),
-                        band,
-                        0,
-                        lane,
-                        scores,
-                    );
+
+                    // Pass 2: probabilities against the segment reference,
+                    // re-draining the same chunks and storing each through
+                    // `stmatrix` before the next is read.
+                    let probabilities = self.shared.p.tile(key_tile).chunk_writer();
+                    let mut tile_sum = Rows::splat(0.0);
+                    let mut column = 0u32;
+                    while column < TILE as u32 {
+                        let mut chunk = self.chunk(segment, band, column);
+                        if masked {
+                            chunk.make_causal_at(
+                                lane,
+                                query_base + band,
+                                key_base + column,
+                                MASKED_SCORE,
+                            );
+                        }
+                        chunk.sub_row_assign(m_ref);
+                        chunk.unary_map_assign::<Exp2Approx>();
+                        tile_sum.add_assign(chunk.row_sum());
+                        store_tile(probabilities, band, column, lane, chunk);
+                        column += SCORE_CHUNK as u32;
+                    }
+                    running_sum.add_assign(tile_sum);
 
                     // P was written through the generic proxy; fence before the
                     // async-proxy MMA reads it.
