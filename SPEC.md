@@ -1511,17 +1511,28 @@ Each gated on tests; correctness before speed at every step.
      array plus a barrier phase. **Parity** against the staged-bf16 CPU
      reference at [2,128,3], [1,256,2], [1,384,2], [1,512,2] and [4,256,38]:
      y ≤ **1.47e-3** (tolerance 5e-3, recorded maximum 1.4e-3), lse ≤
-     **7.33e-5** — half the recorded 1.4e-4. **Bench** at [32,1024,24,128]:
-     **2.111 ms** against the persistent kernel's recorded 1.929, **+9.4%**.
-     Two things are known to be in that gap and one is inherent: a 128-row
-     query block necessarily reads one fully-masked 64x64 pair per block
-     (8 of 144 at T=1024, **5.9%**), and the kernel takes three block-wide
-     barriers per key tile where the persistent form's softmax warpgroups
-     handed off through mbarriers alone and never rendezvoused with the
-     TMA/MMA warps. Against that it issues **half** the tensor-core work per
-     unit of algorithm, which is why the bench's FLOP count changed from issued
-     to algorithmic in the same commit — the old TFLOP/s figures are 2x this
-     scale and only the milliseconds are comparable. **The measurement that
+     **9.54e-7** — 147x under the recorded 1.4e-4, because the SFU `exp2` is
+     the more accurate of the two (~2 ULP against the polynomial's measured
+     7.5e-5 relative), which is the opposite of what an "approx" instruction is
+     usually reached for. **Bench** at [32,1024,24,128]:
+     **1.343 ms** against the persistent kernel's recorded 1.929, **−30.4%**,
+     over four measured steps from a 2.635 ms first flight. It issues **half**
+     the tensor-core work per unit of algorithm, which is why the bench's FLOP
+     count changed from issued to algorithmic in the same commit — the old
+     TFLOP/s figures are 2x this scale and only the milliseconds are
+     comparable. **What each step bought**, one container per row: the softmax
+     walked in 16-column chunks 2.635 → 2.111 (−19.9%, the score band leaves
+     the local depot); the SFU `exp2` 2.111 → **1.845** (−12.6%, and past the
+     baseline); two K/V stages with one probability buffer and a launch that
+     requests the plan rather than a ceiling 1.845 → **1.343** (−27.2%, and the
+     first time this kernel family has run **2 CTAs/SM**). One step measured
+     backwards and was reverted: replacing `block_reduce`'s two `bar.sync` with
+     the votes ring and one mbarrier phase all three extracted kernels used
+     cost **+2.3%**, which says the vote's cost is the *rendezvous* and not the
+     primitive it is spelled with — a 128-arrival mbarrier is not cheaper than
+     a `barrier.sync`, and `block_reduce` throws in the fold. What remains in
+     the gap is inherent: a 128-row query block necessarily reads one
+     fully-masked 64x64 pair per block (8 of 144 at T=1024, **5.9%**). **The measurement that
      moved most:** holding the whole `[32, 64]` score band as a value beside
      the 128-register output accumulator put it in the LLVM local depot —
      1328 B of frame, 3546 `ld/st.local`, the drain block storing what it had
