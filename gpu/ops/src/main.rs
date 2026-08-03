@@ -16,6 +16,7 @@ mod device;
 use device::{
     CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS,
     MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM,
+    SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS,
     ROUTER_GEMM_BN, ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS,
     ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, kernels,
 };
@@ -41,6 +42,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_rms_norm(&stream, &module)?;
     eprintln!("[ops] checking swiglu");
     check_swiglu(&stream, &module)?;
+    eprintln!("[ops] checking swiglu tiles");
+    check_swiglu_tile(&stream, &module)?;
     eprintln!("[ops] checking embedding");
     check_embedding(&stream, &module)?;
     eprintln!("[ops] checking cross_entropy");
@@ -1124,6 +1127,100 @@ fn check_rms_norm(
             &dw_dev.to_host_vec(stream)?,
             5e-6,
             2e-5,
+        );
+        Ok(())
+    }
+}
+
+/// Every tile SwiGLU kernel against the flat one it would replace.
+///
+/// The flat kernels are already gated against the CPU module by
+/// [`check_swiglu`]; what is left to prove here is that the tile walk covers
+/// the same rectangle, which a wrong row band or column stride would break
+/// loudly.
+fn check_swiglu_tile(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: every buffer is ROWS x COLUMNS, ROWS is a multiple of
+    // SWIGLU_TILE_BLOCK_ROWS and COLUMNS of SWIGLU_TILE_CHUNK, and both
+    // launches cover exactly that rectangle.
+    unsafe {
+        const ROWS: usize = 1024;
+        const COLUMNS: usize = 192;
+        const LEN: usize = ROWS * COLUMNS;
+        assert_eq!(ROWS % SWIGLU_TILE_BLOCK_ROWS, 0);
+        assert_eq!(COLUMNS % SWIGLU_TILE_CHUNK, 0);
+
+        let gate = CpuTensor::<f32, Rank2<ROWS, COLUMNS>>::uniform(20);
+        let up = CpuTensor::<f32, Rank2<ROWS, COLUMNS>>::uniform(21);
+        let dy = CpuTensor::<f32, Rank2<ROWS, COLUMNS>>::uniform(22);
+        let gate_dev = DeviceBuffer::from_host(stream, gate.as_slice())?;
+        let up_dev = DeviceBuffer::from_host(stream, up.as_slice())?;
+        let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+
+        let flat = LaunchConfig::for_num_elems(LEN as u32);
+        let tiles = LaunchConfig {
+            grid_dim: ((ROWS / SWIGLU_TILE_BLOCK_ROWS) as u32, 1, 1),
+            block_dim: (SWIGLU_TILE_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Looser than the flat kernels' own gate against the CPU: kittens'
+        // `exp` is not libdevice's, and every kernel here is a sigmoid.
+        let (atol, rtol) = (1e-6, 1e-4);
+
+        let mut shipped = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+        let mut tiled = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+        module.swiglu_forward(stream, flat, &gate_dev, &up_dev, &mut shipped)?;
+        module.swiglu_forward_tile(
+            stream,
+            tiles,
+            &gate_dev,
+            &up_dev,
+            COLUMNS as u32,
+            &mut tiled,
+        )?;
+        assert_close(
+            "swiglu tile vs flat",
+            &tiled.to_host_vec(stream)?,
+            &shipped.to_host_vec(stream)?,
+            atol,
+            rtol,
+        );
+
+        module.swiglu_backward_gate(stream, flat, &gate_dev, &up_dev, &dy_dev, &mut shipped)?;
+        module.swiglu_backward_gate_tile(
+            stream,
+            tiles,
+            &gate_dev,
+            &up_dev,
+            &dy_dev,
+            COLUMNS as u32,
+            &mut tiled,
+        )?;
+        assert_close(
+            "swiglu dgate tile vs flat",
+            &tiled.to_host_vec(stream)?,
+            &shipped.to_host_vec(stream)?,
+            atol,
+            rtol,
+        );
+
+        module.swiglu_backward_up(stream, flat, &gate_dev, &dy_dev, &mut shipped)?;
+        module.swiglu_backward_up_tile(
+            stream,
+            tiles,
+            &gate_dev,
+            &dy_dev,
+            COLUMNS as u32,
+            &mut tiled,
+        )?;
+        assert_close(
+            "swiglu dup tile vs flat",
+            &tiled.to_host_vec(stream)?,
+            &shipped.to_host_vec(stream)?,
+            atol,
+            rtol,
         );
         Ok(())
     }

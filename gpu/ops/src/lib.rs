@@ -15,6 +15,11 @@ use cuda_device::{
     cuda_module, kernel, thread,
 };
 
+use kittens::global::{GlobalRows, load_rows, store_rows};
+use kittens::reg::{BaseLdtm, RegTile};
+use kittens::shared::F32;
+use kittens::{lane, warp_id};
+
 /// Threads in the row-parallel fused classifier kernels.
 ///
 /// Each block owns one row and lanes stride over the vocabulary. Keeping this
@@ -89,6 +94,25 @@ pub const MOE_SCATTER_DY_THREADS: usize = 256;
 /// Threads in one block-per-bin MoE dead-slot zeroing block.
 pub const MOE_ZERO_BINS_THREADS: usize = 256;
 
+/// Rows one warp owns in the tile SwiGLU kernels.
+///
+/// SwiGLU has no reduction in it, so this is only how a warp's elements are
+/// spread over rows: the whole shape question here is how many accesses a lane
+/// has in flight, which is [`SWIGLU_TILE_CHUNK`]'s.
+pub const SWIGLU_TILE_ROWS: usize = 16;
+
+/// Columns a tile-SwiGLU warp holds in registers at once.
+pub const SWIGLU_TILE_CHUNK: usize = 32;
+
+/// Warps in one tile-SwiGLU block.
+pub const SWIGLU_TILE_WARPS: usize = 4;
+
+/// Threads in one tile-SwiGLU block.
+pub const SWIGLU_TILE_THREADS: usize = 32 * SWIGLU_TILE_WARPS;
+
+/// Rows one tile-SwiGLU block owns — the grid's row quantum.
+pub const SWIGLU_TILE_BLOCK_ROWS: usize = SWIGLU_TILE_ROWS * SWIGLU_TILE_WARPS;
+
 /// `f32` lanes in one 16-byte vector memory access.
 ///
 /// Rows are walked through `*const u128` / `*mut u128` rather than an
@@ -97,6 +121,9 @@ pub const MOE_ZERO_BINS_THREADS: usize = 256;
 /// A row base `row * dim` is 16-byte aligned whenever `dim % QUAD_LANES == 0`,
 /// which is the guard every vectorized row walk below checks.
 pub const QUAD_LANES: usize = 4;
+
+/// One warp's slice of a SwiGLU row band.
+type SwigluChunk = RegTile<SWIGLU_TILE_ROWS, SWIGLU_TILE_CHUNK, BaseLdtm>;
 
 #[cuda_module]
 pub mod kernels {
@@ -1174,6 +1201,129 @@ pub mod kernels {
                 *logits.get_unchecked_mut(base + pair) = packed;
             }
             pair += CLASSIFIER_THREADS;
+        }
+    }
+
+    /// The SwiGLU row band a tile kernel reads: `silu(gate) * up`.
+    ///
+    /// Split out because all three tile kernels of this family walk the same
+    /// rectangle and differ only in what they compute on it.
+    #[inline(always)]
+    fn swiglu_row(row: u32) -> u32 {
+        SWIGLU_TILE_BLOCK_ROWS as u32 * thread::blockIdx_x() + SWIGLU_TILE_ROWS as u32 * row
+    }
+
+    /// `sigmoid(x)`, as a tile map.
+    #[inline(always)]
+    fn tile_sigmoid(x: SwigluChunk) -> SwigluChunk {
+        x.neg().exp().shift(1.0).recip()
+    }
+
+    /// [`swiglu_forward`] over register tiles.
+    ///
+    /// The flat kernel gives one output element to one thread, which is one
+    /// 4-byte load from each input and one 4-byte store per thread and a grid
+    /// of `rows * columns` of them. Here a warp owns a
+    /// `SWIGLU_TILE_ROWS x SWIGLU_TILE_CHUNK` rectangle, so adjacent columns
+    /// pair into one 8-byte access and a lane carries a chunk's worth of them
+    /// in flight at once. There is no reduction in this kernel and no statistic
+    /// to share — the tile buys memory-level parallelism and nothing else,
+    /// which on this family is the whole of what was missing.
+    ///
+    /// # Safety
+    ///
+    /// Launch with [`SWIGLU_TILE_THREADS`] threads and exactly
+    /// `rows / SWIGLU_TILE_BLOCK_ROWS` blocks over `rows x columns` buffers;
+    /// `rows` must be a multiple of [`SWIGLU_TILE_BLOCK_ROWS`] and `columns` of
+    /// [`SWIGLU_TILE_CHUNK`], both the launcher's to check.
+    #[kernel]
+    pub unsafe fn swiglu_forward_tile(
+        gate: &[f32],
+        up: &[f32],
+        columns: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let row = swiglu_row(warp_id());
+            let width = columns as usize;
+            let gates = GlobalRows::<F32>::from_raw(gate.as_ptr() as *mut u8, width);
+            let ups = GlobalRows::<F32>::from_raw(up.as_ptr() as *mut u8, width);
+            let destination = GlobalRows::<F32>::from_slice(&mut y, width);
+
+            let mut column = 0u32;
+            while column < columns {
+                let g: SwigluChunk = load_rows(gates, row, column, lane);
+                let u: SwigluChunk = load_rows(ups, row, column, lane);
+                store_rows(destination, row, column, lane, g.mul(tile_sigmoid(g)).mul(u));
+                column += SWIGLU_TILE_CHUNK as u32;
+            }
+        }
+    }
+
+    /// [`swiglu_backward_gate`] over register tiles.
+    ///
+    /// # Safety
+    ///
+    /// As [`swiglu_forward_tile`].
+    #[kernel]
+    pub unsafe fn swiglu_backward_gate_tile(
+        gate: &[f32],
+        up: &[f32],
+        dy: &[f32],
+        columns: u32,
+        mut dgate: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let row = swiglu_row(warp_id());
+            let width = columns as usize;
+            let gates = GlobalRows::<F32>::from_raw(gate.as_ptr() as *mut u8, width);
+            let ups = GlobalRows::<F32>::from_raw(up.as_ptr() as *mut u8, width);
+            let upstream = GlobalRows::<F32>::from_raw(dy.as_ptr() as *mut u8, width);
+            let destination = GlobalRows::<F32>::from_slice(&mut dgate, width);
+
+            let mut column = 0u32;
+            while column < columns {
+                let g: SwigluChunk = load_rows(gates, row, column, lane);
+                let u: SwigluChunk = load_rows(ups, row, column, lane);
+                let d: SwigluChunk = load_rows(upstream, row, column, lane);
+                let s = tile_sigmoid(g);
+                // silu'(g) = s * (1 + g * (1 - s)), the flat kernel's `dsilu`.
+                let dsilu = s.mul(g.mul(s.neg().shift(1.0)).shift(1.0));
+                store_rows(destination, row, column, lane, d.mul(u).mul(dsilu));
+                column += SWIGLU_TILE_CHUNK as u32;
+            }
+        }
+    }
+
+    /// [`swiglu_backward_up`] over register tiles.
+    ///
+    /// # Safety
+    ///
+    /// As [`swiglu_forward_tile`].
+    #[kernel]
+    pub unsafe fn swiglu_backward_up_tile(
+        gate: &[f32],
+        dy: &[f32],
+        columns: u32,
+        mut dup: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let row = swiglu_row(warp_id());
+            let width = columns as usize;
+            let gates = GlobalRows::<F32>::from_raw(gate.as_ptr() as *mut u8, width);
+            let upstream = GlobalRows::<F32>::from_raw(dy.as_ptr() as *mut u8, width);
+            let destination = GlobalRows::<F32>::from_slice(&mut dup, width);
+
+            let mut column = 0u32;
+            while column < columns {
+                let g: SwigluChunk = load_rows(gates, row, column, lane);
+                let d: SwigluChunk = load_rows(upstream, row, column, lane);
+                store_rows(destination, row, column, lane, d.mul(g).mul(tile_sigmoid(g)));
+                column += SWIGLU_TILE_CHUNK as u32;
+            }
         }
     }
 

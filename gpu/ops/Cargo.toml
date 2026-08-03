@@ -13,6 +13,8 @@ cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "20a56163f
 tensor-core = { path = "../../crates/tensor-core" }
 tensor-cpu = { path = "../../crates/tensor-cpu" }
 nn = { path = "../../crates/nn" }
+bench-util = { path = "../bench-util" }
+kittens = { package = "ferro-kittens", git = "https://github.com/feitreim/ferro-kittens", rev = "caa60756c4bf96a836a4e42c1a843408d3c7271b" }
 
 [profile.release]
 debug = false
