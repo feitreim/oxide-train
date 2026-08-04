@@ -47,6 +47,7 @@ modal run modal_app.py::doctor          # toolchain + GPU sanity check
 ./run.sh vecadd bench                   # throughput
 ./run.sh ops                            # Dense leaf-op CPU/GPU parity
 ./run.sh model profile                  # ~183M-param full-step CUDA-event profile
+FEATURES=cublas ./run.sh gemm model_shapes         # every step GEMM shape vs cuBLASLt
 SWEEP="BM=128 BN=128,BM=256 BN=64" ./run.sh gemm   # tuning sweep (one container)
 ```
 
