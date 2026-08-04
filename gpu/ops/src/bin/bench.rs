@@ -4,7 +4,7 @@
 //! second and not FLOP/s: each row reports the traffic its kernel is obliged to
 //! move — compulsory reads plus writes, no reuse assumed — divided by the
 //! measured time. A kernel that moves the same bytes slower has lost, whatever
-//! it does to the instruction count, and that is how #70 and #77 decided which
+//! it does to the instruction count, and that is how #70 and #78 decided which
 //! families reached tiles: the ones that won are the ones with two rows.
 //!
 //! Shapes are `gpu/model/src/bin/train.rs`'s: `N = 24576` rows, `D = 3072`
@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// not change that: a warp-per-band version re-measured on the fixed pin is
 /// 0.442x, and 0.563x with its `right_fill` deleted so it carries no frame at
 /// all. What it is short of is CTAs — 24576 rows become 384 blocks against the
-/// shipped kernel's 24576 — and no tile shape reaches that (#70, #77).
+/// shipped kernel's 24576 — and no tile shape reaches that (#70, #78).
 fn bench_classifier(
     stream: &std::sync::Arc<CudaStream>,
     module: &kernels::LoadedModule,
