@@ -664,6 +664,155 @@ pub mod kernels {
         }
     }
 
+    /// [`swiglu_forward`] reading gate and up out of one interleaved
+    /// `[rows, 2, ff]` panel — the layout the fused gate/up GEMM writes — so
+    /// no split pass ever copies the panel into separate gate/up buffers.
+    #[kernel]
+    pub fn swiglu_forward_interleaved(gate_up: &[f32], ff: u32, mut y: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let ff = ff as usize;
+        if ff == 0 {
+            return;
+        }
+        let row = i / ff;
+        let column = i % ff;
+        let base = row * 2 * ff + column;
+        if base + ff >= gate_up.len() {
+            return;
+        }
+        if let Some(slot) = y.get_mut(index) {
+            let gate = gate_up[base];
+            let sigmoid = 1.0 / (1.0 + (-gate).exp());
+            *slot = gate * sigmoid * gate_up[base + ff];
+        }
+    }
+
+    /// [`swiglu_forward_interleaved`] storing packed-bf16 pairs: one 16-byte
+    /// gate load, one 16-byte up load, and one 8-byte packed store per
+    /// thread. `ff` must be a multiple of [`QUAD_LANES`], which the tcgen05
+    /// alignment gate on packed panels already guarantees.
+    #[kernel]
+    pub unsafe fn swiglu_forward_interleaved_bf16(
+        gate_up: &[f32],
+        ff: u32,
+        mut y: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        let ff = ff as usize;
+        if ff == 0 || !ff.is_multiple_of(QUAD_LANES) {
+            return;
+        }
+        let row_quads = ff / QUAD_LANES;
+        let row = i / row_quads;
+        let quad = i % row_quads;
+        let base = row * 2 * ff + QUAD_LANES * quad;
+        if base + ff + QUAD_LANES > gate_up.len() || 2 * i + 1 >= y.len() {
+            return;
+        }
+        // SAFETY: `base` and `base + ff` are multiples of `QUAD_LANES`, so
+        // both 16-byte loads are aligned; bounds were checked above, and this
+        // thread exclusively owns output words `2i` and `2i + 1`.
+        let gates = quad_lanes(unsafe { *(gate_up.as_ptr().add(base) as *const u128) });
+        let ups = quad_lanes(unsafe { *(gate_up.as_ptr().add(base + ff) as *const u128) });
+        let mut packed = 0u64;
+        for lane in 0..QUAD_LANES {
+            let gate = gates[lane];
+            let sigmoid = 1.0 / (1.0 + (-gate).exp());
+            packed |= (f32_to_bf16_bits(gate * sigmoid * ups[lane]) as u64) << (16 * lane);
+        }
+        unsafe {
+            *(y.as_mut_ptr() as *mut u64).add(i) = packed;
+        }
+    }
+
+    /// Fused [`swiglu_backward_gate`] + [`swiglu_backward_up`]: reads the
+    /// interleaved `[rows, 2, ff]` gate/up panel once and writes both halves
+    /// of the interleaved `[rows, 2, ff]` gradient, so the two separate
+    /// gradient buffers and the join pass that merged them never exist.
+    #[kernel]
+    pub unsafe fn swiglu_backward_interleaved(
+        gate_up: &[f32],
+        dy: &[f32],
+        ff: u32,
+        mut d_gate_up: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let ff = ff as usize;
+        if ff == 0 {
+            return;
+        }
+        let row = i / ff;
+        let column = i % ff;
+        let base = row * 2 * ff + column;
+        if i >= dy.len() || base + ff >= gate_up.len() || base + ff >= d_gate_up.len() {
+            return;
+        }
+        let gate = gate_up[base];
+        let up = gate_up[base + ff];
+        let grad = dy[i];
+        let sigmoid = 1.0 / (1.0 + (-gate).exp());
+        let dsilu = sigmoid * (1.0 + gate * (1.0 - sigmoid));
+        // SAFETY: this thread exclusively owns both halves of column `i`.
+        unsafe {
+            *d_gate_up.get_unchecked_mut(base) = grad * up * dsilu;
+            *d_gate_up.get_unchecked_mut(base + ff) = grad * gate * sigmoid;
+        }
+    }
+
+    /// [`swiglu_backward_interleaved`] storing packed-bf16 pairs (every
+    /// reader of the gate/up gradient panel is a tcgen05 operand, #59).
+    /// Three 16-byte loads and two 8-byte packed stores per thread; `ff`
+    /// must be a multiple of [`QUAD_LANES`].
+    #[kernel]
+    pub unsafe fn swiglu_backward_interleaved_bf16(
+        gate_up: &[f32],
+        dy: &[f32],
+        ff: u32,
+        mut d_gate_up: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        let ff = ff as usize;
+        if ff == 0 || !ff.is_multiple_of(QUAD_LANES) {
+            return;
+        }
+        let row_quads = ff / QUAD_LANES;
+        let row = i / row_quads;
+        let quad = i % row_quads;
+        let base = row * 2 * ff + QUAD_LANES * quad;
+        let dy_base = row * ff + QUAD_LANES * quad;
+        // The packed row holds `ff` words: this thread's two gate words start
+        // at `gate_word` and its two up words `ff / 2` words later.
+        let gate_word = row * ff + 2 * quad;
+        if base + ff + QUAD_LANES > gate_up.len()
+            || dy_base + QUAD_LANES > dy.len()
+            || gate_word + ff / 2 + 1 >= d_gate_up.len()
+        {
+            return;
+        }
+        // SAFETY: `base`, `base + ff`, and `dy_base` are multiples of
+        // `QUAD_LANES` so the 16-byte loads are aligned; `gate_word` and
+        // `gate_word + ff / 2` are even so the 8-byte stores are aligned;
+        // bounds were checked above and this thread owns both word pairs.
+        let gates = quad_lanes(unsafe { *(gate_up.as_ptr().add(base) as *const u128) });
+        let ups = quad_lanes(unsafe { *(gate_up.as_ptr().add(base + ff) as *const u128) });
+        let grads = quad_lanes(unsafe { *(dy.as_ptr().add(dy_base) as *const u128) });
+        let mut dgate = 0u64;
+        let mut dup = 0u64;
+        for lane in 0..QUAD_LANES {
+            let gate = gates[lane];
+            let grad = grads[lane];
+            let sigmoid = 1.0 / (1.0 + (-gate).exp());
+            let dsilu = sigmoid * (1.0 + gate * (1.0 - sigmoid));
+            dgate |= (f32_to_bf16_bits(grad * ups[lane] * dsilu) as u64) << (16 * lane);
+            dup |= (f32_to_bf16_bits(grad * gate * sigmoid) as u64) << (16 * lane);
+        }
+        unsafe {
+            *(d_gate_up.as_mut_ptr().add(gate_word) as *mut u64) = dgate;
+            *(d_gate_up.as_mut_ptr().add(gate_word + ff / 2) as *mut u64) = dup;
+        }
+    }
+
     #[kernel]
     pub fn split_group2(
         input: &[f32],
@@ -2191,6 +2340,56 @@ pub mod kernels {
         }
     }
 
+    /// [`moe_scatter_bf16`] moving one 16-byte source quad and one 8-byte
+    /// packed store per thread. `dim` must be a multiple of [`QUAD_LANES`].
+    #[kernel]
+    pub unsafe fn moe_scatter_bf16_quad(
+        x: &[f32],
+        selected_experts: &[u32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut expert_input: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if d == 0 || k == 0 || !d.is_multiple_of(QUAD_LANES) {
+            return;
+        }
+        let row_quads = d / QUAD_LANES;
+        let pair = i / row_quads;
+        let quad = i % row_quads;
+        if pair >= selected_experts.len() || pair >= slots.len() {
+            return;
+        }
+        let slot = slots[pair];
+        if slot == MOE_DROPPED_SLOT {
+            return;
+        }
+        let expert = selected_experts[pair] as usize;
+        let token = pair / k;
+        let source = token * d + QUAD_LANES * quad;
+        let word = (expert * c + slot as usize) * (d / 2) + 2 * quad;
+        if source + QUAD_LANES > x.len() || word + 1 >= expert_input.len() {
+            return;
+        }
+        // SAFETY: `source` is a multiple of `QUAD_LANES` so the 16-byte load
+        // is aligned; `word` is even so the 8-byte store is aligned; bounds
+        // were checked above and deterministic bin assignment guarantees one
+        // writer per accepted slot.
+        let values = quad_lanes(unsafe { *(x.as_ptr().add(source) as *const u128) });
+        let mut packed = 0u64;
+        for lane in 0..QUAD_LANES {
+            packed |= (f32_to_bf16_bits(values[lane]) as u64) << (16 * lane);
+        }
+        unsafe {
+            *(expert_input.as_mut_ptr().add(word) as *mut u64) = packed;
+        }
+    }
+
     /// Gather expert outputs to token order using the renormalized gate weights.
     #[kernel]
     pub fn moe_gather_combine(
@@ -2231,6 +2430,111 @@ pub mod kernels {
         }
         if let Some(slot) = output.get_mut(index) {
             *slot = value;
+        }
+    }
+
+    /// [`moe_gather_combine`] with the residual add folded in: each output
+    /// element is `residual + Σ_k gate · expert_output`, so the separate
+    /// `[N, D]` residual-add pass and the intermediate it read never run.
+    #[kernel]
+    pub fn moe_gather_combine_add(
+        expert_output: &[f32],
+        selected_experts: &[u32],
+        gate_weights: &[f32],
+        slots: &[u32],
+        residual: &[f32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if i >= output.len() || i >= residual.len() || d == 0 || k == 0 {
+            return;
+        }
+        let token = i / d;
+        let column = i % d;
+        let mut value = residual[i];
+        for rank in 0..k {
+            let pair = token * k + rank;
+            if pair >= slots.len() || pair >= selected_experts.len() || pair >= gate_weights.len() {
+                return;
+            }
+            let slot = slots[pair];
+            if slot != MOE_DROPPED_SLOT {
+                let expert = selected_experts[pair] as usize;
+                let input = (expert * c + slot as usize) * d + column;
+                if input >= expert_output.len() {
+                    return;
+                }
+                value += gate_weights[pair] * expert_output[input];
+            }
+        }
+        if let Some(slot) = output.get_mut(index) {
+            *slot = value;
+        }
+    }
+
+    /// [`moe_gather_combine_add`] moving one 16-byte quad per access. `dim`
+    /// must be a multiple of [`QUAD_LANES`].
+    #[kernel]
+    pub unsafe fn moe_gather_combine_add_quad(
+        expert_output: &[f32],
+        selected_experts: &[u32],
+        gate_weights: &[f32],
+        slots: &[u32],
+        residual: &[f32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut output: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if d == 0 || k == 0 || !d.is_multiple_of(QUAD_LANES) {
+            return;
+        }
+        let row_quads = d / QUAD_LANES;
+        let token = i / row_quads;
+        let quad = i % row_quads;
+        let base = token * d + QUAD_LANES * quad;
+        if base + QUAD_LANES > residual.len()
+            || base + QUAD_LANES > output.len()
+            || (token + 1) * k > slots.len()
+            || (token + 1) * k > selected_experts.len()
+            || (token + 1) * k > gate_weights.len()
+        {
+            return;
+        }
+        // SAFETY: `base` and every bin row offset are multiples of
+        // `QUAD_LANES`, so all 16-byte accesses are aligned; bounds were
+        // checked above and this thread exclusively owns its output quad.
+        let mut value = quad_lanes(unsafe { *(residual.as_ptr().add(base) as *const u128) });
+        for rank in 0..k {
+            let pair = token * k + rank;
+            let slot = slots[pair];
+            if slot != MOE_DROPPED_SLOT {
+                let expert = selected_experts[pair] as usize;
+                let input = (expert * c + slot as usize) * d + QUAD_LANES * quad;
+                if input + QUAD_LANES > expert_output.len() {
+                    return;
+                }
+                let gate = gate_weights[pair];
+                let outputs =
+                    quad_lanes(unsafe { *(expert_output.as_ptr().add(input) as *const u128) });
+                for lane in 0..QUAD_LANES {
+                    value[lane] += gate * outputs[lane];
+                }
+            }
+        }
+        unsafe {
+            *(output.as_mut_ptr().add(base) as *mut u128) = quad_bits(value);
         }
     }
 
@@ -2635,6 +2939,108 @@ pub mod kernels {
         }
         if let Some(slot) = dx.get_mut(index) {
             *slot = value;
+        }
+    }
+
+    /// [`moe_gather_dx`] with the router input-gradient add folded in: each
+    /// output element is `router_dx + Σ_k expert_input_gradient`, so the
+    /// separate `[N, D]` combine pass and the intermediate it read never run.
+    #[kernel]
+    pub fn moe_gather_dx_add(
+        expert_input_gradient: &[f32],
+        selected_experts: &[u32],
+        slots: &[u32],
+        router_dx: &[f32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut dx: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if i >= dx.len() || i >= router_dx.len() || d == 0 || k == 0 {
+            return;
+        }
+        let token = i / d;
+        let column = i % d;
+        let mut value = router_dx[i];
+        for rank in 0..k {
+            let pair = token * k + rank;
+            if pair >= selected_experts.len() || pair >= slots.len() {
+                return;
+            }
+            let slot = slots[pair];
+            if slot != MOE_DROPPED_SLOT {
+                let expert = selected_experts[pair] as usize;
+                let input = (expert * c + slot as usize) * d + column;
+                if input >= expert_input_gradient.len() {
+                    return;
+                }
+                value += expert_input_gradient[input];
+            }
+        }
+        if let Some(slot) = dx.get_mut(index) {
+            *slot = value;
+        }
+    }
+
+    /// [`moe_gather_dx_add`] moving one 16-byte quad per access. `dim` must
+    /// be a multiple of [`QUAD_LANES`].
+    #[kernel]
+    pub unsafe fn moe_gather_dx_add_quad(
+        expert_input_gradient: &[f32],
+        selected_experts: &[u32],
+        slots: &[u32],
+        router_dx: &[f32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut dx: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if d == 0 || k == 0 || !d.is_multiple_of(QUAD_LANES) {
+            return;
+        }
+        let row_quads = d / QUAD_LANES;
+        let token = i / row_quads;
+        let quad = i % row_quads;
+        let base = token * d + QUAD_LANES * quad;
+        if base + QUAD_LANES > router_dx.len()
+            || base + QUAD_LANES > dx.len()
+            || (token + 1) * k > slots.len()
+            || (token + 1) * k > selected_experts.len()
+        {
+            return;
+        }
+        // SAFETY: `base` and every bin row offset are multiples of
+        // `QUAD_LANES`, so all 16-byte accesses are aligned; bounds were
+        // checked above and this thread exclusively owns its output quad.
+        let mut value = quad_lanes(unsafe { *(router_dx.as_ptr().add(base) as *const u128) });
+        for rank in 0..k {
+            let pair = token * k + rank;
+            let slot = slots[pair];
+            if slot != MOE_DROPPED_SLOT {
+                let expert = selected_experts[pair] as usize;
+                let input = (expert * c + slot as usize) * d + QUAD_LANES * quad;
+                if input + QUAD_LANES > expert_input_gradient.len() {
+                    return;
+                }
+                let gradients = quad_lanes(unsafe {
+                    *(expert_input_gradient.as_ptr().add(input) as *const u128)
+                });
+                for lane in 0..QUAD_LANES {
+                    value[lane] += gradients[lane];
+                }
+            }
+        }
+        unsafe {
+            *(dx.as_mut_ptr().add(base) as *mut u128) = quad_bits(value);
         }
     }
 
