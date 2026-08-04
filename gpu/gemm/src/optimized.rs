@@ -214,7 +214,9 @@ pub const SHARED_BYTES: usize = staged(shared(SharedPlan::sizing()).plan).1.byte
 
 const _: () = {
     assert!(THREADS == 160 && MAX_CLUSTERS == 148);
-    assert!(SHARED_BYTES == 114_824 && SHARED_BYTES <= 116_736);
+    // `acc_free` costs the plan nothing: the eight bytes land in the
+    // 128-byte alignment padding in front of the staging tiles.
+    assert!(SHARED_BYTES == 114_816 && SHARED_BYTES <= 116_736);
     assert!(
         BLOCK_N == 4 * STAGE_N,
         "every drain spells its four passes out to hoist the loads ahead of the stores"
