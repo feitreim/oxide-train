@@ -123,25 +123,29 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 /// two registers. The fp32 store entry point's 512 B frame (ferro #174's "band
 /// plus `C` beside it") went to zero when the fold left with the accumulate
 /// split, so every shipped GEMM kernel now carries no depot at all.
+// The deferred-drain epilogue (oxide-train#80 remedy 2) holds registers past
+// its last `tcgen05.ld` — that hold is the overlap, since the accumulator is
+// released to the next item's MMA while the held bands' stores still issue —
+// so every ceiling moved up: bf16 82 → 137 and the reduce 80 → 127 (each a
+// one-pass hoist), the fp32 store 102 → 118 (no hoist; its two-band form
+// measured 181, past the ~170 the register file grants 12 warps an SM, and
+// paid the 2 → 1 CTA cliff — model_shapes f32 rows at 0.46–0.53). A priced
+// trade, not a leak: at these counts residency stays tensor-memory-bound at
+// 2 CTAs/SM.
 const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
         name: "gemm_tcgen05_bf16_optimized",
-        max_registers: 82,
+        max_registers: 137,
         max_spill_bytes: 0,
     },
-    // Ratcheted 120/512 → 102/0 when the fold left: the store path no longer
-    // monomorphizes a `C` load beside the band, and the `.local` frame ferro
-    // #174 attributed to holding both went with it.
     KernelBudget {
         name: "gemm_tcgen05_f32_optimized",
-        max_registers: 102,
+        max_registers: 118,
         max_spill_bytes: 0,
     },
-    // Below even the bf16 drain: a `[16, 64]` half-band is the largest thing
-    // it ever holds, and the engine owns the add.
     KernelBudget {
         name: "gemm_tcgen05_f32_accumulate",
-        max_registers: 80,
+        max_registers: 127,
         max_spill_bytes: 0,
     },
 ];

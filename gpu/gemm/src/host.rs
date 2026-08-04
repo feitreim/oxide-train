@@ -420,7 +420,10 @@ impl Tcgen05Gemm {
         [
             ("gemm_tcgen05_bf16_optimized", &self.optimized),
             ("gemm_tcgen05_f32_optimized", &self.optimized_f32),
-            ("gemm_tcgen05_f32_accumulate", &self.optimized_f32_accumulate),
+            (
+                "gemm_tcgen05_f32_accumulate",
+                &self.optimized_f32_accumulate,
+            ),
         ]
     }
 
