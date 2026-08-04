@@ -54,7 +54,25 @@ mod gemm_device;
 pub mod tensor_device;
 
 pub use dense_device::kernels as dense_kernels;
-use dense_device::{SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS};
+use dense_device::{
+    NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK, NORM_TILE_THREADS, SWIGLU_TILE_BLOCK_ROWS,
+    SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS,
+};
+
+/// The tile RMSNorm forward's launch, or `None` at a shape it cannot cover.
+///
+/// The kernel bounds-checks nothing, so this is the single place the
+/// divisibility is decided and `rms_norm_forward_fast` is the arm every other
+/// shape takes.
+fn norm_tiles(rows: usize, columns: usize) -> Option<LaunchConfig> {
+    (rows.is_multiple_of(NORM_TILE_BLOCK_ROWS) && columns.is_multiple_of(NORM_TILE_CHUNK)).then(
+        || LaunchConfig {
+            grid_dim: ((rows / NORM_TILE_BLOCK_ROWS) as u32, 1, 1),
+            block_dim: (NORM_TILE_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        },
+    )
+}
 
 /// The tile-SwiGLU launch for a `rows x columns` rectangle, or `None` when the
 /// shape does not divide the tile the way the kernels require.
@@ -2247,17 +2265,29 @@ impl<const D: usize> GpuRmsNorm<D> {
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
-        // SAFETY: norm launch dimensions and Rank2 buffers agree on N * D.
+        // SAFETY: norm launch dimensions and Rank2 buffers agree on N * D, and
+        // the tile arm is only taken at a shape `norm_tiles` accepted.
         profiler.measure(stream, name, || unsafe {
-            kernels.rms_norm_forward_fast(
-                stream,
-                norm_config::<N>(),
-                x.as_device_buffer(),
-                self.w.as_device_buffer(),
-                self.eps,
-                D as u32,
-                y.as_device_buffer_mut(),
-            )
+            match norm_tiles(N, D) {
+                Some(tiles) => kernels.rms_norm_forward_tile(
+                    stream,
+                    tiles,
+                    x.as_device_buffer(),
+                    self.w.as_device_buffer(),
+                    self.eps,
+                    D as u32,
+                    y.as_device_buffer_mut(),
+                ),
+                None => kernels.rms_norm_forward_fast(
+                    stream,
+                    norm_config::<N>(),
+                    x.as_device_buffer(),
+                    self.w.as_device_buffer(),
+                    self.eps,
+                    D as u32,
+                    y.as_device_buffer_mut(),
+                ),
+            }
         })
     }
 
