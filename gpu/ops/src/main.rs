@@ -47,6 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_swiglu(&stream, &module)?;
     eprintln!("[ops] checking swiglu tiles");
     check_swiglu_tile(&stream, &module)?;
+    eprintln!("[ops] checking swiglu interleaved");
+    check_swiglu_interleaved(&stream, &module)?;
     eprintln!("[ops] checking embedding");
     check_embedding(&stream, &module)?;
     eprintln!("[ops] checking cross_entropy");
@@ -582,6 +584,215 @@ fn check_moe_routing(
             expected_router_dx.as_slice(),
             2e-6,
             2e-6,
+        );
+
+        // Fused gathers: the residual (forward) and router-dx (backward) adds
+        // folded in, in both the scalar and 16-byte-quad walks (D = 4 divides
+        // by four, so the quad kernels cover every lane).
+        let residual = CpuTensor::<f32, Rank2<N, D>>::uniform(401);
+        let residual_dev = DeviceBuffer::from_host(stream, residual.as_slice())?;
+        let expected_combine_add: Vec<f32> = residual
+            .as_slice()
+            .iter()
+            .zip(cpu_output.as_slice())
+            .map(|(&base, &combined)| base + combined)
+            .collect();
+        let mut combine_add_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+        module.moe_gather_combine_add(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &expert_output_dev,
+            &selected_dev,
+            &gates_dev,
+            &slots_dev,
+            &residual_dev,
+            D as u32,
+            K as u32,
+            C as u32,
+            &mut combine_add_dev,
+        )?;
+        assert_close(
+            "MoE fused gather/combine + residual",
+            &combine_add_dev.to_host_vec(stream)?,
+            &expected_combine_add,
+            1e-6,
+            1e-6,
+        );
+        let mut combine_add_quad_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+        unsafe {
+            module.moe_gather_combine_add_quad(
+                stream,
+                LaunchConfig::for_num_elems((N * D / 4) as u32),
+                &expert_output_dev,
+                &selected_dev,
+                &gates_dev,
+                &slots_dev,
+                &residual_dev,
+                D as u32,
+                K as u32,
+                C as u32,
+                &mut combine_add_quad_dev,
+            )?;
+        }
+        assert_eq!(
+            combine_add_quad_dev.to_host_vec(stream)?,
+            combine_add_dev.to_host_vec(stream)?,
+            "quad fused gather/combine must match the scalar kernel bit for bit"
+        );
+
+        // `dy` stands in for the router input gradient the fused kernel adds.
+        let router_dx_stand_in = dy_dev.to_host_vec(stream)?;
+        let expected_dx_add: Vec<f32> = expected_expert_dx
+            .iter()
+            .zip(&router_dx_stand_in)
+            .map(|(&gathered, &router)| gathered + router)
+            .collect();
+        let mut dx_add_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+        module.moe_gather_dx_add(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &expert_input_gradient_dev,
+            &selected_dev,
+            &slots_dev,
+            &dy_dev,
+            D as u32,
+            K as u32,
+            C as u32,
+            &mut dx_add_dev,
+        )?;
+        assert_close(
+            "MoE fused gather dx + router dx",
+            &dx_add_dev.to_host_vec(stream)?,
+            &expected_dx_add,
+            1e-6,
+            1e-6,
+        );
+        let mut dx_add_quad_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+        unsafe {
+            module.moe_gather_dx_add_quad(
+                stream,
+                LaunchConfig::for_num_elems((N * D / 4) as u32),
+                &expert_input_gradient_dev,
+                &selected_dev,
+                &slots_dev,
+                &dy_dev,
+                D as u32,
+                K as u32,
+                C as u32,
+                &mut dx_add_quad_dev,
+            )?;
+        }
+        assert_eq!(
+            dx_add_quad_dev.to_host_vec(stream)?,
+            dx_add_dev.to_host_vec(stream)?,
+            "quad fused gather dx must match the scalar kernel bit for bit"
+        );
+
+        // The forward dead-bin pass composed with the scatter must between
+        // them rewrite every input bin (the forward no longer pre-fills the
+        // whole panel): poisoned storage that survives fails the compare.
+        let input_poison: Vec<f32> = (0..E * C * D).map(|index| -(index as f32) - 2.0).collect();
+        let mut poisoned_bins_dev = DeviceBuffer::from_host(stream, &input_poison)?;
+        unsafe {
+            module.moe_zero_dead_bins(
+                stream,
+                LaunchConfig {
+                    grid_dim: ((E * C) as u32, 1, 1),
+                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &counts_dev,
+                D as u32,
+                C as u32,
+                &mut poisoned_bins_dev,
+            )?;
+            module.moe_scatter(
+                stream,
+                LaunchConfig::for_num_elems((N * K * D) as u32),
+                &x_dev,
+                &selected_dev,
+                &slots_dev,
+                D as u32,
+                K as u32,
+                C as u32,
+                &mut poisoned_bins_dev,
+            )?;
+        }
+        assert_eq!(
+            poisoned_bins_dev.to_host_vec(stream)?,
+            expected_expert_input,
+            "dead-bin zeroing plus scatter must rewrite every input bin"
+        );
+
+        // Same composition over the packed panel, through both the pair and
+        // quad scatter walks.
+        let expected_packed_input: Vec<u32> = expected_expert_input
+            .chunks(2)
+            .map(|pair| {
+                bf16::from_f32(pair[0]).to_bits() as u32
+                    | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
+            })
+            .collect();
+        let word_poison = vec![0xdead_beefu32; E * C * D / 2];
+        let mut packed_pair_dev = DeviceBuffer::from_host(stream, &word_poison)?;
+        let mut packed_quad_dev = DeviceBuffer::from_host(stream, &word_poison)?;
+        unsafe {
+            module.moe_zero_dead_bins_bf16(
+                stream,
+                LaunchConfig {
+                    grid_dim: ((E * C) as u32, 1, 1),
+                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &counts_dev,
+                D as u32,
+                C as u32,
+                &mut packed_pair_dev,
+            )?;
+            module.moe_scatter_bf16(
+                stream,
+                LaunchConfig::for_num_elems((N * K * D / 2) as u32),
+                &x_dev,
+                &selected_dev,
+                &slots_dev,
+                D as u32,
+                K as u32,
+                C as u32,
+                &mut packed_pair_dev,
+            )?;
+            module.moe_zero_dead_bins_bf16(
+                stream,
+                LaunchConfig {
+                    grid_dim: ((E * C) as u32, 1, 1),
+                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &counts_dev,
+                D as u32,
+                C as u32,
+                &mut packed_quad_dev,
+            )?;
+            module.moe_scatter_bf16_quad(
+                stream,
+                LaunchConfig::for_num_elems((N * K * D / 4) as u32),
+                &x_dev,
+                &selected_dev,
+                &slots_dev,
+                D as u32,
+                K as u32,
+                C as u32,
+                &mut packed_quad_dev,
+            )?;
+        }
+        assert_eq!(
+            packed_pair_dev.to_host_vec(stream)?,
+            expected_packed_input,
+            "dead-bin zeroing plus packed scatter must rewrite every input bin"
+        );
+        assert_eq!(
+            packed_quad_dev.to_host_vec(stream)?,
+            expected_packed_input,
+            "quad packed scatter must match the pair walk bit for bit"
         );
 
         check_moe_tie_routing(stream, module)?;
@@ -1466,6 +1677,136 @@ fn check_swiglu(
             2e-6,
             1e-5,
         );
+        Ok(())
+    }
+}
+
+/// The fused interleaved-layout SwiGLU kernels against the flat split-layout
+/// ones: identical math on identical values, with gate and up read out of one
+/// `[rows, 2, ff]` panel and — in backward — both gradient halves written
+/// back interleaved, replacing the split and join passes. The packed-bf16
+/// forms must reproduce the flat fp32 results rounded to bf16 exactly.
+fn check_swiglu_interleaved(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // FF = 5 exercises the fp32 oracle arm alone; FF = 8 is quad-aligned so
+    // the packed-bf16 arms run too.
+    check_swiglu_interleaved_case::<3, 5>(stream, module)?;
+    check_swiglu_interleaved_case::<4, 8>(stream, module)
+}
+
+#[allow(unused_unsafe)]
+fn check_swiglu_interleaved_case<const ROWS: usize, const FF: usize>(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: every launch covers exactly the element count its output dtype
+    // packs the `ROWS x FF` (or interleaved `ROWS x 2FF`) rectangle into, and
+    // the bf16 launches only run at an FF divisible by four.
+    unsafe {
+        let gate = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(14);
+        let up = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(15);
+        let dy = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(16);
+        let mut interleaved = vec![0.0f32; ROWS * 2 * FF];
+        for row in 0..ROWS {
+            for column in 0..FF {
+                interleaved[row * 2 * FF + column] = gate.as_slice()[row * FF + column];
+                interleaved[row * 2 * FF + FF + column] = up.as_slice()[row * FF + column];
+            }
+        }
+
+        let flat = LaunchConfig::for_num_elems((ROWS * FF) as u32);
+        let gate_dev = DeviceBuffer::from_host(stream, gate.as_slice())?;
+        let up_dev = DeviceBuffer::from_host(stream, up.as_slice())?;
+        let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+        let mut y_ref_dev = DeviceBuffer::<f32>::zeroed(stream, ROWS * FF)?;
+        let mut dgate_ref_dev = DeviceBuffer::<f32>::zeroed(stream, ROWS * FF)?;
+        let mut dup_ref_dev = DeviceBuffer::<f32>::zeroed(stream, ROWS * FF)?;
+        module.swiglu_forward(stream, flat, &gate_dev, &up_dev, &mut y_ref_dev)?;
+        module.swiglu_backward_gate(
+            stream,
+            flat,
+            &gate_dev,
+            &up_dev,
+            &dy_dev,
+            &mut dgate_ref_dev,
+        )?;
+        module.swiglu_backward_up(stream, flat, &gate_dev, &dy_dev, &mut dup_ref_dev)?;
+        let y_ref = y_ref_dev.to_host_vec(stream)?;
+        let dgate_ref = dgate_ref_dev.to_host_vec(stream)?;
+        let dup_ref = dup_ref_dev.to_host_vec(stream)?;
+
+        let gate_up_dev = DeviceBuffer::from_host(stream, &interleaved)?;
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, ROWS * FF)?;
+        module.swiglu_forward_interleaved(stream, flat, &gate_up_dev, FF as u32, &mut y_dev)?;
+        assert_eq!(
+            y_dev.to_host_vec(stream)?,
+            y_ref,
+            "interleaved swiglu forward must match the flat kernel bit for bit"
+        );
+
+        let mut d_gate_up_dev = DeviceBuffer::<f32>::zeroed(stream, ROWS * 2 * FF)?;
+        module.swiglu_backward_interleaved(
+            stream,
+            flat,
+            &gate_up_dev,
+            &dy_dev,
+            FF as u32,
+            &mut d_gate_up_dev,
+        )?;
+        let mut expected_d_interleaved = vec![0.0f32; ROWS * 2 * FF];
+        for row in 0..ROWS {
+            for column in 0..FF {
+                expected_d_interleaved[row * 2 * FF + column] = dgate_ref[row * FF + column];
+                expected_d_interleaved[row * 2 * FF + FF + column] = dup_ref[row * FF + column];
+            }
+        }
+        assert_eq!(
+            d_gate_up_dev.to_host_vec(stream)?,
+            expected_d_interleaved,
+            "fused interleaved swiglu backward must match the flat kernels bit for bit"
+        );
+
+        if FF.is_multiple_of(4) {
+            let pack = |values: &[f32]| -> Vec<u32> {
+                values
+                    .chunks(2)
+                    .map(|pair| {
+                        bf16::from_f32(pair[0]).to_bits() as u32
+                            | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
+                    })
+                    .collect()
+            };
+            let mut y_words = DeviceBuffer::<u32>::zeroed(stream, ROWS * FF / 2)?;
+            module.swiglu_forward_interleaved_bf16(
+                stream,
+                LaunchConfig::for_num_elems((ROWS * FF / 4) as u32),
+                &gate_up_dev,
+                FF as u32,
+                &mut y_words,
+            )?;
+            assert_eq!(
+                y_words.to_host_vec(stream)?,
+                pack(&y_ref),
+                "packed interleaved swiglu forward must be the flat result rounded to bf16"
+            );
+
+            let mut d_words = DeviceBuffer::<u32>::zeroed(stream, ROWS * FF)?;
+            module.swiglu_backward_interleaved_bf16(
+                stream,
+                LaunchConfig::for_num_elems((ROWS * FF / 4) as u32),
+                &gate_up_dev,
+                &dy_dev,
+                FF as u32,
+                &mut d_words,
+            )?;
+            assert_eq!(
+                d_words.to_host_vec(stream)?,
+                pack(&expected_d_interleaved),
+                "packed interleaved swiglu backward must be the flat result rounded to bf16"
+            );
+        }
         Ok(())
     }
 }

@@ -55,7 +55,7 @@ pub mod tensor_device;
 
 pub use dense_device::kernels as dense_kernels;
 use dense_device::{
-    NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK, NORM_TILE_THREADS, SWIGLU_TILE_BLOCK_ROWS,
+    NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK, NORM_TILE_THREADS, QUAD_LANES, SWIGLU_TILE_BLOCK_ROWS,
     SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS,
 };
 
@@ -81,7 +81,9 @@ fn norm_tiles(rows: usize, columns: usize) -> Option<LaunchConfig> {
 /// decided; every training shape in `bin/train.rs` divides, and the flat
 /// kernels stay as the arm anything else takes. The bf16 forward has no tile
 /// arm on purpose — it measured 0.70x of the flat one, which already stores a
-/// packed pair per thread (#70).
+/// packed pair per thread (#70). Only the dense (non-MoE) FFN takes this
+/// launch now: the expert path reads its gate/up activation interleaved and
+/// its fused kernels size their own flat launches.
 fn swiglu_tiles(rows: usize, columns: usize) -> Option<LaunchConfig> {
     (rows.is_multiple_of(SWIGLU_TILE_BLOCK_ROWS) && columns.is_multiple_of(SWIGLU_TILE_CHUNK)).then(
         || LaunchConfig {
@@ -1325,32 +1327,6 @@ impl ExpertPanel {
         }
     }
 
-    fn fill_zero<P: KernelProfiler>(
-        &mut self,
-        stream: &CudaStream,
-        kernels: &tensor_kernels::LoadedModule,
-        profiler: &mut P,
-        name: &'static str,
-    ) -> Result<(), DriverError> {
-        // SAFETY: each arm launches over its own buffer's exact length.
-        profiler.measure(stream, name, || unsafe {
-            match self {
-                Self::Wide(values) => kernels.fill(
-                    stream,
-                    LaunchConfig::for_num_elems(values.len() as u32),
-                    0.0,
-                    values,
-                ),
-                Self::Packed(panel) => kernels.fill_u32(
-                    stream,
-                    LaunchConfig::for_num_elems(panel.words.len() as u32),
-                    0,
-                    &mut panel.words,
-                ),
-            }
-        })
-    }
-
     /// Host upload in element order, rounding to bf16 for packed storage.
     /// Parity-gate entry point; it synchronizes the stream.
     fn upload(&mut self, values: &[f32], stream: &CudaStream) -> Result<(), DriverError> {
@@ -1774,11 +1750,20 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         dense: &dense_kernels::LoadedModule,
         profiler: &mut P,
     ) -> Result<(), DriverError> {
+        let GpuExpertActs {
+            bin_input,
+            gate_up,
+            activated,
+            ..
+        } = &mut *acts;
+        // The GEMM writes the interleaved `[E, C, 2, FF]` activation directly
+        // and SwiGLU reads it in place, so the split copy that used to build
+        // separate gate/up buffers never runs.
         expert_linear_forward::<E, C, P>(
-            &acts.bin_input,
+            bin_input,
             self.gate_up.as_words(),
             self.gate_up_compute.as_ref(),
-            scratch.gate_up.as_device_buffer_mut(),
+            gate_up.as_device_buffer_mut(),
             D,
             2 * FF,
             &mut scratch.fp32_staging,
@@ -1789,51 +1774,26 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             profiler,
             "forward.experts.gate_up_gemm",
         )?;
-        // SAFETY: expert buffers contain E * C rows at the configured widths.
-        profiler.measure(stream, "forward.experts.gate_up_split", || unsafe {
-            dense.split_group2(
-                stream,
-                LaunchConfig::for_num_elems((E * C * FF) as u32),
-                scratch.gate_up.as_device_buffer(),
-                FF as u32,
-                acts.gate.as_device_buffer_mut(),
-                acts.up.as_device_buffer_mut(),
-            )
-        })?;
-        let GpuExpertActs {
-            gate,
-            up,
-            activated,
-            ..
-        } = &mut *acts;
-        // SAFETY: gate and up hold E * C * FF elements, and each arm launches
-        // over the element count its own output dtype packs them into.
+        // SAFETY: `gate_up` holds E * C interleaved rows of 2 * FF elements,
+        // and each arm launches over the element count its own output dtype
+        // packs them into; the packed arm's FF is tcgen05-aligned, hence a
+        // multiple of QUAD_LANES.
         profiler.measure(stream, "forward.experts.swiglu", || unsafe {
             match activated {
-                ExpertPanel::Packed(panel) => dense.swiglu_forward_bf16(
+                ExpertPanel::Packed(panel) => dense.swiglu_forward_interleaved_bf16(
                     stream,
-                    LaunchConfig::for_num_elems((E * C * FF / 2) as u32),
-                    gate.as_device_buffer(),
-                    up.as_device_buffer(),
+                    LaunchConfig::for_num_elems((E * C * FF / QUAD_LANES) as u32),
+                    gate_up.as_device_buffer(),
+                    FF as u32,
                     &mut panel.words,
                 ),
-                ExpertPanel::Wide(values) => match swiglu_tiles(E * C, FF) {
-                    Some(tiles) => dense.swiglu_forward_tile(
-                        stream,
-                        tiles,
-                        gate.as_device_buffer(),
-                        up.as_device_buffer(),
-                        FF as u32,
-                        values,
-                    ),
-                    None => dense.swiglu_forward(
-                        stream,
-                        LaunchConfig::for_num_elems((E * C * FF) as u32),
-                        gate.as_device_buffer(),
-                        up.as_device_buffer(),
-                        values,
-                    ),
-                },
+                ExpertPanel::Wide(values) => dense.swiglu_forward_interleaved(
+                    stream,
+                    LaunchConfig::for_num_elems((E * C * FF) as u32),
+                    gate_up.as_device_buffer(),
+                    FF as u32,
+                    values,
+                ),
             }
         })?;
         expert_linear_forward::<E, C, P>(
@@ -1908,83 +1868,39 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
                 "backward.experts.down_input_gemm",
             ],
         )?;
-        let elementwise = LaunchConfig::for_num_elems((E * C * FF) as u32);
-        let tiles = swiglu_tiles(E * C, FF);
-        // SAFETY: all elementwise buffers contain E * C * FF elements, and the
-        // tile arms are only taken at a shape `swiglu_tiles` accepted.
-        profiler.measure(stream, "backward.experts.swiglu_gate", || unsafe {
-            match tiles {
-                Some(tiles) => dense.swiglu_backward_gate_tile(
-                    stream,
-                    tiles,
-                    acts.gate.as_device_buffer(),
-                    acts.up.as_device_buffer(),
-                    scratch.d_activated.as_device_buffer(),
-                    FF as u32,
-                    scratch.d_gate.as_device_buffer_mut(),
-                ),
-                None => dense.swiglu_backward_gate(
-                    stream,
-                    elementwise,
-                    acts.gate.as_device_buffer(),
-                    acts.up.as_device_buffer(),
-                    scratch.d_activated.as_device_buffer(),
-                    scratch.d_gate.as_device_buffer_mut(),
-                ),
-            }
-        })?;
-        // SAFETY: as above.
-        profiler.measure(stream, "backward.experts.swiglu_up", || unsafe {
-            match tiles {
-                Some(tiles) => dense.swiglu_backward_up_tile(
-                    stream,
-                    tiles,
-                    acts.gate.as_device_buffer(),
-                    scratch.d_activated.as_device_buffer(),
-                    FF as u32,
-                    scratch.d_up.as_device_buffer_mut(),
-                ),
-                None => dense.swiglu_backward_up(
-                    stream,
-                    elementwise,
-                    acts.gate.as_device_buffer(),
-                    scratch.d_activated.as_device_buffer(),
-                    scratch.d_up.as_device_buffer_mut(),
-                ),
-            }
-        })?;
         let GpuExpertScratch {
-            d_gate,
-            d_up,
+            d_activated,
             d_gate_up,
             ..
         } = &mut *scratch;
-        profiler.measure(
-            stream,
-            "backward.experts.gate_up_join",
-            || match d_gate_up {
-                ExpertPanel::Packed(panel) => unsafe {
-                    dense.join_group2_bf16(
-                        stream,
-                        LaunchConfig::for_num_elems((E * C * FF / 2) as u32),
-                        d_gate.as_device_buffer(),
-                        d_up.as_device_buffer(),
-                        FF as u32,
-                        &mut panel.words,
-                    )
-                },
-                ExpertPanel::Wide(values) => unsafe {
-                    dense.join_group2(
-                        stream,
-                        elementwise,
-                        d_gate.as_device_buffer(),
-                        d_up.as_device_buffer(),
-                        FF as u32,
-                        values,
-                    )
-                },
-            },
-        )?;
+        // One fused pass reads the interleaved gate/up activation and the
+        // downstream gradient once and writes both interleaved gradient
+        // halves in place, so the separate gate/up gradient buffers and the
+        // join pass that merged them never exist.
+        // SAFETY: `gate_up` holds E * C interleaved rows of 2 * FF elements,
+        // `d_activated` E * C * FF, and each arm launches over the element
+        // count its own output dtype packs them into; the packed arm's FF is
+        // tcgen05-aligned, hence a multiple of QUAD_LANES.
+        profiler.measure(stream, "backward.experts.swiglu", || unsafe {
+            match d_gate_up {
+                ExpertPanel::Packed(panel) => dense.swiglu_backward_interleaved_bf16(
+                    stream,
+                    LaunchConfig::for_num_elems((E * C * FF / QUAD_LANES) as u32),
+                    acts.gate_up.as_device_buffer(),
+                    d_activated.as_device_buffer(),
+                    FF as u32,
+                    &mut panel.words,
+                ),
+                ExpertPanel::Wide(values) => dense.swiglu_backward_interleaved(
+                    stream,
+                    LaunchConfig::for_num_elems((E * C * FF) as u32),
+                    acts.gate_up.as_device_buffer(),
+                    d_activated.as_device_buffer(),
+                    FF as u32,
+                    values,
+                ),
+            }
+        })?;
         expert_linear_backward::<E, C, P>(
             &acts.bin_input,
             &scratch.d_gate_up,
@@ -2066,15 +1982,15 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
 /// Capacity-bin activations one backward pass will read again: forward writes
 /// them and every block in a deep model owns its own copy.
 ///
-/// `gate`/`up` stay fp32 for the SwiGLU pointwise math and `bin_output` for
-/// the gate-gradient dot product; `bin_input` and `activated` are packed bf16
-/// because every reader of those two is a tcgen05 operand (SPEC §7.1). The
-/// fp32 buffers occupy `4 * E * C * (D + 2 * FF)` bytes plus
-/// `2 * E * C * (D + FF)` packed.
+/// `gate_up` is the interleaved `[E, C, 2, FF]` gate/up activation the fused
+/// GEMM writes; it stays fp32 for the SwiGLU pointwise math, as does
+/// `bin_output` for the gate-gradient dot product. `bin_input` and
+/// `activated` are packed bf16 because every reader of those two is a tcgen05
+/// operand (SPEC §7.1). The fp32 buffers occupy `4 * E * C * (D + 2 * FF)`
+/// bytes plus `2 * E * C * (D + FF)` packed.
 pub struct GpuExpertActs<const E: usize, const C: usize, const D: usize, const FF: usize> {
     pub bin_input: ExpertPanel,
-    gate: GpuTensor<f32, Rank3<E, C, FF>>,
-    up: GpuTensor<f32, Rank3<E, C, FF>>,
+    gate_up: GpuTensor<f32, Rank4<E, C, 2, FF>>,
     activated: ExpertPanel,
     pub bin_output: GpuTensor<f32, Rank3<E, C, D>>,
 }
@@ -2087,8 +2003,7 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize> GpuExpertA
         let aligned = expert_tcgen05_aligned::<C, D, FF>();
         Ok(Self {
             bin_input: ExpertPanel::new(stream, E, C, D, aligned)?,
-            gate: GpuTensor::zeros(stream)?,
-            up: GpuTensor::zeros(stream)?,
+            gate_up: GpuTensor::zeros(stream)?,
             activated: ExpertPanel::new(stream, E, C, FF, aligned)?,
             bin_output: GpuTensor::zeros(stream)?,
         })
@@ -2100,16 +2015,13 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize> GpuExpertA
 ///
 /// `d_bin_output` and `d_gate_up` are packed bf16 (every reader is a tcgen05
 /// operand, SPEC §7.1); the rest stay fp32 as epilogue targets or pointwise
-/// operands, occupying `4 * E * C * (D + 5 * FF)` bytes plus
+/// operands, occupying `4 * E * C * (D + FF)` bytes plus
 /// `2 * E * C * (D + 2 * FF)` packed. Aligned tcgen05 shapes now stage nothing
 /// at all — every operand is addressed in place — so only the non-aligned
 /// oracle allocates the three one-expert fp32 staging buffers.
 pub struct GpuExpertScratch<const E: usize, const C: usize, const D: usize, const FF: usize> {
-    gate_up: GpuTensor<f32, Rank4<E, C, 2, FF>>,
     pub d_bin_output: ExpertPanel,
     d_activated: GpuTensor<f32, Rank3<E, C, FF>>,
-    d_gate: GpuTensor<f32, Rank3<E, C, FF>>,
-    d_up: GpuTensor<f32, Rank3<E, C, FF>>,
     d_gate_up: ExpertPanel,
     pub d_bin_input: GpuTensor<f32, Rank3<E, C, D>>,
     fp32_staging: Option<ExpertFp32Scratch>,
@@ -2122,11 +2034,8 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize>
         assert!(E > 0 && C > 0 && D > 0 && FF > 0);
         let aligned = expert_tcgen05_aligned::<C, D, FF>();
         Ok(Self {
-            gate_up: GpuTensor::zeros(stream)?,
             d_bin_output: ExpertPanel::new(stream, E, C, D, aligned)?,
             d_activated: GpuTensor::zeros(stream)?,
-            d_gate: GpuTensor::zeros(stream)?,
-            d_up: GpuTensor::zeros(stream)?,
             d_gate_up: ExpertPanel::new(stream, E, C, 2 * FF, aligned)?,
             d_bin_input: GpuTensor::zeros(stream)?,
             fp32_staging: (!aligned)
@@ -4380,9 +4289,6 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                 acts.routing.assignment_counts.as_device_buffer_mut(),
             )
         })?;
-        acts.experts
-            .bin_input
-            .fill_zero(stream, tensor, profiler, "forward.router.zero_bins")?;
         let GpuBlockActs {
             ffn_normalized,
             routing,
@@ -4390,11 +4296,38 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             ..
         } = &mut *acts;
         let bin_input = &mut experts.bin_input;
-        profiler.measure(stream, "forward.router.scatter", || match bin_input {
+        // The scatter below overwrites every assigned bin row, so only the
+        // unassigned capacity tail needs clearing — mirroring the backward's
+        // dead-bin pass rather than pre-filling the whole `E·C·D` panel.
+        profiler.measure(stream, "forward.router.zero_bins", || match bin_input {
             ExpertPanel::Packed(panel) => unsafe {
-                dense.moe_scatter_bf16(
+                dense.moe_zero_dead_bins_bf16(
                     stream,
-                    LaunchConfig::for_num_elems((N * K * D / 2) as u32),
+                    moe_zero_bins_config(E * C),
+                    routing.assignment_counts.as_device_buffer(),
+                    D as u32,
+                    C as u32,
+                    &mut panel.words,
+                )
+            },
+            ExpertPanel::Wide(values) => unsafe {
+                dense.moe_zero_dead_bins(
+                    stream,
+                    moe_zero_bins_config(E * C),
+                    routing.assignment_counts.as_device_buffer(),
+                    D as u32,
+                    C as u32,
+                    values,
+                )
+            },
+        })?;
+        profiler.measure(stream, "forward.router.scatter", || match bin_input {
+            // The packed panel's tcgen05 alignment makes D a multiple of
+            // QUAD_LANES, so the quad walk always applies.
+            ExpertPanel::Packed(panel) => unsafe {
+                dense.moe_scatter_bf16_quad(
+                    stream,
+                    LaunchConfig::for_num_elems((N * K * D / QUAD_LANES) as u32),
                     ffn_normalized.as_device_buffer(),
                     routing.selected_experts.as_device_buffer(),
                     routing.slots.as_device_buffer(),
@@ -4428,30 +4361,40 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             dense,
             profiler,
         )?;
+        // The gather folds the ffn residual add in, writing the block output
+        // directly instead of an intermediate a separate add pass re-reads.
         // SAFETY: routing indices and slots were produced for the same N/K/C shape.
         profiler.measure(stream, "forward.router.gather", || unsafe {
-            dense.moe_gather_combine(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                acts.experts.bin_output.as_device_buffer(),
-                acts.routing.selected_experts.as_device_buffer(),
-                acts.routing.gate_weights.as_device_buffer(),
-                acts.routing.slots.as_device_buffer(),
-                D as u32,
-                K as u32,
-                C as u32,
-                scratch.projection_output.as_device_buffer_mut(),
-            )
-        })?;
-        add_into(
-            &acts.ffn_input,
-            &scratch.projection_output,
-            output,
-            stream,
-            tensor,
-            profiler,
-            "forward.ffn_residual",
-        )
+            if D.is_multiple_of(QUAD_LANES) {
+                dense.moe_gather_combine_add_quad(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D / QUAD_LANES) as u32),
+                    acts.experts.bin_output.as_device_buffer(),
+                    acts.routing.selected_experts.as_device_buffer(),
+                    acts.routing.gate_weights.as_device_buffer(),
+                    acts.routing.slots.as_device_buffer(),
+                    acts.ffn_input.as_device_buffer(),
+                    D as u32,
+                    K as u32,
+                    C as u32,
+                    output.as_device_buffer_mut(),
+                )
+            } else {
+                dense.moe_gather_combine_add(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    acts.experts.bin_output.as_device_buffer(),
+                    acts.routing.selected_experts.as_device_buffer(),
+                    acts.routing.gate_weights.as_device_buffer(),
+                    acts.routing.slots.as_device_buffer(),
+                    acts.ffn_input.as_device_buffer(),
+                    D as u32,
+                    K as u32,
+                    C as u32,
+                    output.as_device_buffer_mut(),
+                )
+            }
+        })
     }
 
     /// Runs one block backward.
@@ -4573,20 +4516,6 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             dense,
             profiler,
         )?;
-        // SAFETY: routing indices and slots were produced for the same N/K/C shape.
-        profiler.measure(stream, "backward.router.gather_dx", || unsafe {
-            dense.moe_gather_dx(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                scratch.experts.d_bin_input.as_device_buffer(),
-                acts.routing.selected_experts.as_device_buffer(),
-                acts.routing.slots.as_device_buffer(),
-                D as u32,
-                K as u32,
-                C as u32,
-                scratch.d_model_3.as_device_buffer_mut(),
-            )
-        })?;
         profiler.measure(stream, "backward.router.softmax", || unsafe {
             dense.router_backward(
                 stream,
@@ -4634,15 +4563,40 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                 self.d_router.as_device_buffer_mut(),
             )
         })?;
-        add_into(
-            &scratch.d_model_3,
-            &scratch.router_dx,
-            &mut scratch.d_model_4,
-            stream,
-            tensor,
-            profiler,
-            "backward.router.combine_dx",
-        )?;
+        // The gather folds the router input-gradient add in, writing the
+        // combined ffn input gradient directly instead of an intermediate a
+        // separate add pass re-reads; it runs after `router_backward_input`
+        // so `router_dx` is ready.
+        // SAFETY: routing indices and slots were produced for the same N/K/C shape.
+        profiler.measure(stream, "backward.router.gather_dx", || unsafe {
+            if D.is_multiple_of(QUAD_LANES) {
+                dense.moe_gather_dx_add_quad(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D / QUAD_LANES) as u32),
+                    scratch.experts.d_bin_input.as_device_buffer(),
+                    acts.routing.selected_experts.as_device_buffer(),
+                    acts.routing.slots.as_device_buffer(),
+                    scratch.router_dx.as_device_buffer(),
+                    D as u32,
+                    K as u32,
+                    C as u32,
+                    scratch.d_model_4.as_device_buffer_mut(),
+                )
+            } else {
+                dense.moe_gather_dx_add(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    scratch.experts.d_bin_input.as_device_buffer(),
+                    acts.routing.selected_experts.as_device_buffer(),
+                    acts.routing.slots.as_device_buffer(),
+                    scratch.router_dx.as_device_buffer(),
+                    D as u32,
+                    K as u32,
+                    C as u32,
+                    scratch.d_model_4.as_device_buffer_mut(),
+                )
+            }
+        })?;
         self.ffn_norm.backward_into(
             &acts.ffn_input,
             &scratch.d_model_4,
