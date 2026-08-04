@@ -114,16 +114,22 @@ const CHUNKS: usize = BLOCK_K / 16;
 /// Ring depth. 3 → 2 is −11.8% / −7.3% at unchanged residency (ferro #87).
 const STAGES: usize = 3;
 /// One warp per 32 accumulator rows — the band warps, every one of which
-/// drains — plus the scheduler warp, which never does.
-pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32 + 32;
+/// drains — plus the producer warp and the MMA warp, which never do.
+pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32 + 64;
 /// Warps that own a 32-row band of the accumulator.
 const DRAIN_WARPS: usize = BLOCK_M / 32;
-/// The warp that produces and multiplies instead of draining: lane 0 issues
-/// the item's TMA loads, lane 16 (leader rank only) waits the accumulator
-/// free and issues the MMA chain. Two roles in one warp because both are
-/// single-lane loops that spin on barriers, and a warp apiece would put the
-/// register file's per-subpartition granting in play for nothing.
-const SCHEDULER: u32 = DRAIN_WARPS as u32;
+/// The warp whose lane 0 issues the item's TMA loads.
+const PRODUCER: u32 = DRAIN_WARPS as u32;
+/// The warp whose lane 0 (leader rank only) waits the accumulator free and
+/// issues the MMA chain. A warp of its own, not a diverged lane of the
+/// producer's: both roles are single-lane loops spinning on barriers, and the
+/// first cut of this design ran them as two lanes of one warp — every
+/// model_shapes row lost 5–20%, because divergent spin loops share the warp's
+/// issue and the MMA chain stalled behind the producer's polling. The two
+/// kernels this repo has had before (the extraction-point kernel and ferro's
+/// `gemm_ws`) both kept these roles on warps of their own; now this one does
+/// too.
+const ISSUER: u32 = PRODUCER + 1;
 /// The staged drain's band: the narrowest bf16 tile `Swizzle128B` admits *and*
 /// the widest four of fit beside the operand rings.
 const STAGE_N: usize = 64;
@@ -213,7 +219,7 @@ const fn staged(at: SharedPlan) -> (StageRun, SharedPlan) {
 pub const SHARED_BYTES: usize = staged(shared(SharedPlan::sizing()).plan).1.bytes();
 
 const _: () = {
-    assert!(THREADS == 160 && MAX_CLUSTERS == 148);
+    assert!(THREADS == 192 && MAX_CLUSTERS == 148);
     // `acc_free` costs the plan nothing: the eight bytes land in the
     // 128-byte alignment padding in front of the staging tiles.
     assert!(SHARED_BYTES == 114_816 && SHARED_BYTES <= 116_736);
@@ -375,16 +381,22 @@ impl Drain for Wide {
         release: Release,
     ) {
         unsafe {
+            // One band live, not two: this drain already holds the fattest
+            // registers in the file, and the two-band hoist measured 181 —
+            // past the 170 the register file grants 12 warps an SM, which is
+            // the 2 → 1 CTA cliff by another name. Releasing after the fourth
+            // load still overlaps the last store pass and every store's
+            // completion with the next item's MMA.
             let (lane, band_row) = (lane(), 32 * warp_id());
             let n = STAGE_N as u32;
             let first: Band = accumulator.tile_x8(band_row, 0);
-            let second: Band = accumulator.tile_x8(band_row, n);
             store_rows(self.c, row, column, lane, first);
-            let third: Band = accumulator.tile_x8(band_row, 2 * n);
+            let second: Band = accumulator.tile_x8(band_row, n);
             store_rows(self.c, row, column + n, lane, second);
+            let third: Band = accumulator.tile_x8(band_row, 2 * n);
+            store_rows(self.c, row, column + 2 * n, lane, third);
             let fourth: Band = accumulator.tile_x8(band_row, 3 * n);
             release.now();
-            store_rows(self.c, row, column + 2 * n, lane, third);
             store_rows(self.c, row, column + 3 * n, lane, fourth);
         }
     }
@@ -649,11 +661,12 @@ impl<D: Drain> Job for Tile<D> {
             let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP);
             let (warp, lane) = (warp_id(), lane());
 
-            if warp == SCHEDULER {
+            if warp == PRODUCER {
                 if lane == 0 {
                     self.produce(tile_m, tile_n);
                 }
-                if self.rank == LEADER && lane == 16 {
+            } else if warp == ISSUER {
+                if self.rank == LEADER && lane == 0 {
                     self.acc_free.wait(0);
                     self.multiply();
                 }
@@ -733,7 +746,7 @@ pub mod kernels {
     #[inline(always)]
     unsafe fn drain_last<D: Drain>(tile: &Tile<D>) {
         unsafe {
-            if tile.pending != 0 && warp_id() < SCHEDULER {
+            if tile.pending != 0 && warp_id() < DRAIN_WARPS as u32 {
                 let (row, column) = tile.origin(tile.pending - 1);
                 let release = Release {
                     sem: tile.acc_free.at_rank(LEADER),
