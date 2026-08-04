@@ -1640,10 +1640,32 @@ Each gated on tests; correctness before speed at every step.
      `enable_d` on, and the epilogue drains once. **Bench** at
      [32,1024,24,128], forward **1.212 → 0.832 ms (−31.4%)**, 180.8 → 263.2
      TFLOP/s, with **128 regs / 0 B frame** against 193 / 560. Parity is
-     identical to the digit at all five gated shapes (y ≤ 1.47e-3, lse ≤
-     9.54e-7, corrections 0.00% of 49152 eligible visits), which it has to be:
-     the rescale is the same arithmetic in the same order, applied to the
-     accumulator rather than to a copy of it.
+     identical to the digit at all five uniform gated shapes (y ≤ 1.47e-3,
+     lse ≤ 9.54e-7), which it has to be: the rescale is the same arithmetic in
+     the same order, applied to the accumulator rather than to a copy of it.
+     **And a sixth shape, because those five never enter the path they were
+     cited for.** All five correct on **0.00%** of eligible visits — that is
+     the same number the old scheme's checklist reported and treated as good
+     news, and it means every one of them gates the epilogue drain and none of
+     them gates the mid-stream rescale. Uniform operands cannot climb
+     `CORRECTION_THRESHOLD`; the gate has to make them. `CORRECTION_KEY_GAIN`
+     scales key `p`'s staged row by `1 + 7·(p / 64)`, which multiplies its
+     score by the same factor (scores are linear in K) and makes the row max
+     climb ~7.7 base-2 per key tile, just over the threshold. At [1,512,2] that
+     corrects on **32 of 32 eligible visits (100.00%)** with y ≤ **1.156e-3**
+     and lse ≤ **2.842e-4** against the unchanged tolerances, and the count is
+     asserted nonzero so it cannot regress back to vacuous. The CPU reference
+     needed no ramp of its own: it reads the *staged* operands, so a transform
+     applied before staging is automatically part of what it expects.
+     **The gate was checked against a negative control**, since a test that
+     cannot fail is the same hole in a new shape. With the two `rescale_half`
+     calls deleted and everything else — the vote, the counter, `store_wait`,
+     `enable_d` — left standing, all five uniform shapes pass **byte-identical**
+     and the ramped one fails on y by **0.114 against a 0.0062 tolerance**, 18x
+     over. Only `y` catches it; `lse` is unmoved, because `running_sum` is
+     rescaled in registers either way and only the O segment is left stale.
+     That is the whole argument for the assert being on `y` at a shape that
+     corrects.
      **The width is the whole lesson, and it is ferro #181's.** Three
      formulations were measured, same container: the resident `&mut`
      accumulator, 560 B / **1.212 ms**; the segment drained whole into a
