@@ -1,9 +1,10 @@
 //! # The tcgen05 GEMMs — `C = A·Bᵀ` and `dW += Aᵀ·B` on the `cta_group::2` path
 //!
 //! bf16 operands, an fp32 TMEM accumulator, and a `C` that is either packed
-//! bf16 or fp32, either overwritten or folded into. Four training variants over
-//! one compute pipeline: the operand layout is a runtime flag on the *walk* and
-//! the epilogue is a type parameter, so neither is a second MMA chain.
+//! bf16 or fp32, either overwritten or accumulated into. The training variants
+//! share one compute pipeline: the operand layout is a runtime flag on the
+//! *walk* and the epilogue is a type parameter, so neither is a second MMA
+//! chain.
 //!
 //! A cluster of two CTAs shares one `M256_N256` UMMA. Each rank stages its own
 //! [`BLOCK_M`] rows of `A` and its own [`HALF_N`] columns of `B` at the same
@@ -48,30 +49,39 @@
 //! store: #123 measured that route *losing* by 1.0–1.7% at warp scope on this
 //! tile.
 //!
-//! An **accumulating** `C` leaves the same way through
+//! An **accumulating bf16** `C` leaves the same way through
 //! [`accumulate_shared_rows`], which is that store with one `ld.global.v4` in
 //! front of it. The kernel this replaced read-modify-wrote `C` a 32-bit word at
 //! a time and paid more than the whole rest of the kernel for it: 1113.8
 //! TFLOP/s storing against 536.2 accumulating, at 4096³ on a B200.
 //!
-//! An **fp32** `C` cannot take that route at all — `stmatrix` moves b16
-//! matrices, so nothing can fill an fp32 staging tile — and drains through
-//! [`store_rows`] a value at a time instead. That is a ferro-kittens gap rather
-//! than a choice here; GAPS.md §2.6 carries it.
+//! An **fp32** `C` cannot take the `stmatrix` route at all — it moves b16
+//! matrices, so nothing can fill an fp32 staging tile that way — and the
+//! *store* mode drains through [`store_rows`] a value at a time instead
+//! (GAPS.md §2.6 carries the staged-fp32 gap).
+//!
+//! The **accumulating fp32** `C` — the weight-gradient fold that oxide-train#80
+//! measured at +25–29% over its own store at K = 6144 — no longer reads `C` at
+//! all. Its drain scatters each fp32 band into a `[16, STAGE_N]` staging tile
+//! ([`scatter_tile`], byte-for-byte the bf16 drain's `[32, STAGE_N]` buffer)
+//! and hands it to the copy engine as a *reduction store*
+//! (`cp.reduce.async.bulk.tensor.add`, ferro #42): the engine adds the tile
+//! into `C` in fp32, so the fold's `ld.global` disappears and the sum stays at
+//! the accumulator's own precision. One CTA owns each output tile and each
+//! element is reduced exactly once per launch, so element order — and with it
+//! SPEC decision #20's fp32 weight-gradient accumulation — is unchanged.
 
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cluster, cluster_launch, kernel, thread, warp};
 use cuda_host::cuda_module;
 
-use kittens::global::{
-    GlobalRows, accumulate_shared_rows, load_rows, store_rows, store_shared_rows,
-};
-use kittens::ldst::store_tile_x4;
+use kittens::epilogue::{StoreRing, Warp};
+use kittens::global::{GlobalRows, accumulate_shared_rows, store_rows, store_shared_rows};
+use kittens::ldst::{scatter_tile, store_tile_x4};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, Job};
 use kittens::plan::SharedPlan;
-use kittens::reg::Add;
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
@@ -248,18 +258,19 @@ impl Drain for Packed {
     }
 }
 
-/// fp32 `C`, straight out of the registers.
+/// Overwriting fp32 `C`, straight out of the registers.
 ///
 /// No staging tile, and not for want of asking: [`store_shared_rows`] is
 /// generic over its element and would take an fp32 tile, but `stmatrix` moves
-/// b16 matrices and nothing in ferro-kittens can *fill* one (GAPS.md §2.6). So
+/// b16 matrices and nothing bf16-shaped can *fill* one (GAPS.md §2.6). So
 /// this is the scattered per-value drain the bf16 path stopped using — one
 /// `st.global.v2.f32` per pair of columns against the other's contiguous 16
-/// bytes — and it is why the fp32 rows of the benchmark trail the bf16 ones.
+/// bytes — and it is why the fp32 store rows of the benchmark trail the bf16
+/// ones. The *accumulating* fp32 drain is [`Reduce`], which owes nothing to
+/// this shape.
 #[derive(Clone, Copy)]
 struct Wide {
     c: GlobalRows<F32>,
-    fold: bool,
 }
 
 impl Drain for Wide {
@@ -269,17 +280,72 @@ impl Drain for Wide {
             let (lane, band_row) = (lane(), 32 * warp_id());
             let mut at = 0u32;
             while at < BLOCK_N as u32 {
-                let mut band: Band = accumulator.tile_x8(band_row, at);
-                if self.fold {
-                    // The fold's addresses are the store's, so `C` comes back
-                    // at the width it goes out at, and the sum is held in fp32
-                    // — the accumulator's own precision, with nothing rounded
-                    // on the way through.
-                    band.bin_map_assign::<Add>(load_rows(self.c, row, column + at, lane));
-                }
+                let band: Band = accumulator.tile_x8(band_row, at);
                 store_rows(self.c, row, column + at, lane, band);
                 at += STAGE_N as u32;
             }
+        }
+    }
+}
+
+/// The accumulating drain's staging ring: one fp32 `[16, STAGE_N]` buffer per
+/// warp, byte-for-byte this warp's bf16 `[32, STAGE_N]` staging tile — so the
+/// fp32 path borrows the bf16 drain's shared plan without costing the plan a
+/// byte, and `SHARED_BYTES` does not move.
+type ReduceRing = StoreRing<F32, 16, STAGE_N, Swizzle128B, 0, Warp>;
+
+const _: () = assert!(
+    ReduceRing::BYTES == StageTile::BYTES,
+    "the reduce ring reinterprets one bf16 staging tile exactly"
+);
+
+/// Accumulating fp32 `C` that never reads `C`: `dW += Aᵀ·B` with the fold done
+/// by the copy engine (`cp.reduce.async.bulk.tensor.add`, ferro #42 —
+/// oxide-train#80 remedy 1).
+///
+/// Each `[16, STAGE_N]` half-band leaves TMEM on the same
+/// `tcgen05.ld.16x256b.x8` issue shape as every other drain, is scattered into
+/// the warp's fp32 staging tile ([`scatter_tile`]), and is *reduce-stored*:
+/// the engine adds it into `C` in fp32, keeping SPEC decision #20's precision
+/// with nothing rounded on the way through. The fold that read `C` back at
+/// +25–29% over the store is gone.
+///
+/// Determinism: one CTA owns each output tile, one warp owns each 32-row band,
+/// and each element is reduced exactly once per launch — the add order per
+/// element is one engine-side `old + new`, the same as the register fold's.
+///
+/// The ring is depth 1 ([`StoreRing::acquire`] fully drains the engine's read
+/// of the previous pass before the next scatter), at warp scope because the
+/// buffer is warp-private — the [`kittens::epilogue::Warp`] contract.
+#[derive(Clone, Copy)]
+struct Reduce {
+    c_map: *const TmaDescriptor,
+}
+
+impl Drain for Reduce {
+    #[inline(always)]
+    unsafe fn drain(self, accumulator: Accumulator, stage: StageTile, row: u32, column: u32) {
+        unsafe {
+            let (lane, band_row) = (lane(), 32 * warp_id());
+            let mut ring = ReduceRing::attach(stage.base());
+            let mut half = 0u32;
+            while half < 2 {
+                let mut at = 0u32;
+                while at < BLOCK_N as u32 {
+                    let staging = ring.acquire();
+                    let band: RegTile<16, STAGE_N, BaseLdtm> =
+                        accumulator.tile_x8(band_row + 16 * half, at);
+                    scatter_tile(staging.chunk_writer(), 0, 0, lane, band);
+                    ring.commit_add_2d(
+                        self.c_map,
+                        (column + at) as i32,
+                        (row + 16 * half) as i32,
+                    );
+                    at += STAGE_N as u32;
+                }
+                half += 1;
+            }
+            ring.drain();
         }
     }
 }
@@ -552,8 +618,11 @@ pub mod kernels {
         }
     }
 
-    /// [`gemm_tcgen05_bf16_optimized`] with an fp32 `C`. `c_offset` selects one
-    /// matrix in a stacked allocation without host-side pointer marshalling.
+    /// [`gemm_tcgen05_bf16_optimized`] with an fp32 `C`, **overwrite only**.
+    /// `c_offset` selects one matrix in a stacked allocation without host-side
+    /// pointer marshalling. The accumulating fp32 form is
+    /// [`gemm_tcgen05_f32_accumulate`], which folds at the copy engine instead
+    /// of here.
     ///
     /// # Safety
     /// As [`gemm_tcgen05_bf16_optimized`], with `c_offset..c_offset + m * n`
@@ -570,13 +639,11 @@ pub mod kernels {
         k: i32,
         tiles_m: u32,
         tiles_n: u32,
-        mode: u32,
         transposed: u32,
     ) {
         unsafe {
             let out = Wide {
                 c: GlobalRows::<F32>::from_raw(c.as_mut_ptr().add(c_offset) as *mut u8, n as usize),
-                fold: mode % 2 == 1,
             };
             let mut tile = attach(
                 a_map,
@@ -586,6 +653,48 @@ pub mod kernels {
                 k as u32 / BLOCK_K as u32,
                 transposed != 0,
                 out,
+            );
+            pipeline::run(&mut tile, tiles_m * tiles_n);
+            release(&tile);
+        }
+    }
+
+    /// `C += A·Bᵀ` (or `dW += Aᵀ·B` under `transposed`) into an fp32 `C`
+    /// described by a rank-2 tensor map, with the fold done by the copy engine:
+    /// the epilogue *reduce-stores* its tile (`cp.reduce...add`, ferro #42) and
+    /// never reads `C` — oxide-train#80's remedy 1 for the +25–29% the
+    /// register fold cost over the plain store.
+    ///
+    /// `C`'s geometry — base, `n`, the row stride of a region inside a stacked
+    /// gradient allocation — all live in `c_map`, so the kernel takes no `C`
+    /// slice at all; the box is `[16, 32]` fp32 under SWIZZLE_128B, the shape
+    /// [`Reduce`]'s staging tile stores through.
+    ///
+    /// # Safety
+    /// As [`gemm_tcgen05_bf16_optimized`] for the operand maps; `c_map` must
+    /// describe a live fp32 matrix holding initialized values (a reduction
+    /// reads what a store would ignore) covering every tile the item walk
+    /// reaches, and nothing else may write it during the launch.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    pub unsafe fn gemm_tcgen05_f32_accumulate(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        c_map: *const TmaDescriptor,
+        k: i32,
+        tiles_m: u32,
+        tiles_n: u32,
+        transposed: u32,
+    ) {
+        unsafe {
+            let mut tile = attach(
+                a_map,
+                b_map,
+                tiles_m,
+                tiles_n,
+                k as u32 / BLOCK_K as u32,
+                transposed != 0,
+                Reduce { c_map },
             );
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);

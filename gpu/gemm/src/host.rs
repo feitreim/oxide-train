@@ -1,9 +1,11 @@
 //! Host-side tcgen05 support: tile contracts, TMA tensor maps, and ergonomic
 //! adapters over cuda-oxide's generated typed launchers.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+use std::sync::Mutex;
 
 use cuda_core::{CudaContext, CudaFunction, CudaStream, DeviceBuffer, DriverError, LaunchConfig};
 use cuda_device::tma::TmaDescriptor;
@@ -156,6 +158,64 @@ fn encode_bf16_tma_map_strided(
     Ok(DeviceBuffer::from_host(stream, &tensor_map.opaque)?)
 }
 
+/// Encode a `SWIZZLE_128B` fp32 tensor map delivering `[16, 32]` boxes of a
+/// row-major `[height, width]` fp32 matrix whose rows are `row_stride`
+/// elements apart — the reduction-store epilogue's `C`
+/// (`gemm_tcgen05_f32_accumulate`, ferro-kittens #42). The box is the
+/// `[16, STAGE_N]` fp32 staging tile's subtile: 32 fp32 columns is one
+/// 128-byte swizzle atom.
+///
+/// Panics if the driver rejects the descriptor: every input is derived from
+/// shapes the launch entry points already assert, so a rejection is a
+/// programming error, not a runtime condition.
+fn encode_f32_tma_map(
+    stream: &CudaStream,
+    base: u64,
+    width: usize,
+    height: usize,
+    row_stride: usize,
+) -> Result<DeviceBuffer<u64>, DriverError> {
+    use cuda_core::sys::{
+        CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B, cuTensorMapEncodeTiled,
+        cudaError_enum_CUDA_SUCCESS,
+    };
+
+    assert!(width.is_multiple_of(TC_N_TILE));
+    assert!(height.is_multiple_of(TC_M_TILE));
+    assert!(row_stride >= width);
+    let mut tensor_map = MaybeUninit::<cuda_core::sys::CUtensorMap>::uninit();
+    let global_dimensions = [width as u64, height as u64];
+    let global_strides = [(row_stride * 4) as u64];
+    let box_dimensions = [32u32, 16u32];
+    let element_strides = [1u32, 1u32];
+    let status = unsafe {
+        cuTensorMapEncodeTiled(
+            tensor_map.as_mut_ptr(),
+            CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+            2,
+            base as *mut std::ffi::c_void,
+            global_dimensions.as_ptr(),
+            global_strides.as_ptr(),
+            box_dimensions.as_ptr(),
+            element_strides.as_ptr(),
+            CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B,
+            CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        )
+    };
+    assert!(
+        status == cudaError_enum_CUDA_SUCCESS,
+        "cuTensorMapEncodeTiled(f32 [{height}, {width}] stride {row_stride}) failed: {status:?}"
+    );
+    let tensor_map = unsafe { tensor_map.assume_init() };
+    DeviceBuffer::from_host(stream, &tensor_map.opaque)
+}
+
 /// Device-resident CUDA tensor map for a row-major bf16 matrix.
 ///
 /// The map owns only the descriptor. The mapped matrix buffer must outlive all
@@ -297,6 +357,15 @@ pub struct Tcgen05Gemm {
     generated: super::optimized::kernels::LoadedModule,
     optimized: CudaFunction,
     optimized_f32: CudaFunction,
+    optimized_f32_accumulate: CudaFunction,
+    /// Reduction-store `C` maps, keyed by `(device address, n, m)` and kept
+    /// for the module's lifetime. The cache is the lifetime guarantee the
+    /// async launch needs — a descriptor built per call would be freed while
+    /// the kernel still reads it — and gradient buffers are stable across
+    /// steps, so after the first step every accumulate launch is a lookup. A
+    /// key's address being reused by a later allocation is harmless: the map's
+    /// contents are a pure function of the key.
+    c_maps: Mutex<HashMap<(u64, usize, usize), DeviceBuffer<u64>>>,
 }
 
 /// Raise a kernel's dynamic-shared-memory ceiling above the 48 KiB default.
@@ -331,21 +400,88 @@ impl Tcgen05Gemm {
         let optimized_f32 = generated
             .as_cuda_module()
             .load_function("gemm_tcgen05_f32_optimized")?;
+        let optimized_f32_accumulate = generated
+            .as_cuda_module()
+            .load_function("gemm_tcgen05_f32_accumulate")?;
         opt_in_dynamic_smem(&optimized, super::SHARED_BYTES as u32)?;
         opt_in_dynamic_smem(&optimized_f32, super::SHARED_BYTES as u32)?;
+        opt_in_dynamic_smem(&optimized_f32_accumulate, super::SHARED_BYTES as u32)?;
         Ok(Self {
             generated,
             optimized,
             optimized_f32,
+            optimized_f32_accumulate,
+            c_maps: Mutex::new(HashMap::new()),
         })
     }
 
     /// The loaded kernels, named for `bench_util::enforce_kernel_budgets`.
-    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 2] {
+    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 3] {
         [
             ("gemm_tcgen05_bf16_optimized", &self.optimized),
             ("gemm_tcgen05_f32_optimized", &self.optimized_f32),
+            ("gemm_tcgen05_f32_accumulate", &self.optimized_f32_accumulate),
         ]
+    }
+
+    /// The cached reduction-store map for `output[offset..offset + elements]`
+    /// read as an `[m, n]` fp32 matrix — see [`Tcgen05Gemm::c_maps`] for why
+    /// the descriptor must outlive the call that built it.
+    fn reduce_c_map(
+        &self,
+        stream: &CudaStream,
+        output: &DeviceBuffer<f32>,
+        output_offset: usize,
+        output_elements: usize,
+        n: u32,
+    ) -> Result<*const TmaDescriptor, DriverError> {
+        let base = output.cu_deviceptr() + (output_offset * std::mem::size_of::<f32>()) as u64;
+        let m = output_elements / n as usize;
+        let key = (base, n as usize, m);
+        let mut maps = self.c_maps.lock().expect("reduction-map cache poisoned");
+        if !maps.contains_key(&key) {
+            let map = encode_f32_tma_map(stream, base, n as usize, m, n as usize)?;
+            maps.insert(key, map);
+        }
+        Ok(maps[&key].cu_deviceptr() as *const TmaDescriptor)
+    }
+
+    /// Launch the reduction-store accumulate kernel: every `f32_accumulate*`
+    /// adapter lands here, so the fold's read of `C` is gone from all of them
+    /// at once (#80 remedy 1).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_f32_accumulate(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<f32>,
+        output_offset: usize,
+        output_elements: usize,
+        n: u32,
+        k: u32,
+        layout: TmaLayout,
+    ) -> Result<(), DriverError> {
+        let output_end = output_offset
+            .checked_add(output_elements)
+            .expect("tcgen05 fp32 output region overflow");
+        assert!(output_end <= output.len());
+        let c_map = self.reduce_c_map(stream, output, output_offset, output_elements, n)?;
+        let m = output_elements / n as usize;
+        unsafe {
+            self.generated.gemm_tcgen05_f32_accumulate(
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                c_map,
+                k as i32,
+                (m / TC_M_TILE) as u32,
+                (n as usize / TC_N_TILE) as u32,
+                u32::from(layout == TmaLayout::MnMajor),
+            )
+        }
     }
 
     /// Blackwell bf16 `C = A B^T`; see the kernel for the full contract.
@@ -444,7 +580,6 @@ impl Tcgen05Gemm {
                 output_elements,
                 n,
                 k,
-                2,
                 TmaLayout::KMajor,
             )
         }
@@ -482,7 +617,6 @@ impl Tcgen05Gemm {
                 output_elements,
                 n,
                 k,
-                2,
                 TmaLayout::KMajor,
             )
         }
@@ -506,8 +640,7 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         let output_elements = output.len();
         unsafe {
-            launch_tcgen05_f32(
-                &self.generated,
+            self.launch_f32_accumulate(
                 stream,
                 config,
                 a_tma,
@@ -517,7 +650,6 @@ impl Tcgen05Gemm {
                 output_elements,
                 n,
                 k,
-                3,
                 TmaLayout::KMajor,
             )
         }
@@ -543,8 +675,7 @@ impl Tcgen05Gemm {
         k: u32,
     ) -> Result<(), DriverError> {
         unsafe {
-            launch_tcgen05_f32(
-                &self.generated,
+            self.launch_f32_accumulate(
                 stream,
                 config,
                 a_tma,
@@ -554,7 +685,6 @@ impl Tcgen05Gemm {
                 output_elements,
                 n,
                 k,
-                3,
                 TmaLayout::KMajor,
             )
         }
@@ -620,8 +750,7 @@ impl Tcgen05Gemm {
         k: u32,
     ) -> Result<(), DriverError> {
         unsafe {
-            launch_tcgen05_f32(
-                &self.generated,
+            self.launch_f32_accumulate(
                 stream,
                 config,
                 a_tma,
@@ -631,7 +760,6 @@ impl Tcgen05Gemm {
                 output_elements,
                 n,
                 k,
-                3,
                 TmaLayout::MnMajor,
             )
         }
@@ -671,7 +799,6 @@ impl Tcgen05Gemm {
                 output_elements,
                 n,
                 k,
-                2,
                 TmaLayout::MnMajor,
             )
         }
@@ -757,7 +884,6 @@ unsafe fn launch_tcgen05_f32(
     output_elements: usize,
     n: u32,
     k: u32,
-    mode: u32,
     layout: TmaLayout,
 ) -> Result<(), DriverError> {
     let output_end = output_offset
@@ -777,7 +903,6 @@ unsafe fn launch_tcgen05_f32(
             k as i32,
             (m / TC_M_TILE) as u32,
             (n as usize / TC_N_TILE) as u32,
-            mode,
             u32::from(layout == TmaLayout::MnMajor),
         )
     }

@@ -165,8 +165,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "walk and fold priced apart (ours only): store is mode 2 K-major, \
-         store-T mode 2 MN-major, acc-T mode 3 MN-major"
+        "walk and accumulate priced apart (ours only): store is the f32 kernel \
+         K-major, store-T the same MN-major, acc-T the reduction-store kernel \
+         MN-major"
     );
     for case in CASES.iter().filter(|c| c.mode == Mode::F32AccumulateT) {
         decompose(&stream, &module, case)?;
@@ -176,8 +177,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Three timings at one weight-gradient shape, one variable apart each:
 /// `store → store-T` is the MN-major operand walk, `store-T → acc-T` is the
-/// fold's extra read-modify of `C`. Checked first: from a zeroed `C` the fold
-/// adds exact zeros, so store-T and one acc-T launch must agree bitwise.
+/// accumulate epilogue against the scattered store — since #80 remedy 1 that
+/// is the staged *reduction store* (`cp.reduce...add`, ferro #42), not a fold,
+/// so the delta prices the engine-side add rather than a read of `C`. Checked
+/// first: into a zeroed `C` the reduction adds exact values to exact zeros, so
+/// store-T and one acc-T launch must agree bitwise.
 fn decompose(
     stream: &Arc<CudaStream>,
     module: &Tcgen05Gemm,
