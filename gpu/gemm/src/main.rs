@@ -123,29 +123,29 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 /// two registers. The fp32 store entry point's 512 B frame (ferro #174's "band
 /// plus `C` beside it") went to zero when the fold left with the accumulate
 /// split, so every shipped GEMM kernel now carries no depot at all.
-// The deferred-drain epilogue (oxide-train#80 remedy 2) holds **two** bands
-// live where the exposed drain held one — the hoist is what lets a warp
-// release the accumulator to the next item's MMA before its store tail — so
-// every ceiling moved up by about a band (64 fp32 for the store drains, 32
-// for the half-band reduce). That is a priced trade, not a leak: residency is
-// tensor-memory-bound at 2 CTAs/SM regardless, and at 10 warps an SM the
-// binding sub-partition holds 3 warps, so up to ~170 registers a thread costs
-// no occupancy. PROVISIONAL ceilings until the first gated run prints the
-// counts — ratchet each to its measured value then.
+// The deferred-drain epilogue (oxide-train#80 remedy 2) holds registers past
+// its last `tcgen05.ld` — that hold is the overlap, since the accumulator is
+// released to the next item's MMA while the held bands' stores still issue —
+// so every ceiling moved up: bf16 82 → 137 and the reduce 80 → 127 (each a
+// one-pass hoist), the fp32 store 102 → 118 (no hoist; its two-band form
+// measured 181, past the ~170 the register file grants 12 warps an SM, and
+// paid the 2 → 1 CTA cliff — model_shapes f32 rows at 0.46–0.53). A priced
+// trade, not a leak: at these counts residency stays tensor-memory-bound at
+// 2 CTAs/SM.
 const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
         name: "gemm_tcgen05_bf16_optimized",
-        max_registers: 176,
+        max_registers: 137,
         max_spill_bytes: 0,
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_optimized",
-        max_registers: 200,
+        max_registers: 118,
         max_spill_bytes: 0,
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_accumulate",
-        max_registers: 144,
+        max_registers: 127,
         max_spill_bytes: 0,
     },
 ];
