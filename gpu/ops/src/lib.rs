@@ -15,8 +15,8 @@ use cuda_device::{
     cuda_module, kernel, thread,
 };
 
-use kittens::global::{GlobalRows, load_rows, store_rows};
-use kittens::reg::{BaseLdtm, RegTile};
+use kittens::global::{GlobalRows, load_cols, load_rows, store_rows};
+use kittens::reg::{BaseLdtm, ColVec, RegTile, RegVec};
 use kittens::shared::F32;
 use kittens::{lane, warp_id};
 
@@ -94,6 +94,38 @@ pub const MOE_SCATTER_DY_THREADS: usize = 256;
 /// Threads in one block-per-bin MoE dead-slot zeroing block.
 pub const MOE_ZERO_BINS_THREADS: usize = 256;
 
+/// Rows one warp owns in the tile RMSNorm forward.
+///
+/// `BaseLdtm` hands a warp its rows in 16-row blocks, so this is the tile's
+/// `M` and the unit the grid is cut in. 16 and not 32: what this kernel wants
+/// is columns per lane, and spending the register budget on rows instead
+/// measures 1.026x against 16's 1.246x.
+pub const NORM_TILE_ROWS: usize = 16;
+
+/// Columns a tile-RMSNorm warp holds in registers at once.
+///
+/// The row statistic is carried across chunks, so this trades registers for
+/// the number of times the row is walked, and it is the only knob that buys a
+/// lane more loads in flight — the one thing this kernel was short of. `dim`
+/// must be a multiple of it.
+///
+/// 64 is the peak and the edge: 96 falls to 0.387x, which is the `[16, 96]`
+/// band no longer fitting the register file rather than the rolled-walk depot
+/// that used to collapse everything past 32 (ferro-kittens#180 fixed that, and
+/// fixing it is what moved this shape from 0.280x to 1.246x).
+pub const NORM_TILE_CHUNK: usize = 64;
+
+/// Warps in one tile-RMSNorm block. Each owns its own [`NORM_TILE_ROWS`] rows
+/// and never talks to the others, so this only sets how many bands a CTA
+/// carries; 2 and 4 measure the same and 8 gives up the win.
+pub const NORM_TILE_WARPS: usize = 4;
+
+/// Threads in one tile-RMSNorm block.
+pub const NORM_TILE_THREADS: usize = 32 * NORM_TILE_WARPS;
+
+/// Rows one tile-RMSNorm block owns — the grid's row quantum.
+pub const NORM_TILE_BLOCK_ROWS: usize = NORM_TILE_ROWS * NORM_TILE_WARPS;
+
 /// Rows one warp owns in the tile SwiGLU kernels.
 ///
 /// SwiGLU has no reduction in it, so this is only how a warp's elements are
@@ -121,6 +153,17 @@ pub const SWIGLU_TILE_BLOCK_ROWS: usize = SWIGLU_TILE_ROWS * SWIGLU_TILE_WARPS;
 /// A row base `row * dim` is 16-byte aligned whenever `dim % QUAD_LANES == 0`,
 /// which is the guard every vectorized row walk below checks.
 pub const QUAD_LANES: usize = 4;
+
+/// One warp's slice of a row band, [`NORM_TILE_CHUNK`] columns wide.
+type NormChunk = RegTile<NORM_TILE_ROWS, NORM_TILE_CHUNK, BaseLdtm>;
+
+/// One `f32` per row of a [`NormChunk`], replicated across each quad — where a
+/// row statistic lives between the passes that produce and consume it.
+type NormRows = RegVec<NORM_TILE_ROWS, BaseLdtm>;
+
+/// The chunk's slice of the `[dim]` weight, one `f32` per column this thread
+/// owns rather than one per (row, column) pair.
+type NormColumns = ColVec<NORM_TILE_CHUNK, BaseLdtm>;
 
 /// One warp's slice of a SwiGLU row band.
 type SwigluChunk = RegTile<SWIGLU_TILE_ROWS, SWIGLU_TILE_CHUNK, BaseLdtm>;
@@ -496,6 +539,70 @@ pub mod kernels {
         // zero/accumulation state and subsequent optimizer read.
         let slot = unsafe { DeviceAtomicF32::from_ptr(dweight.as_mut_ptr().add(col)) };
         slot.fetch_add(grad, AtomicOrdering::Relaxed);
+    }
+
+    /// Warp-per-band RMSNorm forward on kittens register tiles.
+    ///
+    /// [`rms_norm_forward_fast`] gives a row to a 256-thread block and pays a
+    /// shared-memory tree and eight barriers for its one statistic. Here a warp
+    /// owns [`NORM_TILE_ROWS`] rows at once, so the same statistic is
+    /// `RegTile::row_sum` — two shuffles, no shared memory and no barrier —
+    /// and the row is walked [`NORM_TILE_CHUNK`] columns at a time through
+    /// `load_rows`, which pairs adjacent columns into one access.
+    ///
+    /// The reduction is not what buys the 1.246x, and #70 was right that it
+    /// never was: this kernel trades 6.3M threads for 98k, and it wins anyway
+    /// because 64 columns per lane put more loads in flight than the 12
+    /// elements per thread the block-per-row kernel carries. At 4167 GB/s
+    /// against the 5641 the *backward* reaches over the same buffers on the
+    /// same card, work per thread was the whole of what the forward was short
+    /// of; collecting it lands at 5184 GB/s, and the backward is where that
+    /// road ends, which is why it has no tile version.
+    ///
+    /// # Safety
+    ///
+    /// Launch with [`NORM_TILE_THREADS`] threads and a grid covering exactly
+    /// `rows / NORM_TILE_BLOCK_ROWS` blocks: `rows` must be a multiple of
+    /// [`NORM_TILE_BLOCK_ROWS`] and `dim` of [`NORM_TILE_CHUNK`], both checked
+    /// by the launcher rather than the kernel, which never bounds-checks.
+    #[kernel]
+    pub unsafe fn rms_norm_forward_tile(
+        x: &[f32],
+        weight: &[f32],
+        eps: f32,
+        dim: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let row = NORM_TILE_BLOCK_ROWS as u32 * thread::blockIdx_x()
+                + NORM_TILE_ROWS as u32 * warp_id();
+            let d = dim as usize;
+            let source = GlobalRows::<F32>::from_raw(x.as_ptr() as *mut u8, d);
+            let destination = GlobalRows::<F32>::from_slice(&mut y, d);
+            // A one-row cursor: the weight is a per-column operand, and
+            // `load_cols` reads it as one. Reading it through `load_rows`
+            // instead would hold every value once per row the thread owns and
+            // put the chunk width on a spill cliff (ferro-kittens#172).
+            let parameters = GlobalRows::<F32>::from_raw(weight.as_ptr() as *mut u8, 0);
+
+            let mut total = NormRows::splat(0.0);
+            let mut column = 0u32;
+            while column < dim {
+                let v: NormChunk = load_rows(source, row, column, lane);
+                total.add_assign(v.mul(v).row_sum());
+                column += NORM_TILE_CHUNK as u32;
+            }
+            let inv = total.scale(1.0 / dim as f32).shift(eps).rsqrt();
+
+            column = 0;
+            while column < dim {
+                let v: NormChunk = load_rows(source, row, column, lane);
+                let w: NormColumns = load_cols(parameters, 0, column, lane);
+                store_rows(destination, row, column, lane, v.mul_row(inv).mul_col(w));
+                column += NORM_TILE_CHUNK as u32;
+            }
+        }
     }
 
     #[kernel]
@@ -1255,7 +1362,13 @@ pub mod kernels {
             while column < columns {
                 let g: SwigluChunk = load_rows(gates, row, column, lane);
                 let u: SwigluChunk = load_rows(ups, row, column, lane);
-                store_rows(destination, row, column, lane, g.mul(tile_sigmoid(g)).mul(u));
+                store_rows(
+                    destination,
+                    row,
+                    column,
+                    lane,
+                    g.mul(tile_sigmoid(g)).mul(u),
+                );
                 column += SWIGLU_TILE_CHUNK as u32;
             }
         }
@@ -1321,7 +1434,13 @@ pub mod kernels {
             while column < columns {
                 let g: SwigluChunk = load_rows(gates, row, column, lane);
                 let d: SwigluChunk = load_rows(upstream, row, column, lane);
-                store_rows(destination, row, column, lane, d.mul(g).mul(tile_sigmoid(g)));
+                store_rows(
+                    destination,
+                    row,
+                    column,
+                    lane,
+                    d.mul(g).mul(tile_sigmoid(g)),
+                );
                 column += SWIGLU_TILE_CHUNK as u32;
             }
         }

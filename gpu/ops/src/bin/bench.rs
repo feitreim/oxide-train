@@ -4,8 +4,8 @@
 //! second and not FLOP/s: each row reports the traffic its kernel is obliged to
 //! move — compulsory reads plus writes, no reuse assumed — divided by the
 //! measured time. A kernel that moves the same bytes slower has lost, whatever
-//! it does to the instruction count, and that is how #70 decided which families
-//! reached tiles: SwiGLU is the one that won, and it is the one with two rows.
+//! it does to the instruction count, and that is how #70 and #78 decided which
+//! families reached tiles: the ones that won are the ones with two rows.
 //!
 //! Shapes are `gpu/model/src/bin/train.rs`'s: `N = 24576` rows, `D = 3072`
 //! model width, `FF = 4096` FFN width, `VP = 50432` padded vocabulary.
@@ -22,7 +22,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 #[allow(dead_code)]
 mod device;
 use device::{
-    CLASSIFIER_THREADS, NORM_THREADS, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_THREADS, kernels,
+    CLASSIFIER_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_THREADS,
+    SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_THREADS, kernels,
 };
 
 /// Rows the norms are timed at — the training config's `B * T`.
@@ -42,6 +43,14 @@ fn row_grid(rows: usize, threads: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (rows as u32, 1, 1),
         block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn norm_tile_grid(rows: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((rows / NORM_TILE_BLOCK_ROWS) as u32, 1, 1),
+        block_dim: (NORM_TILE_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -66,7 +75,11 @@ fn report(family: &str, bytes: f64, shipped_ms: f64, tile_ms: f64) {
     println!(
         "  speedup: {:.3}x  ({})",
         shipped_ms / tile_ms,
-        if tile_ms < shipped_ms { "tile wins" } else { "tile loses" }
+        if tile_ms < shipped_ms {
+            "tile wins"
+        } else {
+            "tile loses"
+        }
     );
 }
 
@@ -92,6 +105,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The fused classifier forward, packed-bf16 logits, at the lm-head's shape.
+///
+/// No tile row, and the `.local` fix that gave the norm forward one below does
+/// not change that: a warp-per-band version re-measured on the fixed pin is
+/// 0.442x, and 0.563x with its `right_fill` deleted so it carries no frame at
+/// all. What it is short of is CTAs — 24576 rows become 384 blocks against the
+/// shipped kernel's 24576 — and no tile shape reaches that (#70, #78).
 fn bench_classifier(
     stream: &std::sync::Arc<CudaStream>,
     module: &kernels::LoadedModule,
@@ -121,7 +140,11 @@ fn bench_classifier(
         Ok(())
     })?;
     // One pass over the packed logits; the losses are N floats and round off.
-    report_one("fused_classifier forward bf16", (N * VP) as f64 * 2.0, shipped);
+    report_one(
+        "fused_classifier forward bf16",
+        (N * VP) as f64 * 2.0,
+        shipped,
+    );
     Ok(())
 }
 
@@ -154,7 +177,14 @@ fn bench_swiglu(
     let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: N divides SWIGLU_TILE_BLOCK_ROWS and FF the tile chunk.
         unsafe {
-            module.swiglu_forward_tile(stream, swiglu_tile_grid(N), &gate, &up, FF as u32, &mut y)?
+            module.swiglu_forward_tile(
+                stream,
+                swiglu_tile_grid(N),
+                &gate,
+                &up,
+                FF as u32,
+                &mut y,
+            )?
         };
         Ok(())
     })?;
@@ -289,9 +319,29 @@ fn bench_rms_norm(
         };
         Ok(())
     })?;
-    report_one("rms_norm forward", 3.0 * row, shipped);
+    let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
+        // SAFETY: N is a multiple of NORM_TILE_BLOCK_ROWS and D of the chunk.
+        unsafe {
+            module.rms_norm_forward_tile(
+                stream,
+                norm_tile_grid(N),
+                &x,
+                &weight,
+                EPS,
+                D as u32,
+                &mut y,
+            )?
+        };
+        Ok(())
+    })?;
+    report("rms_norm forward", 3.0 * row, shipped, tile);
 
     // Backward reads x and dy twice each and writes dx.
+    //
+    // No tile row, and the rate directly above is why: the forward's tile
+    // collects it to 5184 GB/s and stops there, which is where this kernel
+    // already is. A tile version measured 0.985-0.997x over four shapes — it
+    // reaches the same roof from the same side, and matching is not winning.
     let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: as the forward launch, plus `inv` being N long.
         unsafe {

@@ -15,10 +15,11 @@ use tensor_cpu::CpuTensor;
 mod device;
 use device::{
     CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS,
-    MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM,
-    SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS,
-    ROUTER_GEMM_BN, ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS,
-    ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, kernels,
+    MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK, NORM_TILE_THREADS,
+    NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN, ROUTER_GEMM_THREADS,
+    ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM,
+    ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK,
+    SWIGLU_TILE_THREADS, kernels,
 };
 use tensor_core::bf16;
 
@@ -40,6 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[ops] checking rms_norm");
     check_rms_norm(&stream, &module)?;
+    eprintln!("[ops] checking rms_norm tiles");
+    check_rms_norm_tile(&stream, &module)?;
     eprintln!("[ops] checking swiglu");
     check_swiglu(&stream, &module)?;
     eprintln!("[ops] checking swiglu tiles");
@@ -1126,6 +1129,58 @@ fn check_rms_norm(
             &dw_fast_dev.to_host_vec(stream)?,
             &dw_dev.to_host_vec(stream)?,
             5e-6,
+            2e-5,
+        );
+        Ok(())
+    }
+}
+
+/// The tile RMSNorm forward against the same CPU oracle the shipped one uses.
+///
+/// A separate shape from [`check_rms_norm`]'s deliberately unaligned one: the
+/// tile kernel takes its divisibility from the launcher and does not bounds-
+/// check, so the case that exercises it is an aligned one. `1024` rows cross
+/// several blocks at every `NORM_TILE_WARPS` a sweep might set, and `192`
+/// columns divide by every `NORM_TILE_CHUNK` up to 64.
+fn check_rms_norm_tile(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: every buffer and launch below uses the same N x D shape, and N is
+    // a multiple of NORM_TILE_BLOCK_ROWS and D of NORM_TILE_CHUNK.
+    unsafe {
+        const N: usize = 1024;
+        const D: usize = 192;
+        assert_eq!(N % NORM_TILE_BLOCK_ROWS, 0);
+        assert_eq!(D % NORM_TILE_CHUNK, 0);
+
+        let x = CpuTensor::<f32, Rank2<N, D>>::uniform(1);
+        let weight = CpuTensor::<f32, Rank1<D>>::uniform(2).map(|v| v + 1.25);
+        let cpu = RmsNorm::<N, D>::new(weight.clone(), 1e-5);
+        let (cpu_y, _) = cpu.forward(x.clone());
+
+        let x_dev = DeviceBuffer::from_host(stream, x.as_slice())?;
+        let weight_dev = DeviceBuffer::from_host(stream, weight.as_slice())?;
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+
+        module.rms_norm_forward_tile(
+            stream,
+            LaunchConfig {
+                grid_dim: ((N / NORM_TILE_BLOCK_ROWS) as u32, 1, 1),
+                block_dim: (NORM_TILE_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &x_dev,
+            &weight_dev,
+            1e-5,
+            D as u32,
+            &mut y_dev,
+        )?;
+        assert_close(
+            "rmsnorm tile y",
+            &y_dev.to_host_vec(stream)?,
+            cpu_y.as_slice(),
+            2e-5,
             2e-5,
         );
         Ok(())
