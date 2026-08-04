@@ -427,12 +427,10 @@ impl Tcgen05Gemm {
         ]
     }
 
-    /// The cached engine-side `C` map for `output[offset..offset + elements]`
-    /// read as an `[m, n]` fp32 matrix — both fp32 drains (store and
-    /// reduce-store) go through the copy engine and share it. See
-    /// [`Tcgen05Gemm::c_maps`] for why the descriptor must outlive the call
-    /// that built it.
-    fn f32_c_map(
+    /// The cached reduction-store map for `output[offset..offset + elements]`
+    /// read as an `[m, n]` fp32 matrix — see [`Tcgen05Gemm::c_maps`] for why
+    /// the descriptor must outlive the call that built it.
+    fn reduce_c_map(
         &self,
         stream: &CudaStream,
         output: &DeviceBuffer<f32>,
@@ -472,48 +470,10 @@ impl Tcgen05Gemm {
             .checked_add(output_elements)
             .expect("tcgen05 fp32 output region overflow");
         assert!(output_end <= output.len());
-        let c_map = self.f32_c_map(stream, output, output_offset, output_elements, n)?;
+        let c_map = self.reduce_c_map(stream, output, output_offset, output_elements, n)?;
         let m = output_elements / n as usize;
         unsafe {
             self.generated.gemm_tcgen05_f32_accumulate(
-                stream,
-                config,
-                a_tma,
-                b_tma,
-                c_map,
-                k as i32,
-                (m / TC_M_TILE) as u32,
-                (n as usize / TC_N_TILE) as u32,
-                u32::from(layout == TmaLayout::MnMajor),
-            )
-        }
-    }
-
-    /// Launch the engine-store fp32 kernel: every `f32_store*` adapter lands
-    /// here, so the store drain and the accumulate drain share one map cache
-    /// and one geometry check.
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn launch_f32_store(
-        &self,
-        stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
-        output: &mut DeviceBuffer<f32>,
-        output_offset: usize,
-        output_elements: usize,
-        n: u32,
-        k: u32,
-        layout: TmaLayout,
-    ) -> Result<(), DriverError> {
-        let output_end = output_offset
-            .checked_add(output_elements)
-            .expect("tcgen05 fp32 output region overflow");
-        assert!(output_end <= output.len());
-        let c_map = self.f32_c_map(stream, output, output_offset, output_elements, n)?;
-        let m = output_elements / n as usize;
-        unsafe {
-            self.generated.gemm_tcgen05_f32_optimized(
                 stream,
                 config,
                 a_tma,
@@ -612,7 +572,8 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         let output_elements = output.len();
         unsafe {
-            self.launch_f32_store(
+            launch_tcgen05_f32(
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -648,7 +609,8 @@ impl Tcgen05Gemm {
         k: u32,
     ) -> Result<(), DriverError> {
         unsafe {
-            self.launch_f32_store(
+            launch_tcgen05_f32(
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -829,7 +791,8 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         let output_elements = output.len();
         unsafe {
-            self.launch_f32_store(
+            launch_tcgen05_f32(
+                &self.generated,
                 stream,
                 config,
                 a_tma,
@@ -907,6 +870,42 @@ unsafe fn launch_tcgen05(
             (m / TC_M_TILE) as u32,
             (n as usize / TC_N_TILE) as u32,
             mode,
+            u32::from(layout == TmaLayout::MnMajor),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_tcgen05_f32(
+    module: &super::optimized::kernels::LoadedModule,
+    stream: &CudaStream,
+    config: LaunchConfig,
+    a_tma: *const TmaDescriptor,
+    b_tma: *const TmaDescriptor,
+    output: &mut DeviceBuffer<f32>,
+    output_offset: usize,
+    output_elements: usize,
+    n: u32,
+    k: u32,
+    layout: TmaLayout,
+) -> Result<(), DriverError> {
+    let output_end = output_offset
+        .checked_add(output_elements)
+        .expect("tcgen05 fp32 output region overflow");
+    assert!(output_end <= output.len());
+    let m = output_elements / n as usize;
+    unsafe {
+        module.gemm_tcgen05_f32_optimized(
+            stream,
+            config,
+            a_tma,
+            b_tma,
+            output,
+            output_offset,
+            n as i32,
+            k as i32,
+            (m / TC_M_TILE) as u32,
+            (n as usize / TC_N_TILE) as u32,
             u32::from(layout == TmaLayout::MnMajor),
         )
     }
