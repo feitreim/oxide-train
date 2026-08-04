@@ -94,8 +94,9 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 }
 
 /// ptxas allocation pins for the production kernels (SPEC §13, 7e17): hard
-/// ceiling on regression, ratchet hint on improvement. Re-pinned at #67's gated
-/// measurement on a B200.
+/// ceiling on regression, ratchet hint on improvement. Re-pinned at the ferro
+/// `c648c67` bump's gated measurement on a B200, after ferro #180 unrolled the
+/// mover walks and the `.local` frames they homed disappeared.
 ///
 /// They went **up** from the 48 the exact-cover kernel held, and that is the
 /// rewrite working rather than regressing. That kernel's four epilogue warps
@@ -112,20 +113,23 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 /// accumulating mode holds `C` beside it.
 ///
 /// `max_spill_bytes` here is the **local-memory frame**, not spill stores —
-/// `bench_util` reads `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES`. 256 B is what
-/// ferro-kittens' own `gemm_cg2_staged_x8x4` carries at these same 80
-/// registers, with `ptxas -v` reporting zero spill stores beside it; the frame
-/// is the `Job`'s state, not values that failed to fit.
+/// `bench_util` reads `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES`. The bf16 frame is
+/// zero since ferro #180: the 256 B it used to carry was the `Job`'s state
+/// homed behind a rolled mover walk, and unrolling the walk bought it back for
+/// two registers. The fp32 entry point keeps a frame because its cost is not a
+/// rolled walk — its `store_rows` drain holds a whole fp32 band with no
+/// staging tile to hand values off to (GAPS.md §2.6, ferro #174), and the
+/// accumulating mode holds `C` beside it.
 const KERNEL_BUDGETS: [KernelBudget; 2] = [
     KernelBudget {
         name: "gemm_tcgen05_bf16_optimized",
-        max_registers: 80,
-        max_spill_bytes: 256,
+        max_registers: 82,
+        max_spill_bytes: 0,
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_optimized",
-        max_registers: 126,
-        max_spill_bytes: 528,
+        max_registers: 120,
+        max_spill_bytes: 512,
     },
 ];
 
