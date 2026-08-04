@@ -71,6 +71,7 @@
 //! element is reduced exactly once per launch, so element order — and with it
 //! SPEC decision #20's fp32 weight-gradient accumulation — is unchanged.
 
+use cuda_device::debug::globaltimer;
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cluster, cluster_launch, kernel, thread, warp};
@@ -508,6 +509,39 @@ impl<D: Drain> Job for Tile<D> {
     }
 }
 
+/// Delay half the grid's first item by a stated number of nanoseconds —
+/// oxide-train#80 remedy 2's phase probe, off (and free) at `0`.
+///
+/// ferro-kittens #114's cube measured this kernel's epilogue *fully exposed*
+/// (1.01× with the MMA beside it and without), while a lone `M256_N256` chain
+/// sustains ~0.90 of two chains' aggregate (ferro #188) — so an SM whose two
+/// resident CTAs drained at *different* times could cover most of either drain
+/// with the other's MMA, and the 1.01× says they currently do not: the static
+/// schedule starts every cluster together on identically-priced items, so
+/// co-residents drain in phase and the tensor core idles through every drain.
+/// One stagger at launch flips the grid to the anti-phased equilibrium, which
+/// identical item periods then preserve; the launch pays the delay once.
+///
+/// Encoding: bits 0–23 are nanoseconds, bits 24+ select who is late — `0` the
+/// upper half of the cluster indices (co-residency by launch wave), `1` the
+/// odd ones (co-residency by adjacency). Which rule matches the hardware's
+/// placement is exactly what the probe sweeps.
+#[inline(always)]
+fn stagger_start(encoded: u32) {
+    if encoded == 0 {
+        return;
+    }
+    let late = match encoded >> 24 {
+        1 => cluster::cluster_idx() % 2 == 1,
+        _ => cluster::cluster_idx() >= cluster::num_clusters() / 2,
+    };
+    if late {
+        let nanoseconds = (encoded & 0x00ff_ffff) as u64;
+        let start = globaltimer();
+        while globaltimer().wrapping_sub(start) < nanoseconds {}
+    }
+}
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -596,6 +630,7 @@ pub mod kernels {
         tiles_n: u32,
         mode: u32,
         transposed: u32,
+        stagger: u32,
     ) {
         unsafe {
             // Packed pairs: the slice's storage word is two elements wide, so
@@ -613,6 +648,7 @@ pub mod kernels {
                 transposed != 0,
                 out,
             );
+            stagger_start(stagger);
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -640,6 +676,7 @@ pub mod kernels {
         tiles_m: u32,
         tiles_n: u32,
         transposed: u32,
+        stagger: u32,
     ) {
         unsafe {
             let out = Wide {
@@ -654,6 +691,7 @@ pub mod kernels {
                 transposed != 0,
                 out,
             );
+            stagger_start(stagger);
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -685,6 +723,7 @@ pub mod kernels {
         tiles_m: u32,
         tiles_n: u32,
         transposed: u32,
+        stagger: u32,
     ) {
         unsafe {
             let mut tile = attach(
@@ -696,6 +735,7 @@ pub mod kernels {
                 transposed != 0,
                 Reduce { c_map },
             );
+            stagger_start(stagger);
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }

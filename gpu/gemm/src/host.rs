@@ -462,6 +462,7 @@ impl Tcgen05Gemm {
         n: u32,
         k: u32,
         layout: TmaLayout,
+        stagger: u32,
     ) -> Result<(), DriverError> {
         let output_end = output_offset
             .checked_add(output_elements)
@@ -480,6 +481,7 @@ impl Tcgen05Gemm {
                 (m / TC_M_TILE) as u32,
                 (n as usize / TC_N_TILE) as u32,
                 u32::from(layout == TmaLayout::MnMajor),
+                stagger,
             )
         }
     }
@@ -514,6 +516,7 @@ impl Tcgen05Gemm {
                 k,
                 0,
                 TmaLayout::KMajor,
+                0,
             )
         }
     }
@@ -546,6 +549,7 @@ impl Tcgen05Gemm {
                 k,
                 1,
                 TmaLayout::KMajor,
+                0,
             )
         }
     }
@@ -581,6 +585,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::KMajor,
+                0,
             )
         }
     }
@@ -618,6 +623,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::KMajor,
+                0,
             )
         }
     }
@@ -651,6 +657,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::KMajor,
+                0,
             )
         }
     }
@@ -686,6 +693,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::KMajor,
+                0,
             )
         }
     }
@@ -721,6 +729,7 @@ impl Tcgen05Gemm {
                 k,
                 1,
                 TmaLayout::MnMajor,
+                0,
             )
         }
     }
@@ -761,6 +770,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::MnMajor,
+                0,
             )
         }
     }
@@ -800,6 +810,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::MnMajor,
+                0,
             )
         }
     }
@@ -835,6 +846,114 @@ impl Tcgen05Gemm {
             )
         }
     }
+
+    /// [`Tcgen05Gemm::f32_store`] with `stagger` — `bin/stagger_probe.rs`'s
+    /// arm of oxide-train#80 remedy 2. See `stagger_start` in the kernel for
+    /// the encoding; `0` is byte-for-byte the unstaggered launch.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Tcgen05Gemm::f32_store`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_store_staggered(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<f32>,
+        n: u32,
+        k: u32,
+        stagger: u32,
+    ) -> Result<(), DriverError> {
+        let output_elements = output.len();
+        unsafe {
+            launch_tcgen05_f32(
+                &self.generated,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                0,
+                output_elements,
+                n,
+                k,
+                TmaLayout::KMajor,
+                stagger,
+            )
+        }
+    }
+
+    /// [`Tcgen05Gemm::store`] with `stagger`, as [`Tcgen05Gemm::f32_store_staggered`].
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Tcgen05Gemm::store`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn store_staggered(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<u32>,
+        n: u32,
+        k: u32,
+        stagger: u32,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            launch_tcgen05(
+                &self.generated,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                n,
+                k,
+                0,
+                TmaLayout::KMajor,
+                stagger,
+            )
+        }
+    }
+
+    /// [`Tcgen05Gemm::f32_accumulate_transposed`] with `stagger`, as
+    /// [`Tcgen05Gemm::f32_store_staggered`].
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Tcgen05Gemm::f32_accumulate_transposed`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_accumulate_transposed_staggered(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<f32>,
+        n: u32,
+        k: u32,
+        stagger: u32,
+    ) -> Result<(), DriverError> {
+        let output_elements = output.len();
+        unsafe {
+            self.launch_f32_accumulate(
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                0,
+                output_elements,
+                n,
+                k,
+                TmaLayout::MnMajor,
+                stagger,
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -849,6 +968,7 @@ unsafe fn launch_tcgen05(
     k: u32,
     mode: u32,
     layout: TmaLayout,
+    stagger: u32,
 ) -> Result<(), DriverError> {
     let m = output
         .len()
@@ -868,6 +988,7 @@ unsafe fn launch_tcgen05(
             (n as usize / TC_N_TILE) as u32,
             mode,
             u32::from(layout == TmaLayout::MnMajor),
+            stagger,
         )
     }
 }
@@ -885,6 +1006,7 @@ unsafe fn launch_tcgen05_f32(
     n: u32,
     k: u32,
     layout: TmaLayout,
+    stagger: u32,
 ) -> Result<(), DriverError> {
     let output_end = output_offset
         .checked_add(output_elements)
@@ -904,6 +1026,7 @@ unsafe fn launch_tcgen05_f32(
             (m / TC_M_TILE) as u32,
             (n as usize / TC_N_TILE) as u32,
             u32::from(layout == TmaLayout::MnMajor),
+            stagger,
         )
     }
 }
