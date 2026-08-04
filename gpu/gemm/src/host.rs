@@ -637,6 +637,46 @@ impl Tcgen05Gemm {
         }
     }
 
+    /// Overwrite form of [`Tcgen05Gemm::f32_accumulate_transposed`]: the same
+    /// MN-major walk with the fold turned off, `C = Aᵀ·B`. The mode grid had
+    /// this hole — the kernel takes `mode` and `transposed` independently and
+    /// no adapter said so. It is what a caller writing the first micro-batch
+    /// of a zeroed gradient wants, and what lets `bin/model_shapes.rs` price
+    /// the fold's extra read of `C` apart from the MN-major operand walk.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Tcgen05Gemm::f32_accumulate_transposed`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_store_transposed(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: *const TmaDescriptor,
+        b_tma: *const TmaDescriptor,
+        output: &mut DeviceBuffer<f32>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        let output_elements = output.len();
+        unsafe {
+            launch_tcgen05_f32(
+                &self.generated,
+                stream,
+                config,
+                a_tma,
+                b_tma,
+                output,
+                0,
+                output_elements,
+                n,
+                k,
+                2,
+                TmaLayout::MnMajor,
+            )
+        }
+    }
+
     /// Whole-buffer form of [`Tcgen05Gemm::f32_accumulate_transposed_at`].
     ///
     /// # Safety

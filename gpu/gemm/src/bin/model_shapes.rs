@@ -162,6 +162,125 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for row in &summary {
         println!("{row}");
     }
+
+    println!();
+    println!(
+        "walk and fold priced apart (ours only): store is mode 2 K-major, \
+         store-T mode 2 MN-major, acc-T mode 3 MN-major"
+    );
+    for case in CASES.iter().filter(|c| c.mode == Mode::F32AccumulateT) {
+        decompose(&stream, &module, case)?;
+    }
+    Ok(())
+}
+
+/// Three timings at one weight-gradient shape, one variable apart each:
+/// `store → store-T` is the MN-major operand walk, `store-T → acc-T` is the
+/// fold's extra read-modify of `C`. Checked first: from a zeroed `C` the fold
+/// adds exact zeros, so store-T and one acc-T launch must agree bitwise.
+fn decompose(
+    stream: &Arc<CudaStream>,
+    module: &Tcgen05Gemm,
+    case: &Case,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (m, k, n) = (case.m, case.k, case.n);
+    let a = DeviceBuffer::from_host(stream, &operand(m * k, 13))?;
+    let b = DeviceBuffer::from_host(stream, &operand(n * k, 14))?;
+    let a_k = create_bf16_tma_map(stream, &a, k, m, TmaLayout::KMajor)?;
+    let b_k = create_bf16_tma_map(stream, &b, k, n, TmaLayout::KMajor)?;
+    let a_mn = create_bf16_tma_map(stream, &a, m, k, TmaLayout::MnMajor)?;
+    let b_mn = create_bf16_tma_map(stream, &b, n, k, TmaLayout::MnMajor)?;
+    let config = tcgen05_launch_config(m, n, k);
+    let mut c = DeviceBuffer::<f32>::zeroed(stream, m * n)?;
+
+    unsafe {
+        module.f32_accumulate_transposed(
+            stream,
+            config,
+            a_mn.as_ptr(),
+            b_mn.as_ptr(),
+            &mut c,
+            n as u32,
+            k as u32,
+        )
+    }?;
+    let folded_once = c.to_host_vec(stream)?;
+    unsafe {
+        module.f32_store_transposed(
+            stream,
+            config,
+            a_mn.as_ptr(),
+            b_mn.as_ptr(),
+            &mut c,
+            n as u32,
+            k as u32,
+        )
+    }?;
+    let stored = c.to_host_vec(stream)?;
+    if let Some(at) = (0..m * n).find(|&at| folded_once[at].to_bits() != stored[at].to_bits()) {
+        return Err(format!(
+            "store-T and a from-zero acc-T disagree at {} ({}, {}): {} vs {}",
+            case.name,
+            at / n,
+            at % n,
+            stored[at],
+            folded_once[at]
+        )
+        .into());
+    }
+
+    let store = time_gpu_iters(stream, WARMUP, ITERS, || {
+        unsafe {
+            module.f32_store(
+                stream,
+                config,
+                a_k.as_ptr(),
+                b_k.as_ptr(),
+                &mut c,
+                n as u32,
+                k as u32,
+            )
+        }
+        .map_err(Into::into)
+    })?;
+    let store_t = time_gpu_iters(stream, WARMUP, ITERS, || {
+        unsafe {
+            module.f32_store_transposed(
+                stream,
+                config,
+                a_mn.as_ptr(),
+                b_mn.as_ptr(),
+                &mut c,
+                n as u32,
+                k as u32,
+            )
+        }
+        .map_err(Into::into)
+    })?;
+    let acc_t = time_gpu_iters(stream, WARMUP, ITERS, || {
+        unsafe {
+            module.f32_accumulate_transposed(
+                stream,
+                config,
+                a_mn.as_ptr(),
+                b_mn.as_ptr(),
+                &mut c,
+                n as u32,
+                k as u32,
+            )
+        }
+        .map_err(Into::into)
+    })?;
+    println!(
+        "{}: {m}x{k}x{n}  store {store:7.3} ms {:7.2} TF/s | store-T {store_t:7.3} ms {:7.2} TF/s \
+         (walk {:+5.1}%) | acc-T {acc_t:7.3} ms {:7.2} TF/s (fold {:+5.1}%)",
+        case.name,
+        tflops(m, n, k, store),
+        tflops(m, n, k, store_t),
+        100.0 * (store_t - store) / store,
+        tflops(m, n, k, acc_t),
+        100.0 * (acc_t - store_t) / store_t,
+    );
     Ok(())
 }
 
