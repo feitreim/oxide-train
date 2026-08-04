@@ -344,8 +344,29 @@ pub fn about() -> String {
     format!("cuBLASLt version {}", unsafe { cublasLtGetVersion() })
 }
 
-/// A configured `C = A·Bᵀ` at one shape: bf16 in, fp32 across, bf16 out — the
-/// signature `gemm_tcgen05_bf16_optimized`'s store mode has.
+/// Which product the baseline computes — the same two operand walks the kernel
+/// has, spelled in cuBLASLt's column-major terms by [`Baseline::with_form`].
+#[derive(Clone, Copy, PartialEq)]
+pub enum Form {
+    /// `C = A·Bᵀ` over K-major `[m, k]` and `[n, k]` operands, `β = 0`: the
+    /// store modes.
+    Store,
+    /// `C += Aᵀ·B` over MN-major `[k, m]` and `[k, n]` panels, `β = 1`: the
+    /// weight-gradient modes. `C` is read as well as written, exactly as the
+    /// kernel's fold reads it.
+    AccumulateTransposed,
+}
+
+/// `C`'s element — the one thing the kernel's two entry points disagree on, so
+/// the denominator has to be priced at both widths too.
+#[derive(Clone, Copy, PartialEq)]
+pub enum OutElement {
+    Bf16,
+    F32,
+}
+
+/// A configured product at one shape: bf16 in, fp32 across, and a [`Form`] and
+/// [`OutElement`] matching whichever kernel mode it is the denominator for.
 ///
 /// Holds its session and workspace so a caller can launch it repeatedly under
 /// whatever clock it likes, which is what makes "the same harness on both
@@ -360,8 +381,30 @@ pub struct Baseline {
 
 impl Baseline {
     /// Configure the baseline for `[m, k] × [n, k]ᵀ → [m, n]`, all packed
-    /// row-major bf16.
+    /// row-major bf16 — [`Form::Store`] at [`OutElement::Bf16`], the signature
+    /// `gemm_tcgen05_bf16_optimized`'s store mode has.
     pub fn new(stream: &CudaStream, m: usize, n: usize, k: usize) -> Result<Self, Box<dyn Error>> {
+        Self::with_form(stream, m, n, k, Form::Store, OutElement::Bf16)
+    }
+
+    /// Configure the baseline for one of the kernel's four mode/element
+    /// combinations, `[m, n]` out.
+    ///
+    /// The transpose algebra follows the module header. For
+    /// [`Form::AccumulateTransposed`] the operands are their native row-major
+    /// panels — `a` is `[k, m]`, `b` is `[k, n]` — and the target is
+    /// `Ĉ = Cᵀ = (AᵀB)ᵀ = Bᵀ·A`. Read as column-major, `b`'s bytes *are* `Bᵀ`
+    /// (`n × k`, `ld = n`, `CUBLAS_OP_N`) and `a`'s are `Aᵀ` (`m × k`,
+    /// `ld = m`), so `A` itself is reached under `CUBLAS_OP_T`. The first
+    /// operand cuBLASLt sees is still our `b`, as in the store form.
+    pub fn with_form(
+        stream: &CudaStream,
+        m: usize,
+        n: usize,
+        k: usize,
+        form: Form,
+        out: OutElement,
+    ) -> Result<Self, Box<dyn Error>> {
         // Outside anybody's timed region, as every allocation on both sides is.
         let workspace = DeviceBuffer::<u8>::zeroed(stream, WORKSPACE_BYTES)?;
         let mut session = Session::new();
@@ -376,17 +419,33 @@ impl Baseline {
             "cublasLtMatmulDescCreate",
         )?;
 
-        // `Ĉ = (B̂)ᵀ · Â`, per the module header: the first operand is our `b`,
-        // transposed; the second is our `a`, not.
-        set_transpose(session.desc, DESC_TRANSA, CUBLAS_OP_T)?;
-        set_transpose(session.desc, DESC_TRANSB, CUBLAS_OP_N)?;
-        layout(&mut session.a, CUDA_R_16BF, k, n, k)?;
-        layout(&mut session.b, CUDA_R_16BF, k, m, k)?;
-        // bf16 out, because ours is. An fp32 `D` here would time a baseline
-        // writing twice what the kernel it divides writes, and report the
-        // difference as ours. The compute type is untouched: both sides still
-        // accumulate in fp32.
-        layout(&mut session.d, CUDA_R_16BF, n, m, n)?;
+        match form {
+            // `Ĉ = (B̂)ᵀ · Â`, per the module header: the first operand is our
+            // `b`, transposed; the second is our `a`, not.
+            Form::Store => {
+                set_transpose(session.desc, DESC_TRANSA, CUBLAS_OP_T)?;
+                set_transpose(session.desc, DESC_TRANSB, CUBLAS_OP_N)?;
+                layout(&mut session.a, CUDA_R_16BF, k, n, k)?;
+                layout(&mut session.b, CUDA_R_16BF, k, m, k)?;
+            }
+            // `Ĉ = Bᵀ·A`, per [`Baseline::with_form`]: our `b` read as-is, our
+            // `a` transposed.
+            Form::AccumulateTransposed => {
+                set_transpose(session.desc, DESC_TRANSA, CUBLAS_OP_N)?;
+                set_transpose(session.desc, DESC_TRANSB, CUBLAS_OP_T)?;
+                layout(&mut session.a, CUDA_R_16BF, n, k, n)?;
+                layout(&mut session.b, CUDA_R_16BF, m, k, m)?;
+            }
+        }
+        // `C` at the kernel's width, because a denominator writing (and, under
+        // the fold, reading) a different number of bytes than the kernel it
+        // divides would report the difference as ours. The compute type is
+        // untouched: both sides still accumulate in fp32.
+        let out_element = match out {
+            OutElement::Bf16 => CUDA_R_16BF,
+            OutElement::F32 => CUDA_R_32F,
+        };
+        layout(&mut session.d, out_element, n, m, n)?;
 
         checked(
             unsafe { cublasLtMatmulPreferenceCreate(&mut session.preference) },
@@ -444,7 +503,10 @@ impl Baseline {
             heuristic,
             workspace,
             alpha: 1.0,
-            beta: 0.0,
+            beta: match form {
+                Form::Store => 0.0,
+                Form::AccumulateTransposed => 1.0,
+            },
         })
     }
 
@@ -466,23 +528,42 @@ impl Baseline {
         b: &DeviceBuffer<u16>,
         c: &DeviceBuffer<u16>,
     ) -> Result<(), Box<dyn Error>> {
+        unsafe { self.launch_devptrs(stream, a.cu_deviceptr(), b.cu_deviceptr(), c.cu_deviceptr()) }
+    }
+
+    /// [`Baseline::launch`] by device pointer, for a `C` whose element the
+    /// configuration chose — a typed signature per [`OutElement`] would say no
+    /// more than the layouts already do.
+    ///
+    /// # Safety
+    ///
+    /// The pointers must name live device buffers of the shapes and elements
+    /// this baseline was configured for: `a` and `b` the kernel's own bf16
+    /// operands, `c` an `m * n` output in the configured [`OutElement`].
+    pub unsafe fn launch_devptrs(
+        &self,
+        stream: &CudaStream,
+        a: u64,
+        b: u64,
+        c: u64,
+    ) -> Result<(), Box<dyn Error>> {
         // SAFETY: every handle is live for the call, the device pointers name
         // buffers sized by the layouts, and `c` is both `C` and `D` — legal,
-        // and unread since `beta` is zero.
+        // and either unread (`β = 0`) or the in-place fold the form asks for.
         checked(
             unsafe {
                 cublasLtMatmul(
                     self.session.handle,
                     self.session.desc,
                     (&raw const self.alpha).cast(),
-                    b.cu_deviceptr() as *const c_void,
+                    b as *const c_void,
                     self.session.a,
-                    a.cu_deviceptr() as *const c_void,
+                    a as *const c_void,
                     self.session.b,
                     (&raw const self.beta).cast(),
-                    c.cu_deviceptr() as *const c_void,
+                    c as *const c_void,
                     self.session.d,
-                    c.cu_deviceptr() as *mut c_void,
+                    c as *mut c_void,
                     self.session.d,
                     &self.heuristic.algo,
                     self.workspace.cu_deviceptr() as *mut c_void,
