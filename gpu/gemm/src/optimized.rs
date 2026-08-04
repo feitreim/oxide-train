@@ -68,9 +68,13 @@
 //! TFLOP/s storing against 536.2 accumulating, at 4096³ on a B200.
 //!
 //! An **fp32** `C` cannot take the `stmatrix` route at all — it moves b16
-//! matrices, so nothing can fill an fp32 staging tile that way — and the
-//! *store* mode drains through [`store_rows`] a value at a time instead
-//! (GAPS.md §2.6 carries the staged-fp32 gap).
+//! matrices, so nothing can fill an fp32 staging tile that way. Both fp32
+//! modes go through [`scatter_tile`] and the copy engine instead: the *store*
+//! mode as a plain tensor store, the *accumulating* mode as a reduction store,
+//! one drain shape with the add turned on or off. The scattered per-value
+//! `store_rows` walk GAPS.md §2.6 priced is gone from this file — under the
+//! deferred epilogue its stores sat on the critical path exactly where the
+//! engine's do not.
 //!
 //! The **accumulating fp32** `C` — the weight-gradient fold that oxide-train#80
 //! measured at +25–29% over its own store at K = 6144 — no longer reads `C` at
@@ -89,7 +93,7 @@ use cuda_device::{DisjointSlice, cluster, cluster_launch, kernel, warp};
 use cuda_host::cuda_module;
 
 use kittens::epilogue::{StoreRing, Warp};
-use kittens::global::{GlobalRows, accumulate_shared_rows, store_rows, store_shared_rows};
+use kittens::global::{GlobalRows, accumulate_shared_rows, store_shared_rows};
 use kittens::ldst::{scatter_tile, store_tile_x4};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, Job};
@@ -355,19 +359,45 @@ impl Drain for Packed {
     }
 }
 
-/// Overwriting fp32 `C`, straight out of the registers.
+/// Overwriting fp32 `C`, through the staging tile and the copy engine —
+/// [`Reduce`]'s drain with the add turned off.
 ///
-/// No staging tile, and not for want of asking: [`store_shared_rows`] is
-/// generic over its element and would take an fp32 tile, but `stmatrix` moves
-/// b16 matrices and nothing bf16-shaped can *fill* one (GAPS.md §2.6). So
-/// this is the scattered per-value drain the bf16 path stopped using — one
-/// `st.global.v2.f32` per pair of columns against the other's contiguous 16
-/// bytes — and it is why the fp32 store rows of the benchmark trail the bf16
-/// ones. The *accumulating* fp32 drain is [`Reduce`], which owes nothing to
-/// this shape.
+/// The register drain this replaces (`store_rows`, one `st.global.v2.f32` per
+/// pair of columns) was why the fp32 store rows trailed the bf16 ones, and
+/// under the deferred epilogue it hit a harder wall: the overlap a drain can
+/// buy is the registers it holds past its last load over the band's 256, and
+/// the register file grants 12 warps an SM at most ~170 a thread — a two-band
+/// hoist measured 181 and paid the 2 → 1 CTA cliff. Handing the stores to the
+/// engine dissolves the trade: the thread-side work is eight scatters into
+/// the warp's `[16, STAGE_N]` staging tile, and everything past
+/// [`Release::now`] — the last scatter, the engine's reads, every byte to HBM
+/// — runs beside the next item's MMA. ferro #123 measured the engine losing
+/// 1.0–1.7% to 16-byte stores *at warp scope on the bf16 tile*; this element
+/// has no 16-byte route to lose to (`stmatrix` moves b16, GAPS.md §2.6), and
+/// the exposed cost is what the deferral exists to hide.
 #[derive(Clone, Copy)]
 struct Wide {
-    c: GlobalRows<F32>,
+    c_map: *const TmaDescriptor,
+}
+
+impl Wide {
+    /// One `[16, STAGE_N]` pass: acquire the staging tile back from the
+    /// engine, scatter the band in, and hand it off as a plain tensor store.
+    #[inline(always)]
+    unsafe fn emit(
+        self,
+        ring: &mut ReduceRing,
+        lane: u32,
+        band: RegTile<16, STAGE_N, BaseLdtm>,
+        row: u32,
+        column: u32,
+    ) {
+        unsafe {
+            let staging = ring.acquire();
+            scatter_tile(staging.chunk_writer(), 0, 0, lane, band);
+            ring.commit_2d(self.c_map, column as i32, row as i32);
+        }
+    }
 }
 
 impl Drain for Wide {
@@ -375,29 +405,34 @@ impl Drain for Wide {
     unsafe fn drain(
         self,
         accumulator: Accumulator,
-        _stage: StageTile,
+        stage: StageTile,
         row: u32,
         column: u32,
         release: Release,
     ) {
         unsafe {
-            // One band live, not two: this drain already holds the fattest
-            // registers in the file, and the two-band hoist measured 181 —
-            // past the 170 the register file grants 12 warps an SM, which is
-            // the 2 → 1 CTA cliff by another name. Releasing after the fourth
-            // load still overlaps the last store pass and every store's
-            // completion with the next item's MMA.
             let (lane, band_row) = (lane(), 32 * warp_id());
+            let mut ring = ReduceRing::attach(stage.base());
             let n = STAGE_N as u32;
-            let first: Band = accumulator.tile_x8(band_row, 0);
-            store_rows(self.c, row, column, lane, first);
-            let second: Band = accumulator.tile_x8(band_row, n);
-            store_rows(self.c, row, column + n, lane, second);
-            let third: Band = accumulator.tile_x8(band_row, 2 * n);
-            store_rows(self.c, row, column + 2 * n, lane, third);
-            let fourth: Band = accumulator.tile_x8(band_row, 3 * n);
+            let (top, bottom) = (band_row, band_row + 16);
+            let b0: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(top, 0);
+            let b1: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(top, n);
+            self.emit(&mut ring, lane, b0, row, column);
+            let b2: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(top, 2 * n);
+            self.emit(&mut ring, lane, b1, row, column + n);
+            let b3: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(top, 3 * n);
+            self.emit(&mut ring, lane, b2, row, column + 2 * n);
+            let b4: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(bottom, 0);
+            self.emit(&mut ring, lane, b3, row, column + 3 * n);
+            let b5: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(bottom, n);
+            self.emit(&mut ring, lane, b4, row + 16, column);
+            let b6: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(bottom, 2 * n);
+            self.emit(&mut ring, lane, b5, row + 16, column + n);
+            let b7: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(bottom, 3 * n);
+            self.emit(&mut ring, lane, b6, row + 16, column + 2 * n);
             release.now();
-            store_rows(self.c, row, column + 3 * n, lane, fourth);
+            self.emit(&mut ring, lane, b7, row + 16, column + 3 * n);
+            ring.drain();
         }
     }
 }
@@ -827,33 +862,28 @@ pub mod kernels {
         }
     }
 
-    /// [`gemm_tcgen05_bf16_optimized`] with an fp32 `C`, **overwrite only**.
-    /// `c_offset` selects one matrix in a stacked allocation without host-side
-    /// pointer marshalling. The accumulating fp32 form is
-    /// [`gemm_tcgen05_f32_accumulate`], which folds at the copy engine instead
-    /// of here.
+    /// [`gemm_tcgen05_bf16_optimized`] with an fp32 `C`, **overwrite only**,
+    /// described by a rank-2 tensor map exactly as [`gemm_tcgen05_f32_accumulate`]'s
+    /// is — the drain is that kernel's with the add turned off, so `C`'s base,
+    /// `n`, and any offset into a stacked allocation all live in `c_map`. The
+    /// accumulating fp32 form folds at the copy engine; this one stores there.
     ///
     /// # Safety
-    /// As [`gemm_tcgen05_bf16_optimized`], with `c_offset..c_offset + m * n`
-    /// inside `c`.
+    /// As [`gemm_tcgen05_bf16_optimized`] for the operand maps; `c_map` must
+    /// describe a live fp32 matrix covering every tile the item walk reaches,
+    /// and nothing else may write it during the launch.
     #[kernel]
     #[cluster_launch(2, 1, 1)]
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_tcgen05_f32_optimized(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
-        mut c: DisjointSlice<f32>,
-        c_offset: usize,
-        n: i32,
+        c_map: *const TmaDescriptor,
         k: i32,
         tiles_m: u32,
         tiles_n: u32,
         transposed: u32,
     ) {
         unsafe {
-            let out = Wide {
-                c: GlobalRows::<F32>::from_raw(c.as_mut_ptr().add(c_offset) as *mut u8, n as usize),
-            };
             let mut tile = attach(
                 a_map,
                 b_map,
@@ -861,7 +891,7 @@ pub mod kernels {
                 tiles_n,
                 k as u32 / BLOCK_K as u32,
                 transposed != 0,
-                out,
+                Wide { c_map },
             );
             pipeline::run(&mut tile, tiles_m * tiles_n);
             drain_last(&tile);
