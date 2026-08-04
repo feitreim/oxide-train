@@ -75,62 +75,70 @@ use host::{
 /// synchronous kernel for a whole pipeline. #69 retired both: the two backward
 /// kernels below are the only ones now, and their pins are re-set to what
 /// ptxas gives a 128-thread `.maxntid` rather than a 192- or 1024-thread one.
+///
+/// Re-pins for ferro c648c67 and the O-segment rescale (2026-08-04): **every
+/// frame in this module is now zero.** The pin bump to ferro #180 unrolled the
+/// library's mover walks and took the backwards' 528 B with it (244/528 →
+/// 182/0 and 190/0, untouched by this change); the forward's own 560 B was the
+/// last one left, and #77 moved the flash rescale into tensor memory to end it.
+/// Every pin below is the measured number exactly.
 const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
-        // The unified forward (#68): 244 regs / 1136 B frame, against the
-        // persistent kernel's 236 / 592.
+        // The unified forward (#68), at 128 regs / **0 B frame** where the
+        // 2026-08-03 pin was 244/1136 and ferro #180 left it at 193/560.
         //
-        // The 1136 B is `out_acc`, the 128-register output accumulator. Both
-        // things that write it — `online_rescale` and `merge_output_tile` —
-        // take it by `&mut`, so it is address-taken and lands in the LLVM
-        // local depot whole. It is not hot: the only reader inside the key
-        // stream is the correction path, which fires on **0.00%** of visits at
-        // every gated shape.
+        // That 560 B was `out_acc`, the 128-register output accumulator the
+        // conditional correction carried across the key stream. Nothing about
+        // it was hot — the correction fires on **0.00%** of tile visits at
+        // every shape with uniform operands, which is why the rescale takes
+        // `CORRECTION_KEY_GAIN`'s ramped case to gate at all — but both writers
+        // took it by `&mut`, so it was address-taken, live from the first key
+        // tile to the epilogue, and homed in the LLVM local depot whole: 405
+        // `ld/st.local`, and 1.212 ms at the profile shape against 0.832
+        // without it.
         //
-        // The band beside it *was* hot, and that is what `SCORE_CHUNK`
-        // records: holding the whole `[32, 64]` score band as a value put it
-        // in the depot too (1328 B, 3546 local accesses) and cost **2.635 ms**
-        // at the profile shape; walking it 16 columns at a time is 2.125.
+        // The band beside it was hot for the same underlying reason, and that
+        // is what `SCORE_CHUNK` records: the whole `[32, 64]` score band as a
+        // value was 1328 B, 3546 local accesses and **2.635 ms**; 16 columns
+        // at a time is 2.125.
         //
-        // Getting the accumulator out of the depot means not keeping it in
-        // registers at all — `tcgen05.st` (absent when this correction scheme
-        // was designed, present in the library now) lets the rescale happen in
-        // the O segment. See the PR.
+        // Both are ferro #181's category — a band that does not fit — and the
+        // fix is the same shape: hold fp32 in register-sized chunks and let
+        // tensor memory hold the rest. `tcgen05.st` was absent when the
+        // correction scheme was designed and is `TmemTile::store_tile` now, so
+        // O is rescaled in its segment and drained 64 columns at a time.
         name: "forward",
-        max_registers: 246,
-        max_spill_bytes: 1072,
+        max_registers: 128,
+        max_spill_bytes: 0,
     },
     KernelBudget {
-        // The unified query-parallel backward (#69): 244 regs / 528 B frame,
+        // The unified query-parallel backward (#69): 182 regs / **0 B frame**,
         // against the warp-specialized kernel's 52 / 512 and the synchronous
         // one's 53 / 512.
         //
-        // **The jump is `.maxntid`, not the code.** Those kernels declared 192
-        // and 1024 threads; this one declares 128, so ptxas' per-thread budget
-        // went from 65536/1024 to 65536/128 and it spent what it was given.
-        // 244 × 128 threads is 31.2K of the 64K register file — two blocks'
-        // worth — and residency is pinned at one CTA an SM by tensor memory
-        // regardless, so there is nothing here to reclaim.
+        // **The register jump is `.maxntid`, not the code.** Those kernels
+        // declared 192 and 1024 threads; this one declares 128, so ptxas'
+        // per-thread budget went from 65536/1024 to 65536/128 and it spent what
+        // it was given. 182 × 128 threads is 23.3K of the 64K register file,
+        // and residency is pinned at one CTA an SM by tensor memory regardless.
         //
-        // The frame is 528 B and flat: dQ lives in tensor memory for the whole
-        // key stream, so unlike the forward there is no 128-register
-        // accumulator taken by `&mut` to land in the LLVM local depot. What is
-        // there is the `pipeline::Job` struct itself, which `pipeline::run`
-        // takes by `&mut` for the same reason.
+        // The frame was 528 B of `pipeline::Job` reached through a rolled
+        // library walk, and ferro #180 unrolled it away. dQ never leaves tensor
+        // memory during the key stream, so this kernel never had the forward's
+        // resident accumulator to begin with.
         name: "backward q",
-        max_registers: 244,
-        max_spill_bytes: 528,
+        max_registers: 182,
+        max_spill_bytes: 0,
     },
     KernelBudget {
-        // The unified key-parallel backward, at exactly kernel A's 244 / 528
-        // despite carrying a second gradient accumulator and holding `Pᵀ` live
-        // across forming `dSᵀ` from it — the two kernels' pressure is the same
-        // `.maxntid` ceiling and neither is near what it would need to spill.
-        // Its predecessors differed (59/1024 sync, 70/1024 pipelined) because
-        // they were near theirs.
+        // The unified key-parallel backward: 190 regs / 0 B, eight registers
+        // over kernel A for a second gradient accumulator and `Pᵀ` held live
+        // across forming `dSᵀ` from it. Its predecessors differed more
+        // (59/1024 sync, 70/1024 pipelined) because they were near their
+        // ceiling and neither of these is.
         name: "backward kv",
-        max_registers: 244,
-        max_spill_bytes: 528,
+        max_registers: 190,
+        max_spill_bytes: 0,
     },
 ];
 
@@ -384,12 +392,57 @@ fn check_transpose_probe(
     Ok(())
 }
 
+/// Per-key-tile gain of the forced-correction parity case: key `p`'s staged row
+/// is multiplied by `1 + CORRECTION_KEY_GAIN * (p / FLASH_TILE)`.
+///
+/// **Uniform operands never correct.** Every shape gated with
+/// `key_gain_per_tile = 0.0` reports 0.00% at every size, because a row's tile
+/// max has no reason to climb `CORRECTION_THRESHOLD` (8, base-2) above the O
+/// segment's reference when all keys are drawn from the same distribution — so
+/// without this case the mid-stream rescale (drain the segment, scale it,
+/// `tcgen05.st` it back, keep accumulating onto the stored values) is never
+/// once executed by a parity check, and only the epilogue drain is really
+/// gated.
+///
+/// A score is linear in K, so scaling key `p`'s row by `g(p)` scales its score
+/// by `g(p)` too and a tile's row max is its gain times the unramped one. With
+/// these operands an unramped row max runs ~1.15, so the climb across one key
+/// tile is ~1.15 × `CORRECTION_KEY_GAIN`; at 7 that sits just above the
+/// threshold, which is the side of it worth testing. The correction then fires
+/// on most visits *and* the output mass accumulated before each one is the
+/// largest the threshold permits — a rescale that dropped its factor, missed a
+/// warp's rows, or scrambled a lane on the way through `tcgen05.st` moves `y`
+/// far outside tolerance rather than hiding under an already-negligible term.
+const CORRECTION_KEY_GAIN: f32 = 7.0;
+
+/// Scale token `p`'s features by `1 + gain_per_tile * (p / FLASH_TILE)`, in the
+/// fp32 `[B*T, H*HD]` layout [`stage_heads`] consumes.
+///
+/// Applied before staging on purpose: the CPU reference below reads the
+/// *staged* operands through [`staged_value`], so a transform made here is
+/// automatically part of what it expects and the reference needs no ramp of its
+/// own.
+fn ramp_tokens(input: &mut [f32], b: usize, t: usize, d: usize, gain_per_tile: f32) {
+    for batch in 0..b {
+        for token in 0..t {
+            let gain = 1.0 + gain_per_tile * (token as f32 / FLASH_TILE as f32);
+            for value in &mut input[(batch * t + token) * d..][..d] {
+                *value *= gain;
+            }
+        }
+    }
+}
+
 /// Forward parity for every kernel against one CPU reference computed from
 /// the same staged bf16 operands (exact exp2, f64 accumulation), so the
 /// tolerance covers only the device-side differences: fp32 tensor-core
 /// accumulation, the exp2 polynomial, the bf16 rounding of P, and the
 /// conditional-segment rescale points. Also reports each kernel's measured
-/// mid-stream O-segment correction rate.
+/// mid-stream O-segment correction rate, and returns it so a caller that means
+/// to exercise the correction can assert it happened.
+///
+/// `key_gain_per_tile` is [`CORRECTION_KEY_GAIN`] for the case that forces the
+/// mid-stream rescale and `0.0` for the uniform ones.
 fn check_forward(
     stream: &Arc<CudaStream>,
     flash: &Tcgen05Flash,
@@ -397,12 +450,17 @@ fn check_forward(
     b: usize,
     t: usize,
     h: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+    key_gain_per_tile: f32,
+) -> Result<u64, Box<dyn std::error::Error>> {
     let d = h * FLASH_HD;
     let n = b * t;
     let q = uniform_vec(n * d, 71);
-    let k = uniform_vec(n * d, 72);
+    let mut k = uniform_vec(n * d, 72);
     let v = uniform_vec(n * d, 73);
+    // Q and V stay uniform: the ramp has to move the *scores*, and putting it
+    // anywhere else would change what the output means without changing when
+    // the segment reference has to move.
+    ramp_tokens(&mut k, b, t, d, key_gain_per_tile);
     let q_scale = LOG2_E / (FLASH_HD as f32).sqrt();
     let q_staged = stage_heads(&q, b, t, h, q_scale);
     let k_staged = stage_heads(&k, b, t, h, 1.0);
@@ -466,7 +524,12 @@ fn check_forward(
             &mut corrections,
         )?;
     }
-    println!("tcgen05 forward parity against staged-bf16 CPU reference [{b},{t},{h},{FLASH_HD}]");
+    let operands = if key_gain_per_tile == 0.0 {
+        "staged-bf16"
+    } else {
+        "ramped-key staged-bf16"
+    };
+    println!("tcgen05 forward parity against {operands} CPU reference [{b},{t},{h},{FLASH_HD}]");
     let y_host = y.to_host_vec(stream)?;
     let lse_host = lse.to_host_vec(stream)?;
     // Diagnostic slice (batch 0, head 0): one y feature and the LSE per
@@ -486,8 +549,7 @@ fn check_forward(
     // Measured maxima: y 1.4e-3, lse 1.4e-4 (T=128..512); ~3x headroom.
     assert_close("y", &y_host, &expected_y, 5.0e-3, 5.0e-3);
     assert_close("lse", &lse_host, &expected_lse, 1.0e-3, 0.0);
-    print_correction_rate(stream, &corrections, b, t, h)?;
-    Ok(())
+    print_correction_rate(stream, &corrections, b, t, h)
 }
 
 /// Backward parity for the two tcgen05 gradient kernels against a CPU
@@ -657,14 +719,15 @@ fn check_backward(
 
 /// Sum the per-workstream correction counts and report them against the
 /// number of key-tile visits that could have corrected (everything past
-/// each stream's first tile).
+/// each stream's first tile). Returns the total, which is what
+/// [`CORRECTION_KEY_GAIN`]'s case asserts on.
 fn print_correction_rate(
     stream: &Arc<CudaStream>,
     corrections: &DeviceBuffer<u32>,
     b: usize,
     t: usize,
     h: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<u64, Box<dyn std::error::Error>> {
     let counts = corrections.to_host_vec(stream)?;
     let total: u64 = counts.iter().map(|&c| c as u64).sum();
     // A query block of `FLASH_QUERIES` rows streams `2 * (block + 1)` key
@@ -679,7 +742,7 @@ fn print_correction_rate(
         total as f64 / eligible as f64 * 100.0
     };
     println!("  corrections: {total} of {eligible} eligible tile visits ({rate:.2}%)");
-    Ok(())
+    Ok(total)
 }
 
 /// Kernel-only TFLOP/s at the post-7e9 profile shape (B=32, T=1024, H=24)
@@ -909,11 +972,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_transpose_probe(&stream, &flash)?;
     // T=384 exercises the persistent kernel's inactive-stream-B pair;
     // (4, 256, 38) puts 152 work items over the SM count so CTAs loop.
-    check_forward(&stream, &flash, sm_count, 2, 128, 3)?;
-    check_forward(&stream, &flash, sm_count, 1, 256, 2)?;
-    check_forward(&stream, &flash, sm_count, 1, 384, 2)?;
-    check_forward(&stream, &flash, sm_count, 1, 512, 2)?;
-    check_forward(&stream, &flash, sm_count, 4, 256, 38)?;
+    check_forward(&stream, &flash, sm_count, 2, 128, 3, 0.0)?;
+    check_forward(&stream, &flash, sm_count, 1, 256, 2, 0.0)?;
+    check_forward(&stream, &flash, sm_count, 1, 384, 2, 0.0)?;
+    check_forward(&stream, &flash, sm_count, 1, 512, 2, 0.0)?;
+    check_forward(&stream, &flash, sm_count, 4, 256, 38, 0.0)?;
+    // Every shape above corrects on 0.00% of eligible visits, so all of them
+    // together gate the epilogue drain and not one of them enters the
+    // mid-stream rescale. This one ramps K so later keys dominate earlier ones
+    // and the O segment has to be rescaled in place, `tcgen05.st` and all —
+    // see `CORRECTION_KEY_GAIN`. The assert is the point: a ramp that stopped
+    // tripping the threshold would leave the path silently unexercised again.
+    let corrections = check_forward(&stream, &flash, sm_count, 1, 512, 2, CORRECTION_KEY_GAIN)?;
+    assert!(
+        corrections > 0,
+        "the forced-correction shape corrected on no visit at all, so the \
+         mid-stream O-segment rescale is still ungated; re-tune \
+         CORRECTION_KEY_GAIN against CORRECTION_THRESHOLD"
+    );
     check_backward(&stream, &flash, sm_count, 2, 128, 3)?;
     check_backward(&stream, &flash, sm_count, 1, 256, 2)?;
     check_backward(&stream, &flash, sm_count, 1, 1024, 4)?;

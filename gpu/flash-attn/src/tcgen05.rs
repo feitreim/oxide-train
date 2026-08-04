@@ -24,12 +24,16 @@
 //! `S = Q·Kᵀ` accumulates in a double-buffered fp32 TMEM segment, a register
 //! softmax (mask → row max → software exp2 → running sum) packs bf16
 //! probabilities back to shared memory with swizzled `stmatrix` stores, and
-//! `O += P·V` accumulates in a TMEM *segment* under a fixed per-row max
-//! reference (`enable_d` across tiles). FA4's conditional correction, adapted
-//! for the missing `tcgen05.st`: only when some row's tile max climbs more than
+//! `O += P·V` accumulates in a TMEM segment under a fixed per-row max
+//! reference (`enable_d` across every tile but the first). FA4's conditional
+//! correction: only when some row's tile max climbs more than
 //! `CORRECTION_THRESHOLD` above the reference does the warpgroup drain the
-//! segment into per-thread registers, rescale, and restart it — otherwise the
-//! segment just keeps accumulating and the warpgroup never touches O TMEM.
+//! segment, rescale it, and `tcgen05.st` it back — otherwise the segment just
+//! keeps accumulating and the warpgroup never touches O TMEM. **O never
+//! reaches a resident register band**, which is what keeps this kernel's frame
+//! at zero; the earlier scheme, written when `tcgen05.st` was missing from the
+//! library, restarted the segment and carried the running output in a
+//! 128-register accumulator that the LLVM local depot took whole.
 //!
 //! The three generations it replaces were all shaped by a 64-query tile against
 //! an `M128` accumulator: every MMA filled 64 real rows and 64 phantom ones,
@@ -40,8 +44,8 @@
 //! double-buffered score segment is the whole of the overlap. What is left is
 //! the library's: `SharedPlan` for the plan, `pipeline::run` for the persistent
 //! work-item loop, `make_causal_at` for the coordinate-origin mask,
-//! `online_rescale` for the flash rescale, and `block_reduce` for the
-//! correction vote all three kernels used to open-code.
+//! `TmemTile::tile_x8`/`store_tile` for the rescale's round trip, and
+//! `block_reduce` for the correction vote all three kernels used to open-code.
 //!
 //! `flash_backward_q` and `flash_backward_kv` are one kernel each where there
 //! were two (#69), and they are the forward's own shape: a CTA owns `QUERIES`
@@ -83,12 +87,11 @@ use kittens::mma::{self, MmaShape, mma_ab, mma_abt};
 use kittens::pipeline;
 use kittens::plan::SharedPlan;
 use kittens::reg::{
-    BaseLdtm, ColVec, Exp2Hw, Max, RegTile, RegVec, exp2_approx, log2_approx, online_rescale,
-    warp_reduce,
+    BaseLdtm, ColVec, Exp2Hw, Max, RegTile, RegVec, exp2_approx, log2_approx, warp_reduce,
 };
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, SharedVec, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing, block_reduce};
-use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
+use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait};
 
 // Tile contract; `host.rs` mirrors these as FLASH_TILE / FLASH_HD (kept
 // non-pub here so SWEEP's one-definition rule never sees two copies).
@@ -153,24 +156,39 @@ type AccTmem = TmemTile<QUERIES, HD>;
 
 /// Columns of a warp's score band that one pass of the softmax holds.
 ///
-/// **Not the whole `[32, TILE]` band.** The output accumulator is 128
-/// registers and resident for the whole key stream; a 64-wide score band
-/// beside it is 64 more, and at that width the register ops' generic
-/// `SLOTS x VALUES` loops stop scalarizing — the band lands in the LLVM local
-/// depot and the drain, the mask, the reduction and the `exp2` all become
+/// **Not the whole `[32, TILE]` band.** At 64 columns the register ops'
+/// generic `SLOTS x VALUES` loops stop scalarizing — the band lands in the LLVM
+/// local depot and the drain, the mask, the reduction and the `exp2` all become
 /// `ld.local`/`st.local` in the one loop this kernel cannot afford traffic in.
 /// Measured: 1328 B of frame and 3546 local accesses at 64 columns, and
 /// **2.635 ms** at the profile shape against the persistent kernel's 1.937.
 /// At 16 the chunk is 16 registers, every pass stays in them, and the price is
 /// a second drain of the segment — which is what `softmax_tile` paid too.
+///
+/// This is [`OutHalf`]'s rule on the other axis, and the two are the whole of
+/// what keeps this kernel's frame at zero: no fp32 value here is wider than the
+/// registers that hold it, and everything wider lives in tensor memory.
 const SCORE_CHUNK: usize = 16;
 const _: () = assert!(TILE.is_multiple_of(SCORE_CHUNK));
 
-/// One `SCORE_CHUNK`-wide slice of a warp's score band, and the whole of its
-/// output accumulator: the four warps of an `M128` drain own 32 TMEM lanes
-/// each.
+/// One `SCORE_CHUNK`-wide slice of a warp's score band: the four warps of an
+/// `M128` drain own 32 TMEM lanes each.
 type ScoreChunk = RegTile<32, SCORE_CHUNK, BaseLdtm>;
+/// A warp's whole `[32, HD]` output band. The backward kernels' drain, where
+/// the segment goes straight out and the band is one value with one use.
 type OutBand = RegTile<32, HD, BaseLdtm>;
+/// One 64-column group of that band — the `.x8` drain's own width, and the
+/// widest fp32 value the *forward* holds.
+///
+/// **Not the whole band**, for `SCORE_CHUNK`'s reason one axis over: a band
+/// that is transformed on the way out is two 128-register values at once (the
+/// drain and the rescaled result) or one with its address taken, and either is
+/// a band that does not fit (ferro #181). Measured at the profile shape: the
+/// resident `&mut` accumulator this replaced was 560 B of frame and
+/// **1.212 ms**; draining the segment whole into a short-lived `&mut` band was
+/// 1072 B and 0.996; the by-value 128 was 253 registers, over the ptxas pin.
+/// At 64 the drain, the rescale and the store all stay in registers.
+type OutHalf = RegTile<32, TILE, BaseLdtm>;
 /// A per-row statistic of one of those bands — the running max, the running
 /// sum, the LSE.
 type Rows = RegVec<32, BaseLdtm>;
@@ -468,42 +486,6 @@ pub mod kernels {
     // the quad reductions now live in kittens::reg; the swizzled stmatrix
     // mover in kittens::ldst. Same code, same bits — see their docs for the
     // libdevice discipline they encode.
-
-    /// Drain an accumulator segment and add it into the per-thread output
-    /// accumulator: the forward's `O = P·V` on a correction and at the
-    /// epilogue, and the backward's `dQ`/`dK`/`dV` at theirs. `warp_id` is
-    /// warpgroup-local, and its four values cover the segment's 128 rows.
-    #[inline(always)]
-    unsafe fn merge_output_tile(
-        o_tmem: AccTmem,
-        warp_id: u32,
-        out_acc: &mut RegTile<32, 128, BaseLdtm>,
-    ) {
-        unsafe {
-            let mut row_block = 0u32;
-            while row_block < 2 {
-                let tmem_row = warp_id * 32 + row_block * 16;
-                let mut column_block = 0u32;
-                while column_block < 8 {
-                    let column = column_block * 16;
-                    let (low, high) = o_tmem.fragment(tmem_row, column);
-                    let slot_a = (row_block * 2) as usize;
-                    let slot_b = slot_a + 1;
-                    let base = (column_block * 4) as usize;
-                    out_acc.0[slot_a][base] += low[0];
-                    out_acc.0[slot_a][base + 1] += low[1];
-                    out_acc.0[slot_a][base + 2] += high[0];
-                    out_acc.0[slot_a][base + 3] += high[1];
-                    out_acc.0[slot_b][base] += low[2];
-                    out_acc.0[slot_b][base + 1] += low[3];
-                    out_acc.0[slot_b][base + 2] += high[2];
-                    out_acc.0[slot_b][base + 3] += high[3];
-                    column_block += 1;
-                }
-                row_block += 1;
-            }
-        }
-    }
 
     /// Issue one `S = Q·Kᵀ` tile from the current leader thread — `M128_N64`,
     /// eight chained K=16 MMAs walking the two stacked HD subtiles of both
@@ -1464,6 +1446,20 @@ pub mod kernels {
                 full.expect_tx(charge);
             }
         }
+
+        /// Multiply one 64-column half of this warp's rows of the O segment by
+        /// `factor`, in place — the correction's whole effect on the output.
+        ///
+        /// The store is left outstanding; the caller retires both halves with
+        /// one `store_wait`.
+        #[inline(always)]
+        unsafe fn rescale_half(&self, band: u32, column: u32, factor: Rows) {
+            unsafe {
+                let half: OutHalf = self.accumulator.tile_x8(band, column);
+                self.accumulator
+                    .store_tile(band, column, half.mul_row(factor));
+            }
+        }
     }
 
     impl pipeline::Job for ForwardStream<'_, '_> {
@@ -1547,7 +1543,6 @@ pub mod kernels {
 
                 let mut m_ref = Rows::splat(MASKED_SCORE);
                 let mut running_sum = Rows::splat(0.0);
-                let mut out_acc = OutBand::zero();
                 let mut corrections = 0u32;
 
                 let mut key_tile = 0u32;
@@ -1611,24 +1606,42 @@ pub mod kernels {
 
                     // FA4's conditional correction. The output segment keeps
                     // accumulating under `m_ref` until some row's tile max
-                    // climbs more than `CORRECTION_THRESHOLD` above it; a
-                    // restart is collective, since `enable_d` is one flag for
-                    // the whole MMA, so the per-thread test folds to a warp
-                    // value and then to a block one. Tile 0 always trips it —
-                    // `m_ref` is still the sentinel — and starts the first
-                    // segment without a drain.
+                    // climbs more than `CORRECTION_THRESHOLD` above it; the
+                    // vote is collective because a rescale rewrites tensor
+                    // memory four warps share. Tile 0 always trips it —
+                    // `m_ref` is still the sentinel.
                     let exceeded = row_max.any_exceeds(m_ref, CORRECTION_THRESHOLD);
-                    let restart = block_reduce::<Max, FORWARD_WARPS>(
+                    let rescale = block_reduce::<Max, FORWARD_WARPS>(
                         self.shared.votes,
                         warp_reduce::<Max>(if exceeded { 1.0 } else { 0.0 }),
                     ) != 0.0;
-                    if restart {
+                    if rescale {
+                        // `online_rescale`'s two scalar halves, open-coded,
+                        // because its third argument is an `&mut RegTile` and
+                        // this kernel must not hand a 128-register band an
+                        // address: **the rescale happens in the O segment**.
+                        // The scheme this replaces restarted the segment and
+                        // carried the running output in registers instead, and
+                        // that band — address-taken, live from the first key
+                        // tile to the epilogue — was the 560 B frame and 405
+                        // `ld/st.local` ferro #180 left behind, and 1.212 ms at
+                        // the profile shape against this form's 0.832.
+                        // `tcgen05.st` was absent when the scheme was designed
+                        // and is `TmemTile::store_tile` now.
+                        let next = m_ref.max(row_max);
+                        let factor = m_ref.sub(next).exp2();
+                        m_ref = next;
+                        running_sum.mul_assign(factor);
+                        // Tile 0 has no segment to rescale — its MMA is the one
+                        // that writes the segment rather than accumulating into
+                        // it, and the sum it scales is still zero.
                         if key_tile > 0 {
                             self.shared.accumulated.wait(key_tile - 1);
-                            merge_output_tile(self.accumulator, warp_id, &mut out_acc);
+                            self.rescale_half(band, 0, factor);
+                            self.rescale_half(band, TILE as u32, factor);
+                            store_wait();
                             corrections += 1;
                         }
-                        online_rescale(&mut m_ref, row_max, &mut running_sum, &mut out_acc);
                     }
 
                     // This slot was last read by the output MMA
@@ -1686,7 +1699,7 @@ pub mod kernels {
                             self.shared.p.tile(key_tile),
                             self.shared.v.tile(key_tile),
                             MMA_SHAPE,
-                            !restart,
+                            key_tile != 0,
                         );
                         mma::commit(self.shared.accumulated.sem(key_tile));
                     }
@@ -1694,11 +1707,23 @@ pub mod kernels {
                 }
 
                 self.shared.accumulated.wait(key_tiles - 1);
-                merge_output_tile(self.accumulator, warp_id, &mut out_acc);
-                out_acc.scale_rows(running_sum.recip());
-
+                // The drain, at the end of the stream: the segment holds the
+                // whole sum, because every correction was applied to it rather
+                // than to a register copy. A 64-column half at a time — see
+                // `OutHalf` — and the normalization rides the way out, so the
+                // segment is read once and nothing here has an address.
                 let row = batch * self.t + query_base + band;
-                store_rows(self.y, row, head * HD as u32, lane, out_acc);
+                let inverse = running_sum.recip();
+                let low: OutHalf = self.accumulator.tile_x8(band, 0);
+                store_rows(self.y, row, head * HD as u32, lane, low.mul_row(inverse));
+                let high: OutHalf = self.accumulator.tile_x8(band, TILE as u32);
+                store_rows(
+                    self.y,
+                    row,
+                    head * HD as u32 + TILE as u32,
+                    lane,
+                    high.mul_row(inverse),
+                );
                 // The reference the sum is relative to trails the true row max
                 // by at most the correction threshold, and adding it back is
                 // what makes the LSE exact anyway.
@@ -1741,15 +1766,16 @@ pub mod kernels {
     /// The rest is the library's. `SharedPlan` carves the plan,
     /// `pipeline::run` is the persistent work-item loop (items dealt by
     /// descending query tile, longest key streams first), `make_causal_at`
-    /// masks against the *pair* of block origins, `online_rescale` is the flash
-    /// rescale, and `block_reduce` is the correction vote three kernels used to
-    /// open-code as a votes array and a barrier phase.
+    /// masks against the *pair* of block origins, `TmemTile::tile_x8` and
+    /// `store_tile` are the rescale's round trip through the O segment, and
+    /// `block_reduce` is the correction vote three kernels used to open-code as
+    /// a votes array and a barrier phase.
     ///
     /// Operand and output contracts are the extraction's: packed-bf16
     /// `[B*H, T, HD]` staging panels with Q pre-scaled by
     /// `softmax_scale * log2(e)`, fp32 `y[B*T, H*HD]`, fp32 `logsumexp[B*T, H]`
     /// in natural-log units, and one `correction_counts` word per work item
-    /// (`plane * tiles + query_tile`) counting mid-stream segment restarts.
+    /// (`plane * tiles + query_tile`) counting mid-stream segment rescales.
     #[kernel]
     #[launch_bounds(128, 1)]
     pub unsafe fn flash_forward(
