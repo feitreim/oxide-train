@@ -1623,6 +1623,41 @@ Each gated on tests; correctness before speed at every step.
      fp32 `[128, 128]` tiles through `store_rows`' scattered per-value stores,
      which ferro #174 measured at 3x a staged drain — once per work item here,
      so it is small, but it is the same hole.
+   - ✅ **The flash forward's rescale moves into tensor memory, and the last
+     `.local` frame in the module goes to zero** (#77). Two things removed the
+     frames #74/#75 left: the ferro pin bump to c648c67 (#76), which unrolled
+     the library's mover walks (ferro #180) and took **both backward kernels'
+     528 B to 0** on its own (244 regs → 182 and 190, dQ 1.298 → 1.094 ms, dK/dV
+     1.990 → 1.552), and this change, which is the forward's own. A PTX census
+     after the bump named exactly one depot left in the module —
+     `flash_forward`, 560 B, 405 `ld/st.local`, and no depot at all in either
+     backward — and it was `out_acc`: the 128-register output accumulator the
+     conditional correction carried from the first key tile to the epilogue,
+     address-taken because `online_rescale` and `merge_output_tile` both wrote
+     it through `&mut`. `tcgen05.st` was absent when that scheme was designed
+     and is `TmemTile::store_tile` now, so **O is rescaled in its own segment**:
+     a correction drains the segment, scales it, stores it back and keeps
+     `enable_d` on, and the epilogue drains once. **Bench** at
+     [32,1024,24,128], forward **1.212 → 0.832 ms (−31.4%)**, 180.8 → 263.2
+     TFLOP/s, with **128 regs / 0 B frame** against 193 / 560. Parity is
+     identical to the digit at all five gated shapes (y ≤ 1.47e-3, lse ≤
+     9.54e-7, corrections 0.00% of 49152 eligible visits), which it has to be:
+     the rescale is the same arithmetic in the same order, applied to the
+     accumulator rather than to a copy of it.
+     **The width is the whole lesson, and it is ferro #181's.** Three
+     formulations were measured, same container: the resident `&mut`
+     accumulator, 560 B / **1.212 ms**; the segment drained whole into a
+     short-lived `&mut` band inside the correction branch, 1072 B / **0.996**
+     (the frame *grew* and the time fell by 18%, because what costs is the
+     traffic in the loop and not the bytes in the depot); the same band by
+     value, where the drain and the rescaled result are live together —
+     **253 registers**, over the ptxas pin and never timed. Only the fourth,
+     64 columns at a time, is both zero-frame and fastest. A 128-register fp32
+     band cannot be transformed on the way out of tensor memory, whichever way
+     it is spelled; a 64-register one can. `SCORE_CHUNK` had already found this
+     on the score axis (whole `[32, 64]` band: 1328 B, 3546 local accesses,
+     2.635 ms) and the two rules together are why the module's frame is now
+     zero everywhere.
    - Then: activation checkpointing if B wants to grow past memory,
      (much later) multi-GPU
 

@@ -75,62 +75,68 @@ use host::{
 /// synchronous kernel for a whole pipeline. #69 retired both: the two backward
 /// kernels below are the only ones now, and their pins are re-set to what
 /// ptxas gives a 128-thread `.maxntid` rather than a 192- or 1024-thread one.
+///
+/// Re-pins for ferro c648c67 and the O-segment rescale (2026-08-04): **every
+/// frame in this module is now zero.** The pin bump to ferro #180 unrolled the
+/// library's mover walks and took the backwards' 528 B with it (244/528 →
+/// 182/0 and 190/0, untouched by this change); the forward's own 560 B was the
+/// last one left, and #77 moved the flash rescale into tensor memory to end it.
+/// Every pin below is the measured number exactly.
 const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
-        // The unified forward (#68): 244 regs / 1136 B frame, against the
-        // persistent kernel's 236 / 592.
+        // The unified forward (#68), at 128 regs / **0 B frame** where the
+        // 2026-08-03 pin was 244/1136 and ferro #180 left it at 193/560.
         //
-        // The 1136 B is `out_acc`, the 128-register output accumulator. Both
-        // things that write it — `online_rescale` and `merge_output_tile` —
-        // take it by `&mut`, so it is address-taken and lands in the LLVM
-        // local depot whole. It is not hot: the only reader inside the key
-        // stream is the correction path, which fires on **0.00%** of visits at
-        // every gated shape.
+        // That 560 B was `out_acc`, the 128-register output accumulator the
+        // conditional correction carried across the key stream. Nothing about
+        // it was hot — the correction fires on **0.00%** of tile visits at
+        // every gated shape — but both writers took it by `&mut`, so it was
+        // address-taken, live from the first key tile to the epilogue, and
+        // homed in the LLVM local depot whole: 405 `ld/st.local`, and 1.212 ms
+        // at the profile shape against 0.832 without it.
         //
-        // The band beside it *was* hot, and that is what `SCORE_CHUNK`
-        // records: holding the whole `[32, 64]` score band as a value put it
-        // in the depot too (1328 B, 3546 local accesses) and cost **2.635 ms**
-        // at the profile shape; walking it 16 columns at a time is 2.125.
+        // The band beside it was hot for the same underlying reason, and that
+        // is what `SCORE_CHUNK` records: the whole `[32, 64]` score band as a
+        // value was 1328 B, 3546 local accesses and **2.635 ms**; 16 columns
+        // at a time is 2.125.
         //
-        // Getting the accumulator out of the depot means not keeping it in
-        // registers at all — `tcgen05.st` (absent when this correction scheme
-        // was designed, present in the library now) lets the rescale happen in
-        // the O segment. See the PR.
+        // Both are ferro #181's category — a band that does not fit — and the
+        // fix is the same shape: hold fp32 in register-sized chunks and let
+        // tensor memory hold the rest. `tcgen05.st` was absent when the
+        // correction scheme was designed and is `TmemTile::store_tile` now, so
+        // O is rescaled in its segment and drained 64 columns at a time.
         name: "forward",
-        max_registers: 246,
-        max_spill_bytes: 1072,
+        max_registers: 128,
+        max_spill_bytes: 0,
     },
     KernelBudget {
-        // The unified query-parallel backward (#69): 244 regs / 528 B frame,
+        // The unified query-parallel backward (#69): 182 regs / **0 B frame**,
         // against the warp-specialized kernel's 52 / 512 and the synchronous
         // one's 53 / 512.
         //
-        // **The jump is `.maxntid`, not the code.** Those kernels declared 192
-        // and 1024 threads; this one declares 128, so ptxas' per-thread budget
-        // went from 65536/1024 to 65536/128 and it spent what it was given.
-        // 244 × 128 threads is 31.2K of the 64K register file — two blocks'
-        // worth — and residency is pinned at one CTA an SM by tensor memory
-        // regardless, so there is nothing here to reclaim.
+        // **The register jump is `.maxntid`, not the code.** Those kernels
+        // declared 192 and 1024 threads; this one declares 128, so ptxas'
+        // per-thread budget went from 65536/1024 to 65536/128 and it spent what
+        // it was given. 182 × 128 threads is 23.3K of the 64K register file,
+        // and residency is pinned at one CTA an SM by tensor memory regardless.
         //
-        // The frame is 528 B and flat: dQ lives in tensor memory for the whole
-        // key stream, so unlike the forward there is no 128-register
-        // accumulator taken by `&mut` to land in the LLVM local depot. What is
-        // there is the `pipeline::Job` struct itself, which `pipeline::run`
-        // takes by `&mut` for the same reason.
+        // The frame was 528 B of `pipeline::Job` reached through a rolled
+        // library walk, and ferro #180 unrolled it away. dQ never leaves tensor
+        // memory during the key stream, so this kernel never had the forward's
+        // resident accumulator to begin with.
         name: "backward q",
-        max_registers: 244,
-        max_spill_bytes: 528,
+        max_registers: 182,
+        max_spill_bytes: 0,
     },
     KernelBudget {
-        // The unified key-parallel backward, at exactly kernel A's 244 / 528
-        // despite carrying a second gradient accumulator and holding `Pᵀ` live
-        // across forming `dSᵀ` from it — the two kernels' pressure is the same
-        // `.maxntid` ceiling and neither is near what it would need to spill.
-        // Its predecessors differed (59/1024 sync, 70/1024 pipelined) because
-        // they were near theirs.
+        // The unified key-parallel backward: 190 regs / 0 B, eight registers
+        // over kernel A for a second gradient accumulator and `Pᵀ` held live
+        // across forming `dSᵀ` from it. Its predecessors differed more
+        // (59/1024 sync, 70/1024 pipelined) because they were near their
+        // ceiling and neither of these is.
         name: "backward kv",
-        max_registers: 244,
-        max_spill_bytes: 528,
+        max_registers: 190,
+        max_spill_bytes: 0,
     },
 ];
 
