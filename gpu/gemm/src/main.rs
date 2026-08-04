@@ -108,28 +108,41 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 /// ceiling is 255: two CTAs of 128 threads admit the whole file, so the
 /// headroom is what matters and there is a great deal of it.
 ///
-/// The fp32 entry point is higher because its drain has no staging tile to hand
-/// values off to (GAPS.md §2.6): its `store_rows` walk holds the band, and the
-/// accumulating mode holds `C` beside it.
+/// The fp32 store entry point is higher because its drain has no staging tile
+/// to hand values off to (GAPS.md §2.6): its `store_rows` walk holds the band.
+/// It no longer accumulates — the fold moved to `gemm_tcgen05_f32_accumulate`,
+/// whose drain never reads `C` at all (the reduction store, ferro #42 /
+/// oxide-train#80 remedy 1): each `[16, 64]` half-band is scattered into a
+/// staging tile and added into `C` by the copy engine, so it holds half the
+/// band the store path holds and no `C` values beside it.
 ///
 /// `max_spill_bytes` here is the **local-memory frame**, not spill stores —
 /// `bench_util` reads `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES`. The bf16 frame is
 /// zero since ferro #180: the 256 B it used to carry was the `Job`'s state
 /// homed behind a rolled mover walk, and unrolling the walk bought it back for
-/// two registers. The fp32 entry point keeps a frame because its cost is not a
-/// rolled walk — its `store_rows` drain holds a whole fp32 band with no
-/// staging tile to hand values off to (GAPS.md §2.6, ferro #174), and the
-/// accumulating mode holds `C` beside it.
-const KERNEL_BUDGETS: [KernelBudget; 2] = [
+/// two registers. The fp32 store entry point's 512 B frame (ferro #174's "band
+/// plus `C` beside it") went to zero when the fold left with the accumulate
+/// split, so every shipped GEMM kernel now carries no depot at all.
+const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
         name: "gemm_tcgen05_bf16_optimized",
         max_registers: 82,
         max_spill_bytes: 0,
     },
+    // Ratcheted 120/512 → 102/0 when the fold left: the store path no longer
+    // monomorphizes a `C` load beside the band, and the `.local` frame ferro
+    // #174 attributed to holding both went with it.
     KernelBudget {
         name: "gemm_tcgen05_f32_optimized",
-        max_registers: 120,
-        max_spill_bytes: 512,
+        max_registers: 102,
+        max_spill_bytes: 0,
+    },
+    // Below even the bf16 drain: a `[16, 64]` half-band is the largest thing
+    // it ever holds, and the engine owns the add.
+    KernelBudget {
+        name: "gemm_tcgen05_f32_accumulate",
+        max_registers: 80,
+        max_spill_bytes: 0,
     },
 ];
 
