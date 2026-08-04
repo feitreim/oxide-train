@@ -208,7 +208,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "ferro-kittens"
 version = "0.1.0"
-source = "git+https://github.com/feitreim/ferro-kittens?rev=37ea9e753b8dd555cb2062ca397fb0981e2b1060#37ea9e753b8dd555cb2062ca397fb0981e2b1060"
+source = "git+https://github.com/feitreim/ferro-kittens?rev=c648c67b28f75a0cd60becfab11bab7d75a288e4#c648c67b28f75a0cd60becfab11bab7d75a288e4"
 dependencies = [
  "cuda-device",
 ]
