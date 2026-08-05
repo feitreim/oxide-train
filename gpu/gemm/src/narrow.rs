@@ -17,8 +17,16 @@
 //!   double-buffered — two slots at two CTAs an SM would need 1024 of the SM's
 //!   512 tensor-memory columns — so the wide kernel's drain must release
 //!   *early*, and the loads it cannot hoist stay serial. At 128 columns two
-//!   slots fit exactly (`2 × 128 × 2 = 512`), which is the door this tile
-//!   opens.
+//!   slots fit exactly (`2 × 128 × 2 = 512`), and this kernel takes them:
+//!   the MMA of one item and the drain of the previous one run on disjoint
+//!   column halves of a 256-column allocation, so **the whole drain — loads
+//!   included — runs beside the MMA**, and the wide kernel's release barrier
+//!   disappears outright. The rendezvous that keeps the slots exclusive is
+//!   `pipeline::run`'s own item boundary: the drain of item `i-2` retired
+//!   inside item `i-1` (its warps' last `tcgen05.ld` is fenced by the
+//!   boundary's `tcgen05_fence_before_thread_sync`), so when item `i` opens,
+//!   its slot is free by construction and the MMA issuer waits on nothing but
+//!   its operands.
 //!
 //! The tile is `[256, 128]` at `STAGES = 4`: the narrower B ring frees exactly
 //! one more K stage inside the same 114 816-byte plan, so the shared envelope,
@@ -28,10 +36,11 @@
 //! −7.7% / +2.1% on big squares; the dispatch keeps squares on the wide
 //! kernel.)
 //!
-//! Halving `BLOCK_N` halves per-tile B reuse (`M·N/(M+N)`: 128 → 85.3), so
-//! rows whose wave math does not improve are not expected to win here on this
-//! increment alone — the composed win is the double-buffered drain this tile
-//! admits.
+//! Halving `BLOCK_N` halves per-tile B reuse (`M·N/(M+N)`: 128 → 85.3) and
+//! doubles the per-output epilogue count; the double-buffered drain is what
+//! pays those costs back, which is why this kernel ships in the composed form
+//! rather than as a wave-math-only variant (that increment was measured
+//! separately on the way here — oxide-train#80).
 
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
@@ -45,7 +54,7 @@ use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, Job};
 use kittens::plan::SharedPlan;
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B};
-use kittens::sync::{ClusterSemaphore, Semaphore, SemaphoreRing};
+use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
 use kittens::{BaseLdtm, RegTile, lane, warp_id};
 
@@ -121,13 +130,16 @@ pub const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / CLUSTER_RANKS;
 /// measured at.
 pub const GROUP: u32 = 8;
 
+/// Tensor-memory columns one CTA allocates: two [`BLOCK_N`]-column slots,
+/// which at [`CTAS_PER_SM`] = 2 is the SM's whole 512 — exactly.
+const TMEM_COLUMNS: u32 = 2 * BLOCK_N as u32;
+
 struct Shared {
     a_ring: ARing,
     b_ring: BRing,
     load: SemaphoreRing<STAGES>,
     free: SemaphoreRing<STAGES>,
     done: Semaphore,
-    acc_free: Semaphore,
     tmem_slot: *mut u32,
     plan: SharedPlan,
 }
@@ -139,7 +151,6 @@ const fn shared(at: SharedPlan) -> Shared {
     let (load, at) = at.semaphores::<STAGES>();
     let (free, at) = at.semaphores::<STAGES>();
     let (done, at) = at.semaphore();
-    let (acc_free, at) = at.semaphore();
     let (tmem_slot, at) = at.tmem_slot();
     Shared {
         a_ring,
@@ -147,7 +158,6 @@ const fn shared(at: SharedPlan) -> Shared {
         load,
         free,
         done,
-        acc_free,
         tmem_slot,
         plan: at,
     }
@@ -173,57 +183,22 @@ const _: () = {
     );
 };
 
-/// The moment a drain has read everything it will read from tensor memory —
-/// the wide kernel's release, verbatim.
-#[derive(Clone, Copy)]
-struct Release {
-    sem: ClusterSemaphore,
-    live: bool,
-}
-
-impl Release {
-    /// # Safety
-    ///
-    /// Every lane of the warp calls this together, with the warp's last
-    /// `tcgen05.ld` of the accumulator already waited out.
-    #[inline(always)]
-    unsafe fn now(self) {
-        unsafe {
-            tcgen05_fence_before_thread_sync();
-            warp::sync_mask(u32::MAX);
-            if self.live && lane() == 0 {
-                self.sem.arrive();
-            }
-        }
-    }
-}
-
 /// Where a band of the accumulator goes, and how — the wide kernel's trait at
-/// two passes a band instead of four.
-///
-/// At two passes the release discipline gets *stronger* than the wide
-/// kernel's could be: a drain's last load is half a band away from its first,
-/// so the bf16 path holds both bands and releases with **every** store still
-/// owed, where the wide tile could only put half its stores behind the
-/// release.
+/// two passes a band instead of four, and with no release parameter: the
+/// double-buffered accumulator frees a drain from ever having to hand its
+/// columns to anyone mid-flight. Loads still run a pass ahead of stores for
+/// their latency, not for a barrier.
 trait Drain: Copy {
     /// Push this warp's whole `[32, BLOCK_N]` band out to `C` at
-    /// `(row, column)`, releasing the accumulator on the way.
+    /// `(row, column)`.
     ///
     /// # Safety
     ///
     /// - Every lane of the warp calls this together, with the accumulator
-    ///   complete and fenced and nothing that will overwrite it in flight
-    ///   until `release` is arrived at.
+    ///   slot's MMA complete and fenced, and nothing writing that slot until
+    ///   the item boundary retires these reads.
     /// - The band's rectangle lies inside `C`.
-    unsafe fn drain(
-        self,
-        accumulator: Accumulator,
-        stage: StageTile,
-        row: u32,
-        column: u32,
-        release: Release,
-    );
+    unsafe fn drain(self, accumulator: Accumulator, stage: StageTile, row: u32, column: u32);
 }
 
 /// Packed-bf16 `C`, through the staging tile — see the wide kernel's `Packed`.
@@ -255,20 +230,12 @@ impl Packed {
 
 impl Drain for Packed {
     #[inline(always)]
-    unsafe fn drain(
-        self,
-        accumulator: Accumulator,
-        stage: StageTile,
-        row: u32,
-        column: u32,
-        release: Release,
-    ) {
+    unsafe fn drain(self, accumulator: Accumulator, stage: StageTile, row: u32, column: u32) {
         unsafe {
             let band_row = 32 * warp_id();
             let n = STAGE_N as u32;
             let first: Band = accumulator.tile_x8(band_row, 0);
             let second: Band = accumulator.tile_x8(band_row, n);
-            release.now();
             self.pass(stage, first, row, column);
             self.pass(stage, second, row, column + n);
         }
@@ -276,10 +243,7 @@ impl Drain for Packed {
 }
 
 /// Overwriting fp32 `C`, straight out of the registers — the wide kernel's
-/// `Wide`, at one band held: the second load is already the last, so releasing
-/// between the two passes keeps this drain at the register count that stays on
-/// the right side of the 2-CTA cliff while still putting half the store issue
-/// and all completion behind the release.
+/// `Wide` at one band held, the shape GAPS.md §2.6 explains.
 #[derive(Clone, Copy)]
 struct WideOut {
     c: GlobalRows<F32>,
@@ -287,21 +251,13 @@ struct WideOut {
 
 impl Drain for WideOut {
     #[inline(always)]
-    unsafe fn drain(
-        self,
-        accumulator: Accumulator,
-        _stage: StageTile,
-        row: u32,
-        column: u32,
-        release: Release,
-    ) {
+    unsafe fn drain(self, accumulator: Accumulator, _stage: StageTile, row: u32, column: u32) {
         unsafe {
             let (lane, band_row) = (lane(), 32 * warp_id());
             let n = STAGE_N as u32;
             let first: Band = accumulator.tile_x8(band_row, 0);
             store_rows(self.c, row, column, lane, first);
             let second: Band = accumulator.tile_x8(band_row, n);
-            release.now();
             store_rows(self.c, row, column + n, lane, second);
         }
     }
@@ -343,20 +299,12 @@ impl Reduce {
 
 impl Drain for Reduce {
     #[inline(always)]
-    unsafe fn drain(
-        self,
-        accumulator: Accumulator,
-        stage: StageTile,
-        row: u32,
-        column: u32,
-        release: Release,
-    ) {
+    unsafe fn drain(self, accumulator: Accumulator, stage: StageTile, row: u32, column: u32) {
         unsafe {
             let (lane, band_row) = (lane(), 32 * warp_id());
             let mut ring = ReduceRing::attach(stage.base());
-            // Four passes spelled out, loads one pass ahead of the engine,
-            // release between the last load and the last scatter — the wide
-            // kernel's schedule at half the passes.
+            // Four passes spelled out, loads one pass ahead of the engine —
+            // the wide kernel's schedule at half the passes.
             let n = STAGE_N as u32;
             let (top, bottom) = (band_row, band_row + 16);
             let b0: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(top, 0);
@@ -366,7 +314,6 @@ impl Drain for Reduce {
             self.emit(&mut ring, lane, b1, row, column + n);
             let b3: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(bottom, n);
             self.emit(&mut ring, lane, b2, row + 16, column);
-            release.now();
             self.emit(&mut ring, lane, b3, row + 16, column + n);
             ring.drain();
         }
@@ -390,10 +337,14 @@ struct Tile<D: Drain> {
     k_blocks: u32,
     transposed: bool,
     rank: u32,
-    acc_free: Semaphore,
     /// The item whose accumulator is still in tensor memory, plus one — the
     /// deferred epilogue's cursor, `0` before the first item.
     pending: u32,
+    /// Items this *cluster* has started — the slot-parity counter. Not
+    /// derivable from the item index: the static schedule strides items by the
+    /// cluster count, which is even, so a global index's parity would park
+    /// every cluster on one slot forever.
+    cycle: u32,
 }
 
 impl<D: Drain> Tile<D> {
@@ -433,10 +384,10 @@ impl<D: Drain> Tile<D> {
     }
 
     /// # Safety
-    /// One thread of the leader rank, with the accumulator's previous contents
-    /// already read: only the first stage of an item starts it fresh.
+    /// One thread of the leader rank, with `accumulator` — this item's slot —
+    /// free: its last reader retired behind an item boundary.
     #[inline(always)]
-    unsafe fn multiply(&self) {
+    unsafe fn multiply(&self, accumulator: Accumulator) {
         unsafe {
             let mut k = 0u32;
             while k < self.k_blocks {
@@ -450,7 +401,7 @@ impl<D: Drain> Tile<D> {
                     (a.k_walk(), b.k_walk())
                 };
                 mma_walk_cg2::<Bf16, CHUNKS>(
-                    self.accumulator.raw(),
+                    accumulator.raw(),
                     a_walk,
                     b_walk,
                     MmaShape::M256_N128,
@@ -461,6 +412,13 @@ impl<D: Drain> Tile<D> {
             }
             commit_multicast_cg2(self.done, PAIR);
         }
+    }
+
+    /// One of the allocation's two [`BLOCK_N`]-column slots, by parity.
+    #[inline(always)]
+    fn slot(&self, parity: u32) -> Accumulator {
+        self.accumulator
+            .columns_right(BLOCK_N as u32 * (parity & 1))
     }
 
     /// This warp's origin in `C` for `item`.
@@ -485,7 +443,6 @@ impl<D: Drain> Job for Tile<D> {
             self.load.init_all(1);
             self.free.init_all(1);
             self.done.init(1);
-            self.acc_free.init(DRAIN_WARPS as u32 * CLUSTER_RANKS);
         }
     }
 
@@ -497,15 +454,20 @@ impl<D: Drain> Job for Tile<D> {
             self.load.inval_all();
             self.free.inval_all();
             self.done.inval();
-            self.acc_free.inval();
         }
     }
 
     /// # Safety
     /// Every thread of both CTAs of the cluster must enter with the same
     /// `item`, and the maps must cover the tile it names — and the one before
-    /// it, whose drain this item runs. The deferred-epilogue schedule is the
-    /// wide kernel's, unchanged.
+    /// it, whose drain this item runs.
+    ///
+    /// The epilogue is deferred one item, as in the wide kernel — but the two
+    /// accumulator slots make the MMA wait for **nothing**: item `i` multiplies
+    /// into slot `cycle & 1` while the band warps drain item `i-1` out of the
+    /// other slot, loads and all. The slot being free needs no barrier — its
+    /// last reader was item `i-2`'s drain, which ran inside item `i-1` and was
+    /// retired by the item boundary's `tcgen05` fence and cluster sync.
     #[inline(always)]
     unsafe fn work(&mut self, item: u32) {
         unsafe {
@@ -518,24 +480,18 @@ impl<D: Drain> Job for Tile<D> {
                 }
             } else if warp == ISSUER {
                 if self.rank == LEADER && lane == 0 {
-                    self.acc_free.wait(0);
-                    self.multiply();
+                    self.multiply(self.slot(self.cycle));
                 }
             } else {
-                let release = Release {
-                    sem: self.acc_free.at_rank(LEADER),
-                    live: true,
-                };
-                if self.pending == 0 {
-                    release.now();
-                } else {
+                if self.pending != 0 {
                     let (row, column) = self.origin(self.pending - 1);
                     self.out
-                        .drain(self.accumulator, self.stage, row, column, release);
+                        .drain(self.slot(self.cycle + 1), self.stage, row, column);
                 }
                 self.done.wait(0);
             }
             self.pending = item + 1;
+            self.cycle += 1;
         }
     }
 }
@@ -567,7 +523,7 @@ pub mod kernels {
                 done: shared.done,
                 a_map,
                 b_map,
-                accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, BLOCK_N as u32)),
+                accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, TMEM_COLUMNS)),
                 stage: run.tile(warp_id() % DRAIN_WARPS as u32),
                 out,
                 tiles_m,
@@ -575,14 +531,14 @@ pub mod kernels {
                 k_blocks,
                 transposed,
                 rank: cluster::block_rank(),
-                acc_free: shared.acc_free,
                 pending: 0,
+                cycle: 0,
             }
         }
     }
 
-    /// Drain the accumulator the deferred epilogue still holds after the item
-    /// loop — see the wide kernel's `drain_last`.
+    /// Drain the accumulator slot the deferred epilogue still holds after the
+    /// item loop — the last item's, at the parity its `work` multiplied into.
     ///
     /// # Safety
     /// After [`pipeline::run`] returns and before [`release`], every thread.
@@ -591,12 +547,8 @@ pub mod kernels {
         unsafe {
             if tile.pending != 0 && warp_id() < DRAIN_WARPS as u32 {
                 let (row, column) = tile.origin(tile.pending - 1);
-                let release = Release {
-                    sem: tile.acc_free.at_rank(LEADER),
-                    live: false,
-                };
                 tile.out
-                    .drain(tile.accumulator, tile.stage, row, column, release);
+                    .drain(tile.slot(tile.cycle + 1), tile.stage, row, column);
             }
         }
     }
@@ -609,7 +561,7 @@ pub mod kernels {
         unsafe {
             tcgen05_fence_before_thread_sync();
             cluster::cluster_sync();
-            dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
+            dealloc_cluster(tile.accumulator.raw(), TMEM_COLUMNS);
         }
     }
 
