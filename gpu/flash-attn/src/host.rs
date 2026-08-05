@@ -33,8 +33,9 @@ pub const FLASH_BACKWARD_Q_SMEM_BYTES: u32 = super::tcgen05::FLASH_BACKWARD_Q_SM
 /// repo: it carries a second gradient operand ring, since its MMA pair reads
 /// `Pᵀ` and `dSᵀ` where kernel A's reads only `dS`.
 pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = super::tcgen05::FLASH_BACKWARD_KV_SMEM as u32;
-/// Threads of either backward kernel: the four warps that drain an `M128`
-/// accumulator plus the warp that issues every TMA and MMA. Mirrors
+/// Threads of either backward kernel: the `PASS_GROUPS` warpgroups that share
+/// an `M128` accumulator's 128 TMEM lanes and split its columns between them,
+/// plus the warp that issues every TMA and MMA. Mirrors
 /// `FLASH_BACKWARD_BLOCK`, and `flash.rs`'s `main` asserts the two agree.
 pub const FLASH_BACKWARD_BLOCK_THREADS: u32 = super::tcgen05::FLASH_BACKWARD_BLOCK as u32;
 /// Dynamic shared allocation for the forward: **exactly** the kernel's own

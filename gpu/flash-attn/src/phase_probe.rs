@@ -68,7 +68,7 @@ use kittens::pipeline;
 use kittens::plan::SharedPlan;
 use kittens::reg::Exp2Hw;
 use kittens::shared::F32;
-use kittens::tmem::{alloc_block, dealloc_block};
+use kittens::tmem::{alloc_block, dealloc_block, warp_lanes};
 
 use super::*;
 
@@ -293,7 +293,8 @@ impl pipeline::Job for BackwardQProbe {
             let first_masked = 2 * query_block;
 
             let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
-            let band = 32 * warp_id;
+            let band = warp_lanes();
+            let group = warp_id / DRAIN_WARPS;
             let issuing = warp_id == ISSUE_WARP;
 
             if leader {
@@ -412,8 +413,9 @@ impl pipeline::Job for BackwardQProbe {
                     let masked = key_tile >= first_masked;
                     let ds = self.shared.ds.tile(key_tile).chunk_writer();
 
-                    let mut column = 0u32;
-                    while column < TILE as u32 {
+                    let mut column = group * PASS_COLUMNS;
+                    let last = column + PASS_COLUMNS;
+                    while column < last {
                         let mut dscore: ScoreChunk = scores.tile(band, column);
                         if masked {
                             dscore.make_causal_at(
@@ -445,8 +447,9 @@ impl pipeline::Job for BackwardQProbe {
 
                 let waited = clock64();
                 self.shared.accumulated.wait(key_tiles - 1);
-                let dq: OutBand = self.accumulator.tile_x8(band, 0);
-                store_rows(self.dq, row, head * HD as u32, lane, dq);
+                let columns = group * DRAIN_COLUMNS as u32;
+                let dq: OutHalf = self.accumulator.tile_x8(band, columns);
+                store_rows(self.dq, row, head * HD as u32 + columns, lane, dq);
                 self.sums.epi += clock64().wrapping_sub(waited);
             }
             self.sums.items += 1;
@@ -496,7 +499,13 @@ pub unsafe fn backward_q(
             h: heads,
             tiles,
             planes,
-            leader: thread::threadIdx_x() == 0,
+            // The issue warp's lane 0, as the shipped kernels have it.
+            // #96 moved `leader` there and left the probe's at thread 0, so
+            // until now the instrument had a pass warp doing the item head's
+            // TMA loads and first score MMA. Per item rather than per visit,
+            // which is why it stayed inside the probe's 1% overhead band —
+            // and still not what ships.
+            leader: thread::threadIdx_x() == ISSUE_WARP * 32,
             warp_id: warp::warp_id(),
             lane: warp::lane_id(),
             shared,
@@ -624,7 +633,8 @@ impl pipeline::Job for BackwardKvProbe {
             let steps = 2 * (self.tiles - key_block);
 
             let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
-            let band = 32 * warp_id;
+            let band = warp_lanes();
+            let group = warp_id / DRAIN_WARPS;
             let issuing = warp_id == ISSUE_WARP;
 
             if leader {
@@ -748,8 +758,9 @@ impl pipeline::Job for BackwardKvProbe {
                     // kernel A's loop, and the reason STAT is separated from
                     // PASS on both sides.
                     let mut stat = 0u64;
-                    let mut column = 0u32;
-                    while column < TILE as u32 {
+                    let mut column = group * PASS_COLUMNS;
+                    let last = column + PASS_COLUMNS;
+                    while column < last {
                         let query = batch * self.t + query_base + column;
                         let at = clock64();
                         let mut lse2: Cols = load_col_vec(self.lse, query, head, lane);
@@ -791,10 +802,11 @@ impl pipeline::Job for BackwardKvProbe {
 
                 let waited = clock64();
                 self.shared.accumulated.wait(steps - 1);
-                let dv: OutBand = self.dv_acc.tile_x8(band, 0);
-                store_rows(self.dv, row, head * HD as u32, lane, dv);
-                let dk: OutBand = self.dk_acc.tile_x8(band, 0);
-                store_rows(self.dk, row, head * HD as u32, lane, dk);
+                let columns = group * DRAIN_COLUMNS as u32;
+                let dv: OutHalf = self.dv_acc.tile_x8(band, columns);
+                store_rows(self.dv, row, head * HD as u32 + columns, lane, dv);
+                let dk: OutHalf = self.dk_acc.tile_x8(band, columns);
+                store_rows(self.dk, row, head * HD as u32 + columns, lane, dk);
                 self.sums.epi += clock64().wrapping_sub(waited);
             }
             self.sums.items += 1;
@@ -846,7 +858,13 @@ pub unsafe fn backward_kv(
             h: heads,
             tiles,
             planes,
-            leader: thread::threadIdx_x() == 0,
+            // The issue warp's lane 0, as the shipped kernels have it.
+            // #96 moved `leader` there and left the probe's at thread 0, so
+            // until now the instrument had a pass warp doing the item head's
+            // TMA loads and first score MMA. Per item rather than per visit,
+            // which is why it stayed inside the probe's 1% overhead band —
+            // and still not what ships.
+            leader: thread::threadIdx_x() == ISSUE_WARP * 32,
             warp_id: warp::warp_id(),
             lane: warp::lane_id(),
             shared,
