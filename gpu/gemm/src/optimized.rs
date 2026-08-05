@@ -10,8 +10,9 @@
 //! [`BLOCK_M`] rows of `A` and its own [`HALF_N`] columns of `B` at the same
 //! shared offsets, the instruction reads both ranks' shared memory, and each
 //! rank drains its own `[BLOCK_M, BLOCK_N]` band. Rank [`LEADER`] owns the MMA,
-//! the accumulator and the stage barriers, so the item boundary is
-//! `barrier.cluster` rather than `bar.sync`.
+//! the accumulator and the stage barriers, and every barrier a peer arrives at
+//! is the leader's, so the launch synchronizes at `barrier.cluster` scope —
+//! twice, at [`Tile::arm`] and [`Tile::retire`], and nowhere else.
 //!
 //! The grid is **persistent** — [`MAX_CLUSTERS`] clusters, two CTAs an SM — and
 //! one work item is one `[2·BLOCK_M, BLOCK_N]` output tile. Each of the three
@@ -35,9 +36,10 @@
 //! boundary with [`STAGES`] blocks still in flight.
 //!
 //! The same forensics is why nothing else changed: the steady state measured
-//! **1001 ticks a K block — 97% of the B200's dense bf16 peak, and 8.5% ahead
-//! of cuBLASLt's own slope** — and the pipeline fill measured 160 ticks. Depth,
-//! tile and feed were never the deficit.
+//! **1001 ticks a K block — 2182 TFLOP/s aggregate against the B200's 2250
+//! dense bf16, and 8.5% ahead of cuBLASLt's own depth slope** — and the
+//! pipeline fill measured 160 ticks. Depth, tile and feed were never the
+//! deficit.
 //!
 //! ## What replaced what
 //!
