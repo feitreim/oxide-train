@@ -137,8 +137,17 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         // library walk, and ferro #180 unrolled it away. dQ never leaves tensor
         // memory during the key stream, so this kernel never had the forward's
         // resident accumulator to begin with.
+        //
+        // **192 -> 128 at the pass split**, still zero frame, and the first
+        // time a `.maxntid` rise in this file gave registers *back*. Two
+        // things move together and both are liveness, not the budget: a pass
+        // warp runs `PASS_COLUMNS` of chunks where it ran `TILE`, and the
+        // epilogue drains `[32, 64]` where it drained `[32, 128]` — the one
+        // place the kernel held 128 fp32 at once. ptxas' allowance did fall,
+        // from `65536/160` = 409 to `65536/288` = 227, and the allocation
+        // landed a hundred under it anyway.
         name: "backward q",
-        max_registers: 192,
+        max_registers: 128,
         max_spill_bytes: 0,
     },
     KernelBudget {
@@ -147,8 +156,12 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         // across forming `dSᵀ` from it. Its predecessors differed more
         // (59/1024 sync, 70/1024 pipelined) because they were near their
         // ceiling and neither of these is.
+        //
+        // **200 -> 140 at the pass split**, kernel A's reason twice over: two
+        // accumulators drained a half-band each rather than whole. The twelve
+        // registers over A are still `Pᵀ` live across `dSᵀ`.
         name: "backward kv",
-        max_registers: 200,
+        max_registers: 140,
         max_spill_bytes: 0,
     },
 ];

@@ -48,10 +48,12 @@
 //! `block_reduce` for the correction vote all three kernels used to open-code.
 //!
 //! `flash_backward_q` and `flash_backward_kv` are one kernel each where there
-//! were two (#69), and they are the forward's own shape: a CTA owns `QUERIES`
-//! rows of one axis, the four warps of the `M128` accumulator are the whole
-//! block, and the leader issues the next tile's score MMAs before the
-//! warpgroup runs this tile's register pass. `flash_backward_q`
+//! were two (#69), and they are the forward's shape with the roles split off
+//! it: a CTA owns `QUERIES` rows of one axis, one warp issues every TMA and
+//! MMA and runs no pass (#96), and `PASS_GROUPS` warpgroups run the register
+//! pass over the accumulator's 128 lanes — the *same* lanes, disjoint columns,
+//! because a warp addresses the 32 at `tmem::warp_lanes()` whatever warpgroup
+//! it is in (ferro #193). `flash_backward_q`
 //! (query-parallel) holds Q and dY resident, streams the causal key tiles,
 //! recomputes `S`/`dP` per tile and accumulates `dQ += dS·K` in TMEM;
 //! `flash_backward_kv` (key-parallel) holds K and V resident, streams the
@@ -91,7 +93,7 @@ use kittens::reg::{
 };
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, SharedVec, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing, block_reduce};
-use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait};
+use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait, warp_lanes};
 
 // Tile contract; `host.rs` mirrors these as FLASH_TILE / FLASH_HD (kept
 // non-pub here so SWEEP's one-definition rule never sees two copies).
@@ -171,14 +173,14 @@ type AccTmem = TmemTile<QUERIES, HD>;
 const SCORE_CHUNK: usize = 16;
 const _: () = assert!(TILE.is_multiple_of(SCORE_CHUNK));
 
-/// One `SCORE_CHUNK`-wide slice of a warp's score band: the four warps of an
-/// `M128` drain own 32 TMEM lanes each.
+/// One `SCORE_CHUNK`-wide slice of a warp's score band: every warp of an
+/// `M128` drain owns 32 TMEM lanes, and under the pass split two warps own
+/// the same 32 at different columns.
 type ScoreChunk = RegTile<32, SCORE_CHUNK, BaseLdtm>;
-/// A warp's whole `[32, HD]` output band. The backward kernels' drain, where
-/// the segment goes straight out and the band is one value with one use.
-type OutBand = RegTile<32, HD, BaseLdtm>;
-/// One 64-column group of that band — the `.x8` drain's own width, and the
-/// widest fp32 value the *forward* holds.
+/// One 64-column group of a warp's `[32, HD]` band — the `.x8` drain's own
+/// width, the widest fp32 value the *forward* holds, and (since the pass
+/// split) the widest either backward holds: a pass warpgroup drains the
+/// `DRAIN_COLUMNS` of the accumulator it owns and no more.
 ///
 /// **Not the whole band**, for `SCORE_CHUNK`'s reason one axis over: a band
 /// that is transformed on the way out is two 128-register values at once (the
@@ -397,9 +399,39 @@ pub const FLASH_BACKWARD_KV_SMEM: usize = backward_kv_plan(SharedPlan::sizing())
 const MAX_DYNAMIC_SMEM: usize = 232_448;
 const _: () = assert!(FLASH_BACKWARD_Q_SMEM <= MAX_DYNAMIC_SMEM);
 const _: () = assert!(FLASH_BACKWARD_KV_SMEM <= MAX_DYNAMIC_SMEM);
-/// Warps of either backward kernel that run the register pass: the four an
-/// `M128` accumulator's 128 TMEM lanes are drained by.
-const PASS_WARPS: u32 = QUERIES as u32 / 32;
+/// Warps that address one `M128` accumulator's 128 TMEM lanes, 32 each. Not a
+/// choice: it is the accumulator's shape, and `tmem::warp_lanes()` is the
+/// library function that says which 32 a warp gets.
+const DRAIN_WARPS: u32 = QUERIES as u32 / 32;
+
+/// Warpgroups of either backward kernel that run the register pass — issue
+/// #94's remedy 3, and the second half of the answer #96 gave the first of.
+///
+/// **The same 128 accumulator lanes, split by column.** A warp addresses the
+/// 32 TMEM lanes at `tmem::warp_lanes()` — `32 * (warp_id % 4)` — and which
+/// warpgroup it is in does not matter (ferro #193, measured at these kernels'
+/// own `[32, 16]` chunk and `[32, 64]`/`[32, 128]` drain shapes). So warps 4-7
+/// read the same quadrants warps 0-3 do and take the other half of the score
+/// band's columns, and the pass a warp runs is half as long.
+///
+/// This is worth having because #96 left both kernels **pass-bound**: `PASS`
+/// is 90.4% (kernel A) and 89.2% (kernel B) of the pass warps' column, and the
+/// issue warp idles 946 / 4 004 ticks a visit waiting for them. There is
+/// nothing else in the visit to take.
+/// Two, and four is measured worse: at four the block is seventeen warps, so
+/// ptxas' allowance is `65536 / 544`, and it spilled both kernels — kernel B
+/// gained a further 6% and kernel A lost 12%, which cancel (#94).
+const PASS_GROUPS: u32 = 2;
+/// Columns of the score band one pass warpgroup owns, and of the accumulator
+/// band it drains.
+const PASS_COLUMNS: u32 = TILE as u32 / PASS_GROUPS;
+const DRAIN_COLUMNS: usize = HD / PASS_GROUPS as usize;
+const _: () = assert!(
+    PASS_COLUMNS as usize % SCORE_CHUNK == 0 && DRAIN_COLUMNS == TILE,
+    "a warpgroup's share is whole `SCORE_CHUNK`s of the pass and one `OutHalf` of the drain"
+);
+/// Warps of either backward kernel that run the register pass.
+const PASS_WARPS: u32 = PASS_GROUPS * DRAIN_WARPS;
 /// The warp that issues every TMA and every MMA, and runs no pass.
 ///
 /// **It is a fifth warp rather than one of the four**, which is the whole of
@@ -416,12 +448,18 @@ const PASS_WARPS: u32 = QUERIES as u32 / 32;
 /// block sync it hid behind. Here every ring, every barrier and the one
 /// `sync_threads` per tile are exactly as #75 left them; the only change is
 /// which warp calls `mma_*`.
+///
+/// It stays **one** warp under the pass split: `IDLE` says it is not the
+/// critical path at either width, and a second issuer would only put two
+/// writers on rings that have one.
 const ISSUE_WARP: u32 = PASS_WARPS;
-/// Threads of either backward kernel: the accumulator's four drain warps plus
-/// the issue warp.
-pub const FLASH_BACKWARD_BLOCK: usize = QUERIES + 32;
-/// Mirrors the `FLASH_FORWARD_BLOCK` `.maxntid` note.
-const _: () = assert!(FLASH_BACKWARD_BLOCK == 160);
+/// Threads of either backward kernel: the pass warpgroups plus the issue warp.
+pub const FLASH_BACKWARD_BLOCK: usize = PASS_WARPS as usize * 32 + 32;
+/// Mirrors the `FLASH_FORWARD_BLOCK` `.maxntid` note. Nine warps is 288
+/// threads, so ptxas' budget is `65536 / 288` = 227 per thread against the
+/// 409 it had at 160 — the pass split's own cost, and the reason the drain
+/// below went from a `[32, 128]` band to a `[32, 64]` one.
+const _: () = assert!(FLASH_BACKWARD_BLOCK == 288);
 
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
@@ -691,8 +729,9 @@ pub mod kernels {
 
     /// The query-parallel backward as a [`pipeline::Job`], the forward's own
     /// shape: one work item is a (query block, head, batch), the barrier set is
-    /// re-initialized per item by the harness, and the four warps that drain an
-    /// `M128` accumulator are the whole block.
+    /// re-initialized per item by the harness, and the block is the issue warp
+    /// plus the `PASS_GROUPS` warpgroups that share the `M128` accumulator's
+    /// lanes.
     struct BackwardQStream {
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -817,7 +856,14 @@ pub mod kernels {
                 let first_masked = 2 * query_block;
 
                 let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
-                let band = 32 * warp_id;
+                // The 32 accumulator lanes this warp addresses, from either
+                // pass warpgroup. **Never `32 * warp_id`**: from warpgroup 1
+                // that names a lane past the 128 that exist, and reaching past
+                // the bound does not fault — it silently reads the lane at the
+                // same offset inside the reader's *own* quadrant (ferro #193).
+                let band = warp_lanes();
+                // Which half of every band's columns this warp takes.
+                let group = warp_id / DRAIN_WARPS;
                 let issuing = warp_id == ISSUE_WARP;
 
                 if leader {
@@ -948,8 +994,16 @@ pub mod kernels {
                         // a value: that is what put the forward's softmax in the
                         // LLVM local depot and cost it 19.9%, and the two segments
                         // read here would be twice the band.
-                        let mut column = 0u32;
-                        while column < TILE as u32 {
+                        //
+                        // `PASS_COLUMNS` of them, not `TILE`: the other pass
+                        // warpgroup is running the other half over these same
+                        // 32 lanes. Every chunk is the arithmetic it always
+                        // was, on the same inputs, into the same dS columns —
+                        // only the warp that runs it changed, which is why the
+                        // split can be gated at byte-identity.
+                        let mut column = group * PASS_COLUMNS;
+                        let last = column + PASS_COLUMNS;
+                        while column < last {
                             let mut dscore: ScoreChunk = scores.tile(band, column);
                             if masked {
                                 // Both origins go in rather than their difference,
@@ -991,8 +1045,15 @@ pub mod kernels {
                     // so there is no `1/sum` and no correction path, and the band
                     // goes straight out. `.x8` because nothing is added to it on
                     // the way.
-                    let dq: OutBand = self.accumulator.tile_x8(band, 0);
-                    store_rows(self.dq, row, head * HD as u32, lane, dq);
+                    //
+                    // The drain is split the same way the pass is, and for a
+                    // second reason as well as symmetry: at 288 threads ptxas
+                    // has 227 registers a thread, and a `[32, 128]` fp32 band
+                    // is 128 of them live at once in the one place this kernel
+                    // holds a whole value.
+                    let columns = group * DRAIN_COLUMNS as u32;
+                    let dq: OutHalf = self.accumulator.tile_x8(band, columns);
+                    store_rows(self.dq, row, head * HD as u32 + columns, lane, dq);
                 }
             }
         }
@@ -1008,8 +1069,8 @@ pub mod kernels {
     /// One work item is a (query block, head, batch). A CTA owns `QUERIES = 128`
     /// query rows, holds their Q and dY resident, and streams the causal
     /// `TILE`-key tiles beneath them: `S = Q·Kᵀ` and `dP = dY·Vᵀ` land in a
-    /// double-buffered fp32 TMEM segment pair, the warpgroup forms
-    /// `dS = P·(dP − D)·scale` in registers a `SCORE_CHUNK` at a time and packs
+    /// double-buffered fp32 TMEM segment pair, the pass warpgroups form
+    /// `dS = P·(dP − D)·scale` in registers a `SCORE_CHUNK` at a time and pack
     /// it back to shared memory, and `dQ += dS·K` accumulates in TMEM for the
     /// whole stream. **dQ never leaves tensor memory until the item ends**: a
     /// query block owns every key its rows attend to, so its output tile has one
@@ -1029,7 +1090,7 @@ pub mod kernels {
     /// `softmax_scale * log2(e)` and dY staged raw, `logsumexp[B*T, H]` and
     /// `dot[B*T, H]` fp32 read-only, fp32 `dq[B*T, H*HD]` written.
     #[kernel]
-    #[launch_bounds(160, 1)]
+    #[launch_bounds(288, 1)]
     pub unsafe fn flash_backward_q(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -1095,7 +1156,7 @@ pub mod kernels {
     /// [`super::phase_probe::COUNTERS`] zeroed `u64` per CTA of the grid.
     #[allow(clippy::too_many_arguments)]
     #[kernel]
-    #[launch_bounds(160, 1)]
+    #[launch_bounds(288, 1)]
     pub unsafe fn flash_backward_q_probe(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -1133,7 +1194,7 @@ pub mod kernels {
     /// As [`flash_backward_kv`], plus `clocks` as in [`flash_backward_q_probe`].
     #[allow(clippy::too_many_arguments)]
     #[kernel]
-    #[launch_bounds(160, 1)]
+    #[launch_bounds(288, 1)]
     pub unsafe fn flash_backward_kv_probe(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -1288,7 +1349,9 @@ pub mod kernels {
                 let steps = 2 * (self.tiles - key_block);
 
                 let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
-                let band = 32 * warp_id;
+                // As kernel A's: `warp_lanes()`, never `32 * warp_id`.
+                let band = warp_lanes();
+                let group = warp_id / DRAIN_WARPS;
                 let issuing = warp_id == ISSUE_WARP;
 
                 if leader {
@@ -1397,8 +1460,15 @@ pub mod kernels {
                         let p = self.shared.p.tile(step).chunk_writer();
                         let ds = self.shared.ds.tile(step).chunk_writer();
 
-                        let mut column = 0u32;
-                        while column < TILE as u32 {
+                        // Half the columns, as kernel A — and here the statistic
+                        // comes with them: `load_col_vec` is indexed BY column,
+                        // so a warpgroup that runs half the chunks makes half
+                        // the loads. That is the 397 ticks a visit #95 found in
+                        // this kernel and not in A, halved by the same change
+                        // rather than by a separate remedy.
+                        let mut column = group * PASS_COLUMNS;
+                        let last = column + PASS_COLUMNS;
+                        while column < last {
                             let query = batch * self.t + query_base + column;
                             // The saved statistic, read onto the axis this band
                             // indexes it by — one element per column, down the
@@ -1442,10 +1512,13 @@ pub mod kernels {
                     }
 
                     self.shared.accumulated.wait(steps - 1);
-                    let dv: OutBand = self.dv_acc.tile_x8(band, 0);
-                    store_rows(self.dv, row, head * HD as u32, lane, dv);
-                    let dk: OutBand = self.dk_acc.tile_x8(band, 0);
-                    store_rows(self.dk, row, head * HD as u32, lane, dk);
+                    // Both accumulators drain the way kernel A's one does: this
+                    // warpgroup's `DRAIN_COLUMNS`, at its own column offset.
+                    let columns = group * DRAIN_COLUMNS as u32;
+                    let dv: OutHalf = self.dv_acc.tile_x8(band, columns);
+                    store_rows(self.dv, row, head * HD as u32 + columns, lane, dv);
+                    let dk: OutHalf = self.dk_acc.tile_x8(band, columns);
+                    store_rows(self.dk, row, head * HD as u32 + columns, lane, dk);
                 }
             }
         }
@@ -1458,7 +1531,7 @@ pub mod kernels {
     /// (key block, head, batch). A CTA owns `QUERIES = 128` key rows, holds
     /// their K and V resident, and streams the `TILE`-query tiles at and after
     /// them: `Sᵀ = K·Qᵀ` and `dPᵀ = V·dYᵀ` fill a double-buffered TMEM segment
-    /// pair, the warpgroup forms `Pᵀ` and `dSᵀ = Pᵀ·(dPᵀ − D)·ln2`, and
+    /// pair, the pass warpgroups form `Pᵀ` and `dSᵀ = Pᵀ·(dPᵀ − D)·ln2`, and
     /// `dV += Pᵀ·dY` / `dK += dSᵀ·Q` accumulate in TMEM for the whole stream.
     /// Both gradient tiles have one writer, for the reason kernel A's does.
     ///
@@ -1474,7 +1547,7 @@ pub mod kernels {
     /// columns where kernel A takes 384 — and why neither can reach two CTAs an
     /// SM at any shared-memory plan.
     #[kernel]
-    #[launch_bounds(160, 1)]
+    #[launch_bounds(288, 1)]
     pub unsafe fn flash_backward_kv(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
