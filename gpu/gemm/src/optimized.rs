@@ -173,6 +173,8 @@ type Ring = SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
 type StageTile = SharedTile<Bf16, 32, STAGE_N, Swizzle128B>;
 type StageRun = SharedTileRing<Bf16, 32, STAGE_N, Swizzle128B, DRAIN_WARPS>;
 type Band = RegTile<32, STAGE_N, BaseLdtm>;
+/// `.x8` issues one [`Band`] takes: two 16-row blocks of one 64-column group.
+const BAND_ISSUES: usize = (32 / 16) * (STAGE_N / 64);
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 
 const _: () = assert!(HALF_N == BLOCK_M, "one stage type serves both operands");
@@ -371,12 +373,18 @@ impl Drain for Packed {
         unsafe {
             let band_row = 32 * warp_id();
             let n = STAGE_N as u32;
-            let first: Band = accumulator.tile_x8(band_row, 0);
-            let second: Band = accumulator.tile_x8(band_row, n);
+            // Both issues of a band behind one wait: the staging tile is
+            // `[32, STAGE_N]` and nothing slices a wider batch into it, so this
+            // drain halves its exposed TMEM latencies where [`Wide`] quarters
+            // them.
+            let lift =
+                |column| accumulator.tile_x8_batched::<32, STAGE_N, BAND_ISSUES>(band_row, column);
+            let first: Band = lift(0);
+            let second: Band = lift(n);
             self.pass(stage, first, row, column);
-            let third: Band = accumulator.tile_x8(band_row, 2 * n);
+            let third: Band = lift(2 * n);
             self.pass(stage, second, row, column + n);
-            let fourth: Band = accumulator.tile_x8(band_row, 3 * n);
+            let fourth: Band = lift(3 * n);
             release.now();
             self.pass(stage, third, row, column + 2 * n);
             self.pass(stage, fourth, row, column + 3 * n);
@@ -395,24 +403,41 @@ impl Drain for Packed {
 /// ones. The *accumulating* fp32 drain is [`Reduce`], which owes nothing to
 /// this shape.
 ///
-/// It drains in **half-bands**, which is what buys the release its position.
-/// The accumulator is 256 fp32 a lane, so no drain can hold it all — the
-/// fraction of the store work that runs *after* the release is bounded by
-/// held registers over 256, and a `[32, STAGE_N]` band spends 64 of them on
-/// one quarter of the row. At `[16, STAGE_N]` the same registers buy twice the
-/// lookahead: four half-bands are live where two whole ones would be, the last
-/// `tcgen05.ld` retires with half the stores still owed, and those halves run
-/// beside the next item's MMA. oxide-train#80's probe measured the whole-band
-/// form releasing with *three of four* store passes already behind it — ACC
-/// 9 902 ticks against a 9 977-tick drain, which is a deferral that defers
-/// nothing.
+/// It drains in **half-rows behind one wait each**, which is the whole of what
+/// oxide-train#80's probe asked for. Two facts set the shape:
+///
+/// - The drain is `tcgen05.ld` *latency*, not store issue. The probe measured
+///   the accumulator handoff at 9 902 ticks against a 9 977-tick drain — the
+///   release was buying nothing — and moving store passes behind the release
+///   moved the number by 1%. What costs is the **wait per issue**: every
+///   `[M, N]` band [`TmemTile::tile_x8`] lifts pays `(M / 16) · (N / 64)` of
+///   them serially, so the four `[32, STAGE_N]` bands this used to take were
+///   eight exposed TMEM latencies an item.
+/// - The accumulator is 256 fp32 a lane, so no drain holds it all, and the
+///   fraction of store work that runs *after* the release is held registers
+///   over 256.
+///
+/// [`TmemTile::tile_x8_batched`] answers both at once: a `[16, BLOCK_N]`
+/// half-row is [`kittens::tmem::ISSUE_LIMIT`] issues in flight behind **one**
+/// wait and exactly 128 registers, so the band leaves tensor memory in two
+/// waits instead of eight and the release still lands with half the stores
+/// owed.
 #[derive(Clone, Copy)]
 struct Wide {
     c: GlobalRows<F32>,
 }
 
-/// Half a band: the widest `tcgen05.ld.16x256b.x8` result a drain can hold four
-/// of and stay under the 168 registers 12 warps an SM leave a thread.
+/// Half of a warp's band, whole across the tile's columns: the widest
+/// `tcgen05.ld.16x256b.x8` batch there is (`ISSUE_LIMIT` issues, one wait) and
+/// exactly half the accumulator row, so two of them are the band and one of
+/// them is what a thread can hold.
+type HalfRow = RegTile<16, BLOCK_N, BaseLdtm>;
+const HALF_ROW_ISSUES: usize = (16 / 16) * (BLOCK_N / 64);
+const _: () = assert!(HALF_ROW_ISSUES == kittens::tmem::ISSUE_LIMIT);
+
+/// The half-band the reduction drain still lifts one issue at a time: its
+/// staging tile is `[16, STAGE_N]` and nothing slices a wider batch back into
+/// that shape.
 type HalfBand = RegTile<16, STAGE_N, BaseLdtm>;
 
 impl Drain for Wide {
@@ -427,28 +452,16 @@ impl Drain for Wide {
     ) {
         unsafe {
             let (lane, band_row) = (lane(), 32 * warp_id());
-            let n = STAGE_N as u32;
-            let (top, bottom) = (band_row, band_row + 16);
-            // Four half-bands live: the top half's whole row is lifted before
-            // anything is stored, and from there each store frees the register
-            // the next load takes.
-            let b0: HalfBand = accumulator.tile_x8(top, 0);
-            let b1: HalfBand = accumulator.tile_x8(top, n);
-            let b2: HalfBand = accumulator.tile_x8(top, 2 * n);
-            let b3: HalfBand = accumulator.tile_x8(top, 3 * n);
-            store_rows(self.c, row, column, lane, b0);
-            let b4: HalfBand = accumulator.tile_x8(bottom, 0);
-            store_rows(self.c, row, column + n, lane, b1);
-            let b5: HalfBand = accumulator.tile_x8(bottom, n);
-            store_rows(self.c, row, column + 2 * n, lane, b2);
-            let b6: HalfBand = accumulator.tile_x8(bottom, 2 * n);
-            store_rows(self.c, row, column + 3 * n, lane, b3);
-            let b7: HalfBand = accumulator.tile_x8(bottom, 3 * n);
+            // One wait a half-row, and the second one is the release's cue: the
+            // top half is stored while the bottom half's four issues are in
+            // flight, and the bottom half's stores run beside the next MMA.
+            let top: HalfRow =
+                accumulator.tile_x8_batched::<16, BLOCK_N, HALF_ROW_ISSUES>(band_row, 0);
+            store_rows(self.c, row, column, lane, top);
+            let bottom: HalfRow =
+                accumulator.tile_x8_batched::<16, BLOCK_N, HALF_ROW_ISSUES>(band_row + 16, 0);
             release.now();
-            store_rows(self.c, row + 16, column, lane, b4);
-            store_rows(self.c, row + 16, column + n, lane, b5);
-            store_rows(self.c, row + 16, column + 2 * n, lane, b6);
-            store_rows(self.c, row + 16, column + 3 * n, lane, b7);
+            store_rows(self.c, row + 16, column, lane, bottom);
         }
     }
 }
