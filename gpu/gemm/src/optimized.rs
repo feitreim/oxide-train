@@ -364,8 +364,10 @@ const SHARED_OPTIN: usize = 232_448;
 const _: () = {
     assert!(THREADS == 192 && MAX_CLUSTERS == 74);
     // The item rings cost the plan nothing: their sixty-four bytes land in the
-    // 128-byte alignment padding in front of the staging tiles.
-    assert!(SHARED_BYTES <= SHARED_OPTIN);
+    // 128-byte alignment padding in front of the staging tiles. cuBLASLt's own
+    // launch declares 213 280 B, so this is the same rung with 16 KiB more of
+    // staging tile on it.
+    assert!(SHARED_BYTES == 229_632 && SHARED_BYTES <= SHARED_OPTIN);
     assert!(
         BLOCK_N == 2 * STAGE_N,
         "the staged drain spells its two passes out to hoist the loads ahead of the stores"
