@@ -70,7 +70,7 @@ type Stage = SharedTile<Bf16, BLOCK_M, BLOCK_K, Swizzle128B>;
 type MnStage = SharedTile<Bf16, BLOCK_K, BLOCK_M, Swizzle128B>;
 type Ring = SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
 type StageRun = SharedTileRing<Bf16, 32, STAGE_N, Swizzle128B, DRAIN_WARPS>;
-type Band = RegTile<32, STAGE_N, BaseLdtm>;
+type Band = RegTile<16, STAGE_N, BaseLdtm>;
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 
 const SMS: u32 = 148;
@@ -199,15 +199,24 @@ impl Wide {
             }
             let (lane, band_row) = (lane(), 32 * warp_id());
             let n = STAGE_N as u32;
-            let first: Band = accumulator.tile_x8(band_row, 0);
-            store_rows(self.c, row, column, lane, first);
-            let second: Band = accumulator.tile_x8(band_row, n);
-            store_rows(self.c, row, column + n, lane, second);
-            let third: Band = accumulator.tile_x8(band_row, 2 * n);
-            store_rows(self.c, row, column + 2 * n, lane, third);
-            let fourth: Band = accumulator.tile_x8(band_row, 3 * n);
+            let (top, bottom) = (band_row, band_row + 16);
+            let b0: Band = accumulator.tile_x8(top, 0);
+            let b1: Band = accumulator.tile_x8(top, n);
+            let b2: Band = accumulator.tile_x8(top, 2 * n);
+            let b3: Band = accumulator.tile_x8(top, 3 * n);
+            store_rows(self.c, row, column, lane, b0);
+            let b4: Band = accumulator.tile_x8(bottom, 0);
+            store_rows(self.c, row, column + n, lane, b1);
+            let b5: Band = accumulator.tile_x8(bottom, n);
+            store_rows(self.c, row, column + 2 * n, lane, b2);
+            let b6: Band = accumulator.tile_x8(bottom, 2 * n);
+            store_rows(self.c, row, column + 3 * n, lane, b3);
+            let b7: Band = accumulator.tile_x8(bottom, 3 * n);
             release.now();
-            store_rows(self.c, row, column + 3 * n, lane, fourth);
+            store_rows(self.c, row + 16, column, lane, b4);
+            store_rows(self.c, row + 16, column + n, lane, b5);
+            store_rows(self.c, row + 16, column + 2 * n, lane, b6);
+            store_rows(self.c, row + 16, column + 3 * n, lane, b7);
         }
     }
 }

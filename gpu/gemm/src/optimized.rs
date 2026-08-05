@@ -296,11 +296,12 @@ impl Release {
 /// — the ring, the walks, the barriers, the schedule — is shared, so a `C` in a
 /// new element or under a new fold is an impl here and nothing else.
 ///
-/// Every impl owes `release` the same discipline: its loads are hoisted one
-/// pass ahead of its stores — two bands live instead of one, which is what the
-/// register budgets in `main.rs` price — and [`Release::now`] is called the
-/// instant the last load has its registers, so the tail of the store work runs
-/// beside the next item's MMA rather than in front of it.
+/// Every impl owes `release` the same discipline: it holds as many bands live
+/// as the register budgets in `main.rs` admit — four half-bands where a whole
+/// one used to be — and calls [`Release::now`] the instant its last load has
+/// its registers, so that *half* the store work, and every store's completion,
+/// runs beside the next item's MMA rather than in front of it. The fraction is
+/// the whole design: held registers over the accumulator's 256 a lane.
 trait Drain: Copy {
     /// Push this warp's whole `[32, BLOCK_N]` band out to `C` at
     /// `(row, column)`, releasing the accumulator on the way.
@@ -393,10 +394,26 @@ impl Drain for Packed {
 /// bytes — and it is why the fp32 store rows of the benchmark trail the bf16
 /// ones. The *accumulating* fp32 drain is [`Reduce`], which owes nothing to
 /// this shape.
+///
+/// It drains in **half-bands**, which is what buys the release its position.
+/// The accumulator is 256 fp32 a lane, so no drain can hold it all — the
+/// fraction of the store work that runs *after* the release is bounded by
+/// held registers over 256, and a `[32, STAGE_N]` band spends 64 of them on
+/// one quarter of the row. At `[16, STAGE_N]` the same registers buy twice the
+/// lookahead: four half-bands are live where two whole ones would be, the last
+/// `tcgen05.ld` retires with half the stores still owed, and those halves run
+/// beside the next item's MMA. oxide-train#80's probe measured the whole-band
+/// form releasing with *three of four* store passes already behind it — ACC
+/// 9 902 ticks against a 9 977-tick drain, which is a deferral that defers
+/// nothing.
 #[derive(Clone, Copy)]
 struct Wide {
     c: GlobalRows<F32>,
 }
+
+/// Half a band: the widest `tcgen05.ld.16x256b.x8` result a drain can hold four
+/// of and stay under the 168 registers 12 warps an SM leave a thread.
+type HalfBand = RegTile<16, STAGE_N, BaseLdtm>;
 
 impl Drain for Wide {
     #[inline(always)]
@@ -409,23 +426,29 @@ impl Drain for Wide {
         release: Release,
     ) {
         unsafe {
-            // One band live, not two: this drain already holds the fattest
-            // registers in the file, and the two-band hoist measured 181 —
-            // past the 170 the register file grants 12 warps an SM, which is
-            // the 2 → 1 CTA cliff by another name. Releasing after the fourth
-            // load still overlaps the last store pass and every store's
-            // completion with the next item's MMA.
             let (lane, band_row) = (lane(), 32 * warp_id());
             let n = STAGE_N as u32;
-            let first: Band = accumulator.tile_x8(band_row, 0);
-            store_rows(self.c, row, column, lane, first);
-            let second: Band = accumulator.tile_x8(band_row, n);
-            store_rows(self.c, row, column + n, lane, second);
-            let third: Band = accumulator.tile_x8(band_row, 2 * n);
-            store_rows(self.c, row, column + 2 * n, lane, third);
-            let fourth: Band = accumulator.tile_x8(band_row, 3 * n);
+            let (top, bottom) = (band_row, band_row + 16);
+            // Four half-bands live: the top half's whole row is lifted before
+            // anything is stored, and from there each store frees the register
+            // the next load takes.
+            let b0: HalfBand = accumulator.tile_x8(top, 0);
+            let b1: HalfBand = accumulator.tile_x8(top, n);
+            let b2: HalfBand = accumulator.tile_x8(top, 2 * n);
+            let b3: HalfBand = accumulator.tile_x8(top, 3 * n);
+            store_rows(self.c, row, column, lane, b0);
+            let b4: HalfBand = accumulator.tile_x8(bottom, 0);
+            store_rows(self.c, row, column + n, lane, b1);
+            let b5: HalfBand = accumulator.tile_x8(bottom, n);
+            store_rows(self.c, row, column + 2 * n, lane, b2);
+            let b6: HalfBand = accumulator.tile_x8(bottom, 2 * n);
+            store_rows(self.c, row, column + 3 * n, lane, b3);
+            let b7: HalfBand = accumulator.tile_x8(bottom, 3 * n);
             release.now();
-            store_rows(self.c, row, column + 3 * n, lane, fourth);
+            store_rows(self.c, row + 16, column, lane, b4);
+            store_rows(self.c, row + 16, column + n, lane, b5);
+            store_rows(self.c, row + 16, column + 2 * n, lane, b6);
+            store_rows(self.c, row + 16, column + 3 * n, lane, b7);
         }
     }
 }
@@ -468,14 +491,7 @@ impl Reduce {
     /// One `[16, STAGE_N]` pass: acquire the staging tile back from the
     /// engine, scatter the band in, and hand it off as a reduction store.
     #[inline(always)]
-    unsafe fn emit(
-        self,
-        ring: &mut ReduceRing,
-        lane: u32,
-        band: RegTile<16, STAGE_N, BaseLdtm>,
-        row: u32,
-        column: u32,
-    ) {
+    unsafe fn emit(self, ring: &mut ReduceRing, lane: u32, band: HalfBand, row: u32, column: u32) {
         unsafe {
             let staging = ring.acquire();
             scatter_tile(staging.chunk_writer(), 0, 0, lane, band);
@@ -499,29 +515,30 @@ impl Drain for Reduce {
             let mut ring = ReduceRing::attach(stage.base());
             // Eight passes spelled out rather than looped — the same argument
             // `kittens::tmem`'s batching section makes: a loop-carried band
-            // wants a runtime index and lands in local memory. The loads run
-            // one pass ahead of the engine so the eighth is waited out while
-            // the seventh is still being scattered, and the release sits
-            // between them: only the last pass's scatter and the engine's
-            // final read run after the accumulator is handed back.
+            // wants a runtime index and lands in local memory. Four half-bands
+            // are live, as in [`Wide`]: the whole top half is lifted before the
+            // engine is asked for anything, and the last `tcgen05.ld` retires
+            // with the bottom half's four scatters — and every one of their
+            // engine round-trips — still owed. That is what the release is for,
+            // and at one pass of lookahead it was buying an eighth of one.
             let n = STAGE_N as u32;
             let (top, bottom) = (band_row, band_row + 16);
-            let b0: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(top, 0);
-            let b1: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(top, n);
+            let b0: HalfBand = accumulator.tile_x8(top, 0);
+            let b1: HalfBand = accumulator.tile_x8(top, n);
+            let b2: HalfBand = accumulator.tile_x8(top, 2 * n);
+            let b3: HalfBand = accumulator.tile_x8(top, 3 * n);
             self.emit(&mut ring, lane, b0, row, column);
-            let b2: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(top, 2 * n);
+            let b4: HalfBand = accumulator.tile_x8(bottom, 0);
             self.emit(&mut ring, lane, b1, row, column + n);
-            let b3: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(top, 3 * n);
+            let b5: HalfBand = accumulator.tile_x8(bottom, n);
             self.emit(&mut ring, lane, b2, row, column + 2 * n);
-            let b4: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(bottom, 0);
+            let b6: HalfBand = accumulator.tile_x8(bottom, 2 * n);
             self.emit(&mut ring, lane, b3, row, column + 3 * n);
-            let b5: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(bottom, n);
-            self.emit(&mut ring, lane, b4, row + 16, column);
-            let b6: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(bottom, 2 * n);
-            self.emit(&mut ring, lane, b5, row + 16, column + n);
-            let b7: RegTile<16, STAGE_N, BaseLdtm> = accumulator.tile_x8(bottom, 3 * n);
-            self.emit(&mut ring, lane, b6, row + 16, column + 2 * n);
+            let b7: HalfBand = accumulator.tile_x8(bottom, 3 * n);
             release.now();
+            self.emit(&mut ring, lane, b4, row + 16, column);
+            self.emit(&mut ring, lane, b5, row + 16, column + n);
+            self.emit(&mut ring, lane, b6, row + 16, column + 2 * n);
             self.emit(&mut ring, lane, b7, row + 16, column + 3 * n);
             ring.drain();
         }
