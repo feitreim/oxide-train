@@ -1008,6 +1008,21 @@ pub struct GpuGroupedLinear<const IN: usize, const GROUPS: usize, const OUT: usi
     compute: Option<Bf16LinearWeights>,
 }
 
+/// How a grouped linear's backward gets its upstream gradient.
+///
+/// `Staged` means the kernel that produced it wrote the packed-bf16 words
+/// straight into the scratch's row operand, so the backward's own quantize
+/// does not run. The weight product reads that buffer MN-major and the input
+/// product K-major, both through descriptors over the same bytes, so one
+/// packed layout serves both and the panel is rounded once either way (SPEC
+/// §7.1). Ask [`GpuGroupedLinear::packed_row_gradient`] for the buffer; a
+/// `None` there means the fp32 fallback runs and only `Wide` is valid.
+#[derive(Clone, Copy)]
+enum RowGradient<'a, const N: usize, const GROUPS: usize, const OUT: usize> {
+    Staged,
+    Wide(&'a GpuTensor<f32, Rank3<N, GROUPS, OUT>>),
+}
+
 impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN, GROUPS, OUT> {
     fn from_cpu<const N: usize>(
         stream: &CudaStream,
@@ -1039,6 +1054,22 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
             dw: GpuTensor::zeros(stream)?,
             compute,
         })
+    }
+
+    /// The packed row operand [`Self::backward_into`] will read when this
+    /// linear takes the tcgen05 path, for a producing kernel to write itself
+    /// in place of an fp32 panel and the quantize over it.
+    ///
+    /// `None` means the fp32 fallback runs and the producer owes a wide
+    /// `[N, GROUPS * OUT]` panel instead; the condition is `backward_into`'s
+    /// own, so the two never disagree.
+    fn packed_row_gradient<'a, const N: usize, const D: usize, const FF: usize>(
+        &self,
+        scratch: &'a mut LinearScratch<N, D, FF>,
+    ) -> Option<&'a mut DeviceBuffer<u32>> {
+        let staging = scratch.bf16.as_mut()?;
+        (self.compute.is_some() && tcgen05_linear_eligible(N, IN, GROUPS * OUT))
+            .then_some(&mut staging.rows)
     }
 
     #[allow(clippy::too_many_arguments, unused_unsafe)]
@@ -1100,7 +1131,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
     fn backward_into<const N: usize, const D: usize, const FF: usize, P: KernelProfiler>(
         &mut self,
         x: &GpuTensor<f32, Rank2<N, IN>>,
-        dy: &GpuTensor<f32, Rank3<N, GROUPS, OUT>>,
+        dy: RowGradient<'_, N, GROUPS, OUT>,
         dx: &mut GpuTensor<f32, Rank2<N, IN>>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
@@ -1126,12 +1157,14 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     x.as_device_buffer(),
                     &mut staging.lhs,
                 )?;
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * width / 2),
-                    dy.as_device_buffer(),
-                    &mut staging.rows,
-                )?;
+                if let RowGradient::Wide(dy) = dy {
+                    tensor.convert_f32_to_bf16_pairs(
+                        stream,
+                        pairs_config(N * width / 2),
+                        dy.as_device_buffer(),
+                        &mut staging.rows,
+                    )?;
+                }
                 unsafe {
                     tcgen05.f32_accumulate_transposed(
                         stream,
@@ -1144,9 +1177,10 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     )
                 }
             })?;
-            // `staging.rows` still holds the quantized `dy` written by the
-            // weight-gradient pass above; this launch consumes it as its row
-            // operand, so nothing may overwrite `rows` between the two.
+            // `staging.rows` holds the quantized `dy` — written by the pass
+            // above, or by the caller's own kernel — and this launch consumes
+            // it as its row operand, so nothing may overwrite `rows` between
+            // the two.
             profiler.measure(stream, names[1], || unsafe {
                 tcgen05.f32_store(
                     stream,
@@ -1159,6 +1193,9 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                 )
             })
         } else {
+            let RowGradient::Wide(dy) = dy else {
+                panic!("the fp32 fallback reads a wide row gradient, as `packed_row_gradient` says")
+            };
             profiler.measure(stream, names[0], || unsafe {
                 fp32.register_gemm_tn_accumulate(
                     stream,
@@ -4661,27 +4698,24 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             flash_bf16,
             profiler,
         )?;
-        // dQ, dK and dV go straight into the joined panel, un-rotated on the
-        // way: the two `backward.*_rope` passes this used to need are the
-        // join's own arithmetic now.
-        // SAFETY: the three gradients are [N, D] and qkv holds N * 3 * D.
-        profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
-            dense.join_group3_rope(
-                stream,
-                LaunchConfig::for_num_elems((N * D / 2) as u32),
-                scratch.d_model_1.as_device_buffer(),
-                scratch.d_model_3.as_device_buffer(),
-                scratch.d_model_4.as_device_buffer(),
-                &scratch.rope_table,
-                T as u32,
-                H as u32,
-                HD as u32,
-                scratch.qkv.as_device_buffer_mut(),
-            )
-        })?;
+        // dQ, dK and dV go straight into the projection's row gradient,
+        // un-rotated on the way: the two `backward.*_rope` passes this used to
+        // need are the join's own arithmetic now.
+        let dqkv = join_qkv_gradient::<N, T, D, H, HD, FF, P>(
+            &self.qkv_proj,
+            &scratch.d_model_1,
+            &scratch.d_model_3,
+            &scratch.d_model_4,
+            &scratch.rope_table,
+            &mut scratch.qkv,
+            linear_scratch,
+            stream,
+            dense,
+            profiler,
+        )?;
         self.qkv_proj.backward_into(
             &acts.attention_normalized,
-            &scratch.qkv,
+            dqkv,
             &mut scratch.d_model_3,
             stream,
             tensor,
@@ -5564,7 +5598,7 @@ impl<
             })?;
             self.gate_up_proj.backward_into(
                 &workspace.ffn_normalized,
-                &workspace.gate_up,
+                RowGradient::Wide(&workspace.gate_up),
                 &mut workspace.d_model_3,
                 stream,
                 tensor,
@@ -5625,24 +5659,21 @@ impl<
                 profiler,
             )?;
             // See the MoE block backward: the inverse rotation is the join's.
-            // SAFETY: the three gradients are [N, D] and qkv holds N * 3 * D.
-            profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
-                dense.join_group3_rope(
-                    stream,
-                    LaunchConfig::for_num_elems((N * D / 2) as u32),
-                    workspace.d_model_1.as_device_buffer(),
-                    workspace.d_model_3.as_device_buffer(),
-                    workspace.d_model_4.as_device_buffer(),
-                    &workspace.rope_table,
-                    T as u32,
-                    H as u32,
-                    HD as u32,
-                    workspace.qkv.as_device_buffer_mut(),
-                )
-            })?;
+            let dqkv = join_qkv_gradient::<N, T, D, H, HD, FF, P>(
+                &self.qkv_proj,
+                &workspace.d_model_1,
+                &workspace.d_model_3,
+                &workspace.d_model_4,
+                &workspace.rope_table,
+                &mut workspace.qkv,
+                &mut workspace.linear_scratch,
+                stream,
+                dense,
+                profiler,
+            )?;
             self.qkv_proj.backward_into(
                 &workspace.attention_normalized,
-                &workspace.qkv,
+                dqkv,
                 &mut workspace.d_model_3,
                 stream,
                 tensor,
@@ -5841,6 +5872,76 @@ fn stage_attention_operands<
             )?;
             std::mem::swap(k, rotated);
             Ok(())
+        }
+    }
+}
+
+/// Un-rotate dQ and dK and join them with dV into the qkv projection's row
+/// gradient.
+///
+/// The two backward GEMMs read that panel as bf16, so on the tcgen05 path the
+/// join writes their operand buffer directly and the quantize `backward_into`
+/// used to run over `[N, 3D]` disappears — the join's own writes halve with
+/// it. Shapes on the fp32 fallback still get the wide panel its GEMMs read.
+#[allow(clippy::too_many_arguments)]
+fn join_qkv_gradient<
+    'a,
+    const N: usize,
+    const T: usize,
+    const D: usize,
+    const H: usize,
+    const HD: usize,
+    const FF: usize,
+    P: KernelProfiler,
+>(
+    qkv_proj: &GpuGroupedLinear<D, 3, D>,
+    dq: &GpuTensor<f32, Rank2<N, D>>,
+    dk: &GpuTensor<f32, Rank2<N, D>>,
+    dv: &GpuTensor<f32, Rank2<N, D>>,
+    table: &DeviceBuffer<f32>,
+    wide: &'a mut GpuTensor<f32, Rank3<N, 3, D>>,
+    linear_scratch: &mut LinearScratch<N, D, FF>,
+    stream: &CudaStream,
+    dense: &dense_kernels::LoadedModule,
+    profiler: &mut P,
+) -> Result<RowGradient<'a, N, 3, D>, DriverError> {
+    let pairs = LaunchConfig::for_num_elems((N * D / 2) as u32);
+    // SAFETY: the three gradients are [N, D] and either destination holds
+    // N * 3 * D elements of its own width.
+    match qkv_proj.packed_row_gradient(linear_scratch) {
+        Some(rows) => {
+            profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
+                dense.join_group3_rope_bf16(
+                    stream,
+                    pairs,
+                    dq.as_device_buffer(),
+                    dk.as_device_buffer(),
+                    dv.as_device_buffer(),
+                    table,
+                    T as u32,
+                    H as u32,
+                    HD as u32,
+                    rows,
+                )
+            })?;
+            Ok(RowGradient::Staged)
+        }
+        None => {
+            profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
+                dense.join_group3_rope(
+                    stream,
+                    pairs,
+                    dq.as_device_buffer(),
+                    dk.as_device_buffer(),
+                    dv.as_device_buffer(),
+                    table,
+                    T as u32,
+                    H as u32,
+                    HD as u32,
+                    wide.as_device_buffer_mut(),
+                )
+            })?;
+            Ok(RowGradient::Wide(wide))
         }
     }
 }
