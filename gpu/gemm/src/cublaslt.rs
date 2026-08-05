@@ -291,10 +291,6 @@ fn layout(
 }
 
 /// The `uint32_t` configuration attributes that identify a chosen algorithm.
-///
-/// Deliberately not the whole set: `INNER_SHAPE_ID` and `CLUSTER_SHAPE_ID` are
-/// `uint16_t` in the header, and reading them through a `u32` buffer would be a
-/// transcription bug.
 const CONFIG_ATTRIBUTES: [(&str, c_int); 6] = [
     ("id", 0),
     ("tile", 1),
@@ -304,31 +300,47 @@ const CONFIG_ATTRIBUTES: [(&str, c_int); 6] = [
     ("stages", 6),
 ];
 
+/// The `uint16_t` ones, read through a `u16` buffer because reading them
+/// through a `u32` would be a transcription bug. `cluster` is the attribute
+/// oxide-train#80 wants most: it says whether the library's own schedule is a
+/// CTA pair like ours or something else at these shapes.
+const NARROW_ATTRIBUTES: [(&str, c_int); 2] = [("inner", 7), ("cluster", 8)];
+
 /// The chosen algorithm, in one line, so the baseline can be reproduced rather
 /// than merely believed.
 fn describe(heuristic: &Heuristic) -> String {
+    let read = |attribute: c_int, bytes: usize, value: *mut c_void| {
+        let mut written = 0usize;
+        // SAFETY: `value` is `bytes` wide and the attribute is declared at that
+        // width; a width cuBLASLt disagrees with is an error status, not a
+        // write past the end.
+        let status = unsafe {
+            cublasLtMatmulAlgoConfigGetAttribute(
+                &heuristic.algo,
+                attribute,
+                value,
+                bytes,
+                &mut written,
+            )
+        };
+        status == SUCCESS
+    };
     let fields: Vec<String> = CONFIG_ATTRIBUTES
         .iter()
         .map(|&(name, attribute)| {
             let mut value = 0u32;
-            let mut written = 0usize;
-            // SAFETY: the buffer is `u32`-wide and these are the `uint32_t`
-            // attributes; a width cuBLASLt disagrees with is an error status,
-            // not a write past the end.
-            let status = unsafe {
-                cublasLtMatmulAlgoConfigGetAttribute(
-                    &heuristic.algo,
-                    attribute,
-                    (&raw mut value).cast(),
-                    size_of::<u32>(),
-                    &mut written,
-                )
-            };
-            match status {
-                SUCCESS => format!("{name}={value}"),
-                _ => format!("{name}=?"),
+            match read(attribute, size_of::<u32>(), (&raw mut value).cast()) {
+                true => format!("{name}={value}"),
+                false => format!("{name}=?"),
             }
         })
+        .chain(NARROW_ATTRIBUTES.iter().map(|&(name, attribute)| {
+            let mut value = 0u16;
+            match read(attribute, size_of::<u16>(), (&raw mut value).cast()) {
+                true => format!("{name}={value}"),
+                false => format!("{name}=?"),
+            }
+        }))
         .collect();
     format!(
         "{} waves={:.2} workspace={} B",
