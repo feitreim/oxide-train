@@ -450,9 +450,10 @@ impl Drain for Wide {
     ) {
         unsafe {
             let (lane, band_row) = (lane(), 32 * warp_id());
-            // One wait a half-row, and the second one is the release's cue: the
-            // top half is stored while the bottom half's four issues are in
-            // flight, and the bottom half's stores run beside the next MMA.
+            // One wait a half-row, and the second one is the release's cue.
+            // What stays in front of the release is one store pass and two
+            // waits; what runs beside the next item's MMA is the other half of
+            // the row and every store's completion.
             let top: HalfRow =
                 accumulator.tile_x8_batched::<16, BLOCK_N, HALF_ROW_ISSUES>(band_row, 0);
             store_rows(self.c, row, column, lane, top);
