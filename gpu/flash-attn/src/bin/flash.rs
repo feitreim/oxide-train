@@ -82,6 +82,17 @@ use host::{
 /// 182/0 and 190/0, untouched by this change); the forward's own 560 B was the
 /// last one left, and #77 moved the flash rescale into tensor memory to end it.
 /// Every pin below is the measured number exactly.
+///
+/// Re-pins for ferro e26c75c (2026-08-05): the two backwards go **189 → 192**
+/// and **198 → 200**, still zero frame, and the forward does not move.
+/// **`RegTile::mask` is the whole of it** (ferro #191): its two walks unroll
+/// now, and `make_causal_at` / `make_causal_t_at` are the only callers of it in
+/// this crate — the forward masks by clamping its key count instead, which is
+/// why 128 is unmoved. Bisected rather than assumed: the same tree at ferro
+/// 5e4d3ff, the commit before #191, gives 189 / 198 to the register, and the
+/// three other commits in the bump's range are additive API. An unrolled
+/// masking walk makes every `set` a constant slot, which is more live registers
+/// and no frame — the trade #166 named, on the side it is wanted.
 const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
         // The unified forward (#68), at 128 regs / **0 B frame** where the
@@ -127,7 +138,7 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         // memory during the key stream, so this kernel never had the forward's
         // resident accumulator to begin with.
         name: "backward q",
-        max_registers: 189,
+        max_registers: 192,
         max_spill_bytes: 0,
     },
     KernelBudget {
@@ -137,7 +148,7 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         // (59/1024 sync, 70/1024 pipelined) because they were near their
         // ceiling and neither of these is.
         name: "backward kv",
-        max_registers: 198,
+        max_registers: 200,
         max_spill_bytes: 0,
     },
 ];
