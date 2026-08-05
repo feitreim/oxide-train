@@ -449,6 +449,85 @@ def dump_ptx(kernel: str) -> str:
     return "\n".join(f"===== {p.relative_to(proj)} =====\n{p.read_text()}" for p in dumps)
 
 
+@app.function(gpu=DEFAULT_GPU, timeout=3600)
+def profile(kernel: str, bin: str | None = None, features: str | None = None) -> None:
+    """Run a kernel binary under Nsight Compute.
+
+    `ncu` ships in the CUDA devel image at /usr/local/cuda/bin. As with the
+    sanitizer, `cargo oxide run` builds and launches in one step, so the binary
+    is built first and launched under the profiler by hand.
+
+    Two passes over the same binary: a per-kernel summary (cheap, names and
+    durations, which is what decodes a closed library's tile) and the full
+    metric set as CSV (occupancy, launch geometry including the cluster dims,
+    and the memory workload).
+    """
+    import os
+
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    proj = _proj(kernel)
+    name = bin or kernel
+    build = ["cargo", "oxide", "build", kernel, "--arch", "sm_100a"]
+    if features:
+        build += ["--features", features]
+    _run(build, cwd=proj)
+    candidates = [
+        os.path.join(root, f)
+        for root, _, files in os.walk(f"{proj}/target")
+        for f in files
+        if f == name and os.access(os.path.join(root, f), os.X_OK)
+    ]
+    if not candidates:
+        raise SystemExit(f"no built binary named {name} under gpu/{kernel}/target")
+    binary = max(candidates, key=os.path.getmtime)
+
+    print("=== profiler environment ===", flush=True)
+    for probe in [
+        "ncu --version",
+        "ls -l /usr/local/cuda/bin/ncu",
+        "ldconfig -p | grep -Ei 'nvperf|cupti|nvidia-ml|libcuda'",
+        "ls /usr/local/cuda/extras/CUPTI/lib64 2>/dev/null | head",
+        "ls /opt/nvidia/nsight-compute/*/target/linux-desktop-glibc_2_11_3-x64 2>/dev/null | head -30",
+        "cat /proc/driver/nvidia/params | grep -i restrict",
+        "cat /proc/self/status | grep -i cap",
+    ]:
+        print(f"$ {probe}", flush=True)
+        subprocess.run(probe, shell=True)
+
+    common = ["ncu", "--target-processes", "all", "--kernel-name-base", "demangled"]
+    print("=== ncu summary ===", flush=True)
+    subprocess.run([*common, "--print-summary", "per-kernel", binary], cwd=proj)
+    print("=== ncu full metrics ===", flush=True)
+    subprocess.run(
+        [*common, "--set", "full", "--csv", "--page", "raw", binary],
+        cwd=proj,
+    )
+
+    # CUPTI's activity API needs no performance counters: it reports a kernel's
+    # name, grid, block, cluster, register count and shared memory straight from
+    # the driver's launch record. That is most of what decodes a closed
+    # library's configuration, and it survives a container where the counter
+    # library does not. Nsight Systems is the packaged form of it.
+    print("=== nsys ===", flush=True)
+    subprocess.run(
+        "apt-get update -qq && apt-get install -y -qq --no-install-recommends "
+        "nsight-systems-2025.1.1 || apt-get install -y -qq --no-install-recommends nsight-systems",
+        shell=True,
+    )
+    trace = subprocess.run(
+        "nsys profile --trace=cuda --cuda-graph-trace=node --force-overwrite true "
+        f"-o /tmp/decode {binary}",
+        shell=True,
+        cwd=proj,
+    )
+    if trace.returncode == 0:
+        subprocess.run(
+            "nsys stats --report cuda_gpu_kern_sum --report cuda_gpu_trace "
+            "--format csv /tmp/decode.nsys-rep",
+            shell=True,
+        )
+
+
 @app.function(gpu=DEFAULT_GPU, timeout=600)
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
@@ -507,7 +586,12 @@ def main(
     checkpoint_every: int = 0,
     resume: bool = False,
     baseline_ref: str = "",
+    ncu: bool = False,
 ) -> None:
+    if ncu:
+        fn = profile.with_options(gpu=gpu) if gpu else profile
+        fn.remote(kernel, bin or None, features or None)
+        return
     if sanitize:
         fn = run_sanitizer.with_options(gpu=gpu) if gpu else run_sanitizer
         fn.remote(kernel, bin or None, sanitize)
@@ -542,3 +626,16 @@ def main(
         checkpoint_every or None,
         resume,
     )
+
+
+@app.function(gpu=DEFAULT_GPU, timeout=1800)
+def tools_check() -> None:
+    """Is there a profiler in this image, and will the driver let it count?"""
+    import shutil
+    for tool in ["ncu", "nsys", "nvprof", "compute-sanitizer", "cuobjdump", "nvdisasm"]:
+        print(f"{tool}: {shutil.which(tool)}", flush=True)
+    subprocess.run("ls /usr/local/cuda/bin", shell=True)
+    subprocess.run("ls -d /opt/nvidia/nsight-compute* /usr/local/cuda/nsight-compute* 2>/dev/null", shell=True)
+    subprocess.run("cat /proc/driver/nvidia/params 2>/dev/null | grep -i perf", shell=True)
+    subprocess.run("apt-get update -qq && apt-cache search nsight | head -20", shell=True)
+    subprocess.run("nvidia-smi", shell=True)

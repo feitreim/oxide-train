@@ -124,6 +124,8 @@ use kittens::sync::{ClusterSemaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
 use kittens::{BaseLdtm, RegTile, lane, warp_id};
 
+use super::residency_probe;
+
 /// Rows of the pair tile one rank stages and drains.
 pub const BLOCK_M: usize = 128;
 /// Columns of the pair tile — the widest `cta_group::2` MMA shape there is.
@@ -1025,6 +1027,37 @@ pub mod kernels {
                 Reduce { c_map },
             );
             sweep(&tile, tiles_m * tiles_n);
+        }
+    }
+
+    /// What the device keeps co-resident at this launch's *shape* — the
+    /// measurement `cuOccupancyMaxActiveClusters` is only a model of, and whose
+    /// body is [`residency_probe`] (oxide-train#80).
+    ///
+    /// The entry point lives here rather than in a module of its own because a
+    /// binary gets one device artifact: a second `#[cuda_module]` beside this
+    /// one loads, and then every symbol of the other is missing.
+    ///
+    /// # Safety
+    /// As [`residency_probe::hold`], with `out` holding
+    /// [`residency_probe::SLOTS`] `u64` per CTA of the grid.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    pub unsafe fn residency_probe_cg2(mut out: DisjointSlice<u64>, hold_ns: u64, columns: u32) {
+        unsafe { residency_probe::hold(&mut out, hold_ns, residency_probe::Columns::Pair(columns)) }
+    }
+
+    /// [`residency_probe_cg2`] at the four-CTA cluster width oxide-train#80's
+    /// multicast route ran, which the same driver query put at 33 clusters —
+    /// 132 of 148 CTAs — against this one's 74.
+    ///
+    /// # Safety
+    /// As [`residency_probe_cg2`].
+    #[kernel]
+    #[cluster_launch(4, 1, 1)]
+    pub unsafe fn residency_probe_cg4(mut out: DisjointSlice<u64>, hold_ns: u64, columns: u32) {
+        unsafe {
+            residency_probe::hold(&mut out, hold_ns, residency_probe::Columns::Block(columns))
         }
     }
 }
