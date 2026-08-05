@@ -115,7 +115,8 @@ use gemm_device::host::{
 };
 use tensor_device::{
     GpuAdamWMoments, GpuBf16Tensor, GpuMuonMomentum, GpuTensor, MASTER_ROUNDING_NEAREST,
-    MASTER_ROUNDING_STOCHASTIC, MasterAdamW, pack_bf16_pairs, transpose_pairs_config,
+    MASTER_ROUNDING_STOCHASTIC, MasterAdamW, master_transpose_config, pack_bf16_pairs,
+    transpose_pairs_config,
 };
 
 pub mod checkpoint;
@@ -990,6 +991,10 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         }
     }
 
+    /// Rebuild the transposed compute operand from the master. The optimizer
+    /// no longer needs this — its write-back emits both layouts — but a
+    /// checkpoint resume refills masters in place and must catch the
+    /// transpose up.
     fn sync_compute(
         &mut self,
         stream: &CudaStream,
@@ -999,6 +1004,33 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
             compute.sync_from_master(self.w.as_words(), IN, OUT, stream, kernels)?;
         }
         Ok(())
+    }
+
+    /// One AdamW step over the master, which also refreshes the transposed
+    /// compute operand and clears the gradient. A linear without a compute
+    /// copy needs no transpose, so it takes the flat write-back.
+    fn adamw_step(
+        &mut self,
+        moments: &mut GpuAdamWMoments<Rank2<IN, OUT>>,
+        config: MasterAdamW,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        match &mut self.compute {
+            Some(compute) => self.w.adamw_step_transposed(
+                &mut self.dw,
+                moments,
+                config,
+                IN,
+                OUT,
+                &mut compute.transposed,
+                stream,
+                kernels,
+            ),
+            None => self
+                .w
+                .adamw_step(&mut self.dw, moments, config, stream, kernels),
+        }
     }
 }
 
@@ -1225,6 +1257,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         }
     }
 
+    /// [`GpuLinear::sync_compute`] over the interleaved master.
     fn sync_compute(
         &mut self,
         stream: &CudaStream,
@@ -1234,6 +1267,32 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
             compute.sync_from_master(self.w.as_words(), IN, GROUPS * OUT, stream, kernels)?;
         }
         Ok(())
+    }
+
+    /// [`GpuLinear::adamw_step`] over the interleaved `[IN, GROUPS * OUT]`
+    /// master.
+    fn adamw_step(
+        &mut self,
+        moments: &mut GpuAdamWMoments<Rank3<IN, GROUPS, OUT>>,
+        config: MasterAdamW,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        match &mut self.compute {
+            Some(compute) => self.w.adamw_step_transposed(
+                &mut self.dw,
+                moments,
+                config,
+                IN,
+                GROUPS * OUT,
+                &mut compute.transposed,
+                stream,
+                kernels,
+            ),
+            None => self
+                .w
+                .adamw_step(&mut self.dw, moments, config, stream, kernels),
+        }
     }
 }
 
@@ -2001,6 +2060,9 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         Ok(())
     }
 
+    /// Clear both stacked gradients. An AdamW step clears the gradient it
+    /// consumes, so a training loop never calls this; a backward checked on
+    /// its own still needs a way back to a known-zero start.
     pub fn zero_grad(
         &mut self,
         stream: &CudaStream,
@@ -2023,6 +2085,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         )
     }
 
+    /// [`GpuLinear::sync_compute`] over both stacked expert masters.
     pub fn sync_compute(
         &mut self,
         stream: &CudaStream,
@@ -2035,6 +2098,57 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             compute.sync_from_master(self.down.as_words(), stream, tensor)?;
         }
         Ok(())
+    }
+
+    /// [`GpuLinear::adamw_step`] over the stacked `[E * D, 2 * FF]` gate/up
+    /// master.
+    fn adamw_step_gate_up(
+        &mut self,
+        moments: &mut GpuAdamWMoments<Rank4<E, D, 2, FF>>,
+        config: MasterAdamW,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        match &mut self.gate_up_compute {
+            Some(compute) => self.gate_up.adamw_step_transposed(
+                &mut self.d_gate_up,
+                moments,
+                config,
+                E * D,
+                2 * FF,
+                &mut compute.transposed,
+                stream,
+                tensor,
+            ),
+            None => self
+                .gate_up
+                .adamw_step(&mut self.d_gate_up, moments, config, stream, tensor),
+        }
+    }
+
+    /// [`Self::adamw_step_gate_up`] for the stacked `[E * FF, D]` down master.
+    fn adamw_step_down(
+        &mut self,
+        moments: &mut GpuAdamWMoments<Rank3<E, FF, D>>,
+        config: MasterAdamW,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        match &mut self.down_compute {
+            Some(compute) => self.down.adamw_step_transposed(
+                &mut self.d_down,
+                moments,
+                config,
+                E * FF,
+                D,
+                &mut compute.transposed,
+                stream,
+                tensor,
+            ),
+            None => self
+                .down
+                .adamw_step(&mut self.d_down, moments, config, stream, tensor),
+        }
     }
 
     /// The stacked global transpose of the gate/up master. Parity-test
@@ -2194,8 +2308,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertAdamW<E, D, FF> {
             .expect("expert AdamW step overflow");
         let corrections = self.config.bias_correction(self.step);
         let decay = self.config.weight_decay;
-        experts.gate_up.adamw_step(
-            &experts.d_gate_up,
+        experts.adamw_step_gate_up(
             &mut self.gate_up,
             master_adamw(
                 self.config,
@@ -2207,8 +2320,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertAdamW<E, D, FF> {
             stream,
             tensor,
         )?;
-        experts.down.adamw_step(
-            &experts.d_down,
+        experts.adamw_step_down(
             &mut self.down,
             master_adamw(
                 self.config,
@@ -2219,8 +2331,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertAdamW<E, D, FF> {
             ),
             stream,
             tensor,
-        )?;
-        experts.sync_compute(stream, tensor)
+        )
     }
 }
 
@@ -2450,6 +2561,13 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         &self.dw
     }
 
+    /// [`Self::dw_words`] for a check that has to put a gradient back after an
+    /// AdamW step consumed and cleared it.
+    #[allow(dead_code)]
+    pub fn dw_words_mut(&mut self) -> &mut DeviceBuffer<u32> {
+        &mut self.dw
+    }
+
     /// Packed-bf16 `[VP, D]` transposed compute weights. Parity-test accessor:
     /// binaries other than the parity check see it as dead code.
     #[allow(dead_code)]
@@ -2554,7 +2672,7 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
             kernels.adamw_bf16_master_packed_grad(
                 stream,
                 pairs_config(D * VP / 2),
-                &self.dw,
+                &mut self.dw,
                 config.learning_rate,
                 config.beta1,
                 config.beta2,
@@ -2573,6 +2691,12 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
 
     /// Re-transpose the master after an optimizer step; the `[D, VP]` operand
     /// is the master itself and needs nothing.
+    ///
+    /// Alone among the masters the head keeps this as a separate pass. Its
+    /// `[3072, 50432]` shape gives the source a 98 KiB row stride, so a fused
+    /// tile's four operand streams each touch 64 rows 6.4 MiB apart and the
+    /// read side collapses: the fused write-back measured 3.9292 ms against
+    /// 0.6764 + 0.2235 for the split pair (#99).
     fn sync_compute(
         &mut self,
         stream: &CudaStream,
@@ -2703,14 +2827,36 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
 
         // bf16 masters: one fused kernel does the fp32 update and the rounded
         // write-back. Norms keep fp32 storage and the plain `adamw` kernel.
-        macro_rules! master {
+        macro_rules! embedding {
             ($field:ident, $id:expr) => {
                 profiler.measure(
                     stream,
                     concat!("optimizer.", stringify!($field), ".adamw"),
                     || {
                         model.$field.w.adamw_step(
-                            &model.$field.dw,
+                            &mut model.$field.dw,
+                            &mut self.$field,
+                            master_adamw(
+                                self.config,
+                                self.config.weight_decay,
+                                corrections,
+                                step,
+                                $id,
+                            ),
+                            stream,
+                            kernels,
+                        )
+                    },
+                )?;
+            };
+        }
+        macro_rules! master {
+            ($field:ident, $id:expr) => {
+                profiler.measure(
+                    stream,
+                    concat!("optimizer.", stringify!($field), ".adamw"),
+                    || {
+                        model.$field.adamw_step(
                             &mut self.$field,
                             master_adamw(
                                 self.config,
@@ -2733,7 +2879,7 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
                     concat!("optimizer.", stringify!($field), ".adamw"),
                     || {
                         model.$field.w.adamw_step(
-                            &model.$field.dw,
+                            &mut model.$field.dw,
                             &mut self.$field,
                             self.config.learning_rate,
                             self.config.beta1,
@@ -2750,7 +2896,7 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
             };
         }
 
-        master!(embedding, parameter_id::EMBEDDING);
+        embedding!(embedding, parameter_id::EMBEDDING);
         norm!(attention_norm);
         master!(qkv_proj, parameter_id::QKV_PROJ);
         master!(o_proj, parameter_id::O_PROJ);
@@ -2758,19 +2904,6 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         master!(gate_up_proj, parameter_id::GATE_UP_PROJ);
         master!(down_proj, parameter_id::DOWN_PROJ);
         norm!(final_norm);
-        macro_rules! sync_compute {
-            ($field:ident) => {
-                profiler.measure(
-                    stream,
-                    concat!("optimizer.", stringify!($field), ".sync_compute"),
-                    || model.$field.sync_compute(stream, kernels),
-                )?;
-            };
-        }
-        sync_compute!(qkv_proj);
-        sync_compute!(o_proj);
-        sync_compute!(gate_up_proj);
-        sync_compute!(down_proj);
         profiler.measure(stream, "optimizer.lm_head.adamw", || {
             model.lm_head.adamw_step(
                 &mut self.lm_head,
@@ -2964,14 +3097,14 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize, const
         let decay = self.config.weight_decay;
         let config = self.config;
 
-        // bf16 masters take the fused update-and-round kernel; the fp32
-        // parameters (norms, and the router by decision #22) keep the plain
-        // fp32 `adamw`.
+        // bf16 masters take the fused update-and-round kernel, which also
+        // refreshes any transposed compute operand and clears the gradient it
+        // consumed; the fp32 parameters (norms, and the router by decision
+        // #22) keep the plain fp32 `adamw`, which likewise clears its own.
         macro_rules! master {
-            ($name:literal, $parameter:expr, $gradient:expr, $moments:expr, $id:expr) => {
+            ($name:literal, $parameter:expr, $moments:expr, $id:expr) => {
                 profiler.measure(stream, $name, || {
                     $parameter.adamw_step(
-                        $gradient,
                         $moments,
                         master_adamw(config, decay, corrections, step, $id),
                         stream,
@@ -3000,13 +3133,15 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize, const
             };
         }
 
-        master!(
-            "optimizer.embedding.adamw",
-            model.embedding.w,
-            &model.embedding.dw,
-            &mut self.embedding,
-            parameter_id::EMBEDDING
-        );
+        profiler.measure(stream, "optimizer.embedding.adamw", || {
+            model.embedding.w.adamw_step(
+                &mut model.embedding.dw,
+                &mut self.embedding,
+                master_adamw(config, decay, corrections, step, parameter_id::EMBEDDING),
+                stream,
+                kernels,
+            )
+        })?;
         for (index, (block, moments)) in model
             .blocks
             .iter_mut()
@@ -3016,66 +3151,69 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize, const
             fp32!(
                 "optimizer.attention_norm.adamw",
                 block.attention_norm.w,
-                &block.attention_norm.dw,
+                &mut block.attention_norm.dw,
                 &mut moments.attention_norm,
                 0.0
             );
             master!(
                 "optimizer.qkv_proj.adamw",
-                block.qkv_proj.w,
-                &block.qkv_proj.dw,
+                block.qkv_proj,
                 &mut moments.qkv_proj,
                 parameter_id::in_block(index, parameter_id::QKV_PROJ)
             );
             master!(
                 "optimizer.o_proj.adamw",
-                block.o_proj.w,
-                &block.o_proj.dw,
+                block.o_proj,
                 &mut moments.o_proj,
                 parameter_id::in_block(index, parameter_id::O_PROJ)
             );
             fp32!(
                 "optimizer.ffn_norm.adamw",
                 block.ffn_norm.w,
-                &block.ffn_norm.dw,
+                &mut block.ffn_norm.dw,
                 &mut moments.ffn_norm,
                 0.0
             );
             fp32!(
                 "optimizer.router.adamw",
                 block.router,
-                &block.d_router,
+                &mut block.d_router,
                 &mut moments.router,
                 decay
             );
-            master!(
-                "optimizer.experts.gate_up.adamw",
-                block.experts.gate_up,
-                &block.experts.d_gate_up,
-                &mut moments.expert_gate_up,
-                parameter_id::in_block(index, parameter_id::EXPERT_GATE_UP)
-            );
-            master!(
-                "optimizer.experts.down.adamw",
-                block.experts.down,
-                &block.experts.d_down,
-                &mut moments.expert_down,
-                parameter_id::in_block(index, parameter_id::EXPERT_DOWN)
-            );
-            profiler.measure(stream, "optimizer.qkv_proj.sync_compute", || {
-                block.qkv_proj.sync_compute(stream, kernels)
+            profiler.measure(stream, "optimizer.experts.gate_up.adamw", || {
+                block.experts.adamw_step_gate_up(
+                    &mut moments.expert_gate_up,
+                    master_adamw(
+                        config,
+                        decay,
+                        corrections,
+                        step,
+                        parameter_id::in_block(index, parameter_id::EXPERT_GATE_UP),
+                    ),
+                    stream,
+                    kernels,
+                )
             })?;
-            profiler.measure(stream, "optimizer.o_proj.sync_compute", || {
-                block.o_proj.sync_compute(stream, kernels)
-            })?;
-            profiler.measure(stream, "optimizer.experts.sync_compute", || {
-                block.experts.sync_compute(stream, kernels)
+            profiler.measure(stream, "optimizer.experts.down.adamw", || {
+                block.experts.adamw_step_down(
+                    &mut moments.expert_down,
+                    master_adamw(
+                        config,
+                        decay,
+                        corrections,
+                        step,
+                        parameter_id::in_block(index, parameter_id::EXPERT_DOWN),
+                    ),
+                    stream,
+                    kernels,
+                )
             })?;
         }
         fp32!(
             "optimizer.final_norm.adamw",
             model.final_norm.w,
-            &model.final_norm.dw,
+            &mut model.final_norm.dw,
             &mut self.final_norm,
             0.0
         );
@@ -3504,7 +3642,7 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         macro_rules! master_adamw_step {
             ($field:ident, $id:expr) => {
                 model.$field.w.adamw_step(
-                    &model.$field.dw,
+                    &mut model.$field.dw,
                     &mut self.$field,
                     master_adamw(config, config.weight_decay, corrections, step, $id),
                     stream,
@@ -3515,7 +3653,7 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         macro_rules! norm {
             ($field:ident) => {
                 model.$field.w.adamw_step(
-                    &model.$field.dw,
+                    &mut model.$field.dw,
                     &mut self.$field,
                     config.learning_rate,
                     config.beta1,
@@ -3557,6 +3695,8 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
         muon!(gate_up_proj, D, 2, FF, parameter_id::GATE_UP_PROJ);
         muon!(down_proj, FF, 1, D, parameter_id::DOWN_PROJ);
         norm!(final_norm);
+        // Muon writes its masters through `muon_apply_bf16`, which has no
+        // transpose to emit, so those four still need the standalone pass.
         model.sync_linear_compute(stream, tensor)?;
         model.lm_head.adamw_step(
             &mut self.lm_head,

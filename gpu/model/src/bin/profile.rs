@@ -98,10 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let targets: &[usize; N] = targets.as_slice().try_into().expect("length N");
 
     for step in 0..WARMUP_STEPS {
-        eprintln!("warmup {}/{}: zero_grad", step + 1, WARMUP_STEPS);
         let aux_coefficient = optimizer.aux_coefficient();
-        gpu.zero_grad(&stream, &tensor)?;
-        stream.synchronize()?;
         eprintln!("warmup {}/{}: forward", step + 1, WARMUP_STEPS);
         gpu.forward(
             tokens,
@@ -137,10 +134,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("profile: measuring step");
 
     let mut profiler = StepProfiler::start(&stream)?;
-    // Gradient fills are named kernel spans. The pinned input H2D copies remain
-    // deliberately inside the full-step interval and appear as unattributed
-    // device time rather than being mislabeled as kernels.
-    gpu.zero_grad_profiled(&stream, &tensor, &mut profiler)?;
+    // No gradient fills: the AdamW write-back clears each gradient as it
+    // consumes it. The pinned input H2D copies remain deliberately inside the
+    // full-step interval and appear as unattributed device time rather than
+    // being mislabeled as kernels.
     let aux_coefficient = optimizer.aux_coefficient();
     gpu.forward_profiled(
         tokens,
@@ -174,6 +171,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("fp32 top-k routing + bf16 tcgen05 experts/block linears/lm-head");
     println!("{profile}");
     println!();
-    println!("scope: in-place zero_grad + forward + backward + AdamW");
+    println!("scope: forward + backward + AdamW (which clears its own gradients)");
     Ok(())
 }

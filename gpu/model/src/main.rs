@@ -183,6 +183,88 @@ fn assert_close_slices(name: &str, actual: &[f32], expected: &[f32], atol: f32, 
     }
 }
 
+/// Every gradient of a dense model, copied off the device.
+///
+/// An AdamW step clears each gradient as it consumes it, so the Muon parity
+/// below — which is deliberately run over *the exact same* gradients the AdamW
+/// step just saw — has to put them back first.
+struct DenseGradients {
+    embedding: Vec<f32>,
+    attention_norm: Vec<f32>,
+    qkv_proj: Vec<f32>,
+    o_proj: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    gate_up_proj: Vec<f32>,
+    down_proj: Vec<f32>,
+    final_norm: Vec<f32>,
+    lm_head: Vec<u32>,
+}
+
+impl DenseGradients {
+    fn save<
+        const N: usize,
+        const NP: usize,
+        const T: usize,
+        const VOCAB: usize,
+        const VP: usize,
+        const D: usize,
+        const H: usize,
+        const HD: usize,
+        const FF: usize,
+    >(
+        gpu: &model::GpuDenseDense<N, NP, T, VOCAB, VP, D, H, HD, FF>,
+        stream: &cuda_core::CudaStream,
+    ) -> Result<Self, cuda_core::DriverError> {
+        Ok(Self {
+            embedding: gpu.embedding.dw.to_host(stream)?,
+            attention_norm: gpu.attention_norm.dw.to_host(stream)?,
+            qkv_proj: gpu.qkv_proj.dw.to_host(stream)?,
+            o_proj: gpu.o_proj.dw.to_host(stream)?,
+            ffn_norm: gpu.ffn_norm.dw.to_host(stream)?,
+            gate_up_proj: gpu.gate_up_proj.dw.to_host(stream)?,
+            down_proj: gpu.down_proj.dw.to_host(stream)?,
+            final_norm: gpu.final_norm.dw.to_host(stream)?,
+            lm_head: gpu.lm_head.dw_words().to_host_vec(stream)?,
+        })
+    }
+
+    fn restore<
+        const N: usize,
+        const NP: usize,
+        const T: usize,
+        const VOCAB: usize,
+        const VP: usize,
+        const D: usize,
+        const H: usize,
+        const HD: usize,
+        const FF: usize,
+    >(
+        &self,
+        gpu: &mut model::GpuDenseDense<N, NP, T, VOCAB, VP, D, H, HD, FF>,
+        stream: &cuda_core::CudaStream,
+    ) -> Result<(), cuda_core::DriverError> {
+        macro_rules! restore {
+            ($field:ident) => {
+                gpu.$field
+                    .dw
+                    .as_device_buffer_mut()
+                    .copy_from_host(stream, &self.$field)?;
+            };
+        }
+        restore!(embedding);
+        restore!(attention_norm);
+        restore!(qkv_proj);
+        restore!(o_proj);
+        restore!(ffn_norm);
+        restore!(gate_up_proj);
+        restore!(down_proj);
+        restore!(final_norm);
+        gpu.lm_head
+            .dw_words_mut()
+            .copy_from_host(stream, &self.lm_head)
+    }
+}
+
 fn assert_grouped_close<const IN: usize, const GROUPS: usize, const OUT: usize>(
     name: &str,
     gpu: &model::tensor_device::GpuTensor<f32, Rank3<IN, GROUPS, OUT>>,
@@ -1685,6 +1767,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cpu_optimizer = DenseAdamW::new(config);
     let mut gpu_optimizer = GpuDenseDenseAdamW::new(&stream, config)?;
     cpu_optimizer.update(&mut cpu);
+    // The AdamW step below clears every gradient it consumes; the Muon parity
+    // that follows runs over the same ones, so keep a copy.
+    let gradients = DenseGradients::save(&gpu, &stream)?;
     gpu_optimizer.update(&mut gpu, &stream, &tensor)?;
 
     // Norms keep fp32 storage, so they keep the tight fp32 tolerance; every
@@ -1756,6 +1841,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cpu_muon = DenseMuon::new(muon_config, config);
     let mut gpu_muon = GpuDenseMuon::new(&stream, muon_config, config)?;
     cpu_muon.update(&mut cpu);
+    gradients.restore(&mut gpu, &stream)?;
     gpu_muon.update(&mut gpu, &stream, &tensor, &gemm)?;
 
     assert_grouped_close(

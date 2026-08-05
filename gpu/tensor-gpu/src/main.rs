@@ -11,7 +11,7 @@ use tensor_cpu::CpuTensor;
 // pattern as ops) instead of importing the library crate.
 #[path = "lib.rs"]
 mod device;
-use device::{GpuTensor, kernels, transpose_pairs_config};
+use device::{GpuTensor, kernels, master_transpose_config, transpose_pairs_config};
 
 fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
     assert_eq!(actual.len(), expected.len(), "{name}: length mismatch");
@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_gemm(&stream, &module)?;
     check_bf16_pairs(&stream, &module)?;
     check_adamw_master(&stream, &module)?;
+    check_adamw_master_transposed(&stream, &module)?;
 
     println!("✓ tensor-gpu storage, elementwise, reduction, GEMM, and bf16 parity passed");
     Ok(())
@@ -204,59 +205,69 @@ fn check_adamw_master(
         weight - learning_rate * step
     };
 
-    let mut run = |packed_gradient: bool,
-                   rounding: u32|
-     -> Result<Vec<u32>, cuda_core::DriverError> {
-        let mut master = DeviceBuffer::from_host(stream, &master_words)?;
-        let mut first = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
-        let mut second = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
-        let config = LaunchConfig::for_num_elems((LEN / 2) as u32);
-        // SAFETY: master and the packed gradient hold LEN / 2 words, both
-        // moments hold LEN floats, and the launch covers exactly LEN / 2 pairs.
-        unsafe {
-            if packed_gradient {
-                let device_gradient =
-                    DeviceBuffer::from_host(stream, &pack_bf16(gradient.as_slice()))?;
-                module.adamw_bf16_master_packed_grad(
-                    stream,
-                    config,
-                    &device_gradient,
-                    learning_rate,
-                    beta1,
-                    beta2,
-                    epsilon,
-                    weight_decay,
-                    first_correction,
-                    second_correction,
-                    rounding,
-                    SEED,
-                    &mut master,
-                    &mut first,
-                    &mut second,
-                )?;
-            } else {
-                let device_gradient = DeviceBuffer::from_host(stream, gradient.as_slice())?;
-                module.adamw_bf16_master(
-                    stream,
-                    config,
-                    &device_gradient,
-                    learning_rate,
-                    beta1,
-                    beta2,
-                    epsilon,
-                    weight_decay,
-                    first_correction,
-                    second_correction,
-                    rounding,
-                    SEED,
-                    &mut master,
-                    &mut first,
-                    &mut second,
-                )?;
+    let mut run =
+        |packed_gradient: bool, rounding: u32| -> Result<Vec<u32>, cuda_core::DriverError> {
+            let mut master = DeviceBuffer::from_host(stream, &master_words)?;
+            let mut first = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+            let mut second = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+            let config = LaunchConfig::for_num_elems((LEN / 2) as u32);
+            // SAFETY: master and the packed gradient hold LEN / 2 words, both
+            // moments hold LEN floats, and the launch covers exactly LEN / 2 pairs.
+            unsafe {
+                if packed_gradient {
+                    let mut device_gradient =
+                        DeviceBuffer::from_host(stream, &pack_bf16(gradient.as_slice()))?;
+                    module.adamw_bf16_master_packed_grad(
+                        stream,
+                        config,
+                        &mut device_gradient,
+                        learning_rate,
+                        beta1,
+                        beta2,
+                        epsilon,
+                        weight_decay,
+                        first_correction,
+                        second_correction,
+                        rounding,
+                        SEED,
+                        &mut master,
+                        &mut first,
+                        &mut second,
+                    )?;
+                    assert!(
+                        device_gradient.to_host_vec(stream)?.iter().all(|&w| w == 0),
+                        "adamw_bf16_master_packed_grad left the gradient it consumed non-zero"
+                    );
+                } else {
+                    let mut device_gradient = DeviceBuffer::from_host(stream, gradient.as_slice())?;
+                    module.adamw_bf16_master(
+                        stream,
+                        config,
+                        &mut device_gradient,
+                        learning_rate,
+                        beta1,
+                        beta2,
+                        epsilon,
+                        weight_decay,
+                        first_correction,
+                        second_correction,
+                        rounding,
+                        SEED,
+                        &mut master,
+                        &mut first,
+                        &mut second,
+                    )?;
+                    assert!(
+                        device_gradient
+                            .to_host_vec(stream)?
+                            .iter()
+                            .all(|&g| g == 0.0),
+                        "adamw_bf16_master left the gradient it consumed non-zero"
+                    );
+                }
             }
-        }
-        master.to_host_vec(stream)
-    };
+            master.to_host_vec(stream)
+        };
 
     for (packed_gradient, label) in [(false, "fp32 gradient"), (true, "packed gradient")] {
         let seen = if packed_gradient {
@@ -302,6 +313,144 @@ fn check_adamw_master(
         }
     }
     Ok(())
+}
+
+/// The fused write-back that also emits the master's transpose must produce
+/// exactly what the flat write-back produces, bit for bit.
+///
+/// Nothing here is a tolerance: the tile walk reorders which thread owns which
+/// element but not the arithmetic, and the stochastic-rounding stream is keyed
+/// on the global element index either way, so master words and both moments
+/// have to compare equal as words. On top of that the transpose must match the
+/// master it was emitted from, and the gradient must come back zeroed.
+fn check_adamw_master_transposed(
+    stream: &cuda_core::CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Two tiles down by two across, so the walk crosses both block dimensions.
+    const ROWS: usize = 128;
+    const COLS: usize = 128;
+    const LEN: usize = ROWS * COLS;
+    const SEED: u64 = tensor_core::rng::stream_seed(5, 11);
+    let initial = CpuTensor::<f32, Rank1<LEN>>::uniform(21);
+    let master_words = pack_bf16(initial.as_slice());
+    let gradient = CpuTensor::<f32, Rank1<LEN>>::uniform(22);
+    let moment = CpuTensor::<f32, Rank1<LEN>>::uniform(23);
+    let (learning_rate, beta1, beta2, epsilon, weight_decay) = (0.01, 0.9, 0.999, 1e-8, 0.1);
+    let (first_correction, second_correction) = (1.0 / (1.0 - beta1), 1.0 / (1.0 - beta2));
+
+    struct Outcome {
+        master: Vec<u32>,
+        first: Vec<f32>,
+        second: Vec<f32>,
+        gradient: Vec<f32>,
+        transposed: Vec<u32>,
+    }
+
+    let mut run = |tiled: bool, rounding: u32| -> Result<Outcome, cuda_core::DriverError> {
+        let mut master = DeviceBuffer::from_host(stream, &master_words)?;
+        let mut first = DeviceBuffer::from_host(stream, moment.as_slice())?;
+        let mut second = DeviceBuffer::from_host(stream, moment.as_slice())?;
+        let mut wide = DeviceBuffer::from_host(stream, gradient.as_slice())?;
+        let mut transposed = DeviceBuffer::<u32>::zeroed(stream, LEN / 2)?;
+        // SAFETY: every buffer describes the same [ROWS, COLS] matrix in the
+        // dtype its parameter names, and both launches cover it exactly.
+        unsafe {
+            if tiled {
+                module.adamw_bf16_master_transposed(
+                    stream,
+                    master_transpose_config(ROWS, COLS),
+                    &mut wide,
+                    ROWS as u32,
+                    COLS as u32,
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    epsilon,
+                    weight_decay,
+                    first_correction,
+                    second_correction,
+                    rounding,
+                    SEED,
+                    &mut master,
+                    &mut first,
+                    &mut second,
+                    &mut transposed,
+                )?;
+            } else {
+                module.adamw_bf16_master(
+                    stream,
+                    LaunchConfig::for_num_elems((LEN / 2) as u32),
+                    &mut wide,
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    epsilon,
+                    weight_decay,
+                    first_correction,
+                    second_correction,
+                    rounding,
+                    SEED,
+                    &mut master,
+                    &mut first,
+                    &mut second,
+                )?;
+            }
+        }
+        Ok(Outcome {
+            master: master.to_host_vec(stream)?,
+            first: first.to_host_vec(stream)?,
+            second: second.to_host_vec(stream)?,
+            gradient: wide.to_host_vec(stream)?,
+            transposed: transposed.to_host_vec(stream)?,
+        })
+    };
+
+    for (rounding, mode) in [
+        (device::MASTER_ROUNDING_NEAREST, "nearest"),
+        (device::MASTER_ROUNDING_STOCHASTIC, "stochastic"),
+    ] {
+        let flat = run(false, rounding)?;
+        let tiled = run(true, rounding)?;
+        assert_eq!(
+            flat.master, tiled.master,
+            "fused transpose write-back ({mode}) is not bit-identical"
+        );
+        assert_eq!(
+            bits(&flat.first),
+            bits(&tiled.first),
+            "fused transpose write-back ({mode}) moved the first moment"
+        );
+        assert_eq!(
+            bits(&flat.second),
+            bits(&tiled.second),
+            "fused transpose write-back ({mode}) moved the second moment"
+        );
+        for outcome in [&flat, &tiled] {
+            assert!(
+                outcome.gradient.iter().all(|&g| g == 0.0),
+                "an AdamW write-back ({mode}) left the gradient it consumed non-zero"
+            );
+        }
+
+        let updated = unpack_bf16(&tiled.master);
+        let mut expected = vec![0.0f32; LEN];
+        for row in 0..ROWS {
+            for column in 0..COLS {
+                expected[column * ROWS + row] = updated[row * COLS + column];
+            }
+        }
+        assert_eq!(
+            tiled.transposed,
+            pack_bf16(&expected),
+            "fused write-back transpose ({mode}) is not the master's transpose"
+        );
+    }
+    Ok(())
+}
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|value| value.to_bits()).collect()
 }
 
 fn check_storage(stream: &cuda_core::CudaStream) -> Result<(), Box<dyn std::error::Error>> {
