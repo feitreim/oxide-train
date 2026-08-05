@@ -1361,9 +1361,49 @@ pub mod kernels {
         dot: GlobalRows<F32>,
         dk: GlobalRows<F32>,
         dv: GlobalRows<F32>,
+        /// The key row this thread owes dK and dV stores for — the *previous*
+        /// item's, held because [`Self::drain`] runs at the top of the next
+        /// item. [`UNSTAGED`] before the first item and after the tail flush,
+        /// exactly as kernel A's.
+        staged_row: u32,
+        /// The head that row belongs to.
+        staged_head: u32,
     }
 
     impl BackwardKvStream {
+        /// Both accumulators of whatever item is still resident, one item late
+        /// — kernel A's [`BackwardQStream::drain`] with a second band.
+        ///
+        /// The move is worth twice as much here as it is there, and the phase
+        /// budget is why: kernel A's epilogue was 3 470 ticks an item against a
+        /// 3 534-tick fill window, and this one is **6 509 against 4 568**, of
+        /// which `EWAIT` 811 stays behind and `ETREAD` 655 + `ESTORE` 5 042
+        /// move. **The epilogue is the global store, not the tensor-memory
+        /// read** — 128 KiB an item where kernel A writes 64 — and a store
+        /// issued into the window the next item's K/V fill would idle in costs
+        /// that item nothing.
+        ///
+        /// The hazard is kernel A's and it resolves the same way: the first
+        /// gradient MMAs of the next item overwrite both accumulators
+        /// (`accumulate` is `step != 0`), and they are issued after the block
+        /// barrier the pass takes at the bottom of its first step — by which
+        /// time `tile_x8` has retired this drain's `tcgen05.ld`.
+        #[inline(always)]
+        unsafe fn drain(&mut self, band: u32, group: u32, lane: u32) {
+            unsafe {
+                if self.staged_row == UNSTAGED {
+                    return;
+                }
+                let columns = group * DRAIN_COLUMNS as u32;
+                let column = self.staged_head * HD as u32 + columns;
+                let dv: OutHalf = self.dv_acc.tile_x8(band, columns);
+                store_rows(self.dv, self.staged_row, column, lane, dv);
+                let dk: OutHalf = self.dk_acc.tile_x8(band, columns);
+                store_rows(self.dk, self.staged_row, column, lane, dk);
+                self.staged_row = UNSTAGED;
+            }
+        }
+
         #[inline(always)]
         fn buffer(&self, segment: STmem, step: u32) -> STmem {
             if step & 1 == 0 {
@@ -1547,6 +1587,11 @@ pub mod kernels {
                         step += 1;
                     }
                 } else {
+                    // The previous item's dK and dV, into the window this
+                    // item's K/V fill is about to make the pass warps wait in
+                    // anyway — 5 697 ticks of drain against a 4 568-tick
+                    // `FILL` (issue #94).
+                    self.drain(band, group, lane);
                     let row = batch * self.t + key_base + band;
                     let mut step = 0u32;
                     while step < steps {
@@ -1619,14 +1664,13 @@ pub mod kernels {
                         step += 1;
                     }
 
+                    // The last gradient MMAs have to be waited out here, before
+                    // the item boundary re-arms the barrier set. The two drains
+                    // that used to follow do not, and are now the next item's
+                    // opening move — see [`Self::drain`].
                     self.shared.accumulated.wait(steps - 1);
-                    // Both accumulators drain the way kernel A's one does: this
-                    // warpgroup's `DRAIN_COLUMNS`, at its own column offset.
-                    let columns = group * DRAIN_COLUMNS as u32;
-                    let dv: OutHalf = self.dv_acc.tile_x8(band, columns);
-                    store_rows(self.dv, row, head * HD as u32 + columns, lane, dv);
-                    let dk: OutHalf = self.dk_acc.tile_x8(band, columns);
-                    store_rows(self.dk, row, head * HD as u32 + columns, lane, dk);
+                    self.staged_row = row;
+                    self.staged_head = head;
                 }
             }
         }
@@ -1641,7 +1685,11 @@ pub mod kernels {
     /// them: `Sᵀ = K·Qᵀ` and `dPᵀ = V·dYᵀ` fill a double-buffered TMEM segment
     /// pair, the pass warpgroups form `Pᵀ` and `dSᵀ = Pᵀ·(dPᵀ − D)·ln2`, and
     /// `dV += Pᵀ·dY` / `dK += dSᵀ·Q` accumulate in TMEM for the whole stream.
-    /// Both gradient tiles have one writer, for the reason kernel A's does.
+    /// Both gradient tiles have one writer, for the reason kernel A's does, so
+    /// both epilogues are a plain `store_rows` — **issued at the top of the
+    /// next item**, into the window its K/V fill would otherwise have the pass
+    /// warps idle in (issue #94), with a flush after the persistent loop for
+    /// the last item's.
     ///
     /// **Everything kernel A indexes by row this indexes by column**, and that
     /// is the whole of the difference: the band's rows are keys, so the causal
@@ -1707,8 +1755,18 @@ pub mod kernels {
                 dot: GlobalRows::<F32>::from_raw(dot.as_ptr().cast_mut().cast(), stats),
                 dk: GlobalRows::<F32>::from_slice(&mut dk, heads as usize * HD),
                 dv: GlobalRows::<F32>::from_slice(&mut dv, heads as usize * HD),
+                staged_row: UNSTAGED,
+                staged_head: 0,
             };
             pipeline::run(&mut job, tiles * planes);
+            // The tail of a deferred store, as [`flash_backward_q`]: `run`
+            // leaves the last item's dK and dV in the two accumulators, and a
+            // CTA that ran no item stages nothing and no-ops here. The barrier
+            // after it is what keeps the drain's `tcgen05.ld` ahead of the
+            // deallocation.
+            job.drain(warp_lanes(), warp::warp_id() / DRAIN_WARPS, warp::lane_id());
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
             dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
         }
     }
