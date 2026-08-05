@@ -724,12 +724,7 @@ pub mod kernels {
         seed: u64,
     ) -> u32 {
         // SAFETY: the caller's exclusive ownership of this word.
-        let gradients = unsafe {
-            let word = gradient.get_unchecked_mut(pair);
-            let gradients = *word;
-            *word = 0;
-            gradients
-        };
+        let gradients = unsafe { *gradient.get_unchecked_mut(pair) };
 
         let mut packed = 0u32;
         let mut half = 0;
@@ -755,6 +750,15 @@ pub mod kernels {
             };
             packed |= (round_master(updated, rounding, seed, element) as u32) << (16 * half);
             half += 1;
+        }
+        // Clear last. Nothing proves to the compiler that the gradient does
+        // not alias the moments, so a store placed ahead of their loads orders
+        // every one of them behind it and the update loses its memory-level
+        // parallelism: clearing first measured 2.83 ms against 0.66 for the
+        // lm-head's `[3072, 50432]` master (#99).
+        // SAFETY: the caller's exclusive ownership of this word.
+        unsafe {
+            *gradient.get_unchecked_mut(pair) = 0;
         }
         packed
     }
