@@ -34,8 +34,9 @@ pub const FLASH_BACKWARD_Q_SMEM_BYTES: u32 = super::tcgen05::FLASH_BACKWARD_Q_SM
 /// `Pᵀ` and `dSᵀ` where kernel A's reads only `dS`.
 pub const FLASH_BACKWARD_KV_SMEM_BYTES: u32 = super::tcgen05::FLASH_BACKWARD_KV_SMEM as u32;
 /// Threads of either backward kernel: the four warps that drain an `M128`
-/// accumulator, and no others. Mirrors `FLASH_BACKWARD_BLOCK`.
-pub const FLASH_BACKWARD_BLOCK_THREADS: u32 = FLASH_QUERIES as u32;
+/// accumulator plus the warp that issues every TMA and MMA. Mirrors
+/// `FLASH_BACKWARD_BLOCK`, and `flash.rs`'s `main` asserts the two agree.
+pub const FLASH_BACKWARD_BLOCK_THREADS: u32 = super::tcgen05::FLASH_BACKWARD_BLOCK as u32;
 /// Dynamic shared allocation for the forward: **exactly** the kernel's own
 /// plan, not a ceiling sized for the deepest supported `FORWARD_STAGES`.
 ///

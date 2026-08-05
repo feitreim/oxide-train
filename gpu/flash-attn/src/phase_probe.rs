@@ -102,8 +102,14 @@ pub const GRAD: usize = 6;
 pub const STAT: usize = 7;
 /// The register pass.
 pub const PASS: usize = 8;
-/// The proxy fence and the block barrier.
+/// The **pass warps** at the proxy fence and the block barrier — how long
+/// warps 0-3 wait for the issue warp, and so how much of the tile the issue
+/// warp is the critical path for.
 pub const SYNC: usize = 9;
+/// The **issue warp** at the same barrier — the mirror of [`SYNC`]. One of the
+/// two is near zero and the other is the slack; which one says whether the
+/// tile is issue-bound or pass-bound.
+pub const IDLE: usize = 12;
 /// The trailing drain, per item.
 pub const EPI: usize = 10;
 /// First `clock64` to last.
@@ -120,6 +126,7 @@ struct Sums {
     stat: u64,
     pass: u64,
     sync: u64,
+    idle: u64,
     epi: u64,
     visits: u64,
     items: u64,
@@ -140,17 +147,17 @@ impl Clocks {
         unsafe { *self.at.add(slot) = ticks }
     }
 
+    /// The pass warps' column, from warp 0. Owns [`VISITS`], [`ITEMS`] and
+    /// [`SPAN`] because it is the role that runs the item to its end.
+    ///
     /// # Safety
     /// As [`Self::put`]; `sums.visits` and `sums.items` are non-zero.
     #[inline(always)]
-    unsafe fn write(self, sums: &Sums, span: u64) {
+    unsafe fn write_pass(self, sums: &Sums, span: u64) {
         unsafe {
             let (visits, items) = (sums.visits.max(1), sums.items.max(1));
             self.put(VISITS, sums.visits);
             self.put(ITEMS, sums.items);
-            self.put(FEED, sums.feed / visits);
-            self.put(RECYCLE, sums.recycle / visits);
-            self.put(ISSUE, sums.issue / visits);
             self.put(SCORED, sums.scored / visits);
             self.put(GRAD, sums.grad / visits);
             self.put(STAT, sums.stat / visits);
@@ -158,6 +165,22 @@ impl Clocks {
             self.put(SYNC, sums.sync / visits);
             self.put(EPI, sums.epi / items);
             self.put(SPAN, span / items);
+        }
+    }
+
+    /// The issue warp's column. Disjoint slots from [`Self::write_pass`], so
+    /// the two roles publish into one CTA block without a race.
+    ///
+    /// # Safety
+    /// As [`Self::write_pass`].
+    #[inline(always)]
+    unsafe fn write_issue(self, sums: &Sums) {
+        unsafe {
+            let visits = sums.visits.max(1);
+            self.put(FEED, sums.feed / visits);
+            self.put(RECYCLE, sums.recycle / visits);
+            self.put(ISSUE, sums.issue / visits);
+            self.put(IDLE, sums.idle / visits);
         }
     }
 }
@@ -271,6 +294,7 @@ impl pipeline::Job for BackwardQProbe {
 
             let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
             let band = 32 * warp_id;
+            let issuing = warp_id == ISSUE_WARP;
 
             if leader {
                 tcgen05_fence_after_thread_sync();
@@ -318,102 +342,113 @@ impl pipeline::Job for BackwardQProbe {
                 self.sums.issue += clock64().wrapping_sub(opened);
             }
 
-            let waited = clock64();
-            let row = batch * self.t + query_base + band;
-            let mut lse2: Rows = load_row_vec(self.lse, row, head, lane);
-            lse2.scale_assign(LOG2E);
-            let dots: Rows = load_row_vec(self.dot, row, head, lane);
-            self.sums.stat += clock64().wrapping_sub(waited);
+            if issuing {
+                let mut key_tile = 0u32;
+                while key_tile < key_tiles {
+                    if lane == 0 {
+                        let refill = key_tile + BACKWARD_STAGES as u32 - 1;
+                        if key_tile > 0 && refill < key_tiles {
+                            let waited = clock64();
+                            self.shared.accumulated.wait(key_tile - 1);
+                            let opened = clock64();
+                            self.sums.recycle += opened.wrapping_sub(waited);
+                            self.load_kv(refill, plane as i32);
+                            self.sums.issue += clock64().wrapping_sub(opened);
+                        }
+                        if key_tile + 1 < key_tiles {
+                            let waited = clock64();
+                            self.shared.kv_loaded.wait(key_tile + 1);
+                            let opened = clock64();
+                            self.sums.feed += opened.wrapping_sub(waited);
+                            self.score_mmas(key_tile + 1);
+                            self.sums.issue += clock64().wrapping_sub(opened);
+                        }
+                    }
+                    let at = clock64();
+                    tcgen05_fence_before_thread_sync();
+                    thread::sync_threads();
+                    let synced = clock64();
+                    self.sums.idle += synced.wrapping_sub(at);
+                    if lane == 0 {
+                        tcgen05_fence_after_thread_sync();
+                        mma_ab(
+                            self.accumulator.raw(),
+                            self.shared.ds.tile(key_tile),
+                            self.shared.k.tile(key_tile),
+                            MMA_SHAPE,
+                            key_tile != 0,
+                        );
+                        mma::commit(self.shared.accumulated.sem(key_tile));
+                        self.sums.issue += clock64().wrapping_sub(synced);
+                    }
+                    self.sums.visits += 1;
+                    key_tile += 1;
+                }
+            } else {
+                let waited = clock64();
+                let row = batch * self.t + query_base + band;
+                let mut lse2: Rows = load_row_vec(self.lse, row, head, lane);
+                lse2.scale_assign(LOG2E);
+                let dots: Rows = load_row_vec(self.dot, row, head, lane);
+                self.sums.stat += clock64().wrapping_sub(waited);
 
-            let mut key_tile = 0u32;
-            while key_tile < key_tiles {
-                if leader {
-                    let refill = key_tile + BACKWARD_STAGES as u32 - 1;
-                    if key_tile > 0 && refill < key_tiles {
-                        let waited = clock64();
-                        self.shared.accumulated.wait(key_tile - 1);
-                        let opened = clock64();
-                        self.sums.recycle += opened.wrapping_sub(waited);
-                        self.load_kv(refill, plane as i32);
-                        self.sums.issue += clock64().wrapping_sub(opened);
+                let mut key_tile = 0u32;
+                while key_tile < key_tiles {
+                    let waited = clock64();
+                    self.shared.scored.wait(key_tile);
+                    let scored_at = clock64();
+                    self.sums.scored += scored_at.wrapping_sub(waited);
+                    if key_tile >= GRADIENT_STAGES as u32 {
+                        self.shared
+                            .accumulated
+                            .wait(key_tile - GRADIENT_STAGES as u32);
                     }
-                    if key_tile + 1 < key_tiles {
-                        let waited = clock64();
-                        self.shared.kv_loaded.wait(key_tile + 1);
-                        let opened = clock64();
-                        self.sums.feed += opened.wrapping_sub(waited);
-                        self.score_mmas(key_tile + 1);
-                        self.sums.issue += clock64().wrapping_sub(opened);
+                    let opened = clock64();
+                    self.sums.grad += opened.wrapping_sub(scored_at);
+
+                    let scores = self.buffer(self.scores, key_tile);
+                    let gradients = self.buffer(self.gradients, key_tile);
+                    let key_base = key_tile * TILE as u32;
+                    let masked = key_tile >= first_masked;
+                    let ds = self.shared.ds.tile(key_tile).chunk_writer();
+
+                    let mut column = 0u32;
+                    while column < TILE as u32 {
+                        let mut dscore: ScoreChunk = scores.tile(band, column);
+                        if masked {
+                            dscore.make_causal_at(
+                                lane,
+                                query_base + band,
+                                key_base + column,
+                                MASKED_SCORE,
+                            );
+                        }
+                        dscore.sub_row_assign(lse2);
+                        dscore.unary_map_assign::<Exp2Hw>();
+                        let mut dp: ScoreChunk = gradients.tile(band, column);
+                        dp.sub_row_assign(dots);
+                        dscore.mul_assign(dp);
+                        dscore.scale_assign(SCALE);
+                        store_tile(ds, band, column, lane, dscore);
+                        column += SCORE_CHUNK as u32;
                     }
+                    let passed = clock64();
+                    self.sums.pass += passed.wrapping_sub(opened);
+
+                    fence_proxy_async_shared_cta();
+                    tcgen05_fence_before_thread_sync();
+                    thread::sync_threads();
+                    self.sums.sync += clock64().wrapping_sub(passed);
+                    self.sums.visits += 1;
+                    key_tile += 1;
                 }
 
                 let waited = clock64();
-                self.shared.scored.wait(key_tile);
-                let scored_at = clock64();
-                self.sums.scored += scored_at.wrapping_sub(waited);
-                if key_tile >= GRADIENT_STAGES as u32 {
-                    self.shared
-                        .accumulated
-                        .wait(key_tile - GRADIENT_STAGES as u32);
-                }
-                let opened = clock64();
-                self.sums.grad += opened.wrapping_sub(scored_at);
-
-                let scores = self.buffer(self.scores, key_tile);
-                let gradients = self.buffer(self.gradients, key_tile);
-                let key_base = key_tile * TILE as u32;
-                let masked = key_tile >= first_masked;
-                let ds = self.shared.ds.tile(key_tile).chunk_writer();
-
-                let mut column = 0u32;
-                while column < TILE as u32 {
-                    let mut dscore: ScoreChunk = scores.tile(band, column);
-                    if masked {
-                        dscore.make_causal_at(
-                            lane,
-                            query_base + band,
-                            key_base + column,
-                            MASKED_SCORE,
-                        );
-                    }
-                    dscore.sub_row_assign(lse2);
-                    dscore.unary_map_assign::<Exp2Hw>();
-                    let mut dp: ScoreChunk = gradients.tile(band, column);
-                    dp.sub_row_assign(dots);
-                    dscore.mul_assign(dp);
-                    dscore.scale_assign(SCALE);
-                    store_tile(ds, band, column, lane, dscore);
-                    column += SCORE_CHUNK as u32;
-                }
-                let passed = clock64();
-                self.sums.pass += passed.wrapping_sub(opened);
-
-                fence_proxy_async_shared_cta();
-                tcgen05_fence_before_thread_sync();
-                thread::sync_threads();
-                let synced = clock64();
-                self.sums.sync += synced.wrapping_sub(passed);
-                if leader {
-                    tcgen05_fence_after_thread_sync();
-                    mma_ab(
-                        self.accumulator.raw(),
-                        self.shared.ds.tile(key_tile),
-                        self.shared.k.tile(key_tile),
-                        MMA_SHAPE,
-                        key_tile != 0,
-                    );
-                    mma::commit(self.shared.accumulated.sem(key_tile));
-                    self.sums.issue += clock64().wrapping_sub(synced);
-                }
-                self.sums.visits += 1;
-                key_tile += 1;
+                self.shared.accumulated.wait(key_tiles - 1);
+                let dq: OutBand = self.accumulator.tile_x8(band, 0);
+                store_rows(self.dq, row, head * HD as u32, lane, dq);
+                self.sums.epi += clock64().wrapping_sub(waited);
             }
-
-            let waited = clock64();
-            self.shared.accumulated.wait(key_tiles - 1);
-            let dq: OutBand = self.accumulator.tile_x8(band, 0);
-            store_rows(self.dq, row, head * HD as u32, lane, dq);
-            self.sums.epi += clock64().wrapping_sub(waited);
             self.sums.items += 1;
         }
     }
@@ -590,7 +625,7 @@ impl pipeline::Job for BackwardKvProbe {
 
             let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
             let band = 32 * warp_id;
-            let row = batch * self.t + key_base + band;
+            let issuing = warp_id == ISSUE_WARP;
 
             if leader {
                 tcgen05_fence_after_thread_sync();
@@ -636,119 +671,132 @@ impl pipeline::Job for BackwardKvProbe {
                 self.sums.issue += clock64().wrapping_sub(opened);
             }
 
-            let mut step = 0u32;
-            while step < steps {
-                let query_base = key_base + step * TILE as u32;
-                if leader {
-                    let refill = step + BACKWARD_STAGES as u32 - 1;
-                    if step > 0 && refill < steps {
-                        let waited = clock64();
-                        self.shared.accumulated.wait(step - 1);
-                        let opened = clock64();
-                        self.sums.recycle += opened.wrapping_sub(waited);
-                        self.load_qdy(refill, key_base + refill * TILE as u32, plane as i32);
-                        self.sums.issue += clock64().wrapping_sub(opened);
+            if issuing {
+                let mut step = 0u32;
+                while step < steps {
+                    if lane == 0 {
+                        let refill = step + BACKWARD_STAGES as u32 - 1;
+                        if step > 0 && refill < steps {
+                            let waited = clock64();
+                            self.shared.accumulated.wait(step - 1);
+                            let opened = clock64();
+                            self.sums.recycle += opened.wrapping_sub(waited);
+                            self.load_qdy(refill, key_base + refill * TILE as u32, plane as i32);
+                            self.sums.issue += clock64().wrapping_sub(opened);
+                        }
+                        if step + 1 < steps {
+                            let waited = clock64();
+                            self.shared.qdy_loaded.wait(step + 1);
+                            let opened = clock64();
+                            self.sums.feed += opened.wrapping_sub(waited);
+                            self.score_mmas(step + 1);
+                            self.sums.issue += clock64().wrapping_sub(opened);
+                        }
                     }
-                    if step + 1 < steps {
-                        let waited = clock64();
-                        self.shared.qdy_loaded.wait(step + 1);
-                        let opened = clock64();
-                        self.sums.feed += opened.wrapping_sub(waited);
-                        self.score_mmas(step + 1);
-                        self.sums.issue += clock64().wrapping_sub(opened);
+                    let at = clock64();
+                    tcgen05_fence_before_thread_sync();
+                    thread::sync_threads();
+                    let synced = clock64();
+                    self.sums.idle += synced.wrapping_sub(at);
+                    if lane == 0 {
+                        tcgen05_fence_after_thread_sync();
+                        let accumulate = step != 0;
+                        mma_ab(
+                            self.dv_acc.raw(),
+                            self.shared.p.tile(step),
+                            self.shared.dy.tile(step),
+                            MMA_SHAPE,
+                            accumulate,
+                        );
+                        mma_ab(
+                            self.dk_acc.raw(),
+                            self.shared.ds.tile(step),
+                            self.shared.q.tile(step),
+                            MMA_SHAPE,
+                            accumulate,
+                        );
+                        mma::commit(self.shared.accumulated.sem(step));
+                        self.sums.issue += clock64().wrapping_sub(synced);
                     }
+                    self.sums.visits += 1;
+                    step += 1;
+                }
+            } else {
+                let row = batch * self.t + key_base + band;
+                let mut step = 0u32;
+                while step < steps {
+                    let query_base = key_base + step * TILE as u32;
+                    let waited = clock64();
+                    self.shared.scored.wait(step);
+                    let scored_at = clock64();
+                    self.sums.scored += scored_at.wrapping_sub(waited);
+                    if step >= GRADIENT_STAGES as u32 {
+                        self.shared.accumulated.wait(step - GRADIENT_STAGES as u32);
+                    }
+                    let opened = clock64();
+                    self.sums.grad += opened.wrapping_sub(scored_at);
+
+                    let scores = self.buffer(self.scores, step);
+                    let gradients = self.buffer(self.gradients, step);
+                    let masked = step < 2;
+                    let p = self.shared.p.tile(step).chunk_writer();
+                    let ds = self.shared.ds.tile(step).chunk_writer();
+
+                    // The statistic is per streamed query, so it is read a
+                    // chunk at a time inside the pass rather than once at the
+                    // item head — which is the one structural difference from
+                    // kernel A's loop, and the reason STAT is separated from
+                    // PASS on both sides.
+                    let mut stat = 0u64;
+                    let mut column = 0u32;
+                    while column < TILE as u32 {
+                        let query = batch * self.t + query_base + column;
+                        let at = clock64();
+                        let mut lse2: Cols = load_col_vec(self.lse, query, head, lane);
+                        lse2.scale_assign(LOG2E);
+                        let dots: Cols = load_col_vec(self.dot, query, head, lane);
+                        stat += clock64().wrapping_sub(at);
+
+                        let mut probability: ScoreChunk = scores.tile(band, column);
+                        if masked {
+                            probability.make_causal_t_at(
+                                lane,
+                                key_base + band,
+                                query_base + column,
+                                MASKED_SCORE,
+                            );
+                        }
+                        probability.sub_col_assign(lse2);
+                        probability.unary_map_assign::<Exp2Hw>();
+                        store_tile(p, band, column, lane, probability);
+
+                        let mut dpt: ScoreChunk = gradients.tile(band, column);
+                        dpt.sub_col_assign(dots);
+                        probability.mul_assign(dpt);
+                        probability.scale_assign(LN2);
+                        store_tile(ds, band, column, lane, probability);
+                        column += SCORE_CHUNK as u32;
+                    }
+                    let passed = clock64();
+                    self.sums.stat += stat;
+                    self.sums.pass += passed.wrapping_sub(opened) - stat;
+
+                    fence_proxy_async_shared_cta();
+                    tcgen05_fence_before_thread_sync();
+                    thread::sync_threads();
+                    self.sums.sync += clock64().wrapping_sub(passed);
+                    self.sums.visits += 1;
+                    step += 1;
                 }
 
                 let waited = clock64();
-                self.shared.scored.wait(step);
-                let scored_at = clock64();
-                self.sums.scored += scored_at.wrapping_sub(waited);
-                if step >= GRADIENT_STAGES as u32 {
-                    self.shared.accumulated.wait(step - GRADIENT_STAGES as u32);
-                }
-                let opened = clock64();
-                self.sums.grad += opened.wrapping_sub(scored_at);
-
-                let scores = self.buffer(self.scores, step);
-                let gradients = self.buffer(self.gradients, step);
-                let masked = step < 2;
-                let p = self.shared.p.tile(step).chunk_writer();
-                let ds = self.shared.ds.tile(step).chunk_writer();
-
-                // The statistic is per streamed query, so it is read a chunk at
-                // a time inside the pass rather than once at the item head —
-                // which is the one structural difference from kernel A's loop,
-                // and the reason STAT is separated from PASS on both sides.
-                let mut stat = 0u64;
-                let mut column = 0u32;
-                while column < TILE as u32 {
-                    let query = batch * self.t + query_base + column;
-                    let at = clock64();
-                    let mut lse2: Cols = load_col_vec(self.lse, query, head, lane);
-                    lse2.scale_assign(LOG2E);
-                    let dots: Cols = load_col_vec(self.dot, query, head, lane);
-                    stat += clock64().wrapping_sub(at);
-
-                    let mut probability: ScoreChunk = scores.tile(band, column);
-                    if masked {
-                        probability.make_causal_t_at(
-                            lane,
-                            key_base + band,
-                            query_base + column,
-                            MASKED_SCORE,
-                        );
-                    }
-                    probability.sub_col_assign(lse2);
-                    probability.unary_map_assign::<Exp2Hw>();
-                    store_tile(p, band, column, lane, probability);
-
-                    let mut dpt: ScoreChunk = gradients.tile(band, column);
-                    dpt.sub_col_assign(dots);
-                    probability.mul_assign(dpt);
-                    probability.scale_assign(LN2);
-                    store_tile(ds, band, column, lane, probability);
-                    column += SCORE_CHUNK as u32;
-                }
-                let passed = clock64();
-                self.sums.stat += stat;
-                self.sums.pass += passed.wrapping_sub(opened) - stat;
-
-                fence_proxy_async_shared_cta();
-                tcgen05_fence_before_thread_sync();
-                thread::sync_threads();
-                let synced = clock64();
-                self.sums.sync += synced.wrapping_sub(passed);
-                if leader {
-                    tcgen05_fence_after_thread_sync();
-                    let accumulate = step != 0;
-                    mma_ab(
-                        self.dv_acc.raw(),
-                        self.shared.p.tile(step),
-                        self.shared.dy.tile(step),
-                        MMA_SHAPE,
-                        accumulate,
-                    );
-                    mma_ab(
-                        self.dk_acc.raw(),
-                        self.shared.ds.tile(step),
-                        self.shared.q.tile(step),
-                        MMA_SHAPE,
-                        accumulate,
-                    );
-                    mma::commit(self.shared.accumulated.sem(step));
-                    self.sums.issue += clock64().wrapping_sub(synced);
-                }
-                self.sums.visits += 1;
-                step += 1;
+                self.shared.accumulated.wait(steps - 1);
+                let dv: OutBand = self.dv_acc.tile_x8(band, 0);
+                store_rows(self.dv, row, head * HD as u32, lane, dv);
+                let dk: OutBand = self.dk_acc.tile_x8(band, 0);
+                store_rows(self.dk, row, head * HD as u32, lane, dk);
+                self.sums.epi += clock64().wrapping_sub(waited);
             }
-
-            let waited = clock64();
-            self.shared.accumulated.wait(steps - 1);
-            let dv: OutBand = self.dv_acc.tile_x8(band, 0);
-            store_rows(self.dv, row, head * HD as u32, lane, dv);
-            let dk: OutBand = self.dk_acc.tile_x8(band, 0);
-            store_rows(self.dk, row, head * HD as u32, lane, dk);
-            self.sums.epi += clock64().wrapping_sub(waited);
             self.sums.items += 1;
         }
     }
@@ -820,26 +868,33 @@ pub unsafe fn backward_kv(
     }
 }
 
-/// Publish this CTA's counters.
+/// Publish this CTA's counters — the pass warps' column from warp 0, the issue
+/// warp's from warp [`ISSUE_WARP`], into disjoint slots of one block.
 ///
-/// The **leader's** terms (`FEED`, `RECYCLE`, `ISSUE`) belong to thread 0 and
-/// the warpgroup's to everyone, so warp 0 lane 0 is the only thread holding
-/// both — and since every thread of the CTA runs the same pass, warp 0's
-/// warpgroup column is every warp's.
+/// The two roles are now two warps (issue #94), so no single thread holds both
+/// halves and neither can report the other's. What each *can* report is its own
+/// wait at the shared barrier: the pass warps' [`SYNC`] against the issue
+/// warp's [`IDLE`], which is the tile's critical path stated twice from
+/// opposite sides.
 ///
 /// # Safety
-/// `clocks` holds [`COUNTERS`] `u64` per CTA of the grid, and this CTA's block
-/// is written by this thread alone.
+/// `clocks` holds [`COUNTERS`] `u64` per CTA of the grid, and each slot is
+/// written by one thread alone.
 #[inline(always)]
 unsafe fn report(clocks: &mut DisjointSlice<u64>, sums: &Sums, span: u64, warp_id: u32, lane: u32) {
     unsafe {
-        if warp_id == 0 && lane == 0 && sums.items != 0 {
-            let at = Clocks {
-                at: clocks
-                    .as_mut_ptr()
-                    .add(COUNTERS * cluster::cluster_idx() as usize),
-            };
-            at.write(sums, span);
+        if lane != 0 || sums.items == 0 {
+            return;
+        }
+        let at = Clocks {
+            at: clocks
+                .as_mut_ptr()
+                .add(COUNTERS * cluster::cluster_idx() as usize),
+        };
+        if warp_id == 0 {
+            at.write_pass(sums, span);
+        } else if warp_id == ISSUE_WARP {
+            at.write_issue(sums);
         }
     }
 }

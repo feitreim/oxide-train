@@ -397,12 +397,31 @@ pub const FLASH_BACKWARD_KV_SMEM: usize = backward_kv_plan(SharedPlan::sizing())
 const MAX_DYNAMIC_SMEM: usize = 232_448;
 const _: () = assert!(FLASH_BACKWARD_Q_SMEM <= MAX_DYNAMIC_SMEM);
 const _: () = assert!(FLASH_BACKWARD_KV_SMEM <= MAX_DYNAMIC_SMEM);
-/// Threads of either backward kernel: the four warps an `M128` accumulator's
-/// 128 TMEM lanes are drained by, and no others — the same collapse of the
-/// TMA, MMA and gradient warp roles the forward made.
-pub const FLASH_BACKWARD_BLOCK: usize = QUERIES;
+/// Warps of either backward kernel that run the register pass: the four an
+/// `M128` accumulator's 128 TMEM lanes are drained by.
+const PASS_WARPS: u32 = QUERIES as u32 / 32;
+/// The warp that issues every TMA and every MMA, and runs no pass.
+///
+/// **It is a fifth warp rather than one of the four**, which is the whole of
+/// issue #94's first remedy. The leader used to be thread 0 of the pass
+/// warpgroup, so its MMA issue — measured at 2 108 / 2 628 ticks, 42–49% of a
+/// tile visit — ran *before* its own register pass and the other three warps
+/// waited it out at the block barrier. The phase budget put 99% of a visit in
+/// that one serial chain. Split across two warps the tile costs
+/// `max(issue, pass)` instead of their sum.
+///
+/// This is not the warp specialization #75 deleted. That was 192 threads with
+/// a TMA warp *and* an MMA warp, six barrier sets, and a per-query statistic
+/// re-staged through a shared ring because specialization had removed the
+/// block sync it hid behind. Here every ring, every barrier and the one
+/// `sync_threads` per tile are exactly as #75 left them; the only change is
+/// which warp calls `mma_*`.
+const ISSUE_WARP: u32 = PASS_WARPS;
+/// Threads of either backward kernel: the accumulator's four drain warps plus
+/// the issue warp.
+pub const FLASH_BACKWARD_BLOCK: usize = QUERIES + 32;
 /// Mirrors the `FLASH_FORWARD_BLOCK` `.maxntid` note.
-const _: () = assert!(FLASH_BACKWARD_BLOCK == 128);
+const _: () = assert!(FLASH_BACKWARD_BLOCK == 160);
 
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
@@ -799,6 +818,7 @@ pub mod kernels {
 
                 let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
                 let band = 32 * warp_id;
+                let issuing = warp_id == ISSUE_WARP;
 
                 if leader {
                     tcgen05_fence_after_thread_sync();
@@ -846,115 +866,134 @@ pub mod kernels {
                     self.score_mmas(0);
                 }
 
-                // The block's 128 query rows are contiguous and each carries one
-                // saved f32 in the head's own column of `[rows, heads]`, which is
-                // a `RegVec`'s shape exactly — the statistic reaches registers
-                // without a staging tile, a scatter or a barrier (ferro #170).
-                let row = batch * self.t + query_base + band;
-                let mut lse2: Rows = load_row_vec(self.lse, row, head, lane);
-                lse2.scale_assign(LOG2E);
-                let dots: Rows = load_row_vec(self.dot, row, head, lane);
-
-                let mut key_tile = 0u32;
-                while key_tile < key_tiles {
-                    if leader {
-                        // Refill before issuing, for the forward's reason: at the
-                        // ring's floor the stage the score MMA below waits for is
-                        // the one this refill loads, and issuing first deadlocks
-                        // the leader against a load it has not made yet. A K/V
-                        // stage is free once the gradient MMA that read its K
-                        // completed — K is read twice, by the score MMA and again
-                        // by `dQ += dS·K`, and the second is the later.
-                        let refill = key_tile + BACKWARD_STAGES as u32 - 1;
-                        if key_tile > 0 && refill < key_tiles {
-                            self.shared.accumulated.wait(key_tile - 1);
-                            self.load_kv(refill, plane as i32);
+                // Both roles run `key_tiles` iterations and meet at the one
+                // `sync_threads` that publishes dS, so the barrier counts match
+                // whichever branch a warp is in. The issue warp's iteration is
+                // the refill, the next tile's score MMAs and — after the
+                // barrier — this tile's gradient MMA; the pass warps' iteration
+                // is the register pass. They are the two halves the phase
+                // budget found serialized in warp 0, and the tile now costs the
+                // longer of them (issue #94).
+                if issuing {
+                    let mut key_tile = 0u32;
+                    while key_tile < key_tiles {
+                        if lane == 0 {
+                            // Refill before issuing, for the forward's reason: at
+                            // the ring's floor the stage the score MMA below waits
+                            // for is the one this refill loads, and issuing first
+                            // deadlocks the issuer against a load it has not made
+                            // yet. A K/V stage is free once the gradient MMA that
+                            // read its K completed — K is read twice, by the score
+                            // MMA and again by `dQ += dS·K`, and the second is the
+                            // later.
+                            let refill = key_tile + BACKWARD_STAGES as u32 - 1;
+                            if key_tile > 0 && refill < key_tiles {
+                                self.shared.accumulated.wait(key_tile - 1);
+                                self.load_kv(refill, plane as i32);
+                            }
+                            // The next tile's scores are issued before this tile's
+                            // register pass ends, so the tensor core is producing
+                            // `S(i+1)`/`dP(i+1)` while the pass warps form `dS(i)`
+                            // and `dQ(i-1)` accumulates behind it.
+                            if key_tile + 1 < key_tiles {
+                                self.shared.kv_loaded.wait(key_tile + 1);
+                                self.score_mmas(key_tile + 1);
+                            }
                         }
-                        // The next tile's scores are issued before this tile's
-                        // register pass runs, so the tensor core is producing
-                        // `S(i+1)`/`dP(i+1)` while the warpgroup forms `dS(i)`
-                        // and `dQ(i-1)` accumulates behind it.
-                        if key_tile + 1 < key_tiles {
-                            self.shared.kv_loaded.wait(key_tile + 1);
-                            self.score_mmas(key_tile + 1);
-                        }
-                    }
-
-                    self.shared.scored.wait(key_tile);
-                    // The dS slot this tile writes was last read by the gradient
-                    // MMA `GRADIENT_STAGES` tiles back.
-                    if key_tile >= GRADIENT_STAGES as u32 {
-                        self.shared
-                            .accumulated
-                            .wait(key_tile - GRADIENT_STAGES as u32);
-                    }
-
-                    let scores = self.buffer(self.scores, key_tile);
-                    let gradients = self.buffer(self.gradients, key_tile);
-                    let key_base = key_tile * TILE as u32;
-                    let masked = key_tile >= first_masked;
-                    let ds = self.shared.ds.tile(key_tile).chunk_writer();
-
-                    // `dS = exp2(s - lse2)·(dP - D)·scale`, a `SCORE_CHUNK` of
-                    // columns at a time. Never the whole `[32, TILE]` band as a
-                    // value: that is what put the forward's softmax in the LLVM
-                    // local depot and cost it 19.9%, and the two segments read
-                    // here would be twice the band.
-                    let mut column = 0u32;
-                    while column < TILE as u32 {
-                        let mut dscore: ScoreChunk = scores.tile(band, column);
-                        if masked {
-                            // Both origins go in rather than their difference,
-                            // which is negative for a band above the diagonal.
-                            // Masking the *score* rather than the gradient is
-                            // what lets one call replace the `keep` predicate
-                            // the four kernels this replaces each rebuilt: a
-                            // masked score exp2s to a subnormal and multiplies
-                            // the finite `dP - D` to nothing.
-                            dscore.make_causal_at(
-                                lane,
-                                query_base + band,
-                                key_base + column,
-                                MASKED_SCORE,
+                        tcgen05_fence_before_thread_sync();
+                        thread::sync_threads();
+                        if lane == 0 {
+                            tcgen05_fence_after_thread_sync();
+                            mma_ab(
+                                self.accumulator.raw(),
+                                self.shared.ds.tile(key_tile),
+                                self.shared.k.tile(key_tile),
+                                MMA_SHAPE,
+                                key_tile != 0,
                             );
+                            mma::commit(self.shared.accumulated.sem(key_tile));
                         }
-                        dscore.sub_row_assign(lse2);
-                        dscore.unary_map_assign::<Exp2Hw>();
-                        let mut dp: ScoreChunk = gradients.tile(band, column);
-                        dp.sub_row_assign(dots);
-                        dscore.mul_assign(dp);
-                        // The MMA below reads an unscaled K, so `scale` lands
-                        // here; the staged Q already carries `scale·log2e`.
-                        dscore.scale_assign(SCALE);
-                        store_tile(ds, band, column, lane, dscore);
-                        column += SCORE_CHUNK as u32;
+                        key_tile += 1;
+                    }
+                } else {
+                    // The block's 128 query rows are contiguous and each carries
+                    // one saved f32 in the head's own column of `[rows, heads]`,
+                    // which is a `RegVec`'s shape exactly — the statistic reaches
+                    // registers without a staging tile, a scatter or a barrier
+                    // (ferro #170).
+                    let row = batch * self.t + query_base + band;
+                    let mut lse2: Rows = load_row_vec(self.lse, row, head, lane);
+                    lse2.scale_assign(LOG2E);
+                    let dots: Rows = load_row_vec(self.dot, row, head, lane);
+
+                    let mut key_tile = 0u32;
+                    while key_tile < key_tiles {
+                        self.shared.scored.wait(key_tile);
+                        // The dS slot this tile writes was last read by the
+                        // gradient MMA `GRADIENT_STAGES` tiles back.
+                        if key_tile >= GRADIENT_STAGES as u32 {
+                            self.shared
+                                .accumulated
+                                .wait(key_tile - GRADIENT_STAGES as u32);
+                        }
+
+                        let scores = self.buffer(self.scores, key_tile);
+                        let gradients = self.buffer(self.gradients, key_tile);
+                        let key_base = key_tile * TILE as u32;
+                        let masked = key_tile >= first_masked;
+                        let ds = self.shared.ds.tile(key_tile).chunk_writer();
+
+                        // `dS = exp2(s - lse2)·(dP - D)·scale`, a `SCORE_CHUNK` of
+                        // columns at a time. Never the whole `[32, TILE]` band as
+                        // a value: that is what put the forward's softmax in the
+                        // LLVM local depot and cost it 19.9%, and the two segments
+                        // read here would be twice the band.
+                        let mut column = 0u32;
+                        while column < TILE as u32 {
+                            let mut dscore: ScoreChunk = scores.tile(band, column);
+                            if masked {
+                                // Both origins go in rather than their difference,
+                                // which is negative for a band above the diagonal.
+                                // Masking the *score* rather than the gradient is
+                                // what lets one call replace the `keep` predicate
+                                // the four kernels this replaces each rebuilt: a
+                                // masked score exp2s to a subnormal and multiplies
+                                // the finite `dP - D` to nothing.
+                                dscore.make_causal_at(
+                                    lane,
+                                    query_base + band,
+                                    key_base + column,
+                                    MASKED_SCORE,
+                                );
+                            }
+                            dscore.sub_row_assign(lse2);
+                            dscore.unary_map_assign::<Exp2Hw>();
+                            let mut dp: ScoreChunk = gradients.tile(band, column);
+                            dp.sub_row_assign(dots);
+                            dscore.mul_assign(dp);
+                            // The MMA above reads an unscaled K, so `scale` lands
+                            // here; the staged Q already carries `scale·log2e`.
+                            dscore.scale_assign(SCALE);
+                            store_tile(ds, band, column, lane, dscore);
+                            column += SCORE_CHUNK as u32;
+                        }
+
+                        // dS was written through the generic proxy; fence before
+                        // the async-proxy MMA reads it.
+                        fence_proxy_async_shared_cta();
+                        tcgen05_fence_before_thread_sync();
+                        thread::sync_threads();
+                        key_tile += 1;
                     }
 
-                    // dS was written through the generic proxy; fence before the
-                    // async-proxy MMA reads it.
-                    fence_proxy_async_shared_cta();
-                    tcgen05_fence_before_thread_sync();
-                    thread::sync_threads();
-                    if leader {
-                        tcgen05_fence_after_thread_sync();
-                        mma_ab(
-                            self.accumulator.raw(),
-                            self.shared.ds.tile(key_tile),
-                            self.shared.k.tile(key_tile),
-                            MMA_SHAPE,
-                            key_tile != 0,
-                        );
-                        mma::commit(self.shared.accumulated.sem(key_tile));
-                    }
-                    key_tile += 1;
+                    self.shared.accumulated.wait(key_tiles - 1);
+                    // One drain, at the end of the stream: dQ is a complete sum,
+                    // so there is no `1/sum` and no correction path, and the band
+                    // goes straight out. `.x8` because nothing is added to it on
+                    // the way.
+                    let dq: OutBand = self.accumulator.tile_x8(band, 0);
+                    store_rows(self.dq, row, head * HD as u32, lane, dq);
                 }
-
-                self.shared.accumulated.wait(key_tiles - 1);
-                // One drain, at the end of the stream: dQ is a complete sum, so
-                // there is no `1/sum` and no correction path, and the band goes
-                // straight out. `.x8` because nothing is added to it on the way.
-                let dq: OutBand = self.accumulator.tile_x8(band, 0);
-                store_rows(self.dq, row, head * HD as u32, lane, dq);
             }
         }
     }
@@ -990,7 +1029,7 @@ pub mod kernels {
     /// `softmax_scale * log2(e)` and dY staged raw, `logsumexp[B*T, H]` and
     /// `dot[B*T, H]` fp32 read-only, fp32 `dq[B*T, H*HD]` written.
     #[kernel]
-    #[launch_bounds(128, 1)]
+    #[launch_bounds(160, 1)]
     pub unsafe fn flash_backward_q(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -1027,7 +1066,10 @@ pub mod kernels {
                 h: heads,
                 tiles,
                 planes,
-                leader: thread::threadIdx_x() == 0,
+                // The issue warp's lane 0, not thread 0: every `mma_*` and
+                // every `tma_load` of the item belongs to the fifth warp
+                // (issue #94).
+                leader: thread::threadIdx_x() == ISSUE_WARP * 32,
                 warp_id: warp::warp_id(),
                 lane: warp::lane_id(),
                 shared,
@@ -1053,7 +1095,7 @@ pub mod kernels {
     /// [`super::phase_probe::COUNTERS`] zeroed `u64` per CTA of the grid.
     #[allow(clippy::too_many_arguments)]
     #[kernel]
-    #[launch_bounds(128, 1)]
+    #[launch_bounds(160, 1)]
     pub unsafe fn flash_backward_q_probe(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -1091,7 +1133,7 @@ pub mod kernels {
     /// As [`flash_backward_kv`], plus `clocks` as in [`flash_backward_q_probe`].
     #[allow(clippy::too_many_arguments)]
     #[kernel]
-    #[launch_bounds(128, 1)]
+    #[launch_bounds(160, 1)]
     pub unsafe fn flash_backward_kv_probe(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -1247,7 +1289,7 @@ pub mod kernels {
 
                 let (leader, warp_id, lane) = (self.leader, self.warp_id, self.lane);
                 let band = 32 * warp_id;
-                let row = batch * self.t + key_base + band;
+                let issuing = warp_id == ISSUE_WARP;
 
                 if leader {
                     tcgen05_fence_after_thread_sync();
@@ -1289,106 +1331,122 @@ pub mod kernels {
                     self.score_mmas(0);
                 }
 
-                let mut step = 0u32;
-                while step < steps {
-                    // The streamed query tile's rows, which are this band's
-                    // COLUMNS. Everything below indexes by column where the
-                    // query-parallel kernel indexes by row.
-                    let query_base = key_base + step * TILE as u32;
-                    if leader {
-                        let refill = step + BACKWARD_STAGES as u32 - 1;
-                        if step > 0 && refill < steps {
-                            self.shared.accumulated.wait(step - 1);
-                            self.load_qdy(refill, key_base + refill * TILE as u32, plane as i32);
+                // The two roles, and the one barrier they meet at, exactly as
+                // in [`flash_backward_q`] — this kernel's issue warp simply has
+                // two gradient MMAs to post rather than one.
+                if issuing {
+                    let mut step = 0u32;
+                    while step < steps {
+                        if lane == 0 {
+                            let refill = step + BACKWARD_STAGES as u32 - 1;
+                            if step > 0 && refill < steps {
+                                self.shared.accumulated.wait(step - 1);
+                                self.load_qdy(
+                                    refill,
+                                    key_base + refill * TILE as u32,
+                                    plane as i32,
+                                );
+                            }
+                            if step + 1 < steps {
+                                self.shared.qdy_loaded.wait(step + 1);
+                                self.score_mmas(step + 1);
+                            }
                         }
-                        if step + 1 < steps {
-                            self.shared.qdy_loaded.wait(step + 1);
-                            self.score_mmas(step + 1);
-                        }
-                    }
-
-                    self.shared.scored.wait(step);
-                    if step >= GRADIENT_STAGES as u32 {
-                        self.shared.accumulated.wait(step - GRADIENT_STAGES as u32);
-                    }
-
-                    let scores = self.buffer(self.scores, step);
-                    let gradients = self.buffer(self.gradients, step);
-                    // A 128-key band clears the diagonal once the streamed
-                    // query tile is wholly after its last key, which is two
-                    // 64-row tiles in.
-                    let masked = step < 2;
-                    let p = self.shared.p.tile(step).chunk_writer();
-                    let ds = self.shared.ds.tile(step).chunk_writer();
-
-                    let mut column = 0u32;
-                    while column < TILE as u32 {
-                        let query = batch * self.t + query_base + column;
-                        // The saved statistic, read onto the axis this band
-                        // indexes it by — one element per column, down the
-                        // head's own column of `[rows, heads]` (ferro #178).
-                        let mut lse2: Cols = load_col_vec(self.lse, query, head, lane);
-                        lse2.scale_assign(LOG2E);
-                        let dots: Cols = load_col_vec(self.dot, query, head, lane);
-
-                        let mut probability: ScoreChunk = scores.tile(band, column);
-                        if masked {
-                            // The transposed band's mask: rows are keys and
-                            // columns are queries, so this is the other
-                            // diagonal and `key - query` is negative on every
-                            // step but the first.
-                            probability.make_causal_t_at(
-                                lane,
-                                key_base + band,
-                                query_base + column,
-                                MASKED_SCORE,
+                        tcgen05_fence_before_thread_sync();
+                        thread::sync_threads();
+                        if lane == 0 {
+                            tcgen05_fence_after_thread_sync();
+                            let accumulate = step != 0;
+                            mma_ab(
+                                self.dv_acc.raw(),
+                                self.shared.p.tile(step),
+                                self.shared.dy.tile(step),
+                                MMA_SHAPE,
+                                accumulate,
                             );
+                            mma_ab(
+                                self.dk_acc.raw(),
+                                self.shared.ds.tile(step),
+                                self.shared.q.tile(step),
+                                MMA_SHAPE,
+                                accumulate,
+                            );
+                            mma::commit(self.shared.accumulated.sem(step));
                         }
-                        probability.sub_col_assign(lse2);
-                        probability.unary_map_assign::<Exp2Hw>();
-                        store_tile(p, band, column, lane, probability);
+                        step += 1;
+                    }
+                } else {
+                    let row = batch * self.t + key_base + band;
+                    let mut step = 0u32;
+                    while step < steps {
+                        // The streamed query tile's rows, which are this band's
+                        // COLUMNS. Everything below indexes by column where the
+                        // query-parallel kernel indexes by row.
+                        let query_base = key_base + step * TILE as u32;
+                        self.shared.scored.wait(step);
+                        if step >= GRADIENT_STAGES as u32 {
+                            self.shared.accumulated.wait(step - GRADIENT_STAGES as u32);
+                        }
 
-                        let mut dpt: ScoreChunk = gradients.tile(band, column);
-                        dpt.sub_col_assign(dots);
-                        probability.mul_assign(dpt);
-                        // `dK += dSᵀ·Q` runs against the *pre-scaled* Q, so the
-                        // factor here is `ln2` and not `scale`:
-                        // `ln2·scale·log2e = scale`.
-                        probability.scale_assign(LN2);
-                        store_tile(ds, band, column, lane, probability);
-                        column += SCORE_CHUNK as u32;
+                        let scores = self.buffer(self.scores, step);
+                        let gradients = self.buffer(self.gradients, step);
+                        // A 128-key band clears the diagonal once the streamed
+                        // query tile is wholly after its last key, which is two
+                        // 64-row tiles in.
+                        let masked = step < 2;
+                        let p = self.shared.p.tile(step).chunk_writer();
+                        let ds = self.shared.ds.tile(step).chunk_writer();
+
+                        let mut column = 0u32;
+                        while column < TILE as u32 {
+                            let query = batch * self.t + query_base + column;
+                            // The saved statistic, read onto the axis this band
+                            // indexes it by — one element per column, down the
+                            // head's own column of `[rows, heads]` (ferro #178).
+                            let mut lse2: Cols = load_col_vec(self.lse, query, head, lane);
+                            lse2.scale_assign(LOG2E);
+                            let dots: Cols = load_col_vec(self.dot, query, head, lane);
+
+                            let mut probability: ScoreChunk = scores.tile(band, column);
+                            if masked {
+                                // The transposed band's mask: rows are keys and
+                                // columns are queries, so this is the other
+                                // diagonal and `key - query` is negative on
+                                // every step but the first.
+                                probability.make_causal_t_at(
+                                    lane,
+                                    key_base + band,
+                                    query_base + column,
+                                    MASKED_SCORE,
+                                );
+                            }
+                            probability.sub_col_assign(lse2);
+                            probability.unary_map_assign::<Exp2Hw>();
+                            store_tile(p, band, column, lane, probability);
+
+                            let mut dpt: ScoreChunk = gradients.tile(band, column);
+                            dpt.sub_col_assign(dots);
+                            probability.mul_assign(dpt);
+                            // `dK += dSᵀ·Q` runs against the *pre-scaled* Q, so
+                            // the factor here is `ln2` and not `scale`:
+                            // `ln2·scale·log2e = scale`.
+                            probability.scale_assign(LN2);
+                            store_tile(ds, band, column, lane, probability);
+                            column += SCORE_CHUNK as u32;
+                        }
+
+                        fence_proxy_async_shared_cta();
+                        tcgen05_fence_before_thread_sync();
+                        thread::sync_threads();
+                        step += 1;
                     }
 
-                    fence_proxy_async_shared_cta();
-                    tcgen05_fence_before_thread_sync();
-                    thread::sync_threads();
-                    if leader {
-                        tcgen05_fence_after_thread_sync();
-                        let accumulate = step != 0;
-                        mma_ab(
-                            self.dv_acc.raw(),
-                            self.shared.p.tile(step),
-                            self.shared.dy.tile(step),
-                            MMA_SHAPE,
-                            accumulate,
-                        );
-                        mma_ab(
-                            self.dk_acc.raw(),
-                            self.shared.ds.tile(step),
-                            self.shared.q.tile(step),
-                            MMA_SHAPE,
-                            accumulate,
-                        );
-                        mma::commit(self.shared.accumulated.sem(step));
-                    }
-                    step += 1;
+                    self.shared.accumulated.wait(steps - 1);
+                    let dv: OutBand = self.dv_acc.tile_x8(band, 0);
+                    store_rows(self.dv, row, head * HD as u32, lane, dv);
+                    let dk: OutBand = self.dk_acc.tile_x8(band, 0);
+                    store_rows(self.dk, row, head * HD as u32, lane, dk);
                 }
-
-                self.shared.accumulated.wait(steps - 1);
-                let dv: OutBand = self.dv_acc.tile_x8(band, 0);
-                store_rows(self.dv, row, head * HD as u32, lane, dv);
-                let dk: OutBand = self.dk_acc.tile_x8(band, 0);
-                store_rows(self.dk, row, head * HD as u32, lane, dk);
             }
         }
     }
@@ -1416,7 +1474,7 @@ pub mod kernels {
     /// columns where kernel A takes 384 — and why neither can reach two CTAs an
     /// SM at any shared-memory plan.
     #[kernel]
-    #[launch_bounds(128, 1)]
+    #[launch_bounds(160, 1)]
     pub unsafe fn flash_backward_kv(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -1455,7 +1513,8 @@ pub mod kernels {
                 h: heads,
                 tiles,
                 planes,
-                leader: thread::threadIdx_x() == 0,
+                // The issue warp's lane 0; see [`flash_backward_q`].
+                leader: thread::threadIdx_x() == ISSUE_WARP * 32,
                 warp_id: warp::warp_id(),
                 lane: warp::lane_id(),
                 shared,
