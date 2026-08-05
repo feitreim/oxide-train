@@ -251,10 +251,14 @@ impl Tcgen05Flash {
         let backward_q = module.load_function("flash_backward_q")?;
         let backward_kv = module.load_function("flash_backward_kv")?;
         let transpose_probe = module.load_function("transpose_b_probe")?;
+        let backward_q_probe = module.load_function("flash_backward_q_probe")?;
+        let backward_kv_probe = module.load_function("flash_backward_kv_probe")?;
         opt_in_dynamic_smem(&forward, FLASH_FORWARD_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_q, FLASH_BACKWARD_Q_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_kv, FLASH_BACKWARD_KV_SMEM_BYTES)?;
         opt_in_dynamic_smem(&transpose_probe, PROBE_DYNAMIC_SMEM_BYTES)?;
+        opt_in_dynamic_smem(&backward_q_probe, FLASH_BACKWARD_Q_SMEM_BYTES)?;
+        opt_in_dynamic_smem(&backward_kv_probe, FLASH_BACKWARD_KV_SMEM_BYTES)?;
         Ok(Self {
             generated,
             forward,
@@ -262,6 +266,92 @@ impl Tcgen05Flash {
             backward_kv,
             sm_count: device_sm_count(ctx)?,
         })
+    }
+
+    /// [`Self::backward_q`] with the phase stopwatch, writing
+    /// `tcgen05::phase_probe::COUNTERS` ticks per CTA into `clocks`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::backward_q`]; `clocks` holds `COUNTERS * config.grid_dim.0`
+    /// zeroed elements.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn backward_q_probe(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &DeviceBuffer<f32>,
+        dot: &DeviceBuffer<f32>,
+        sequence_length: u32,
+        heads: u32,
+        batches: u32,
+        dq: &mut DeviceBuffer<f32>,
+        clocks: &mut DeviceBuffer<u64>,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            self.generated.flash_backward_q_probe(
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                logsumexp,
+                dot,
+                sequence_length,
+                heads,
+                batches,
+                dq,
+                clocks,
+            )
+        }
+    }
+
+    /// [`Self::backward_kv`] with the phase stopwatch.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::backward_kv`] and [`Self::backward_q_probe`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn backward_kv_probe(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &DeviceBuffer<f32>,
+        dot: &DeviceBuffer<f32>,
+        sequence_length: u32,
+        heads: u32,
+        batches: u32,
+        dk: &mut DeviceBuffer<f32>,
+        dv: &mut DeviceBuffer<f32>,
+        clocks: &mut DeviceBuffer<u64>,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            self.generated.flash_backward_kv_probe(
+                stream,
+                config,
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                logsumexp,
+                dot,
+                sequence_length,
+                heads,
+                batches,
+                dk,
+                dv,
+                clocks,
+            )
+        }
     }
 
     /// SM count captured at load time — the natural `cta_count` for
