@@ -127,7 +127,7 @@
 //!
 //! Within a pass the drain keeps the shape #116/#117 measured: TMEM → registers
 //! (`tcgen05.ld.16x256b.x8`) → `stmatrix.m8n8.x4` into a per-warp
-//! `[32, STAGE_N]` shared tile → 16-byte stores, four passes a band. Not a TMA
+//! `[32, STAGE_N]` shared tile → 16-byte stores, two passes a band. Not a TMA
 //! store: #123 measured that route *losing* by 1.0–1.7% at warp scope on this
 //! tile.
 //!
@@ -217,9 +217,27 @@ const PRODUCER: u32 = DRAIN_WARPS as u32;
 /// `gemm_ws`) both kept these roles on warps of their own; now this one does
 /// too.
 const ISSUER: u32 = PRODUCER + 1;
-/// The staged drain's band: the narrowest bf16 tile `Swizzle128B` admits *and*
-/// the widest four of fit beside the operand rings.
-const STAGE_N: usize = 64;
+/// The staged bf16 drain's band, and the shared tile it passes through.
+///
+/// It was 64 — "the narrowest bf16 tile `Swizzle128B` admits *and* the widest
+/// four of fit beside the operand rings" — and that second clause was the whole
+/// of it. At 64 a `[32, STAGE_N]` band is `(32 / 16) · (64 / 64) = 2` `.x8`
+/// issues, so the bf16 drain paid **four** exposed TMEM latencies a band where
+/// oxide-train#84 got the fp32 store down to two. It could not have the wider
+/// tile: four `[32, 128]` staging tiles are 32 768 B against the 16 384 B four
+/// `[32, 64]` take, and at two CTAs an SM the plan had no such 16 KiB.
+///
+/// At one CTA an SM it does. `128` makes a band exactly
+/// [`kittens::tmem::ISSUE_LIMIT`] issues behind **one** wait and exactly the 128
+/// registers a thread holds — the same shape [`Wide`]'s half-row already had —
+/// so the bf16 band leaves tensor memory in two waits instead of four, and the
+/// plan lands at 229 632 B of the 232 448 an SM will opt a CTA into.
+const STAGE_N: usize = 128;
+/// The reduction drain's band, which is *not* [`STAGE_N`]: its staging buffer is
+/// `[16, REDUCE_N]` fp32 and the reduction store's box is what fixes that width,
+/// so widening the bf16 tile leaves this one where it was and simply borrows
+/// half of it.
+const REDUCE_N: usize = 64;
 /// CTAs of the cluster that share one accumulator and one barrier set.
 ///
 /// Named for the pair rather than `RANKS` because the launch's own rank count
@@ -240,8 +258,10 @@ type Ring = SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
 type StageTile = SharedTile<Bf16, 32, STAGE_N, Swizzle128B>;
 type StageRun = SharedTileRing<Bf16, 32, STAGE_N, Swizzle128B, DRAIN_WARPS>;
 type Band = RegTile<32, STAGE_N, BaseLdtm>;
-/// `.x8` issues one [`Band`] takes: two 16-row blocks of one 64-column group.
+/// `.x8` issues one [`Band`] takes: two 16-row blocks of two 64-column groups,
+/// which is exactly the batch limit and so exactly one wait.
 const BAND_ISSUES: usize = (32 / 16) * (STAGE_N / 64);
+const _: () = assert!(BAND_ISSUES == kittens::tmem::ISSUE_LIMIT);
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 
 const _: () = assert!(HALF_N == BLOCK_M, "one stage type serves both operands");
@@ -347,8 +367,8 @@ const _: () = {
     // 128-byte alignment padding in front of the staging tiles.
     assert!(SHARED_BYTES <= SHARED_OPTIN);
     assert!(
-        BLOCK_N == 4 * STAGE_N,
-        "the staged drains spell their four passes out to hoist the loads ahead of the stores"
+        BLOCK_N == 2 * STAGE_N,
+        "the staged drain spells its two passes out to hoist the loads ahead of the stores"
     );
 };
 
@@ -470,21 +490,17 @@ impl Drain for Packed {
         unsafe {
             let band_row = 32 * warp_id();
             let n = STAGE_N as u32;
-            // Both issues of a band behind one wait: the staging tile is
-            // `[32, STAGE_N]` and nothing slices a wider batch into it, so this
-            // drain halves its exposed TMEM latencies where [`Wide`] quarters
-            // them.
+            // A whole `[32, STAGE_N]` band behind **one** wait — [`STAGE_N`] is
+            // 128 now, so a band is `ISSUE_LIMIT` issues and 128 registers, the
+            // shape [`Wide`] has had since oxide-train#84. Two passes a band
+            // instead of four, and two exposed TMEM latencies instead of four.
             let lift =
                 |column| accumulator.tile_x8_batched::<32, STAGE_N, BAND_ISSUES>(band_row, column);
             let first: Band = lift(0);
-            let second: Band = lift(n);
             self.pass(stage, first, row, column);
-            let third: Band = lift(2 * n);
-            self.pass(stage, second, row, column + n);
-            let fourth: Band = lift(3 * n);
+            let second: Band = lift(n);
             release.now();
-            self.pass(stage, third, row, column + 2 * n);
-            self.pass(stage, fourth, row, column + 3 * n);
+            self.pass(stage, second, row, column + n);
         }
     }
 }
@@ -533,9 +549,9 @@ const HALF_ROW_ISSUES: usize = (16 / 16) * (BLOCK_N / 64);
 const _: () = assert!(HALF_ROW_ISSUES == kittens::tmem::ISSUE_LIMIT);
 
 /// The half-band the reduction drain still lifts one issue at a time: its
-/// staging tile is `[16, STAGE_N]` and nothing slices a wider batch back into
+/// staging tile is `[16, REDUCE_N]` and nothing slices a wider batch back into
 /// that shape.
-type HalfBand = RegTile<16, STAGE_N, BaseLdtm>;
+type HalfBand = RegTile<16, REDUCE_N, BaseLdtm>;
 
 impl Drain for Wide {
     #[inline(always)]
@@ -568,11 +584,11 @@ impl Drain for Wide {
 /// warp, byte-for-byte this warp's bf16 `[32, STAGE_N]` staging tile — so the
 /// fp32 path borrows the bf16 drain's shared plan without costing the plan a
 /// byte, and `SHARED_BYTES` does not move.
-type ReduceRing = StoreRing<F32, 16, STAGE_N, Swizzle128B, 0, Warp>;
+type ReduceRing = StoreRing<F32, 16, REDUCE_N, Swizzle128B, 0, Warp>;
 
 const _: () = assert!(
-    ReduceRing::BYTES == StageTile::BYTES,
-    "the reduce ring reinterprets one bf16 staging tile exactly"
+    ReduceRing::BYTES <= StageTile::BYTES,
+    "the reduce ring reinterprets a prefix of one bf16 staging tile"
 );
 
 /// Accumulating fp32 `C` that never reads `C`: `dW += Aᵀ·B` with the fold done
@@ -634,7 +650,7 @@ impl Drain for Reduce {
             // Three still retires the last `tcgen05.ld` with three scatters and
             // all three of their engine round-trips owed, where one pass of
             // lookahead left an eighth.
-            let n = STAGE_N as u32;
+            let n = REDUCE_N as u32;
             let (top, bottom) = (band_row, band_row + 16);
             let b0: HalfBand = accumulator.tile_x8(top, 0);
             let b1: HalfBand = accumulator.tile_x8(top, n);
