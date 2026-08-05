@@ -156,12 +156,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fp32_module = fp32::kernels::load(&context)?;
     let module = Tcgen05Gemm::load(&context)?;
     enforce_kernel_budgets(&module.kernels(), &KERNEL_BUDGETS)?;
+    report_residency(&module)?;
 
     check_fp32(&stream, &fp32_module)?;
     check_tcgen05_bf16(&stream, &module)?;
     check_tcgen05_bf16_transposed(&stream, &module)?;
     check_tcgen05_many_items(&stream, &module)?;
     println!("✓ fp32 and tcgen05 bf16 GEMM store/accumulate parity passed");
+    Ok(())
+}
+
+/// What the driver will actually keep resident, which is not what the shared
+/// plan and the tensor-memory arithmetic say it is.
+///
+/// `MAX_CLUSTERS` is derived from per-CTA resources — `512 / ACCUM_COLS`
+/// tensor-memory columns, then shared memory, then registers — and every one of
+/// those is a *per-SM* limit that a cluster launch is free to be stricter than.
+/// `cuOccupancyMaxActiveClusters` asks the concrete question with the cluster
+/// shape attached, and the CTAs-per-SM it implies is the number that decides
+/// whether a persistent grid covers the device or half of it.
+fn report_residency(module: &Tcgen05Gemm) -> Result<(), Box<dyn std::error::Error>> {
+    const SMS: u32 = 148;
+    let grid = gemm::tcgen05_launch_config(4096, 4096, 4096);
+    let ranks = gemm::TC_RANKS;
+    println!("cluster residency (cuOccupancyMaxActiveClusters, {ranks}-CTA clusters)");
+    for (name, function) in module.kernels() {
+        let clusters = function.max_active_clusters(
+            grid.grid_dim,
+            grid.block_dim,
+            grid.shared_mem_bytes,
+            (ranks, 1, 1),
+        )?;
+        let ctas = clusters * ranks;
+        println!(
+            "  {name} {clusters} clusters = {ctas} CTAs, {:.2} CTAs/SM",
+            ctas as f32 / SMS as f32
+        );
+    }
+    // Is the cap the shared plan or the cluster's own geometry? The occupancy
+    // query takes the dynamic byte count as a parameter, so the same compiled
+    // function can be asked what it would get with a smaller plan. A number
+    // that does not move as the bytes fall is a shape the device cannot pack,
+    // not a budget this kernel overspent.
+    let (name, function) = module.kernels()[1];
+    println!("  {name} against dynamic shared memory, same {ranks}-CTA shape:");
+    for bytes in [gemm::SHARED_BYTES as u32, 96_000, 64_000, 32_000, 16_000, 0] {
+        let clusters =
+            function.max_active_clusters(grid.grid_dim, grid.block_dim, bytes, (ranks, 1, 1))?;
+        println!(
+            "    {bytes:>7} B  {clusters:>3} clusters  {:>5.2} CTAs/SM",
+            (clusters * ranks) as f32 / SMS as f32
+        );
+    }
     Ok(())
 }
 

@@ -85,7 +85,7 @@ pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
 
 /// CTAs of a cluster — the `cluster_launch` dimension, said once. Four since
 /// the cluster became two `cta_group::2` pairs sharing a multicast `A`.
-const TC_RANKS: u32 = 4;
+pub const TC_RANKS: u32 = 4;
 /// Threads a CTA launches with: one warp per 32 accumulator rows, and every one
 /// of them drains.
 const TC_THREADS: u32 = super::optimized::THREADS;

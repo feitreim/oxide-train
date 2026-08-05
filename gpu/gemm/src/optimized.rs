@@ -256,6 +256,18 @@ const fn leader_of(pair: u32) -> u32 {
 /// stage's `A` is written by one pair's producer into *both* pairs' rings.
 const CLUSTER_MASK: u16 = ((1u32 << CLUSTER_RANKS) - 1) as u16;
 
+/// Whether `A` is replicated between the cluster's two pairs, or each rank
+/// fetches its own.
+///
+/// Off is the **control**, not a fallback, and it is the only way to price the
+/// 4-CTA cluster apart from the thing the 4-CTA cluster was built for. It keeps
+/// the cluster, the region walk, the two accumulators and the per-pair
+/// barriers, and changes exactly two things: every rank fetches the `A` half
+/// its own rank in the pair owes (so the operand bill goes back to the narrow
+/// tile's ×1.50), and `free` goes back to a per-pair release with one arrival,
+/// since no producer writes into a pair it is not in.
+const MULTICAST: bool = true;
+
 /// The `cta_group::2` multicast mask for `pair` — the two CTAs a `tcgen05`
 /// commit has to reach, which is no longer the whole cluster.
 #[inline(always)]
@@ -319,7 +331,24 @@ const _: () = assert!(
 /// does.
 const SMS: u32 = 148;
 const CTAS_PER_SM: u32 = 512 / ACCUM_COLS;
-pub const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / CLUSTER_RANKS;
+/// What the per-CTA resources say the device should hold.
+const RESOURCE_CLUSTERS: u32 = SMS * CTAS_PER_SM / CLUSTER_RANKS;
+/// What the driver says it will actually hold, which is not the same number.
+///
+/// `cuOccupancyMaxActiveClusters` for this compiled shape answers **33** — 132
+/// CTAs of the device's 148 — against **74** (148 CTAs) for the two-CTA
+/// cluster, and it answers the same 33 all the way down to a *zero*-byte
+/// dynamic plan. So the cap is the cluster's **width**, not anything this
+/// kernel spends.
+///
+/// Sizing the grid to it was measured and is **not** the fix: at 33 the
+/// fourteen model rows land at 0.42–0.51 against 0.46–0.60 at
+/// [`RESOURCE_CLUSTERS`], i.e. no better and mostly worse. Kept as the
+/// preserved control rather than the shipped value — over-subscription is not
+/// what this kernel loses to (oxide-train#80).
+const RESIDENT_CLUSTERS: u32 = 33;
+pub const MAX_CLUSTERS: u32 = RESOURCE_CLUSTERS;
+const _: () = assert!(RESIDENT_CLUSTERS <= RESOURCE_CLUSTERS);
 
 /// [`pipeline::grouped`]'s width, swept at this tile shape by ferro-kittens
 /// #89 — a tile change is a reason to re-run that sweep.
@@ -771,7 +800,13 @@ impl<D: Drain> Tile<D> {
             // issues only `B`, and a leader's barrier is charged for exactly
             // twice what a leader issued — the other pair leader's `A` and its
             // own peer's `B` being the same two sizes over again.
-            let leads = self.rank == self.leader;
+            // Under [`MULTICAST`] only the pair leaders fetch `A`, and they
+            // fetch the half their *pair index* names. Without it every rank
+            // fetches the half its own rank in the pair owes, which is the
+            // narrow tile's operand bill and the control this is measured
+            // against.
+            let leads = !MULTICAST || self.rank == self.leader;
+            let a_half = if MULTICAST { self.pair } else { self.rank_in_pair };
             while let Some(item) = walk.next() {
                 let (tile_m, tile_n) = self.locate(item);
                 // The `A` half a leader fetches is the one its *pair index*
@@ -779,8 +814,7 @@ impl<D: Drain> Tile<D> {
                 // ranks {0, 2} and rank 2 brings `BLOCK_M..` to ranks {1, 3},
                 // so every CTA ends up holding the half its rank in the pair
                 // owes the MMA.
-                let a_line =
-                    (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.pair) as i32;
+                let a_line = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * a_half) as i32;
                 let b_line =
                     (BLOCK_N as u32 * tile_n + HALF_N as u32 * self.rank_in_pair) as i32;
                 let mut k = 0u32;
@@ -810,7 +844,9 @@ impl<D: Drain> Tile<D> {
                     let bytes = if self.transposed {
                         let b_bytes = MnBStage::from_raw(b.base())
                             .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage);
-                        if leads {
+                        if !leads {
+                            b_bytes
+                        } else if MULTICAST {
                             MnAStage::from_raw(a.base()).tma_load_2d_multicast_cg2(
                                 self.a_map,
                                 a_line,
@@ -819,11 +855,15 @@ impl<D: Drain> Tile<D> {
                                 self.a_mask,
                             ) + b_bytes
                         } else {
-                            b_bytes
+                            MnAStage::from_raw(a.base())
+                                .tma_load_2d_arriving_at(self.a_map, a_line, depth, stage)
+                                + b_bytes
                         }
                     } else {
                         let b_bytes = b.tma_load_2d_arriving_at(self.b_map, depth, b_line, stage);
-                        if leads {
+                        if !leads {
+                            b_bytes
+                        } else if MULTICAST {
                             a.tma_load_2d_multicast_cg2(
                                 self.a_map,
                                 depth,
@@ -832,10 +872,11 @@ impl<D: Drain> Tile<D> {
                                 self.a_mask,
                             ) + b_bytes
                         } else {
-                            b_bytes
+                            a.tma_load_2d_arriving_at(self.a_map, depth, a_line, stage)
+                                + b_bytes
                         }
                     };
-                    if leads {
+                    if self.rank == self.leader {
                         self.load
                             .sem(stage_index)
                             .expect_tx(bytes.across_ranks(PAIR_RANKS));
@@ -857,6 +898,13 @@ impl<D: Drain> Tile<D> {
     #[inline(always)]
     unsafe fn multiply(&self, mut walk: Walk) {
         unsafe {
+            // `free` is the one release that goes cluster-wide, and only when
+            // `A` is replicated: a pair leader then writes into the *other*
+            // pair's ring, so a slot may not be refilled until both MMAs have
+            // read it. Getting this wrong is not a hang — the accounting still
+            // balances and one pair overwrites an operand the other is still
+            // reading, which measured as 0.77% of `C` wrong.
+            let free_mask = if MULTICAST { CLUSTER_MASK } else { self.pair_mask };
             let mut sequence = 0u32;
             let mut stage_index = 0u32;
             while walk.next().is_some() {
@@ -884,16 +932,7 @@ impl<D: Drain> Tile<D> {
                         MmaShape::M256_N128,
                         k > 0,
                     );
-                    // `free` is the one release that stays cluster-wide. A
-                    // pair leader multicasts `A` into the *other* pair's ring
-                    // at the same stage index, so a slot may not be refilled
-                    // until **both** MMAs have read it — which is why this
-                    // commit reaches all four CTAs and why `free` is armed for
-                    // [`PAIRS`] arrivals rather than one. Getting this wrong is
-                    // not a hang: the accounting still balances and one pair
-                    // simply overwrites an operand the other is still reading,
-                    // which measured as 0.77% of `C` wrong.
-                    commit_multicast_cg2(self.free.sem(stage_index), CLUSTER_MASK);
+                    commit_multicast_cg2(self.free.sem(stage_index), free_mask);
                     k += 1;
                     stage_index += 1;
                 }
@@ -951,7 +990,7 @@ impl<D: Drain> Tile<D> {
                 self.load.init_all(1);
                 // One arrival per pair: a stage is recyclable when both MMAs
                 // have consumed it, since both read `A` this producer wrote.
-                self.free.init_all(PAIRS);
+                self.free.init_all(if MULTICAST { PAIRS } else { 1 });
                 self.full.init_all(1);
                 // One arrival per band warp per rank *of the pair*: the MMA
                 // writes both of its ranks' tensor memory, and the other pair's
