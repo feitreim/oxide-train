@@ -75,6 +75,14 @@ struct Budget {
     idle: f64,
     epi: f64,
     span: f64,
+    tma: f64,
+    smma: f64,
+    gmma: f64,
+    tread: f64,
+    sstore: f64,
+    gap: f64,
+    fill: f64,
+    drain: f64,
 }
 
 impl Budget {
@@ -99,6 +107,14 @@ impl Budget {
             sum.idle += block[probe::IDLE] as f64;
             sum.epi += block[probe::EPI] as f64;
             sum.span += block[probe::SPAN] as f64;
+            sum.tma += block[probe::TMA] as f64;
+            sum.smma += block[probe::SMMA] as f64;
+            sum.gmma += block[probe::GMMA] as f64;
+            sum.tread += block[probe::TREAD] as f64;
+            sum.sstore += block[probe::SSTORE] as f64;
+            sum.gap += block[probe::GAP] as f64;
+            sum.fill += block[probe::FILL] as f64;
+            sum.drain += block[probe::DRAIN] as f64;
         }
         let ctas = ctas.max(1.0);
         Self {
@@ -115,6 +131,14 @@ impl Budget {
             idle: sum.idle / ctas,
             epi: sum.epi / ctas,
             span: sum.span / ctas,
+            tma: sum.tma / ctas,
+            smma: sum.smma / ctas,
+            gmma: sum.gmma / ctas,
+            tread: sum.tread / ctas,
+            sstore: sum.sstore / ctas,
+            gap: sum.gap / ctas,
+            fill: sum.fill / ctas,
+            drain: sum.drain / ctas,
         }
     }
 
@@ -184,6 +208,28 @@ impl Budget {
              IDLE {:>6.0}\n      per item:   EPI   {:>6.0}",
             self.feed, self.recycle, self.issue, self.idle, self.epi,
         );
+        // The two splits, printed only where the probe fills them (kernel A).
+        // `TMA + SMMA + GMMA` partitions `ISSUE` and `TREAD + ARITH + SSTORE`
+        // partitions `PASS`, so each line is a decomposition and not a sample.
+        if self.smma > 0.0 {
+            let arith = self.pass - self.tread - self.sstore;
+            println!(
+                "      ISSUE split: TMA   {:>6.0}          SMMA    {:>6.0}         GMMA  \
+                 {:>6.0}\n      PASS split:  TREAD {:>6.0}          ARITH   {:>6.0}         \
+                 STORE {:>6.0}\n      per item:   FILL  {:>6.0}          GAP     {:>6.0}         \
+                 EPI {:>6.0}          DRAIN   {:>6.0}",
+                self.tma,
+                self.smma,
+                self.gmma,
+                self.tread,
+                arith,
+                self.sstore,
+                self.fill,
+                self.gap,
+                self.epi,
+                self.drain,
+            );
+        }
         println!(
             "      shipped ns/visit {ns_per_visit:.0} at 1 CTA/SM over 148 SMs \
              (implied SM clock {ghz:.2} GHz)",
@@ -200,6 +246,47 @@ fn visits(b: usize, t: usize, h: usize) -> f64 {
     (per_plane * b * h) as f64
 }
 
+/// The cadence probe's variants, in the order the kernel writes them: the
+/// three widths of the score MMA's own walk, then kernel A's gradient MMA both
+/// ways. `units` is the variant's work in `M128_N64_K16` instructions, so the
+/// last column is directly comparable across widths.
+/// `(name, instructions a round, M128_N64_K16-equivalents a round)`.
+const CADENCE: [(&str, f64, f64); 5] = [
+    ("mma_abt  M128_N64   K=128", 8.0, 8.0),
+    ("mma_abt  M128_N128  K=128", 8.0, 16.0),
+    ("mma_abt  M128_N256  K=128", 8.0, 32.0),
+    ("mma_ab   M128_N64x2 K=64 (dQ, shipped)", 8.0, 8.0),
+    ("mma_ab   M128_N128  K=64 (dQ, one band)", 4.0, 8.0),
+];
+
+fn report_cadence(counters: &[u64], rounds: u32) {
+    println!("mma cadence — one warp, one CTA, {rounds} rounds a variant\n");
+    println!(
+        "  {:<41} {:>7} {:>10} {:>10} {:>10}",
+        "variant", "instrs", "issue/ins", "retire/ins", "ticks/unit"
+    );
+    for (variant, (name, per_round, units)) in CADENCE.iter().enumerate() {
+        let block = &counters[variant * probe::CADENCE_SLOTS..];
+        let (issued, retired, latency, instructions) = (
+            block[0] as f64,
+            block[1] as f64,
+            block[2] as f64,
+            block[3] as f64,
+        );
+        if instructions == 0.0 {
+            continue;
+        }
+        println!(
+            "  {name:<41} {instructions:>7.0} {:>10.1} {:>10.1} {:>10.1}   \
+             (drained chain {latency:.0} ticks)",
+            issued / instructions,
+            retired / instructions,
+            retired / (instructions / per_round * units),
+        );
+    }
+    println!();
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
@@ -207,6 +294,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flash = Tcgen05Flash::load(&ctx)?;
     let sm_count = flash.sm_count();
     println!("flash backward phase budget, {sm_count} SMs\n");
+
+    const ROUNDS: u32 = 256;
+    let mut cadence = DeviceBuffer::<u64>::zeroed(stream, probe::CADENCE_COUNTERS)?;
+    unsafe { flash.mma_cadence(stream, ROUNDS, &mut cadence)? };
+    unsafe { flash.mma_cadence(stream, ROUNDS, &mut cadence)? };
+    report_cadence(&cadence.to_host_vec(stream)?, ROUNDS);
 
     for (b, t, h) in SHAPES {
         let d = h * FLASH_HD;

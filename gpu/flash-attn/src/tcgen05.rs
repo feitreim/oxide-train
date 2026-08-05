@@ -113,10 +113,32 @@ const HD: usize = 128;
 /// The 64-query forward that filled half of one is what #68 removed.
 const QUERIES: usize = 2 * TILE;
 
-/// Every MMA here is one warpgroup's `M128_N64`. The element type, the fp32
-/// accumulator and the transpose flags are the operand tiles' and the entry
-/// point's own now, so a call states only the shape.
-const MMA_SHAPE: MmaShape = MmaShape::M128_N64;
+/// Shape of every score MMA — `S = Q·Kᵀ`, `dP = dY·Vᵀ`, and the key-parallel
+/// kernel's transposed twins. `N` is the streamed tile's `TILE` keys (or
+/// queries), which is 64, and that is the *only* reason it is 64: a `TILE` of
+/// 128 would make it `M128_N128` and cost the tensor core nothing extra.
+///
+/// It is 43% off the tensor core's rate and it is the roof kernel A sits on.
+/// The cadence probe (`src/bin/probe.rs`, issue #94) measures `M128_N64` at
+/// **55.7 ticks per `M128_N64_K16`-equivalent against `M128_N128`'s 32.0**, and
+/// the tile cannot widen: a 128-key visit needs 256 KiB of shared memory
+/// against `MAX_DYNAMIC_SMEM`'s 227, with the second dS slot as the binding
+/// term.
+const SCORE_SHAPE: MmaShape = MmaShape::M128_N64;
+/// Shape of every HD-wide accumulation — the forward's `O = P·V` and all three
+/// gradient MMAs. **One `N = HD` band, not two `N = 64` ones**: an MN-major B
+/// reaches its second stacked subtile through the descriptor's leading offset,
+/// so one instruction per K chunk covers the whole accumulator
+/// (ferro-kittens#194).
+///
+/// Same products in the same K order as the banded form it replaced, so it is
+/// the same sum bit for bit; what changes is that the tensor core runs at
+/// **32.1 ticks per unit instead of 48.2**, 1.50×, on the same cadence probe.
+const OUTPUT_SHAPE: MmaShape = MmaShape::M128_N128;
+const _: () = assert!(
+    OUTPUT_SHAPE.n as usize == HD && SCORE_SHAPE.n as usize == TILE,
+    "both shapes are the operands' own product: the accumulator is HD wide and a score band is one streamed tile"
+);
 
 /// One `[TILE, HD]` bf16 operand panel as a kittens tile — two stacked
 /// SWIZZLE_128B subtiles, the layout described above. Phase 1 of issue #61
@@ -517,6 +539,11 @@ const fn forward_plan(at: SharedPlan) -> Forward {
     }
 }
 
+/// A query-parallel backward thread's `staged_row` when it owes no deferred
+/// drain. A row index is `batch * T + query_base + band`, so it cannot collide
+/// with this.
+const UNSTAGED: u32 = u32::MAX;
+
 /// Finite stand-in for "masked" in the base-2 score domain; far enough below
 /// any real score that `exp2` flushes it to a subnormal-scale value while the
 /// running-max recurrence stays NaN-free.
@@ -561,7 +588,7 @@ pub mod kernels {
         q: SharedTile<Bf16, AR, HD, Swizzle128B>,
         k: Panel,
     ) {
-        unsafe { mma_abt(s_tmem, q, k, MMA_SHAPE, false) }
+        unsafe { mma_abt(s_tmem, q, k, SCORE_SHAPE, false) }
     }
 
     /// Elementwise `2^x` accuracy oracle for the standalone parity gate.
@@ -754,6 +781,13 @@ pub mod kernels {
         lse: GlobalRows<F32>,
         dot: GlobalRows<F32>,
         dq: GlobalRows<F32>,
+        /// The output row this thread owes a store for — the *previous* item's,
+        /// held because [`Self::drain`] runs at the top of the next item rather
+        /// than at the bottom of its own. [`UNSTAGED`] before the first item,
+        /// and again after the tail flush.
+        staged_row: u32,
+        /// The head that row belongs to, the other half of the same address.
+        staged_head: u32,
     }
 
     impl BackwardQStream {
@@ -792,10 +826,11 @@ pub mod kernels {
         /// segment, and publish both on one arrival: the register pass reads
         /// them together and there is nothing it could do with one alone.
         ///
-        /// `MMA_SHAPE` is the *band* the accumulator gets, which for a
-        /// `[TILE, HD]` B operand read transposed is its `TILE` rows — the one
-        /// argument no operand can supply, and the one ferro #175 found two
-        /// callers reading as the tile's.
+        /// `SCORE_SHAPE`'s `N` is the streamed panel's `TILE` rows read
+        /// transposed — the one descriptor field no operand can supply. It is
+        /// also this kernel's roof: 64 is the width the tensor core is 43% off
+        /// its rate at, and the tile cannot widen (issue #94, and `probe`'s
+        /// cadence table is the measurement).
         #[inline(always)]
         unsafe fn score_mmas(&self, key_tile: u32) {
             unsafe {
@@ -803,17 +838,63 @@ pub mod kernels {
                     self.buffer(self.scores, key_tile).raw(),
                     self.shared.q,
                     self.shared.k.tile(key_tile),
-                    MMA_SHAPE,
+                    SCORE_SHAPE,
                     false,
                 );
                 mma_abt(
                     self.buffer(self.gradients, key_tile).raw(),
                     self.shared.dy,
                     self.shared.v.tile(key_tile),
-                    MMA_SHAPE,
+                    SCORE_SHAPE,
                     false,
                 );
                 mma::commit(self.shared.scored.sem(key_tile));
+            }
+        }
+
+        /// Drain whatever item's `dQ` is still sitting in the accumulator, if
+        /// there is one, and clear the debt.
+        ///
+        /// **One drain, one item late.** dQ is a complete sum — a query block
+        /// owns every key its rows attend to — so there is no `1/sum`, no
+        /// correction path, and the band goes straight out; `.x8` because
+        /// nothing is added to it on the way, and `DRAIN_COLUMNS` because the
+        /// drain splits the way the pass does (a `[32, 128]` fp32 band is 128
+        /// registers live at once, which at `.maxntid 288` is over half of
+        /// ptxas' 227).
+        ///
+        /// It runs at the *top* of the next item because that is where the
+        /// pass warps have nothing else to do: they open an item waiting out
+        /// its TMA fill at `scored.wait(0)`, measured at 3534 ticks against
+        /// this drain's 2957 (issue #94), and a store issued into that window
+        /// costs the item nothing. What cannot move with it is the
+        /// `accumulated.wait` in front of it — `pipeline::run` re-arms the
+        /// barrier set at the item boundary, so the last gradient MMA has to be
+        /// waited out before the item ends. That wait is 513 ticks of the 3470
+        /// the epilogue used to be.
+        ///
+        /// The hand-off to the *next* item's first gradient MMA, which
+        /// overwrites this accumulator, is the block barrier the pass already
+        /// takes after its first tile: the drain's `tcgen05.ld` are retired by
+        /// `tile_x8` and the MMA is issued after that barrier. The last item's
+        /// debt is settled by the flush in [`flash_backward_q`], which is the
+        /// obligation `pipeline::Job` names for a deferred store.
+        #[inline(always)]
+        unsafe fn drain(&mut self, band: u32, group: u32, lane: u32) {
+            unsafe {
+                if self.staged_row == UNSTAGED {
+                    return;
+                }
+                let columns = group * DRAIN_COLUMNS as u32;
+                let dq: OutHalf = self.accumulator.tile_x8(band, columns);
+                store_rows(
+                    self.dq,
+                    self.staged_row,
+                    self.staged_head * HD as u32 + columns,
+                    lane,
+                    dq,
+                );
+                self.staged_row = UNSTAGED;
             }
         }
     }
@@ -954,7 +1035,7 @@ pub mod kernels {
                                 self.accumulator.raw(),
                                 self.shared.ds.tile(key_tile),
                                 self.shared.k.tile(key_tile),
-                                MMA_SHAPE,
+                                OUTPUT_SHAPE,
                                 key_tile != 0,
                             );
                             mma::commit(self.shared.accumulated.sem(key_tile));
@@ -962,6 +1043,9 @@ pub mod kernels {
                         key_tile += 1;
                     }
                 } else {
+                    // The previous item's dQ, into the window this item's TMA
+                    // fill is about to make the pass warps wait in anyway.
+                    self.drain(band, group, lane);
                     // The block's 128 query rows are contiguous and each carries
                     // one saved f32 in the head's own column of `[rows, heads]`,
                     // which is a `RegVec`'s shape exactly — the statistic reaches
@@ -1040,20 +1124,13 @@ pub mod kernels {
                         key_tile += 1;
                     }
 
+                    // The last gradient MMA has to be waited out *here*, before
+                    // the item boundary re-arms the barrier set. The drain it
+                    // used to be followed by does not, and is now the next
+                    // item's opening move — see `Self::drain`.
                     self.shared.accumulated.wait(key_tiles - 1);
-                    // One drain, at the end of the stream: dQ is a complete sum,
-                    // so there is no `1/sum` and no correction path, and the band
-                    // goes straight out. `.x8` because nothing is added to it on
-                    // the way.
-                    //
-                    // The drain is split the same way the pass is, and for a
-                    // second reason as well as symmetry: at 288 threads ptxas
-                    // has 227 registers a thread, and a `[32, 128]` fp32 band
-                    // is 128 of them live at once in the one place this kernel
-                    // holds a whole value.
-                    let columns = group * DRAIN_COLUMNS as u32;
-                    let dq: OutHalf = self.accumulator.tile_x8(band, columns);
-                    store_rows(self.dq, row, head * HD as u32 + columns, lane, dq);
+                    self.staged_row = row;
+                    self.staged_head = head;
                 }
             }
         }
@@ -1074,7 +1151,10 @@ pub mod kernels {
     /// it back to shared memory, and `dQ += dS·K` accumulates in TMEM for the
     /// whole stream. **dQ never leaves tensor memory until the item ends**: a
     /// query block owns every key its rows attend to, so its output tile has one
-    /// writer and the epilogue is a `store_rows`.
+    /// writer and the epilogue is a `store_rows` — issued at the top of the
+    /// *next* item, into the window its TMA fill would otherwise have the pass
+    /// warps idle in (issue #94), with a flush after the persistent loop for
+    /// the last item's.
     ///
     /// What made this two kernels was the same thing that made the forward
     /// three — a synchronous form that exposed TMA, MMA, the register pass and
@@ -1140,8 +1220,17 @@ pub mod kernels {
                 lse: GlobalRows::<F32>::from_raw(logsumexp.as_ptr().cast_mut().cast(), stats),
                 dot: GlobalRows::<F32>::from_raw(dot.as_ptr().cast_mut().cast(), stats),
                 dq: GlobalRows::<F32>::from_slice(&mut dq, heads as usize * HD),
+                staged_row: UNSTAGED,
+                staged_head: 0,
             };
             pipeline::run(&mut job, tiles * planes);
+            // The tail of a deferred store: `run` leaves the last item's dQ in
+            // the accumulator, because the drain that would have taken it is
+            // the *next* item's and there is no next item. A CTA that ran none
+            // stages nothing and this is a predicated no-op.
+            job.drain(warp_lanes(), warp::warp_id() / DRAIN_WARPS, warp::lane_id());
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
             dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
         }
     }
@@ -1227,6 +1316,25 @@ pub mod kernels {
         }
     }
 
+    /// What one `tcgen05.mma` costs the warp that issues it, as a function of
+    /// `N` — the measurement that says whether kernel A's issue column is the
+    /// tensor core's throughput or a per-instruction toll (issue #94).
+    ///
+    /// One CTA, one warp, no work items and no operand traffic: it stages two
+    /// zeroed panels once and then times chained walks into a resident
+    /// accumulator. Body in [`super::phase_probe::mma_cadence`].
+    ///
+    /// # Safety
+    ///
+    /// Launch as `host::Tcgen05Flash::mma_cadence` does: one CTA of 32 threads
+    /// with `host::CADENCE_SMEM_BYTES` dynamic shared memory, `clocks` holding
+    /// `phase_probe::CADENCE_COUNTERS` zeroed `u64`.
+    #[kernel]
+    #[launch_bounds(32, 1)]
+    pub unsafe fn mma_cadence(rounds: u32, mut clocks: DisjointSlice<u64>) {
+        unsafe { phase_probe::mma_cadence(rounds, &mut clocks) }
+    }
+
     /// The key-parallel backward as a [`pipeline::Job`]: one work item is a
     /// (key block, head, batch), and everything the query-parallel stream does
     /// by row this does by column.
@@ -1299,14 +1407,14 @@ pub mod kernels {
                     self.buffer(self.scores, step).raw(),
                     self.shared.k,
                     self.shared.q.tile(step),
-                    MMA_SHAPE,
+                    SCORE_SHAPE,
                     false,
                 );
                 mma_abt(
                     self.buffer(self.gradients, step).raw(),
                     self.shared.v,
                     self.shared.dy.tile(step),
-                    MMA_SHAPE,
+                    SCORE_SHAPE,
                     false,
                 );
                 mma::commit(self.shared.scored.sem(step));
@@ -1424,14 +1532,14 @@ pub mod kernels {
                                 self.dv_acc.raw(),
                                 self.shared.p.tile(step),
                                 self.shared.dy.tile(step),
-                                MMA_SHAPE,
+                                OUTPUT_SHAPE,
                                 accumulate,
                             );
                             mma_ab(
                                 self.dk_acc.raw(),
                                 self.shared.ds.tile(step),
                                 self.shared.q.tile(step),
-                                MMA_SHAPE,
+                                OUTPUT_SHAPE,
                                 accumulate,
                             );
                             mma::commit(self.shared.accumulated.sem(step));
@@ -1917,7 +2025,7 @@ pub mod kernels {
                             self.accumulator.raw(),
                             self.shared.p.tile(key_tile),
                             self.shared.v.tile(key_tile),
-                            MMA_SHAPE,
+                            OUTPUT_SHAPE,
                             key_tile != 0,
                         );
                         mma::commit(self.shared.accumulated.sem(key_tile));

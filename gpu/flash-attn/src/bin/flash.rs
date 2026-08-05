@@ -158,10 +158,17 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         // ceiling and neither of these is.
         //
         // **200 -> 140 at the pass split**, kernel A's reason twice over: two
-        // accumulators drained a half-band each rather than whole. The twelve
+        // accumulators drained a half-band each rather than whole. The ten
         // registers over A are still `Pᵀ` live across `dSᵀ`.
+        //
+        // **140 -> 138 at the wide gradient MMA** (#94): its two `mma_ab`
+        // walks each issued two banded `N = 64` descriptors and now issue one
+        // `N = HD`, so there is one fewer operand descriptor live at the
+        // point the pair is pushed. Kernel A's own 128 does not move — its
+        // one gradient MMA was never the binding value there — and neither
+        // does the forward's.
         name: "backward kv",
-        max_registers: 140,
+        max_registers: 138,
         max_spill_bytes: 0,
     },
 ];
