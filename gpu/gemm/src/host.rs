@@ -26,10 +26,20 @@ pub const TC_N_TILE: usize = 256;
 /// Output columns of one work item — the kernel's tile, and the divisor its
 /// `tiles_n` argument is counted in.
 pub const TC_N_ITEM: usize = super::optimized::BLOCK_N;
-/// Rows of `B` one rank stages: a `cta_group::2` `M256_N128` reads `TC_TILE`
-/// rows of `A` and this many columns of `B` from each rank, so a bf16 matrix
-/// needs a second TMA box to be usable as the `B` operand.
-pub const TC_B_TILE: usize = TC_N_ITEM / 2;
+/// Rows of `B` one rank stages for **one** chain, so a bf16 matrix needs a
+/// second TMA box to be usable as the `B` operand.
+///
+/// A `cta_group::2` MMA reads `N / 2` columns of `B` from each rank, so an
+/// `M256_N128` chain reads 64 — a *quarter* of the item's [`TC_N_ITEM`]
+/// columns, not a half. The first cut of this probe wrote `TC_N_ITEM / 2` here
+/// against a kernel staging `BLOCK_N / 4`, and the two-fold disagreement is why
+/// it hung rather than ran: each half-box landed 128 rows in the 64-row stage
+/// reserved for it, and the stage barrier was charged half the bytes the engine
+/// delivered, so `load` never completed and every rank waited out the launch.
+pub const TC_B_TILE: usize = TC_N_ITEM / 4;
+/// The box a map hands out and the stage it lands in are the same rectangle,
+/// and nothing else in either file says so.
+const _: () = assert!(TC_B_TILE == super::optimized::HALF_B);
 /// Bytes of one CUDA tensor map, and the stride between the two boxes every
 /// bf16 map encodes.
 const TC_MAP_BYTES: usize = 128;

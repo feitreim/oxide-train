@@ -133,7 +133,7 @@ const HALF_N: usize = BLOCK_N / 2;
 /// Columns of `B` one rank feeds to **one** `M256_N128` chain: half of that
 /// again, because an `M256_N128` reads `N / 2` columns from each rank of the
 /// pair where an `M256_N256` reads `N / 2` of a twice-wider `N`.
-const HALF_B: usize = HALF_N / 2;
+pub const HALF_B: usize = HALF_N / 2;
 /// One 128-byte swizzle atom of bf16, and the only width
 /// [`SharedTile::k_walk`] accepts — so `BLOCK_K` and [`STAGES`] are a
 /// factorization of the shared budget rather than two free axes.
