@@ -255,7 +255,7 @@ const _: () = {
     assert!(SHARED_BYTES == 114_816 && SHARED_BYTES <= 116_736);
     assert!(
         BLOCK_N == 4 * STAGE_N,
-        "every drain spells its four passes out to hoist the loads ahead of the stores"
+        "the staged drains spell their four passes out to hoist the loads ahead of the stores"
     );
 };
 
