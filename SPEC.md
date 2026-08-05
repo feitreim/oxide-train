@@ -1124,6 +1124,57 @@ Each gated on tests; correctness before speed at every step.
        favour the pipelined form further (more key tiles per CTA means the
        prologue amortizes over a longer steady state). Worth confirming with a
        real `BASELINE_REF` A/B before the number is quoted as fact.
+     - ✅ **7e18 the backward's MMA issue leaves the register pass** (#94,
+       #95/#96): after the attention data-path fusion the backward attention
+       rows were the largest block in the step — `flash_kv` 29.80 ms,
+       `flash_q` 21.33, `flash_dot` 5.88, **57.01 ms / 16.0% of a 355.82 ms
+       step** — and neither roof explained it: per key-tile visit both kernels
+       sat at **~13–14% of the tensor-core roof and ~13–14% of the 8 TB/s DRAM
+       roof**. #95 is the `clock64` phase probe that settled it (`phase_probe`
+       as a child module of `tcgen05`, two `#[kernel]` entry points, the
+       `probe` bin; the stopwatch costs under 1%, six measurements spanning
+       −0.7% to +1.0%). **Every wait in the loop was ≤7%** — `SCORED`, the
+       warpgroup waiting the score MMAs, was **91 ticks flat** at every shape
+       in both kernels, so #75's overlap had ~46× more slack than it used and
+       ring depth, staging and `BACKWARD_STAGES` were all priced at zero. What
+       cost was that **the leader was one of the four pass warps**: it issued
+       the tile's MMAs (2 108 / 2 628 ticks, 42–49% of the visit) and *then*
+       ran its share of the register pass, with warps 1–3 waiting it out at the
+       block barrier. Eight columns summed to 4 301 against a 4 390-tick visit
+       — **99% of the visit in one warp's serial chain**.
+       The fix is one warp: `FLASH_BACKWARD_BLOCK` 128 → 160, a fifth warp
+       that issues every TMA and MMA and runs no pass. Every ring, semaphore,
+       plan, TMEM layout and the arithmetic are untouched, so parity is
+       **byte-identical at every gated shape** (dq/dk/dv to the digit) — this
+       is a scheduling change and owes that. It is not #75's warp
+       specialization, which was 192 threads with a separate TMA warp, an MMA
+       warp, six barrier sets and a re-staged statistic; here there is still
+       exactly one `sync_threads` per tile and both roles run the same
+       iteration count through it.
+       **Bench** [32,1024,24,128]: backward q 1.094 → **0.681 ms (−37.7%)**,
+       kv 1.566 → **1.404 (−10.3%)**, the pair 2.659 → **2.088 (−21.5%)**;
+       forward 0.832 either side, to the digit. **Clean standalone profile**:
+       `flash_q` 21.3278 → **12.0008 (−43.7%)**, `flash_kv` 29.7978 →
+       **25.9788 (−12.8%)**, backward attention **57.01 → 43.80 ms**, 16.0% →
+       **12.6% of step**. §10.1 A/B in both orders agrees and the named rows
+       account for the step delta each way (`flash_q` −7.49 / −7.11, `flash_kv`
+       −3.59 / −3.23); the containers were the throttled kind (784 ms absolute
+       against a 355.82 standalone), so the rows are the claim. Training smoke
+       75 553 tok/s, 33.55% MFU. ptxas **189 / 198, zero spill**, up from
+       182 / 190 — that is `.maxntid`, not the code: 160 declared threads make
+       the per-thread budget `65536/160` where it was `65536/128`. Residency is
+       unmoved, TMEM-pinned at 1 CTA/SM either way.
+       **What it leaves** (#94 carries the list): both kernels are now
+       *pass*-bound — the register pass is 90.4% and 89.2% of the pass warps'
+       column and the issue warp idles 946 / 4 004 ticks a visit. The pass does
+       not parallelize linearly across four warps (×1.42 in kernel A, ×1.96 in
+       kernel B for four times the work), and **why kernel B's parallelizes
+       worse is unestablished** — it does two swizzled operand stores and two
+       `sub_col_assign` broadcasts where A does one and two `sub_row_assign`,
+       and the store term is what grew. Splitting the pass across two
+       warpgroups is the leading remedy and is gated on an open question ferro
+       has never had to answer: whether a warp of a *second* warpgroup may
+       `tcgen05.ld` the same TMEM lanes as its opposite number in the first.
    - **7f Muon**: ✅ CPU reference + orthogonality tests (`crates/optim`);
      ✅ GPU step (`GpuDenseMuon`): fp32 register-GEMM Newton–Schulz with
      per-group orthogonalization of the fused qkv/gate-up weights, gated on
