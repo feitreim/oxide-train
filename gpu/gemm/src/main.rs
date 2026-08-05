@@ -135,7 +135,7 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
         name: "gemm_tcgen05_bf16_optimized",
-        max_registers: 133,
+        max_registers: 138,
         max_spill_bytes: 0,
     },
     KernelBudget {
@@ -145,7 +145,7 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_accumulate",
-        max_registers: 145,
+        max_registers: 142,
         max_spill_bytes: 0,
     },
 ];

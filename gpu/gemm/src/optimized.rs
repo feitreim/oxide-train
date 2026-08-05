@@ -6,21 +6,55 @@
 //! *walk* and the epilogue is a type parameter, so neither is a second MMA
 //! chain.
 //!
-//! A cluster of two CTAs shares one `M256_N128` UMMA. Each rank stages its own
-//! [`BLOCK_M`] rows of `A` and its own [`HALF_N`] columns of `B` at the same
-//! shared offsets, the instruction reads both ranks' shared memory, and each
-//! rank drains its own `[BLOCK_M, BLOCK_N]` band. Rank [`LEADER`] owns the MMA,
-//! the accumulator and the stage barriers, and every barrier a peer arrives at
-//! is the leader's, so the launch synchronizes at `barrier.cluster` scope —
+//! A cluster of **four** CTAs runs **two** `M256_N128` UMMAs — one per
+//! `cta_group::2` pair — on adjacent `[2·BLOCK_M, BLOCK_N]` tiles of the same
+//! tile-row. Within a pair each rank stages its own [`BLOCK_M`] rows of `A` and
+//! its own [`HALF_N`] columns of `B` at the same shared offsets, the
+//! instruction reads both ranks' shared memory, and each rank drains its own
+//! `[BLOCK_M, BLOCK_N]` band. The pair's even rank owns its MMA, its
+//! accumulator and its stage barriers, and every barrier a peer arrives at is
+//! that leader's, so the launch synchronizes at `barrier.cluster` scope —
 //! twice, at [`Tile::arm`] and [`Tile::retire`], and nowhere else.
 //!
 //! The grid is **persistent** — [`MAX_CLUSTERS`] clusters, two CTAs an SM — and
-//! one work item is one `[2·BLOCK_M, BLOCK_N]` output tile. Each of the three
-//! roles walks the static strided schedule for itself ([`Walk`]) and
-//! [`pipeline::grouped`] maps an item to a tile in blocks of [`GROUP`]
-//! tile-rows. K is [`STAGES`] deep over a pair of tile rings; the TMA fills
-//! `load` and the MMA's own commit releases `free`, so what proves an operand
-//! has been read is the accumulator instruction and not a thread.
+//! one work item is one `[2·BLOCK_M, PAIRS·BLOCK_N]` **region**, which the two
+//! pairs split a tile each. Each of the three roles walks the static strided
+//! schedule for itself ([`Walk`]) and [`pipeline::grouped`] maps an item to a
+//! region in blocks of [`GROUP`] tile-rows. K is [`STAGES`] deep over a pair of
+//! tile rings; the TMA fills `load` and the MMA's own commit releases `free`,
+//! so what proves an operand has been read is the accumulator instruction and
+//! not a thread.
+//!
+//! ## `A` is fetched once and delivered twice
+//!
+//! Adjacent tiles of one tile-row need **the same `A`**, which is the entire
+//! reason the cluster is four CTAs rather than two. Each pair leader issues one
+//! `A` half as a replicating TMA multicast to the two CTAs that owe the MMA
+//! those rows — one in each pair — so per region `A` is fetched [`PAIRS`] times
+//! and `B` [`CLUSTER_RANKS`] times:
+//!
+//! | | shared-memory fill, bytes/FLOP |
+//! |---|---:|
+//! | `[256, 256]`, one `M256_N256` | 0.00781 |
+//! | `[256, 128]` alone | 0.01172 (×1.50) |
+//! | **`[256, 128]` × 2, multicast `A`** | **0.00781** |
+//!
+//! That is the point of the whole structure. oxide-train#80 measured the narrow
+//! tile fixing wave quantization exactly as predicted — `bwd down dW` 64.9% →
+//! 86.5%, cuBLASLt's own figure — and *losing thirteen of fourteen rows anyway*,
+//! by 5–28 points, because the ×1.50 was not affordable: the fill path
+//! saturates in the high teens of TB/s and the kernel already ran at 10–15. The
+//! multicast keeps the narrow tile's quantization at the wide tile's bytes.
+//!
+//! What makes it expressible is one fact about the instruction, measured by
+//! `src/bin/mcast_probe.rs` because ferro-kittens' own documentation records it
+//! as unestablished: a replicating `cp.async.bulk.tensor` completes on the
+//! barrier at the given **offset**, in the CTA of each destination's own
+//! `cta_group::2` pair picked by the supplied address's rank parity. Handing it
+//! an *even* rank therefore charges every destination's pair leader — so one
+//! instruction feeds and accounts for both pairs, and this kernel keeps the
+//! single-barrier-per-pair structure of the two-CTA one exactly, with no
+//! peer-progress signal anywhere.
 //!
 //! ## There is no item boundary
 //!
@@ -193,13 +227,67 @@ const ISSUER: u32 = PRODUCER + 1;
 /// The staged drain's band: the narrowest bf16 tile `Swizzle128B` admits *and*
 /// the widest four of fit beside the operand rings.
 const STAGE_N: usize = 64;
-/// CTAs of the cluster that share one accumulator and one barrier set.
+/// CTAs that share one accumulator and one barrier set: the `cta_group::2`
+/// pair, which is a property of the instruction and not of the launch.
+const PAIR_RANKS: u32 = 2;
+/// Pairs in one cluster, and so the output tiles a cluster works at once.
+const PAIRS: u32 = 2;
+/// CTAs of the cluster. Must agree with `#[cluster_launch]`, which spells it
+/// again because an attribute cannot read a constant.
+const CLUSTER_RANKS: u32 = PAIRS * PAIR_RANKS;
+
+/// This CTA's pair, and its rank inside it. The `cta_group::2` pairing is the
+/// hardware's — ranks `2p` and `2p + 1` — so both fall out of one bit.
+#[inline(always)]
+const fn pair_of(rank: u32) -> u32 {
+    rank / PAIR_RANKS
+}
+#[inline(always)]
+const fn rank_in_pair(rank: u32) -> u32 {
+    rank % PAIR_RANKS
+}
+/// The even rank of `pair`: the CTA that owns its MMA, its accumulator and its
+/// barriers.
+#[inline(always)]
+const fn leader_of(pair: u32) -> u32 {
+    pair * PAIR_RANKS
+}
+/// Every CTA of the cluster: who a `free` release has to reach, because a
+/// stage's `A` is written by one pair's producer into *both* pairs' rings.
+const CLUSTER_MASK: u16 = ((1u32 << CLUSTER_RANKS) - 1) as u16;
+
+/// The `cta_group::2` multicast mask for `pair` — the two CTAs a `tcgen05`
+/// commit has to reach, which is no longer the whole cluster.
+#[inline(always)]
+const fn pair_mask(pair: u32) -> u16 {
+    (((1u32 << PAIR_RANKS) - 1) << leader_of(pair)) as u16
+}
+
+/// The TMA multicast mask for the `A` half that `pair`'s leader fetches: one
+/// bit per pair, each at the rank that owes the MMA those rows.
 ///
-/// Named for the pair rather than `RANKS` because the launch's own rank count
-/// is spelled by `#[cluster_launch]` and these two must agree.
-const CLUSTER_RANKS: u32 = 2;
-const PAIR: u16 = ((1u32 << CLUSTER_RANKS) - 1) as u16;
-const LEADER: u32 = 0;
+/// The two masks tile the cluster — `0b0101` and `0b1010` — which is the whole
+/// arithmetic-intensity claim in one line: between them the cluster's four CTAs
+/// are filled with `A` by [`PAIRS`] fetches instead of [`CLUSTER_RANKS`].
+#[inline(always)]
+const fn a_mask(pair: u32) -> u16 {
+    let mut mask = 0u32;
+    let mut p = 0u32;
+    while p < PAIRS {
+        mask |= 1 << (leader_of(p) + pair);
+        p += 1;
+    }
+    mask as u16
+}
+
+const _: () = {
+    assert!(PAIRS == 2 && PAIR_RANKS == 2 && CLUSTER_RANKS == 4);
+    // Spelled out once against the shifts above, since every barrier in the
+    // kernel is addressed through them.
+    assert!(pair_mask(0) == 0b0011 && pair_mask(1) == 0b1100);
+    assert!(a_mask(0) == 0b0101 && a_mask(1) == 0b1010);
+    assert!(leader_of(0) == 0 && leader_of(1) == 2);
+};
 
 /// A K-major `[BLOCK_M, BLOCK_K]` stage of `A` — this rank's rows of the pair.
 type AStage = SharedTile<Bf16, BLOCK_M, BLOCK_K, Swizzle128B>;
@@ -236,12 +324,6 @@ pub const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / CLUSTER_RANKS;
 /// [`pipeline::grouped`]'s width, swept at this tile shape by ferro-kittens
 /// #89 — a tile change is a reason to re-run that sweep.
 pub const GROUP: u32 = 8;
-
-/// Whether the item walk pairs each two column halves back into the
-/// `[2·BLOCK_M, 2·BLOCK_N]` tile they came from — see [`Tile::locate`]. Off in
-/// what ships; the pairing exists so the ping-pong can be measured with the
-/// wave quantization held at the old tile's.
-const PAIRED: bool = false;
 
 /// Items the accumulator handoff holds at once.
 ///
@@ -306,7 +388,7 @@ const fn staged(at: SharedPlan) -> (StageRun, SharedPlan) {
 pub const SHARED_BYTES: usize = staged(shared(SharedPlan::sizing()).plan).1.bytes();
 
 const _: () = {
-    assert!(THREADS == 192 && MAX_CLUSTERS == 148);
+    assert!(THREADS == 192 && MAX_CLUSTERS == 74);
     // The item rings cost the plan nothing: their sixty-four bytes land in the
     // 128-byte alignment padding in front of the staging tiles.
     assert!(SHARED_BYTES == 114_944 && SHARED_BYTES <= 116_736);
@@ -618,7 +700,14 @@ struct Tile<D: Drain> {
     tiles_n: u32,
     k_blocks: u32,
     transposed: bool,
+    /// This CTA's place in the cluster, derived once because every barrier,
+    /// mask and operand line in the kernel is addressed through it.
     rank: u32,
+    pair: u32,
+    rank_in_pair: u32,
+    leader: u32,
+    pair_mask: u16,
+    a_mask: u16,
     full: SemaphoreRing<ITEMS>,
     empty: SemaphoreRing<ITEMS>,
 }
@@ -677,21 +766,40 @@ impl<D: Drain> Tile<D> {
     unsafe fn produce(&self, mut walk: Walk) {
         unsafe {
             let mut stage_index = 0u32;
+            // `A` is fetched by the two pair leaders and replicated; `B` is
+            // fetched by everyone. So a leader issues one of each and a peer
+            // issues only `B`, and a leader's barrier is charged for exactly
+            // twice what a leader issued — the other pair leader's `A` and its
+            // own peer's `B` being the same two sizes over again.
+            let leads = self.rank == self.leader;
             while let Some(item) = walk.next() {
                 let (tile_m, tile_n) = self.locate(item);
-                // All four of the pair's tiles complete on the leader's copy of
-                // the stage barrier, and only the leader charges it:
-                // `expect_tx` is `.shared::cta`, so a peer could not charge that
-                // barrier even holding its address. Both ranks derive the same
-                // half-stage charge from the loads they just issued; the leader
-                // scales its own by `RANKS` to cover the peer's, and the peer
-                // drops it.
-                let a_line = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank) as i32;
-                let b_line = (BLOCK_N as u32 * tile_n + HALF_N as u32 * self.rank) as i32;
+                // The `A` half a leader fetches is the one its *pair index*
+                // names, not its rank's: rank 0 brings rows `0..BLOCK_M` to
+                // ranks {0, 2} and rank 2 brings `BLOCK_M..` to ranks {1, 3},
+                // so every CTA ends up holding the half its rank in the pair
+                // owes the MMA.
+                let a_line =
+                    (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.pair) as i32;
+                let b_line =
+                    (BLOCK_N as u32 * tile_n + HALF_N as u32 * self.rank_in_pair) as i32;
                 let mut k = 0u32;
                 while k < self.k_blocks {
                     self.free.wait_recycled(stage_index);
-                    let stage = self.load.sem(stage_index).at_rank(LEADER);
+                    // Every load of the pair completes on the *pair leader's*
+                    // copy of the stage barrier, and only the leader charges it:
+                    // `expect_tx` is `.shared::cta`, so a peer could not charge
+                    // that barrier even holding its address.
+                    //
+                    // For the replicated `A` that works because of what the
+                    // multicast does with this address, which
+                    // `src/mcast_probe.rs` measured: the copy landing in CTA `d`
+                    // completes on the barrier at this *offset* in the CTA of
+                    // `d`'s own `cta_group::2` pair picked by the address's rank
+                    // parity. `at_rank` of an even rank is therefore "each
+                    // destination's leader", which is why one instruction feeds
+                    // and accounts for both pairs at once.
+                    let stage = self.load.sem(stage_index).at_rank(self.leader);
                     let depth = (BLOCK_K as u32 * k) as i32;
                     let (a, b) = (self.a_ring.tile(stage_index), self.b_ring.tile(stage_index));
                     // The map's fast axis dictates the coordinate order: a
@@ -700,18 +808,37 @@ impl<D: Drain> Tile<D> {
                     // bytes either way, so the charge does not depend on the
                     // branch.
                     let bytes = if self.transposed {
-                        MnAStage::from_raw(a.base())
-                            .tma_load_2d_arriving_at(self.a_map, a_line, depth, stage)
-                            + MnBStage::from_raw(b.base())
-                                .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage)
+                        let b_bytes = MnBStage::from_raw(b.base())
+                            .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage);
+                        if leads {
+                            MnAStage::from_raw(a.base()).tma_load_2d_multicast_cg2(
+                                self.a_map,
+                                a_line,
+                                depth,
+                                stage,
+                                self.a_mask,
+                            ) + b_bytes
+                        } else {
+                            b_bytes
+                        }
                     } else {
-                        a.tma_load_2d_arriving_at(self.a_map, depth, a_line, stage)
-                            + b.tma_load_2d_arriving_at(self.b_map, depth, b_line, stage)
+                        let b_bytes = b.tma_load_2d_arriving_at(self.b_map, depth, b_line, stage);
+                        if leads {
+                            a.tma_load_2d_multicast_cg2(
+                                self.a_map,
+                                depth,
+                                a_line,
+                                stage,
+                                self.a_mask,
+                            ) + b_bytes
+                        } else {
+                            b_bytes
+                        }
                     };
-                    if self.rank == LEADER {
+                    if leads {
                         self.load
                             .sem(stage_index)
-                            .expect_tx(bytes.across_ranks(CLUSTER_RANKS));
+                            .expect_tx(bytes.across_ranks(PAIR_RANKS));
                     }
                     k += 1;
                     stage_index += 1;
@@ -757,11 +884,20 @@ impl<D: Drain> Tile<D> {
                         MmaShape::M256_N128,
                         k > 0,
                     );
-                    commit_multicast_cg2(self.free.sem(stage_index), PAIR);
+                    // `free` is the one release that stays cluster-wide. A
+                    // pair leader multicasts `A` into the *other* pair's ring
+                    // at the same stage index, so a slot may not be refilled
+                    // until **both** MMAs have read it — which is why this
+                    // commit reaches all four CTAs and why `free` is armed for
+                    // [`PAIRS`] arrivals rather than one. Getting this wrong is
+                    // not a hang: the accounting still balances and one pair
+                    // simply overwrites an operand the other is still reading,
+                    // which measured as 0.77% of `C` wrong.
+                    commit_multicast_cg2(self.free.sem(stage_index), CLUSTER_MASK);
                     k += 1;
                     stage_index += 1;
                 }
-                commit_multicast_cg2(self.full.sem(sequence), PAIR);
+                commit_multicast_cg2(self.full.sem(sequence), self.pair_mask);
                 sequence += 1;
             }
         }
@@ -784,7 +920,7 @@ impl<D: Drain> Tile<D> {
             if lane() == 0 {
                 let mut slot = 0u32;
                 while slot < SLOTS {
-                    self.empty.sem(slot).at_rank(LEADER).arrive();
+                    self.empty.sem(slot).at_rank(self.leader).arrive();
                     slot += 1;
                 }
             }
@@ -793,7 +929,7 @@ impl<D: Drain> Tile<D> {
                 self.full.wait(sequence);
                 let (row, column) = self.origin(item);
                 let release = Release {
-                    sem: self.empty.sem(sequence + SLOTS).at_rank(LEADER),
+                    sem: self.empty.sem(sequence + SLOTS).at_rank(self.leader),
                 };
                 self.out
                     .drain(self.slot(sequence), self.stage, row, column, release);
@@ -813,11 +949,14 @@ impl<D: Drain> Tile<D> {
         unsafe {
             if thread::threadIdx_x() == 0 {
                 self.load.init_all(1);
-                self.free.init_all(1);
+                // One arrival per pair: a stage is recyclable when both MMAs
+                // have consumed it, since both read `A` this producer wrote.
+                self.free.init_all(PAIRS);
                 self.full.init_all(1);
-                // One arrival per band warp per rank: the MMA writes both ranks'
-                // tensor memory, so it waits for both ranks' drains.
-                self.empty.init_all(DRAIN_WARPS as u32 * CLUSTER_RANKS);
+                // One arrival per band warp per rank *of the pair*: the MMA
+                // writes both of its ranks' tensor memory, and the other pair's
+                // drains are nothing to it.
+                self.empty.init_all(DRAIN_WARPS as u32 * PAIR_RANKS);
                 publish_to_async_proxy();
             }
             cluster::cluster_sync();
@@ -854,7 +993,7 @@ impl<D: Drain> Tile<D> {
                     self.produce(walk);
                 }
             } else if warp == ISSUER {
-                if self.rank == LEADER && lane() == 0 {
+                if self.rank == self.leader && lane() == 0 {
                     self.multiply(walk);
                 }
             } else {
@@ -863,24 +1002,23 @@ impl<D: Drain> Tile<D> {
         }
     }
 
-    /// The `[2·BLOCK_M, BLOCK_N]` tile `item` covers.
+    /// The `[2·BLOCK_M, BLOCK_N]` tile this CTA's pair covers for `item`.
     ///
-    /// Under [`PAIRED`] the walk is over `[2·BLOCK_M, 2·BLOCK_N]` tiles and an
-    /// item is one column half of one, so a cluster takes both halves of a tile
-    /// back to back and the launch quantizes into waves exactly as the
-    /// `M256_N256` kernel did. That is the control the narrow walk is measured
-    /// against: it isolates the accumulator ping-pong from the tile shape,
-    /// which are otherwise one change — both halve the tile, and both read 1.5×
-    /// the operand bytes an output element.
+    /// An item is a **region** of [`PAIRS`] adjacent tiles of one tile-row, and
+    /// the two pairs take one each — which is the whole reason they share `A`.
+    /// The walk is therefore over regions, and only the last step differs
+    /// between the pairs, so nothing about the schedule is dynamic and no role
+    /// has to be told which tile it is on.
+    ///
+    /// Wave quantization is the narrow tile's, not the region's: a cluster is
+    /// [`CLUSTER_RANKS`] CTAs where it used to be [`PAIR_RANKS`], so there are
+    /// half as many clusters and each does one region per item — the same
+    /// tiles-per-wave the `[256, 128]` tile gave on twice the clusters.
     #[inline(always)]
     fn locate(&self, item: u32) -> (u32, u32) {
-        if PAIRED {
-            let (tile_m, tile_n) =
-                pipeline::grouped(item / SLOTS, self.tiles_m, self.tiles_n / SLOTS, GROUP);
-            (tile_m, SLOTS * tile_n + item % SLOTS)
-        } else {
-            pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP)
-        }
+        let (tile_m, region) =
+            pipeline::grouped(item, self.tiles_m, self.tiles_n / PAIRS, GROUP);
+        (tile_m, PAIRS * region + self.pair)
     }
 
     /// The accumulator segment `sequence` owns: consecutive items alternate, so
@@ -898,7 +1036,7 @@ impl<D: Drain> Tile<D> {
     fn origin(&self, item: u32) -> (u32, u32) {
         let (tile_m, tile_n) = self.locate(item);
         (
-            2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * warp_id(),
+            2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank_in_pair + 32 * warp_id(),
             BLOCK_N as u32 * tile_n,
         )
     }
@@ -926,6 +1064,7 @@ pub mod kernels {
         unsafe {
             let shared = shared(SharedPlan::attach());
             let (run, _) = staged(shared.plan);
+            let rank = cluster::block_rank();
             Tile {
                 a_ring: shared.a_ring,
                 b_ring: shared.b_ring,
@@ -940,7 +1079,12 @@ pub mod kernels {
                 tiles_n,
                 k_blocks,
                 transposed,
-                rank: cluster::block_rank(),
+                rank,
+                pair: pair_of(rank),
+                rank_in_pair: rank_in_pair(rank),
+                leader: leader_of(pair_of(rank)),
+                pair_mask: pair_mask(pair_of(rank)),
+                a_mask: a_mask(pair_of(rank)),
                 full: shared.full,
                 empty: shared.empty,
             }
@@ -985,7 +1129,7 @@ pub mod kernels {
     /// reaches, and the grid must be a whole number of clusters — see
     /// [`super::host::tcgen05_launch_config`].
     #[kernel]
-    #[cluster_launch(2, 1, 1)]
+    #[cluster_launch(4, 1, 1)]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_tcgen05_bf16_optimized(
         a_map: *const TmaDescriptor,
@@ -1014,7 +1158,7 @@ pub mod kernels {
                 transposed != 0,
                 out,
             );
-            sweep(&tile, tiles_m * tiles_n);
+            sweep(&tile, tiles_m * tiles_n / PAIRS);
         }
     }
 
@@ -1028,7 +1172,7 @@ pub mod kernels {
     /// As [`gemm_tcgen05_bf16_optimized`], with `c_offset..c_offset + m * n`
     /// inside `c`.
     #[kernel]
-    #[cluster_launch(2, 1, 1)]
+    #[cluster_launch(4, 1, 1)]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_tcgen05_f32_optimized(
         a_map: *const TmaDescriptor,
@@ -1054,7 +1198,7 @@ pub mod kernels {
                 transposed != 0,
                 out,
             );
-            sweep(&tile, tiles_m * tiles_n);
+            sweep(&tile, tiles_m * tiles_n / PAIRS);
         }
     }
 
@@ -1075,7 +1219,7 @@ pub mod kernels {
     /// reads what a store would ignore) covering every tile the item walk
     /// reaches, and nothing else may write it during the launch.
     #[kernel]
-    #[cluster_launch(2, 1, 1)]
+    #[cluster_launch(4, 1, 1)]
     pub unsafe fn gemm_tcgen05_f32_accumulate(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
@@ -1095,7 +1239,7 @@ pub mod kernels {
                 transposed != 0,
                 Reduce { c_map },
             );
-            sweep(&tile, tiles_m * tiles_n);
+            sweep(&tile, tiles_m * tiles_n / PAIRS);
         }
     }
 }

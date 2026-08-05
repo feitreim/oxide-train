@@ -42,8 +42,8 @@ const TC_MAP_BYTES: usize = 128;
 /// conservative test rather than a necessary one.
 pub const TC_K_PIPELINE: usize = 256;
 
-/// Persistent launch grid: [`gemm::MAX_CLUSTERS`](super::MAX_CLUSTERS) CTA
-/// pairs, or fewer where the problem has fewer tiles.
+/// Persistent launch grid: [`gemm::MAX_CLUSTERS`](super::MAX_CLUSTERS)
+/// four-CTA clusters, or fewer where the problem has fewer *regions*.
 ///
 /// The kernel is a work-item loop, not an exact cover, so the grid is a
 /// property of the *device* and only capped by the problem: past
@@ -52,7 +52,7 @@ pub const TC_K_PIPELINE: usize = 256;
 /// start-up and lets one operand panel stay resident across the columns that
 /// re-read it (`pipeline::grouped`, `GROUP = 8`).
 ///
-/// `cluster_launch(2, 1, 1)` requires a whole number of clusters, which
+/// `cluster_launch(4, 1, 1)` requires a whole number of clusters, which
 /// `TC_RANKS *` guarantees.
 ///
 /// `k` needs only to be a whole number of `TC_BK` stages — a three-deep ring
@@ -64,12 +64,17 @@ pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
     assert!(n.is_multiple_of(TC_N_TILE));
     assert!(k.is_multiple_of(TC_BK));
     assert!(m <= u32::MAX as usize && n <= u32::MAX as usize && k <= u32::MAX as usize);
-    let tiles = (m / TC_M_TILE)
-        .checked_mul(n / TC_N_ITEM)
+    // A cluster's work item is a `[TC_M_TILE, TC_N_TILE]` region that its two
+    // `cta_group::2` pairs split a `TC_N_ITEM`-wide tile each — which is what
+    // lets them share one multicast `A`. So the item count is counted in
+    // regions, and `n`'s `TC_N_TILE` multiple (asserted above) is what makes
+    // the tiles pair up evenly.
+    let regions = (m / TC_M_TILE)
+        .checked_mul(n / TC_N_TILE)
         .expect("tcgen05 work grid overflow");
     LaunchConfig {
         grid_dim: (
-            TC_RANKS * tiles.min(super::MAX_CLUSTERS as usize) as u32,
+            TC_RANKS * regions.min(super::MAX_CLUSTERS as usize) as u32,
             1,
             1,
         ),
@@ -78,8 +83,9 @@ pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
     }
 }
 
-/// CTAs of a cluster — the `cluster_launch` dimension, said once.
-const TC_RANKS: u32 = 2;
+/// CTAs of a cluster — the `cluster_launch` dimension, said once. Four since
+/// the cluster became two `cta_group::2` pairs sharing a multicast `A`.
+const TC_RANKS: u32 = 4;
 /// Threads a CTA launches with: one warp per 32 accumulator rows, and every one
 /// of them drains.
 const TC_THREADS: u32 = super::optimized::THREADS;
