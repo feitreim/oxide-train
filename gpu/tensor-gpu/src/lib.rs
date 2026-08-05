@@ -901,45 +901,34 @@ pub mod kernels {
         let tile_col = thread::blockIdx_x() as usize * TRANSPOSE_TILE;
         let words_per_row = cols as usize / 2;
 
-        // Word `step` of the tile this thread owns, and where in the tile it
-        // sits. A statically bounded walk, so the four are independent rather
-        // than a rolled chain.
-        let tile_word = |step: usize| {
+        // A statically bounded walk, so the tile's four words per thread are
+        // independent loads rather than a rolled chain. One word at a time,
+        // and not the whole tile at once: batching all four words' operands
+        // ahead of all four write-backs holds 28 more values live and measured
+        // 18.50 ms against 14.69 on the gate/up master — the round trip it
+        // saves costs less than the occupancy it spends (#99).
+        for step in 0..MASTER_TILE_WORDS {
             let local = tid + step * MASTER_TILE_THREADS;
             let row = local / TILE_WORDS_WIDE;
             let word_column = local % TILE_WORDS_WIDE;
             let pair = (tile_row + row) * words_per_row + tile_col / 2 + word_column;
-            (pair, row, word_column)
-        };
-
-        // The whole tile's operands, read before any of them is written back.
-        // A store cannot be reordered past a later load, and every store here
-        // waits on an update; interleaving them turns the thread's four words
-        // into four memory round trips instead of one (#99).
-        let mut stored = [0u32; MASTER_TILE_WORDS];
-        let mut gradients = [[0.0f32; 2]; MASTER_TILE_WORDS];
-        let mut moment_first = [[0.0f32; 2]; MASTER_TILE_WORDS];
-        let mut moment_second = [[0.0f32; 2]; MASTER_TILE_WORDS];
-        for step in 0..MASTER_TILE_WORDS {
-            let (pair, _, _) = tile_word(step);
+            let element = 2 * pair;
             // SAFETY: each (tile, local) pair maps to a unique master word and
             // so to a unique pair of elements of every per-element buffer.
-            unsafe {
-                stored[step] = *master.get_unchecked_mut(pair);
-                gradients[step] = load_pair(&mut gradient, 2 * pair);
-                moment_first[step] = load_pair(&mut first, 2 * pair);
-                moment_second[step] = load_pair(&mut second, 2 * pair);
-            }
-        }
-
-        for step in 0..MASTER_TILE_WORDS {
-            let (pair, row, word_column) = tile_word(step);
+            let (stored, gradients, mut moment_first, mut moment_second) = unsafe {
+                (
+                    *master.get_unchecked_mut(pair),
+                    load_pair(&mut gradient, element),
+                    load_pair(&mut first, element),
+                    load_pair(&mut second, element),
+                )
+            };
             let packed = adamw_master_pair(
-                stored[step],
-                gradients[step],
-                &mut moment_first[step],
-                &mut moment_second[step],
-                2 * pair,
+                stored,
+                gradients,
+                &mut moment_first,
+                &mut moment_second,
+                element,
                 learning_rate,
                 beta1,
                 beta2,
@@ -953,9 +942,9 @@ pub mod kernels {
             // SAFETY: as above.
             unsafe {
                 *master.get_unchecked_mut(pair) = packed;
-                store_pair(&mut first, 2 * pair, moment_first[step]);
-                store_pair(&mut second, 2 * pair, moment_second[step]);
-                store_pair(&mut gradient, 2 * pair, [0.0, 0.0]);
+                store_pair(&mut first, element, moment_first);
+                store_pair(&mut second, element, moment_second);
+                store_pair(&mut gradient, element, [0.0, 0.0]);
                 VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column] = packed & 0xffff;
                 VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column + 1] = packed >> 16;
             }

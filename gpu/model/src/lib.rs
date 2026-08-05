@@ -251,11 +251,16 @@ fn moe_scatter_dy_config(pairs: usize) -> LaunchConfig {
     }
 }
 
-/// Launch for the MoE dead-slot zeroing pass: a fixed grid striding the bins.
-fn moe_zero_bins_config(bins: usize) -> LaunchConfig {
-    assert!(bins <= u32::MAX as usize);
+/// Launch for the MoE dead-slot zeroing pass: a fixed number of blocks striding
+/// each expert's dead capacity tail.
+fn moe_zero_bins_config(experts: usize, capacity: usize) -> LaunchConfig {
+    assert!(experts <= u32::MAX as usize);
     LaunchConfig {
-        grid_dim: (bins.min(dense_device::MOE_ZERO_BINS_BLOCKS) as u32, 1, 1),
+        grid_dim: (
+            capacity.min(dense_device::MOE_ZERO_BINS_BLOCKS) as u32,
+            experts as u32,
+            1,
+        ),
         block_dim: (dense_device::MOE_ZERO_BINS_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
@@ -4498,7 +4503,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             ExpertPanel::Packed(panel) => unsafe {
                 dense.moe_zero_dead_bins_bf16(
                     stream,
-                    moe_zero_bins_config(E * C),
+                    moe_zero_bins_config(E, C),
                     routing.assignment_counts.as_device_buffer(),
                     D as u32,
                     C as u32,
@@ -4508,7 +4513,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             ExpertPanel::Wide(values) => unsafe {
                 dense.moe_zero_dead_bins(
                     stream,
-                    moe_zero_bins_config(E * C),
+                    moe_zero_bins_config(E, C),
                     routing.assignment_counts.as_device_buffer(),
                     D as u32,
                     C as u32,
@@ -4640,7 +4645,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                 ExpertPanel::Packed(panel) => unsafe {
                     dense.moe_zero_dead_bins_bf16(
                         stream,
-                        moe_zero_bins_config(E * C),
+                        moe_zero_bins_config(E, C),
                         counts,
                         D as u32,
                         C as u32,
@@ -4650,7 +4655,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                 ExpertPanel::Wide(values) => unsafe {
                     dense.moe_zero_dead_bins(
                         stream,
-                        moe_zero_bins_config(E * C),
+                        moe_zero_bins_config(E, C),
                         counts,
                         D as u32,
                         C as u32,

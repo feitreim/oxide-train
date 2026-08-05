@@ -23,12 +23,12 @@ use device::{
 };
 use tensor_core::bf16;
 
-/// Launch for the dead-slot zeroing checks, deliberately shorter than the bin
-/// count: the production launch strides a fixed grid over `E · C` bins, so the
-/// walk — not the one-block-per-bin special case — is what these must cover.
-fn zero_dead_bins_config() -> LaunchConfig {
+/// Launch for the dead-slot zeroing checks: one block per expert, deliberately
+/// fewer than its capacity, so the checks cover the stride over a dead tail
+/// rather than the one-block-per-slot special case.
+fn zero_dead_bins_config<const E: usize>() -> LaunchConfig {
     LaunchConfig {
-        grid_dim: (2, 1, 1),
+        grid_dim: (1, E as u32, 1),
         block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
@@ -357,7 +357,7 @@ fn check_moe_routing(
         unsafe {
             module.moe_zero_dead_bins(
                 stream,
-                zero_dead_bins_config(),
+                zero_dead_bins_config::<E>(),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -703,7 +703,7 @@ fn check_moe_routing(
         unsafe {
             module.moe_zero_dead_bins(
                 stream,
-                zero_dead_bins_config(),
+                zero_dead_bins_config::<E>(),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -742,7 +742,7 @@ fn check_moe_routing(
         unsafe {
             module.moe_zero_dead_bins_bf16(
                 stream,
-                zero_dead_bins_config(),
+                zero_dead_bins_config::<E>(),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -761,7 +761,7 @@ fn check_moe_routing(
             )?;
             module.moe_zero_dead_bins_bf16(
                 stream,
-                zero_dead_bins_config(),
+                zero_dead_bins_config::<E>(),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -855,7 +855,7 @@ fn check_moe_scatter_dy_case<const D: usize>(
         )?;
         module.moe_zero_dead_bins(
             stream,
-            zero_dead_bins_config(),
+            zero_dead_bins_config::<E>(),
             &counts_dev,
             D as u32,
             C as u32,
