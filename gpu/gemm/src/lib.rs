@@ -38,6 +38,12 @@ pub use optimized::{GROUP, MAX_CLUSTERS, SHARED_BYTES, STAGES};
 /// points `optimized::kernels` declares for it reach this (oxide-train#80).
 pub mod residency_probe;
 
+/// The shipped fp32 store kernel with a `clock64` on each phase of an item, and
+/// the ping-pong behind a const so the before and the after are one binary.
+/// Nothing but `bin/budget.rs` and the three entry points `optimized::kernels`
+/// declares for it reach this (oxide-train#80).
+pub mod phase_probe;
+
 /// The denominator `src/bin/bench.rs` divides by. Behind a feature because it
 /// is a link-time dependency on `libcublasLt.so` that nothing else here wants.
 #[cfg(feature = "cublas")]
