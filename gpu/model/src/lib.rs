@@ -251,11 +251,11 @@ fn moe_scatter_dy_config(pairs: usize) -> LaunchConfig {
     }
 }
 
-/// Launch for the MoE dead-slot zeroing pass: one block per `(expert, slot)`.
+/// Launch for the MoE dead-slot zeroing pass: a fixed grid striding the bins.
 fn moe_zero_bins_config(bins: usize) -> LaunchConfig {
     assert!(bins <= u32::MAX as usize);
     LaunchConfig {
-        grid_dim: (bins as u32, 1, 1),
+        grid_dim: (bins.min(dense_device::MOE_ZERO_BINS_BLOCKS) as u32, 1, 1),
         block_dim: (dense_device::MOE_ZERO_BINS_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
@@ -5141,19 +5141,14 @@ impl<
                 profiler,
             )?;
             for acts in &workspace.block_acts {
-                fill_zero(
-                    &mut workspace.block_scratch.probability_sums,
-                    stream,
-                    tensor,
-                    profiler,
-                    "forward.router.zero_probability_sums",
-                )?;
+                // No pre-fill: `moe_probability_sums` stores each expert's sum
+                // rather than accumulating into the slot.
                 profiler.measure(stream, "forward.router.aux_probability_sums", || unsafe {
                     dense.moe_probability_sums(
                         stream,
                         LaunchConfig {
                             grid_dim: (E as u32, 1, 1),
-                            block_dim: (256, 1, 1),
+                            block_dim: (dense_device::MOE_PROBABILITY_SUMS_THREADS as u32, 1, 1),
                             shared_mem_bytes: 0,
                         },
                         acts.routing.probabilities.as_device_buffer(),

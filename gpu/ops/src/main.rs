@@ -23,6 +23,17 @@ use device::{
 };
 use tensor_core::bf16;
 
+/// Launch for the dead-slot zeroing checks, deliberately shorter than the bin
+/// count: the production launch strides a fixed grid over `E · C` bins, so the
+/// walk — not the one-block-per-bin special case — is what these must cover.
+fn zero_dead_bins_config() -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (2, 1, 1),
+        block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
     assert_eq!(actual.len(), expected.len());
     for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
@@ -346,11 +357,7 @@ fn check_moe_routing(
         unsafe {
             module.moe_zero_dead_bins(
                 stream,
-                LaunchConfig {
-                    grid_dim: ((E * C) as u32, 1, 1),
-                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                zero_dead_bins_config(),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -696,11 +703,7 @@ fn check_moe_routing(
         unsafe {
             module.moe_zero_dead_bins(
                 stream,
-                LaunchConfig {
-                    grid_dim: ((E * C) as u32, 1, 1),
-                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                zero_dead_bins_config(),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -739,11 +742,7 @@ fn check_moe_routing(
         unsafe {
             module.moe_zero_dead_bins_bf16(
                 stream,
-                LaunchConfig {
-                    grid_dim: ((E * C) as u32, 1, 1),
-                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                zero_dead_bins_config(),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -762,11 +761,7 @@ fn check_moe_routing(
             )?;
             module.moe_zero_dead_bins_bf16(
                 stream,
-                LaunchConfig {
-                    grid_dim: ((E * C) as u32, 1, 1),
-                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                zero_dead_bins_config(),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -860,11 +855,7 @@ fn check_moe_scatter_dy_case<const D: usize>(
         )?;
         module.moe_zero_dead_bins(
             stream,
-            LaunchConfig {
-                grid_dim: ((E * C) as u32, 1, 1),
-                block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
-                shared_mem_bytes: 0,
-            },
+            zero_dead_bins_config(),
             &counts_dev,
             D as u32,
             C as u32,

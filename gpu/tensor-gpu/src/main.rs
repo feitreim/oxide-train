@@ -205,69 +205,74 @@ fn check_adamw_master(
         weight - learning_rate * step
     };
 
-    let mut run =
-        |packed_gradient: bool, rounding: u32| -> Result<Vec<u32>, cuda_core::DriverError> {
-            let mut master = DeviceBuffer::from_host(stream, &master_words)?;
-            let mut first = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
-            let mut second = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
-            let config = LaunchConfig::for_num_elems((LEN / 2) as u32);
-            // SAFETY: master and the packed gradient hold LEN / 2 words, both
-            // moments hold LEN floats, and the launch covers exactly LEN / 2 pairs.
-            unsafe {
-                if packed_gradient {
-                    let mut device_gradient =
-                        DeviceBuffer::from_host(stream, &pack_bf16(gradient.as_slice()))?;
-                    module.adamw_bf16_master_packed_grad(
-                        stream,
-                        config,
-                        &mut device_gradient,
-                        learning_rate,
-                        beta1,
-                        beta2,
-                        epsilon,
-                        weight_decay,
-                        first_correction,
-                        second_correction,
-                        rounding,
-                        SEED,
-                        &mut master,
-                        &mut first,
-                        &mut second,
-                    )?;
-                    assert!(
-                        device_gradient.to_host_vec(stream)?.iter().all(|&w| w == 0),
-                        "adamw_bf16_master_packed_grad left the gradient it consumed non-zero"
-                    );
-                } else {
-                    let mut device_gradient = DeviceBuffer::from_host(stream, gradient.as_slice())?;
-                    module.adamw_bf16_master(
-                        stream,
-                        config,
-                        &mut device_gradient,
-                        learning_rate,
-                        beta1,
-                        beta2,
-                        epsilon,
-                        weight_decay,
-                        first_correction,
-                        second_correction,
-                        rounding,
-                        SEED,
-                        &mut master,
-                        &mut first,
-                        &mut second,
-                    )?;
-                    assert!(
-                        device_gradient
-                            .to_host_vec(stream)?
-                            .iter()
-                            .all(|&g| g == 0.0),
-                        "adamw_bf16_master left the gradient it consumed non-zero"
-                    );
-                }
+    let mut run = |packed_gradient: bool,
+                   rounding: u32|
+     -> Result<(Vec<u32>, Vec<f32>, Vec<f32>), cuda_core::DriverError> {
+        let mut master = DeviceBuffer::from_host(stream, &master_words)?;
+        let mut first = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+        let mut second = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+        let config = LaunchConfig::for_num_elems((LEN / 2) as u32);
+        // SAFETY: master and the packed gradient hold LEN / 2 words, both
+        // moments hold LEN floats, and the launch covers exactly LEN / 2 pairs.
+        unsafe {
+            if packed_gradient {
+                let mut device_gradient =
+                    DeviceBuffer::from_host(stream, &pack_bf16(gradient.as_slice()))?;
+                module.adamw_bf16_master_packed_grad(
+                    stream,
+                    config,
+                    &mut device_gradient,
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    epsilon,
+                    weight_decay,
+                    first_correction,
+                    second_correction,
+                    rounding,
+                    SEED,
+                    &mut master,
+                    &mut first,
+                    &mut second,
+                )?;
+                assert!(
+                    device_gradient.to_host_vec(stream)?.iter().all(|&w| w == 0),
+                    "adamw_bf16_master_packed_grad left the gradient it consumed non-zero"
+                );
+            } else {
+                let mut device_gradient = DeviceBuffer::from_host(stream, gradient.as_slice())?;
+                module.adamw_bf16_master(
+                    stream,
+                    config,
+                    &mut device_gradient,
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    epsilon,
+                    weight_decay,
+                    first_correction,
+                    second_correction,
+                    rounding,
+                    SEED,
+                    &mut master,
+                    &mut first,
+                    &mut second,
+                )?;
+                assert!(
+                    device_gradient
+                        .to_host_vec(stream)?
+                        .iter()
+                        .all(|&g| g == 0.0),
+                    "adamw_bf16_master left the gradient it consumed non-zero"
+                );
             }
-            master.to_host_vec(stream)
-        };
+        }
+        Ok((
+            master.to_host_vec(stream)?,
+            first.to_host_vec(stream)?,
+            second.to_host_vec(stream)?,
+        ))
+    };
 
     for (packed_gradient, label) in [(false, "fp32 gradient"), (true, "packed gradient")] {
         let seen = if packed_gradient {
@@ -281,17 +286,38 @@ fn check_adamw_master(
             .map(|(&weight, &g)| update(weight, g))
             .collect();
 
-        let nearest = run(packed_gradient, device::MASTER_ROUNDING_NEAREST)?;
+        let (nearest, first, second) = run(packed_gradient, device::MASTER_ROUNDING_NEAREST)?;
         assert_eq!(
             nearest,
             pack_bf16(&expected),
             "adamw_bf16_master ({label}) round-to-nearest write-back"
         );
+        // Both moments, as words, against a host reference. From zero moments
+        // the update is `(1 - beta) * g` and `(1 - beta2) * g * g` — products
+        // only, so no contraction can separate the device's arithmetic from
+        // the host's and the comparison is exact rather than approximate. It is
+        // what says the write-back's batched loads and stores still land each
+        // moment on the element it belongs to (#99).
+        assert_eq!(
+            bits(&first),
+            bits(&seen.iter().map(|&g| (1.0 - beta1) * g).collect::<Vec<_>>()),
+            "adamw_bf16_master ({label}) first moment"
+        );
+        assert_eq!(
+            bits(&second),
+            bits(
+                &seen
+                    .iter()
+                    .map(|&g| (1.0 - beta2) * g * g)
+                    .collect::<Vec<_>>()
+            ),
+            "adamw_bf16_master ({label}) second moment"
+        );
 
-        let stochastic = run(packed_gradient, device::MASTER_ROUNDING_STOCHASTIC)?;
+        let (stochastic, _, _) = run(packed_gradient, device::MASTER_ROUNDING_STOCHASTIC)?;
         assert_eq!(
             stochastic,
-            run(packed_gradient, device::MASTER_ROUNDING_STOCHASTIC)?,
+            run(packed_gradient, device::MASTER_ROUNDING_STOCHASTIC)?.0,
             "stochastic rounding ({label}) is not reproducible"
         );
         assert_ne!(
