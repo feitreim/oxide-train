@@ -16,8 +16,23 @@ pub const TC_TILE: usize = 128;
 pub const TC_BK: usize = 64;
 /// Optimized CTA-pair output rows.
 pub const TC_M_TILE: usize = 256;
-/// Optimized CTA-pair output columns.
+/// Output columns callers test a shape's eligibility against.
+///
+/// Two work items rather than one since the tile halved
+/// ([`gemm::BLOCK_N`](super::optimized::BLOCK_N)): kept at 256 because it is
+/// what `gpu/model` gates on and a conservative gate costs nothing, while the
+/// kernel's own unit is [`TC_N_ITEM`].
 pub const TC_N_TILE: usize = 256;
+/// Output columns of one work item — the kernel's tile, and the divisor its
+/// `tiles_n` argument is counted in.
+pub const TC_N_ITEM: usize = super::optimized::BLOCK_N;
+/// Rows of `B` one rank stages: a `cta_group::2` `M256_N128` reads `TC_TILE`
+/// rows of `A` and this many columns of `B` from each rank, so a bf16 matrix
+/// needs a second TMA box to be usable as the `B` operand.
+pub const TC_B_TILE: usize = TC_N_ITEM / 2;
+/// Bytes of one CUDA tensor map, and the stride between the two boxes every
+/// bf16 map encodes.
+const TC_MAP_BYTES: usize = 128;
 /// The K unit callers still test shapes for eligibility against.
 ///
 /// It was a hard requirement when the pipeline was four hand-unrolled stages
@@ -50,7 +65,7 @@ pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
     assert!(k.is_multiple_of(TC_BK));
     assert!(m <= u32::MAX as usize && n <= u32::MAX as usize && k <= u32::MAX as usize);
     let tiles = (m / TC_M_TILE)
-        .checked_mul(n / TC_N_TILE)
+        .checked_mul(n / TC_N_ITEM)
         .expect("tcgen05 work grid overflow");
     LaunchConfig {
         grid_dim: (
@@ -83,13 +98,39 @@ pub enum TmaLayout {
     MnMajor,
 }
 
+/// Which side of the MMA a map is being encoded for.
+///
+/// The `cta_group::2` `M256_N128` reads [`TC_TILE`] rows of `A` and
+/// [`TC_B_TILE`] columns of `B` from each rank, so the two operands want
+/// different box heights over the same matrix — and a matrix is routinely both
+/// (a weight panel is `B` in the forward and `A` in the backward). Rather than
+/// make callers say which role a map is for, every bf16 map encodes **both**
+/// boxes, adjacent in one buffer, and the launcher picks with [`b_operand`].
+#[derive(Clone, Copy)]
+enum Operand {
+    A,
+    B,
+}
+
 impl TmaLayout {
-    fn box_dimensions(self) -> [u32; 2] {
-        match self {
-            TmaLayout::KMajor => [TC_BK as u32, TC_TILE as u32],
-            TmaLayout::MnMajor => [TC_BK as u32, TC_BK as u32],
-        }
+    fn box_dimensions(self, operand: Operand) -> [u32; 2] {
+        let rows = match (self, operand) {
+            // MN-major boxes are `TC_BK` square either way: the swizzle caps a
+            // box at 128 bytes, so `A`'s 128 MN values arrive as two of them
+            // and `B`'s 64 as one.
+            (TmaLayout::MnMajor, _) => TC_BK,
+            (TmaLayout::KMajor, Operand::A) => TC_TILE,
+            (TmaLayout::KMajor, Operand::B) => TC_B_TILE,
+        };
+        [TC_BK as u32, rows as u32]
     }
+}
+
+/// The `B`-operand box of a map pair — see [`Operand`].
+fn b_operand(map: *const TmaDescriptor) -> *const TmaDescriptor {
+    // SAFETY: every map this crate hands out is two adjacent descriptors, and
+    // the second is in bounds of the same allocation.
+    unsafe { (map as *const u8).add(TC_MAP_BYTES) as *const TmaDescriptor }
 }
 
 /// Encode a `SWIZZLE_128B` tensor map over a row-major `[height, width]` bf16
@@ -130,32 +171,38 @@ fn encode_bf16_tma_map_strided(
         TmaLayout::MnMajor => TC_BK,
     }));
     assert!(row_stride >= width);
-    let mut tensor_map = MaybeUninit::<cuda_core::sys::CUtensorMap>::uninit();
     let global_dimensions = [width as u64, height as u64];
     let global_strides = [(row_stride * 2) as u64];
-    let box_dimensions = layout.box_dimensions();
     let element_strides = [1u32, 1u32];
-    let status = unsafe {
-        cuTensorMapEncodeTiled(
-            tensor_map.as_mut_ptr(),
-            CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            2,
-            base as *mut std::ffi::c_void,
-            global_dimensions.as_ptr(),
-            global_strides.as_ptr(),
-            box_dimensions.as_ptr(),
-            element_strides.as_ptr(),
-            CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B,
-            CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
-            CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-        )
+    let encode = |operand| -> Result<[u64; 16], Box<dyn Error>> {
+        let mut tensor_map = MaybeUninit::<cuda_core::sys::CUtensorMap>::uninit();
+        let box_dimensions = layout.box_dimensions(operand);
+        let status = unsafe {
+            cuTensorMapEncodeTiled(
+                tensor_map.as_mut_ptr(),
+                CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                2,
+                base as *mut std::ffi::c_void,
+                global_dimensions.as_ptr(),
+                global_strides.as_ptr(),
+                box_dimensions.as_ptr(),
+                element_strides.as_ptr(),
+                CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
+                CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B,
+                CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+            )
+        };
+        if status != cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("cuTensorMapEncodeTiled(bf16) failed: {status:?}").into());
+        }
+        Ok(unsafe { tensor_map.assume_init() }.opaque)
     };
-    if status != cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuTensorMapEncodeTiled(bf16) failed: {status:?}").into());
-    }
-    let tensor_map = unsafe { tensor_map.assume_init() };
-    Ok(DeviceBuffer::from_host(stream, &tensor_map.opaque)?)
+    // The `A` box first, so a bare map pointer keeps meaning what it did.
+    let mut pair = [0u64; 32];
+    pair[..16].copy_from_slice(&encode(Operand::A)?);
+    pair[16..].copy_from_slice(&encode(Operand::B)?);
+    Ok(DeviceBuffer::from_host(stream, &pair)?)
 }
 
 /// Encode a `SWIZZLE_128B` fp32 tensor map delivering `[16, 32]` boxes of a
@@ -231,7 +278,10 @@ impl Bf16TmaMap<'_> {
     }
 }
 
-/// Build a `SWIZZLE_128B` tensor map loading a 128x64 bf16 tile.
+/// Build a `SWIZZLE_128B` map pair over a bf16 matrix: the `A`-operand box
+/// (`TC_TILE` rows) and the `B`-operand box (`TC_B_TILE` rows), adjacent in one
+/// buffer, so one map serves a matrix that is `A` in one GEMM and `B` in
+/// another.
 pub fn create_bf16_tma_map<'matrix>(
     stream: &CudaStream,
     matrix: &'matrix DeviceBuffer<u16>,
@@ -477,11 +527,11 @@ impl Tcgen05Gemm {
                 stream,
                 config,
                 a_tma,
-                b_tma,
+                b_operand(b_tma),
                 c_map,
                 k as i32,
                 (m / TC_M_TILE) as u32,
-                (n as usize / TC_N_TILE) as u32,
+                (n as usize / TC_N_ITEM) as u32,
                 u32::from(layout == TmaLayout::MnMajor),
             )
         }
@@ -863,12 +913,12 @@ unsafe fn launch_tcgen05(
             stream,
             config,
             a_tma,
-            b_tma,
+            b_operand(b_tma),
             output,
             n as i32,
             k as i32,
             (m / TC_M_TILE) as u32,
-            (n as usize / TC_N_TILE) as u32,
+            (n as usize / TC_N_ITEM) as u32,
             mode,
             u32::from(layout == TmaLayout::MnMajor),
         )
@@ -899,13 +949,13 @@ unsafe fn launch_tcgen05_f32(
             stream,
             config,
             a_tma,
-            b_tma,
+            b_operand(b_tma),
             output,
             output_offset,
             n as i32,
             k as i32,
             (m / TC_M_TILE) as u32,
-            (n as usize / TC_N_TILE) as u32,
+            (n as usize / TC_N_ITEM) as u32,
             u32::from(layout == TmaLayout::MnMajor),
         )
     }

@@ -6,7 +6,7 @@
 //! *walk* and the epilogue is a type parameter, so neither is a second MMA
 //! chain.
 //!
-//! A cluster of two CTAs shares one `M256_N256` UMMA. Each rank stages its own
+//! A cluster of two CTAs shares one `M256_N128` UMMA. Each rank stages its own
 //! [`BLOCK_M`] rows of `A` and its own [`HALF_N`] columns of `B` at the same
 //! shared offsets, the instruction reads both ranks' shared memory, and each
 //! rank drains its own `[BLOCK_M, BLOCK_N]` band. Rank [`LEADER`] owns the MMA,
@@ -31,7 +31,7 @@
 //! per-item term at all. So the barriers are armed **once per launch**, the
 //! operand ring is indexed by the **global** K block rather than the item's own,
 //! and the item stream is two semaphore rings deep ([`ITEMS`]): `full` says an
-//! item's MMA chain is complete, `empty` says its accumulator has been read.
+//! item's MMA chain is complete, `empty` says an accumulator slot has been read.
 //! Nothing in the loop is cluster-wide, and the producer crosses an item
 //! boundary with [`STAGES`] blocks still in flight.
 //!
@@ -53,12 +53,34 @@
 //! joined, since oxide-train#80 remedy 2, by a producer warp and an MMA warp so
 //! the band warps never block the schedule.
 //!
-//! The tile is `[256, 256]` at `STAGES = 3` because ferro-kittens' own sweep
-//! (#87) put it **+11.6% / +21.6%** at 8192³ / 16384³ over `[256, 128]` at the
-//! same depth — with `[256, 128] @ STAGES = 2`, which *raises* residency to 4
-//! CTAs/SM, the worst rung in that table at −35.3%. Two CTAs an SM is forced
-//! here anyway: at `BLOCK_N = 256` the tensor-memory term binds first
-//! (`512 / 256 = 2`), before shared memory is consulted.
+//! ## The tile is half as wide, and the allocation is not
+//!
+//! The tile was `[256, 256]`, and every attempt to overlap the drain with the
+//! next item's MMA died on the same fact: a second accumulator needs 512 more
+//! tensor-memory columns and an SM has 512. So this splits the allocation it
+//! already owns. [`ACCUM_COLS`] is still 256 columns and residency is still the
+//! two CTAs an SM that pins (`512 / 256`), but the tile is [`BLOCK_N`] = 128
+//! wide and the 256 columns are [`SLOTS`] of them: item `i` multiplies into one
+//! while item `i − 1`'s drain still reads the other, and the release moves from
+//! `empty(i + 1)` to `empty(i + 2)`. The handoff #80's probe measured at
+//! **8 310 ticks — 14% of a K = 3072 item, and after #84 the only thing in an
+//! item besides the multiply** — comes off the critical path entirely, because
+//! what the next item waits for is no longer this item's drain but the one
+//! before it, which has had a whole item to finish.
+//!
+//! Halving the tile is also what answers the *other* residual term. #80 priced
+//! wave quantization at `gate_up fwd` 86.5% against cuBLASLt's 94.4% and
+//! `bwd down dW` **64.9% against 86.4%** — and cuBLASLt reaches those numbers by
+//! running a tile of exactly half our area (`tile=23`, `waves=46.70` against our
+//! 23.35). At `[256, 128]` both rows land on cuBLASLt's own figures: 1536 tiles
+//! over 148 clusters is 94.3%, and 384 is 86.5%.
+//!
+//! It is not free. A tile half as wide reads the same `A` for half the output,
+//! so this kernel moves **1.5× the operand bytes an output element** the
+//! `[256, 256]` tile did. That is the arithmetic-intensity trade ferro #87's
+//! sweep charged `[256, 128]` for — measured there at `STAGES = 2` and 4
+//! CTAs/SM, neither of which this is — and the reason to believe it is payable
+//! is that cuBLASLt pays it on this hardware at 1850–1970 TFLOP/s.
 //!
 //! ## The epilogue is the kernel
 //!
@@ -71,9 +93,10 @@
 //! stagger decays within an item (oxide-train#80's probe) — and the 1 CTA/SM
 //! double-buffer loses more to its solo feed than the drain costs (ferro
 //! #188's floor). So the cover comes from **inside** the item stream: the
-//! epilogue is deferred one item, each drain releases the accumulator's
-//! columns through [`Release`] the moment its last `tcgen05.ld` retires, and
-//! the store tail plus the whole next TMA fill run beside the next MMA.
+//! epilogue is deferred one item, each drain releases its accumulator slot
+//! through [`Release`] the moment its last `tcgen05.ld` retires, and — since
+//! the slot it releases is not the one the next item needs — the entire store
+//! tail runs beside the next MMA rather than a fraction of it.
 //!
 //! What #80's own probe added is *where the drain's time goes*: it is the
 //! **wait per `.x8` issue**, not the store issue, so the release is worth what
@@ -82,7 +105,7 @@
 //!
 //! Within a pass the drain keeps the shape #116/#117 measured: TMEM → registers
 //! (`tcgen05.ld.16x256b.x8`) → `stmatrix.m8n8.x4` into a per-warp
-//! `[32, STAGE_N]` shared tile → 16-byte stores, four passes a band. Not a TMA
+//! `[32, STAGE_N]` shared tile → 16-byte stores, two passes a band. Not a TMA
 //! store: #123 measured that route *losing* by 1.0–1.7% at warp scope on this
 //! tile.
 //!
@@ -126,18 +149,30 @@ use kittens::{BaseLdtm, RegTile, lane, warp_id};
 
 /// Rows of the pair tile one rank stages and drains.
 pub const BLOCK_M: usize = 128;
-/// Columns of the pair tile — the widest `cta_group::2` MMA shape there is.
-pub const BLOCK_N: usize = 256;
-/// Columns of `B` one rank stages: the pair's tile, split down the middle.
+/// Columns of one output tile — **half** the widest `cta_group::2` MMA shape,
+/// so one tensor-memory allocation holds [`SLOTS`] of them.
+pub const BLOCK_N: usize = 128;
+/// Columns of `B` one rank stages: the tile's columns, split down the middle.
 const HALF_N: usize = BLOCK_N / 2;
+/// Accumulator segments one allocation carries, and the depth of the ping-pong
+/// the item stream runs over them.
+const SLOTS: u32 = 2;
+/// fp32 tensor-memory columns a cluster allocates — unchanged from the
+/// `M256_N256` kernel this replaces, which is the whole point: the overlap is
+/// bought by *splitting* an allocation nothing else could afford to double.
+const ACCUM_COLS: u32 = SLOTS * BLOCK_N as u32;
 /// One 128-byte swizzle atom of bf16, and the only width
 /// [`SharedTile::k_walk`] accepts — so `BLOCK_K` and [`STAGES`] are a
 /// factorization of the shared budget rather than two free axes.
 pub const BLOCK_K: usize = 64;
 /// K=16 chunks one stage chains, both layouts alike.
 const CHUNKS: usize = BLOCK_K / 16;
-/// Ring depth. 3 → 2 is −11.8% / −7.3% at unchanged residency (ferro #87).
-const STAGES: usize = 3;
+/// Ring depth. 3 → 2 is −11.8% / −7.3% at unchanged residency (ferro #87), and
+/// 4 is what a [`HALF_N`]-wide `B` stage leaves room for: halving the tile
+/// halved the `B` ring's bytes, and this kernel reads 1.5× the operand bytes an
+/// output element that the `[256, 256]` tile did, so the freed 24 KiB go back
+/// into depth rather than to the plan's slack.
+const STAGES: usize = 4;
 /// One warp per 32 accumulator rows — the band warps, every one of which
 /// drains — plus the producer warp and the MMA warp, which never do.
 pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32 + 64;
@@ -166,15 +201,19 @@ const CLUSTER_RANKS: u32 = 2;
 const PAIR: u16 = ((1u32 << CLUSTER_RANKS) - 1) as u16;
 const LEADER: u32 = 0;
 
-/// A K-major `[BLOCK_M, BLOCK_K]` operand stage. `A`'s and `B`'s are the same
-/// type because a rank stages [`HALF_N`] columns of `B`, and `HALF_N` is
-/// [`BLOCK_M`].
-type Stage = SharedTile<Bf16, BLOCK_M, BLOCK_K, Swizzle128B>;
-/// The same bytes read MN-major: `[BLOCK_K, BLOCK_M]` as two stacked 64-wide
-/// subtiles, K along the rows. A 128-byte swizzle caps a TMA box at 128 bytes,
-/// so a rank's 128 MN values arrive as two boxes rather than one.
-type MnStage = SharedTile<Bf16, BLOCK_K, BLOCK_M, Swizzle128B>;
-type Ring = SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
+/// A K-major `[BLOCK_M, BLOCK_K]` stage of `A` — this rank's rows of the pair.
+type AStage = SharedTile<Bf16, BLOCK_M, BLOCK_K, Swizzle128B>;
+/// A K-major `[HALF_N, BLOCK_K]` stage of `B` — this rank's columns of the
+/// tile. Half the rows of an [`AStage`], because an `M256_N128` reads `M / 2`
+/// rows of `A` and `N / 2` columns of `B` from each rank of the pair.
+type BStage = SharedTile<Bf16, HALF_N, BLOCK_K, Swizzle128B>;
+/// The same bytes read MN-major: K along the rows. A 128-byte swizzle caps a
+/// TMA box at 128 bytes, so a rank's 128 MN values of `A` arrive as two boxes
+/// while its 64 of `B` arrive as one.
+type MnAStage = SharedTile<Bf16, BLOCK_K, BLOCK_M, Swizzle128B>;
+type MnBStage = SharedTile<Bf16, BLOCK_K, HALF_N, Swizzle128B>;
+type ARing = SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
+type BRing = SharedTileRing<Bf16, HALF_N, BLOCK_K, Swizzle128B, STAGES>;
 type StageTile = SharedTile<Bf16, 32, STAGE_N, Swizzle128B>;
 type StageRun = SharedTileRing<Bf16, 32, STAGE_N, Swizzle128B, DRAIN_WARPS>;
 type Band = RegTile<32, STAGE_N, BaseLdtm>;
@@ -182,36 +221,47 @@ type Band = RegTile<32, STAGE_N, BaseLdtm>;
 const BAND_ISSUES: usize = (32 / 16) * (STAGE_N / 64);
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 
-const _: () = assert!(HALF_N == BLOCK_M, "one stage type serves both operands");
 const _: () = assert!(
-    Stage::BYTES == MnStage::BYTES,
-    "one ring serves both operand walks"
+    AStage::BYTES == MnAStage::BYTES && BStage::BYTES == MnBStage::BYTES,
+    "one ring apiece serves both operand walks"
 );
 
-/// SMs on a B200, and the CTAs of one a `BLOCK_N = 256` accumulator admits:
-/// `512 / BLOCK_N` tensor-memory columns, which binds before shared memory
+/// SMs on a B200, and the CTAs of one an [`ACCUM_COLS`] accumulator admits:
+/// `512 / ACCUM_COLS` tensor-memory columns, which binds before shared memory
 /// does.
 const SMS: u32 = 148;
-const CTAS_PER_SM: u32 = (512 / BLOCK_N) as u32;
+const CTAS_PER_SM: u32 = 512 / ACCUM_COLS;
 pub const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / CLUSTER_RANKS;
 
 /// [`pipeline::grouped`]'s width, swept at this tile shape by ferro-kittens
 /// #89 — a tile change is a reason to re-run that sweep.
 pub const GROUP: u32 = 8;
 
+/// Whether the item walk pairs each two column halves back into the
+/// `[2·BLOCK_M, 2·BLOCK_N]` tile they came from — see [`Tile::locate`]. Off in
+/// what ships; the pairing exists so the ping-pong can be measured with the
+/// wave quantization held at the old tile's.
+const PAIRED: bool = false;
+
 /// Items the accumulator handoff holds at once.
 ///
-/// Two, and provably enough rather than a margin: the MMA of item `i` waits
-/// `empty(i)`, which a drain arrives at only after `full(i - 1)`, so the issuer
-/// is never more than one item ahead of the epilogue and a slot's previous user
-/// is two items back. One accumulator is what makes that argument short — it is
-/// [`kittens::sync::handoff::depth_needed`]'s chain with the queue removed,
-/// since the schedule is static and no item has to be published.
-const ITEMS: usize = 2;
+/// The release moved from `empty(i + 1)` to `empty(i + 2)` — a drain hands back
+/// the columns *its own* item used, and the next item is already writing the
+/// other slot — so three indices are live at once (`i` waiting, `i + 1`
+/// running, `i + 2` released) and the ring is the next power of two up, which
+/// keeps the modulo a mask. Four is a ceiling rather than a depth: the issuer
+/// cannot run more than [`SLOTS`] items ahead of the epilogue, because item
+/// `i + 2` waits on item `i`'s drain.
+const ITEMS: usize = 4;
+
+const _: () = assert!(
+    ITEMS as u32 >= SLOTS + 1,
+    "the released index must not alias the one still being waited on"
+);
 
 struct Shared {
-    a_ring: Ring,
-    b_ring: Ring,
+    a_ring: ARing,
+    b_ring: BRing,
     load: SemaphoreRing<STAGES>,
     free: SemaphoreRing<STAGES>,
     full: SemaphoreRing<ITEMS>,
@@ -223,7 +273,7 @@ struct Shared {
 #[inline(always)]
 const fn shared(at: SharedPlan) -> Shared {
     let (a_ring, at) = at.tile_ring::<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>();
-    let (b_ring, at) = at.tile_ring::<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>();
+    let (b_ring, at) = at.tile_ring::<Bf16, HALF_N, BLOCK_K, Swizzle128B, STAGES>();
     let (load, at) = at.semaphores::<STAGES>();
     let (free, at) = at.semaphores::<STAGES>();
     let (full, at) = at.semaphores::<ITEMS>();
@@ -257,12 +307,12 @@ pub const SHARED_BYTES: usize = staged(shared(SharedPlan::sizing()).plan).1.byte
 
 const _: () = {
     assert!(THREADS == 192 && MAX_CLUSTERS == 148);
-    // The item rings cost the plan nothing: their thirty-two bytes land in the
+    // The item rings cost the plan nothing: their sixty-four bytes land in the
     // 128-byte alignment padding in front of the staging tiles.
-    assert!(SHARED_BYTES == 114_816 && SHARED_BYTES <= 116_736);
+    assert!(SHARED_BYTES == 114_944 && SHARED_BYTES <= 116_736);
     assert!(
-        BLOCK_N == 4 * STAGE_N,
-        "the staged drains spell their four passes out to hoist the loads ahead of the stores"
+        BLOCK_N == 2 * STAGE_N,
+        "the staged drains spell their two passes out to hoist the loads ahead of the stores"
     );
 };
 
@@ -379,20 +429,17 @@ impl Drain for Packed {
             let band_row = 32 * warp_id();
             let n = STAGE_N as u32;
             // Both issues of a band behind one wait: the staging tile is
-            // `[32, STAGE_N]` and nothing slices a wider batch into it, so this
-            // drain halves its exposed TMEM latencies where [`Wide`] quarters
-            // them.
+            // `[32, STAGE_N]` and nothing slices a wider batch into it, so a
+            // pass is two issues and one wait. At [`BLOCK_N`] a band is two
+            // passes, so the whole band is read before the release and **every**
+            // store this warp owes runs beside the next item's MMA.
             let lift =
                 |column| accumulator.tile_x8_batched::<32, STAGE_N, BAND_ISSUES>(band_row, column);
             let first: Band = lift(0);
             let second: Band = lift(n);
-            self.pass(stage, first, row, column);
-            let third: Band = lift(2 * n);
-            self.pass(stage, second, row, column + n);
-            let fourth: Band = lift(3 * n);
             release.now();
-            self.pass(stage, third, row, column + 2 * n);
-            self.pass(stage, fourth, row, column + 3 * n);
+            self.pass(stage, first, row, column);
+            self.pass(stage, second, row, column + n);
         }
     }
 }
@@ -408,37 +455,36 @@ impl Drain for Packed {
 /// ones. The *accumulating* fp32 drain is [`Reduce`], which owes nothing to
 /// this shape.
 ///
-/// It drains in **half-rows behind one wait each**, which is the whole of what
-/// oxide-train#80's probe asked for. Two facts set the shape:
+/// It drains in **one batch behind one wait**, which is what halving the tile
+/// bought. Two facts set the shape:
 ///
-/// - The drain is `tcgen05.ld` *latency*, not store issue. The probe measured
+/// - The drain is `tcgen05.ld` *latency*, not store issue. #80's probe measured
 ///   the accumulator handoff at 9 902 ticks against a 9 977-tick drain — the
 ///   release was buying nothing — and moving store passes behind the release
 ///   moved the number by 1%. What costs is the **wait per issue**: every
 ///   `[M, N]` band [`TmemTile::tile_x8`] lifts pays `(M / 16) · (N / 64)` of
-///   them serially, so the four `[32, STAGE_N]` bands this used to take were
-///   eight exposed TMEM latencies an item.
-/// - The accumulator is 256 fp32 a lane, so no drain holds it all, and the
-///   fraction of store work that runs *after* the release is held registers
-///   over 256.
+///   them serially.
+/// - A thread holds 128 fp32 of accumulator and no more, so at
+///   `BLOCK_N = 256` no drain could hold a whole band and the fraction of store
+///   work behind the release was held registers over 256. At `BLOCK_N = 128` a
+///   band *is* 128 a lane, and the fraction is one.
 ///
-/// [`TmemTile::tile_x8_batched`] answers both at once: a `[16, BLOCK_N]`
-/// half-row is [`kittens::tmem::ISSUE_LIMIT`] issues in flight behind **one**
-/// wait and exactly 128 registers, so the band leaves tensor memory in two
-/// waits instead of eight and the release still lands with half the stores
-/// owed.
+/// [`TmemTile::tile_x8_batched`] answers both at once: `[32, BLOCK_N]` is
+/// [`kittens::tmem::ISSUE_LIMIT`] issues in flight behind **one** wait, so the
+/// band leaves tensor memory in a single latency and the release lands with
+/// every store still owed.
 #[derive(Clone, Copy)]
 struct Wide {
     c: GlobalRows<F32>,
 }
 
-/// Half of a warp's band, whole across the tile's columns: the widest
+/// A warp's whole band, whole across the tile's columns: the widest
 /// `tcgen05.ld.16x256b.x8` batch there is (`ISSUE_LIMIT` issues, one wait) and
-/// exactly half the accumulator row, so two of them are the band and one of
-/// them is what a thread can hold.
-type HalfRow = RegTile<16, BLOCK_N, BaseLdtm>;
-const HALF_ROW_ISSUES: usize = (16 / 16) * (BLOCK_N / 64);
-const _: () = assert!(HALF_ROW_ISSUES == kittens::tmem::ISSUE_LIMIT);
+/// — now that a tile is [`BLOCK_N`] wide — the *entire* band rather than half
+/// of it, at the same 128 registers a thread can hold.
+type WideBand = RegTile<32, BLOCK_N, BaseLdtm>;
+const WIDE_BAND_ISSUES: usize = (32 / 16) * (BLOCK_N / 64);
+const _: () = assert!(WIDE_BAND_ISSUES == kittens::tmem::ISSUE_LIMIT);
 
 /// The half-band the reduction drain still lifts one issue at a time: its
 /// staging tile is `[16, STAGE_N]` and nothing slices a wider batch back into
@@ -457,17 +503,16 @@ impl Drain for Wide {
     ) {
         unsafe {
             let (lane, band_row) = (lane(), 32 * warp_id());
-            // One wait a half-row, and the second one is the release's cue.
-            // What stays in front of the release is one store pass and two
-            // waits; what runs beside the next item's MMA is the other half of
-            // the row and every store's completion.
-            let top: HalfRow =
-                accumulator.tile_x8_batched::<16, BLOCK_N, HALF_ROW_ISSUES>(band_row, 0);
-            store_rows(self.c, row, column, lane, top);
-            let bottom: HalfRow =
-                accumulator.tile_x8_batched::<16, BLOCK_N, HALF_ROW_ISSUES>(band_row + 16, 0);
+            // **One** wait, and it is the release's cue. A `[32, BLOCK_N]` band
+            // is exactly `ISSUE_LIMIT` issues and exactly the 128 registers a
+            // thread can hold, so this warp's entire read of tensor memory is
+            // one batch and nothing at all stays in front of the release: every
+            // store, and every store's completion, runs beside the next item's
+            // MMA.
+            let band: WideBand =
+                accumulator.tile_x8_batched::<32, BLOCK_N, WIDE_BAND_ISSUES>(band_row, 0);
             release.now();
-            store_rows(self.c, row + 16, column, lane, bottom);
+            store_rows(self.c, row, column, lane, band);
         }
     }
 }
@@ -532,35 +577,27 @@ impl Drain for Reduce {
         unsafe {
             let (lane, band_row) = (lane(), 32 * warp_id());
             let mut ring = ReduceRing::attach(stage.base());
-            // Eight passes spelled out rather than looped — the same argument
+            // Four passes spelled out rather than looped — the same argument
             // `kittens::tmem`'s batching section makes: a loop-carried band
             // wants a runtime index and lands in local memory. **Three**
-            // half-bands live, one fewer than [`Wide`]: this drain carries the
-            // ring's cursor and the reduction map beside its bands, and the
-            // fourth measured 177 registers — past the 168 that twelve warps an
-            // SM leave a thread, which is the 2 → 1 CTA cliff by another name.
-            // Three still retires the last `tcgen05.ld` with three scatters and
-            // all three of their engine round-trips owed, where one pass of
-            // lookahead left an eighth.
+            // half-bands live, which at `BLOCK_N = 128` is the whole band but
+            // one: this drain carries the ring's cursor and the reduction map
+            // beside its bands, and a fourth live band measured 177 registers —
+            // past the 168 that twelve warps an SM leave a thread, which is the
+            // 2 → 1 CTA cliff by another name. So the release still lands after
+            // the last `tcgen05.ld`, with three of the four scatters and all
+            // three of their engine round-trips owed.
             let n = STAGE_N as u32;
             let (top, bottom) = (band_row, band_row + 16);
             let b0: HalfBand = accumulator.tile_x8(top, 0);
             let b1: HalfBand = accumulator.tile_x8(top, n);
-            let b2: HalfBand = accumulator.tile_x8(top, 2 * n);
+            let b2: HalfBand = accumulator.tile_x8(bottom, 0);
             self.emit(&mut ring, lane, b0, row, column);
-            let b3: HalfBand = accumulator.tile_x8(top, 3 * n);
-            self.emit(&mut ring, lane, b1, row, column + n);
-            let b4: HalfBand = accumulator.tile_x8(bottom, 0);
-            self.emit(&mut ring, lane, b2, row, column + 2 * n);
-            let b5: HalfBand = accumulator.tile_x8(bottom, n);
-            self.emit(&mut ring, lane, b3, row, column + 3 * n);
-            let b6: HalfBand = accumulator.tile_x8(bottom, 2 * n);
-            self.emit(&mut ring, lane, b4, row + 16, column);
-            let b7: HalfBand = accumulator.tile_x8(bottom, 3 * n);
+            let b3: HalfBand = accumulator.tile_x8(bottom, n);
             release.now();
-            self.emit(&mut ring, lane, b5, row + 16, column + n);
-            self.emit(&mut ring, lane, b6, row + 16, column + 2 * n);
-            self.emit(&mut ring, lane, b7, row + 16, column + 3 * n);
+            self.emit(&mut ring, lane, b1, row, column + n);
+            self.emit(&mut ring, lane, b2, row + 16, column);
+            self.emit(&mut ring, lane, b3, row + 16, column + n);
             ring.drain();
         }
     }
@@ -568,8 +605,8 @@ impl Drain for Reduce {
 
 #[derive(Clone, Copy)]
 struct Tile<D: Drain> {
-    a_ring: Ring,
-    b_ring: Ring,
+    a_ring: ARing,
+    b_ring: BRing,
     load: SemaphoreRing<STAGES>,
     free: SemaphoreRing<STAGES>,
     a_map: *const TmaDescriptor,
@@ -641,7 +678,7 @@ impl<D: Drain> Tile<D> {
         unsafe {
             let mut stage_index = 0u32;
             while let Some(item) = walk.next() {
-                let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP);
+                let (tile_m, tile_n) = self.locate(item);
                 // All four of the pair's tiles complete on the leader's copy of
                 // the stage barrier, and only the leader charges it:
                 // `expect_tx` is `.shared::cta`, so a peer could not charge that
@@ -663,9 +700,9 @@ impl<D: Drain> Tile<D> {
                     // bytes either way, so the charge does not depend on the
                     // branch.
                     let bytes = if self.transposed {
-                        MnStage::from_raw(a.base())
+                        MnAStage::from_raw(a.base())
                             .tma_load_2d_arriving_at(self.a_map, a_line, depth, stage)
-                            + MnStage::from_raw(b.base())
+                            + MnBStage::from_raw(b.base())
                                 .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage)
                     } else {
                         a.tma_load_2d_arriving_at(self.a_map, depth, a_line, stage)
@@ -697,6 +734,7 @@ impl<D: Drain> Tile<D> {
             let mut stage_index = 0u32;
             while walk.next().is_some() {
                 self.empty.wait(sequence);
+                let target = self.slot(sequence);
                 let mut k = 0u32;
                 while k < self.k_blocks {
                     self.load.wait(stage_index);
@@ -706,17 +744,17 @@ impl<D: Drain> Tile<D> {
                     // layouts issue through one loop.
                     let (a_walk, b_walk) = if self.transposed {
                         (
-                            MnStage::from_raw(a.base()).mn_walk(),
-                            MnStage::from_raw(b.base()).mn_walk(),
+                            MnAStage::from_raw(a.base()).mn_walk(),
+                            MnBStage::from_raw(b.base()).mn_walk(),
                         )
                     } else {
                         (a.k_walk(), b.k_walk())
                     };
                     mma_walk_cg2::<Bf16, CHUNKS>(
-                        self.accumulator.raw(),
+                        target.raw(),
                         a_walk,
                         b_walk,
-                        MmaShape::M256_N256,
+                        MmaShape::M256_N128,
                         k > 0,
                     );
                     commit_multicast_cg2(self.free.sem(stage_index), PAIR);
@@ -744,17 +782,21 @@ impl<D: Drain> Tile<D> {
     unsafe fn epilogue(&self, mut walk: Walk) {
         unsafe {
             if lane() == 0 {
-                self.empty.sem(0).at_rank(LEADER).arrive();
+                let mut slot = 0u32;
+                while slot < SLOTS {
+                    self.empty.sem(slot).at_rank(LEADER).arrive();
+                    slot += 1;
+                }
             }
             let mut sequence = 0u32;
             while let Some(item) = walk.next() {
                 self.full.wait(sequence);
                 let (row, column) = self.origin(item);
                 let release = Release {
-                    sem: self.empty.sem(sequence + 1).at_rank(LEADER),
+                    sem: self.empty.sem(sequence + SLOTS).at_rank(LEADER),
                 };
                 self.out
-                    .drain(self.accumulator, self.stage, row, column, release);
+                    .drain(self.slot(sequence), self.stage, row, column, release);
                 sequence += 1;
             }
         }
@@ -821,11 +863,40 @@ impl<D: Drain> Tile<D> {
         }
     }
 
-    /// This warp's origin in `C` for `item`: the pair tile, this rank's half of
-    /// it, and the 32 rows the warp owns.
+    /// The `[2·BLOCK_M, BLOCK_N]` tile `item` covers.
+    ///
+    /// Under [`PAIRED`] the walk is over `[2·BLOCK_M, 2·BLOCK_N]` tiles and an
+    /// item is one column half of one, so a cluster takes both halves of a tile
+    /// back to back and the launch quantizes into waves exactly as the
+    /// `M256_N256` kernel did. That is the control the narrow walk is measured
+    /// against: it isolates the accumulator ping-pong from the tile shape,
+    /// which are otherwise one change — both halve the tile, and both read 1.5×
+    /// the operand bytes an output element.
+    #[inline(always)]
+    fn locate(&self, item: u32) -> (u32, u32) {
+        if PAIRED {
+            let (tile_m, tile_n) =
+                pipeline::grouped(item / SLOTS, self.tiles_m, self.tiles_n / SLOTS, GROUP);
+            (tile_m, SLOTS * tile_n + item % SLOTS)
+        } else {
+            pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP)
+        }
+    }
+
+    /// The accumulator segment `sequence` owns: consecutive items alternate, so
+    /// an item's MMA runs into one [`BLOCK_N`]-column slot while the previous
+    /// item's drain still reads the other.
+    #[inline(always)]
+    fn slot(&self, sequence: u32) -> Accumulator {
+        self.accumulator
+            .columns_right(BLOCK_N as u32 * (sequence % SLOTS))
+    }
+
+    /// This warp's origin in `C` for `item`: the tile, this rank's half of its
+    /// rows, and the 32 rows the warp owns.
     #[inline(always)]
     fn origin(&self, item: u32) -> (u32, u32) {
-        let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP);
+        let (tile_m, tile_n) = self.locate(item);
         (
             2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * warp_id(),
             BLOCK_N as u32 * tile_n,
@@ -862,7 +933,7 @@ pub mod kernels {
                 free: shared.free,
                 a_map,
                 b_map,
-                accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, BLOCK_N as u32)),
+                accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, ACCUM_COLS)),
                 stage: run.tile(warp_id() % DRAIN_WARPS as u32),
                 out,
                 tiles_m,
@@ -891,7 +962,7 @@ pub mod kernels {
             // and never looped, and what keeps the accumulator's columns alive
             // until the last drain's reads retire.
             tile.retire();
-            dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
+            dealloc_cluster(tile.accumulator.raw(), ACCUM_COLS);
         }
     }
 
