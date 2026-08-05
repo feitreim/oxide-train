@@ -515,28 +515,30 @@ impl Drain for Reduce {
             let mut ring = ReduceRing::attach(stage.base());
             // Eight passes spelled out rather than looped — the same argument
             // `kittens::tmem`'s batching section makes: a loop-carried band
-            // wants a runtime index and lands in local memory. Four half-bands
-            // are live, as in [`Wide`]: the whole top half is lifted before the
-            // engine is asked for anything, and the last `tcgen05.ld` retires
-            // with the bottom half's four scatters — and every one of their
-            // engine round-trips — still owed. That is what the release is for,
-            // and at one pass of lookahead it was buying an eighth of one.
+            // wants a runtime index and lands in local memory. **Three**
+            // half-bands live, one fewer than [`Wide`]: this drain carries the
+            // ring's cursor and the reduction map beside its bands, and the
+            // fourth measured 177 registers — past the 168 that twelve warps an
+            // SM leave a thread, which is the 2 → 1 CTA cliff by another name.
+            // Three still retires the last `tcgen05.ld` with three scatters and
+            // all three of their engine round-trips owed, where one pass of
+            // lookahead left an eighth.
             let n = STAGE_N as u32;
             let (top, bottom) = (band_row, band_row + 16);
             let b0: HalfBand = accumulator.tile_x8(top, 0);
             let b1: HalfBand = accumulator.tile_x8(top, n);
             let b2: HalfBand = accumulator.tile_x8(top, 2 * n);
-            let b3: HalfBand = accumulator.tile_x8(top, 3 * n);
             self.emit(&mut ring, lane, b0, row, column);
-            let b4: HalfBand = accumulator.tile_x8(bottom, 0);
+            let b3: HalfBand = accumulator.tile_x8(top, 3 * n);
             self.emit(&mut ring, lane, b1, row, column + n);
-            let b5: HalfBand = accumulator.tile_x8(bottom, n);
+            let b4: HalfBand = accumulator.tile_x8(bottom, 0);
             self.emit(&mut ring, lane, b2, row, column + 2 * n);
-            let b6: HalfBand = accumulator.tile_x8(bottom, 2 * n);
+            let b5: HalfBand = accumulator.tile_x8(bottom, n);
             self.emit(&mut ring, lane, b3, row, column + 3 * n);
+            let b6: HalfBand = accumulator.tile_x8(bottom, 2 * n);
+            self.emit(&mut ring, lane, b4, row + 16, column);
             let b7: HalfBand = accumulator.tile_x8(bottom, 3 * n);
             release.now();
-            self.emit(&mut ring, lane, b4, row + 16, column);
             self.emit(&mut ring, lane, b5, row + 16, column + n);
             self.emit(&mut ring, lane, b6, row + 16, column + 2 * n);
             self.emit(&mut ring, lane, b7, row + 16, column + 3 * n);

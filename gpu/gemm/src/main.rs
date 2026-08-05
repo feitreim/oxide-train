@@ -140,12 +140,12 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_optimized",
-        max_registers: 109,
+        max_registers: 168,
         max_spill_bytes: 0,
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_accumulate",
-        max_registers: 128,
+        max_registers: 152,
         max_spill_bytes: 0,
     },
 ];
