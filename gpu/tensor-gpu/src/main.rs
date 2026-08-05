@@ -205,8 +205,14 @@ fn check_adamw_master(
         weight - learning_rate * step
     };
 
+    struct Outcome {
+        master: Vec<u32>,
+        first: Vec<f32>,
+        second: Vec<f32>,
+    }
+
     let mut run =
-        |packed_gradient: bool, rounding: u32| -> Result<Vec<u32>, cuda_core::DriverError> {
+        |packed_gradient: bool, rounding: u32| -> Result<Outcome, cuda_core::DriverError> {
             let mut master = DeviceBuffer::from_host(stream, &master_words)?;
             let mut first = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
             let mut second = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
@@ -266,7 +272,11 @@ fn check_adamw_master(
                     );
                 }
             }
-            master.to_host_vec(stream)
+            Ok(Outcome {
+                master: master.to_host_vec(stream)?,
+                first: first.to_host_vec(stream)?,
+                second: second.to_host_vec(stream)?,
+            })
         };
 
     for (packed_gradient, label) in [(false, "fp32 gradient"), (true, "packed gradient")] {
@@ -283,22 +293,43 @@ fn check_adamw_master(
 
         let nearest = run(packed_gradient, device::MASTER_ROUNDING_NEAREST)?;
         assert_eq!(
-            nearest,
+            nearest.master,
             pack_bf16(&expected),
             "adamw_bf16_master ({label}) round-to-nearest write-back"
         );
+        // Both moments, as words, against a host reference. From zero moments
+        // the update is `(1 - beta) * g` and `(1 - beta2) * g * g` — products
+        // only, so no contraction can separate the device's arithmetic from
+        // the host's and the comparison is exact rather than approximate. It is
+        // what says the write-back's batched loads and stores still land each
+        // moment on the element it belongs to (#99).
+        assert_eq!(
+            bits(&nearest.first),
+            bits(&seen.iter().map(|&g| (1.0 - beta1) * g).collect::<Vec<_>>()),
+            "adamw_bf16_master ({label}) first moment"
+        );
+        assert_eq!(
+            bits(&nearest.second),
+            bits(
+                &seen
+                    .iter()
+                    .map(|&g| (1.0 - beta2) * g * g)
+                    .collect::<Vec<_>>()
+            ),
+            "adamw_bf16_master ({label}) second moment"
+        );
 
-        let stochastic = run(packed_gradient, device::MASTER_ROUNDING_STOCHASTIC)?;
+        let stochastic = run(packed_gradient, device::MASTER_ROUNDING_STOCHASTIC)?.master;
         assert_eq!(
             stochastic,
-            run(packed_gradient, device::MASTER_ROUNDING_STOCHASTIC)?,
+            run(packed_gradient, device::MASTER_ROUNDING_STOCHASTIC)?.master,
             "stochastic rounding ({label}) is not reproducible"
         );
         assert_ne!(
-            stochastic, nearest,
+            stochastic, nearest.master,
             "stochastic rounding ({label}) never differed from nearest"
         );
-        let nearest_values = unpack_bf16(&nearest);
+        let nearest_values = unpack_bf16(&nearest.master);
         for (i, (&drawn, &near)) in unpack_bf16(&stochastic)
             .iter()
             .zip(&nearest_values)

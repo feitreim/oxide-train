@@ -91,8 +91,25 @@ pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
 /// power of two.
 pub const MOE_SCATTER_DY_THREADS: usize = 256;
 
-/// Threads in one block-per-bin MoE dead-slot zeroing block.
+/// Threads in one block-per-expert routing-probability reduction. Lanes stride
+/// the tokens before a tree reduction, so this must remain a power of two.
+///
+/// One block per expert is only `E` blocks, so the token loop's depth is all
+/// the parallelism there is: `N` runs to 24576 and the trip count is a runtime
+/// value NVVM will not unroll, which leaves each lane one load in flight and
+/// the launch `N / threads` load latencies deep. A full block is 24 of them
+/// rather than 96 (#99).
+pub const MOE_PROBABILITY_SUMS_THREADS: usize = 1024;
+
+/// Threads in one MoE dead-slot zeroing block.
 pub const MOE_ZERO_BINS_THREADS: usize = 256;
+
+/// Blocks per expert in the MoE dead-slot zeroing pass.
+///
+/// Each strides its expert's dead tail, so this bounds the dispatch rather than
+/// describing the work: enough blocks to fill the device when the routing drops
+/// a lot of tokens, and when it drops none they each load one count and exit.
+pub const MOE_ZERO_BINS_BLOCKS: usize = 256;
 
 /// Rows one warp owns in the tile RMSNorm forward.
 ///
@@ -2342,8 +2359,14 @@ pub mod kernels {
 
     /// Parallel token reduction for each expert's mean routing probability.
     ///
-    /// One block owns an expert. Each lane accumulates a strided token slice and
-    /// performs one atomic add, keeping the contention bounded by block size.
+    /// One block owns an expert, and so owns that expert's slot outright: lanes
+    /// accumulate strided token slices, a tree reduction combines them, and
+    /// lane 0 stores. Accumulating the lanes with same-address atomics instead
+    /// needed the buffer pre-zeroed by a `fill` launch per layer, serialized
+    /// [`MOE_PROBABILITY_SUMS_THREADS`] adds on one word, and left the summation
+    /// order — and so the reported auxiliary loss — dependent on their arrival
+    /// order (#99). The auxiliary *gradient* never reads this: `router_backward`
+    /// derives it from the assignment counts.
     #[kernel]
     pub unsafe fn moe_probability_sums(
         probabilities: &[f32],
@@ -2351,11 +2374,13 @@ pub mod kernels {
         experts: u32,
         mut probability_sums: DisjointSlice<f32>,
     ) {
+        static mut SUMS: SharedArray<f32, MOE_PROBABILITY_SUMS_THREADS> = SharedArray::UNINIT;
+
         let expert = thread::blockIdx_x() as usize;
         let lane = thread::threadIdx_x() as usize;
-        let stride = thread::blockDim_x() as usize;
         let n = tokens as usize;
         let e = experts as usize;
+        // Uniform over the block, so no lane reaches a barrier the rest skip.
         if expert >= e || expert >= probability_sums.len() || probabilities.len() < n * e {
             return;
         }
@@ -2363,10 +2388,31 @@ pub mod kernels {
         let mut token = lane;
         while token < n {
             sum += probabilities[token * e + expert];
-            token += stride;
+            token += MOE_PROBABILITY_SUMS_THREADS;
         }
-        let slot = unsafe { DeviceAtomicF32::from_ptr(probability_sums.as_mut_ptr().add(expert)) };
-        slot.fetch_add(sum, AtomicOrdering::Relaxed);
+
+        // SAFETY: each lane owns its own slot of the block's scratch.
+        unsafe {
+            SUMS[lane] = sum;
+        }
+        thread::sync_threads();
+        let mut stride = MOE_PROBABILITY_SUMS_THREADS / 2;
+        while stride > 0 {
+            if lane < stride {
+                // SAFETY: the surviving half of the lanes own disjoint slots.
+                unsafe {
+                    SUMS[lane] += SUMS[lane + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if lane == 0 {
+            // SAFETY: this block exclusively owns `expert`.
+            unsafe {
+                *probability_sums.get_unchecked_mut(expert) = SUMS[0];
+            }
+        }
     }
 
     /// Add the weighted Switch-style load-balancing loss to the scalar training
@@ -2941,8 +2987,14 @@ pub mod kernels {
     /// Capacity assignment hands expert `e` the slots `0..min(count[e], C)` and
     /// [`moe_scatter_dy`] overwrites exactly those, so the dead tail
     /// `min(count[e], C)..C` is all that still needs clearing. Together the two
-    /// passes cover the whole `E·C·D` buffer, replacing a full pre-fill. One
-    /// block per `(expert, slot)`, lanes striding the row.
+    /// passes cover the whole `E·C·D` buffer, replacing a full pre-fill.
+    ///
+    /// Blocks walk that tail and nothing else: one block per `(expert, slot)`
+    /// dispatched `E · C` of them — 590K per step across the layers — to
+    /// discover that a balanced router leaves almost every slot live, and cost
+    /// 0.45 ms doing it (#99). The expert is the grid's second dimension, so a
+    /// block reads its count once and then strides only dead slots; lanes
+    /// stride the row.
     #[kernel]
     pub unsafe fn moe_zero_dead_bins(
         assignment_counts: &[u32],
@@ -2952,43 +3004,43 @@ pub mod kernels {
     ) {
         let tid = thread::threadIdx_x() as usize;
         let threads = thread::blockDim_x() as usize;
-        let bin = thread::blockIdx_x() as usize;
+        let expert = thread::blockIdx_y() as usize;
         let d = dim as usize;
         let c = capacity as usize;
-        if d == 0 || c == 0 {
+        if d == 0 || c == 0 || expert >= assignment_counts.len() {
             return;
         }
-        let expert = bin / c;
-        let slot = bin % c;
-        let base = bin * d;
-        if expert >= assignment_counts.len() || base + d > expert_output_gradient.len() {
-            return;
-        }
-        if slot < assignment_counts[expert] as usize {
-            return;
-        }
-
-        if d.is_multiple_of(QUAD_LANES) {
-            // SAFETY: `base` is a multiple of `dim`, hence of `QUAD_LANES`, so
-            // the row is 16-byte aligned; bounds were checked above. Each lane
-            // owns distinct quads of this block's dead bin row.
-            let row = unsafe { expert_output_gradient.as_mut_ptr().add(base) as *mut u128 };
-            let mut quad = tid;
-            while quad < d / QUAD_LANES {
-                unsafe {
-                    *row.add(quad) = 0;
-                }
-                quad += threads;
+        let live = (assignment_counts[expert] as usize).min(c);
+        let mut slot = live + thread::blockIdx_x() as usize;
+        while slot < c {
+            let base = (expert * c + slot) * d;
+            if base + d > expert_output_gradient.len() {
+                return;
             }
-        } else {
-            let mut column = tid;
-            while column < d {
-                // SAFETY: each lane owns distinct columns of this dead bin row.
-                unsafe {
-                    *expert_output_gradient.get_unchecked_mut(base + column) = 0.0;
+            if d.is_multiple_of(QUAD_LANES) {
+                // SAFETY: `base` is a multiple of `dim`, hence of `QUAD_LANES`,
+                // so the row is 16-byte aligned; bounds were checked above.
+                // Each lane owns distinct quads of this block's dead bin row.
+                let row = unsafe { expert_output_gradient.as_mut_ptr().add(base) as *mut u128 };
+                let mut quad = tid;
+                while quad < d / QUAD_LANES {
+                    unsafe {
+                        *row.add(quad) = 0;
+                    }
+                    quad += threads;
                 }
-                column += threads;
+            } else {
+                let mut column = tid;
+                while column < d {
+                    // SAFETY: each lane owns distinct columns of this dead bin
+                    // row.
+                    unsafe {
+                        *expert_output_gradient.get_unchecked_mut(base + column) = 0.0;
+                    }
+                    column += threads;
+                }
             }
+            slot += thread::gridDim_x() as usize;
         }
     }
 
@@ -3002,44 +3054,45 @@ pub mod kernels {
     ) {
         let tid = thread::threadIdx_x() as usize;
         let threads = thread::blockDim_x() as usize;
-        let bin = thread::blockIdx_x() as usize;
+        let expert = thread::blockIdx_y() as usize;
         let d = dim as usize;
         let c = capacity as usize;
-        if d == 0 || c == 0 || !d.is_multiple_of(2) {
+        if d == 0 || c == 0 || !d.is_multiple_of(2) || expert >= assignment_counts.len() {
             return;
         }
         let words = d / 2;
-        let expert = bin / c;
-        let slot = bin % c;
-        let base = bin * words;
-        if expert >= assignment_counts.len() || base + words > expert_output_gradient.len() {
-            return;
-        }
-        if slot < assignment_counts[expert] as usize {
-            return;
-        }
-
-        if words.is_multiple_of(QUAD_LANES) {
-            // SAFETY: `base` is a multiple of `words`, hence of `QUAD_LANES`,
-            // so the row is 16-byte aligned; bounds were checked above. Each
-            // lane owns distinct quads of this block's dead bin row.
-            let row = unsafe { expert_output_gradient.as_mut_ptr().add(base) as *mut u128 };
-            let mut quad = tid;
-            while quad < words / QUAD_LANES {
-                unsafe {
-                    *row.add(quad) = 0;
-                }
-                quad += threads;
+        let live = (assignment_counts[expert] as usize).min(c);
+        let mut slot = live + thread::blockIdx_x() as usize;
+        while slot < c {
+            let base = (expert * c + slot) * words;
+            if base + words > expert_output_gradient.len() {
+                return;
             }
-        } else {
-            let mut column = tid;
-            while column < words {
-                // SAFETY: each lane owns distinct words of this dead bin row.
-                unsafe {
-                    *expert_output_gradient.get_unchecked_mut(base + column) = 0;
+            if words.is_multiple_of(QUAD_LANES) {
+                // SAFETY: `base` is a multiple of `words`, hence of
+                // `QUAD_LANES`, so the row is 16-byte aligned; bounds were
+                // checked above. Each lane owns distinct quads of this block's
+                // dead bin row.
+                let row = unsafe { expert_output_gradient.as_mut_ptr().add(base) as *mut u128 };
+                let mut quad = tid;
+                while quad < words / QUAD_LANES {
+                    unsafe {
+                        *row.add(quad) = 0;
+                    }
+                    quad += threads;
                 }
-                column += threads;
+            } else {
+                let mut column = tid;
+                while column < words {
+                    // SAFETY: each lane owns distinct words of this dead bin
+                    // row.
+                    unsafe {
+                        *expert_output_gradient.get_unchecked_mut(base + column) = 0;
+                    }
+                    column += threads;
+                }
             }
+            slot += thread::gridDim_x() as usize;
         }
     }
 

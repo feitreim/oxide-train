@@ -641,25 +641,60 @@ pub mod kernels {
         }
     }
 
-    /// One packed master pair's worth of AdamW: update both elements of
-    /// `stored` from the fp32 gradients this thread owns, clear those
-    /// gradients, and return the rounded write-back word.
+    /// Read a master pair's two elements of a per-element buffer as one batch.
+    ///
+    /// # Safety
+    /// The caller owns elements `element` and `element + 1` exclusively.
+    #[inline(always)]
+    unsafe fn load_pair(slice: &mut DisjointSlice<f32>, element: usize) -> [f32; 2] {
+        // SAFETY: the caller's exclusive ownership of both elements.
+        unsafe {
+            [
+                *slice.get_unchecked_mut(element),
+                *slice.get_unchecked_mut(element + 1),
+            ]
+        }
+    }
+
+    /// [`load_pair`]'s inverse.
+    ///
+    /// # Safety
+    /// The caller owns elements `element` and `element + 1` exclusively.
+    #[inline(always)]
+    unsafe fn store_pair(slice: &mut DisjointSlice<f32>, element: usize, values: [f32; 2]) {
+        // SAFETY: the caller's exclusive ownership of both elements.
+        unsafe {
+            *slice.get_unchecked_mut(element) = values[0];
+            *slice.get_unchecked_mut(element + 1) = values[1];
+        }
+    }
+
+    /// One packed master pair's worth of AdamW, entirely in registers: the
+    /// stored word and the pair's two gradients in, the rounded write-back word
+    /// out and both moments advanced in place.
+    ///
+    /// Memory is deliberately the caller's business, because *when* it touches
+    /// memory is the whole performance question. Nothing proves to the compiler
+    /// that a gradient, a moment and a master do not alias, so a store cannot
+    /// be reordered past a later load — and every store here depends on an
+    /// update whose divide and square root are not short, so a kernel that
+    /// interleaves stores with loads turns each word into its own memory round
+    /// trip. Every caller therefore issues all of its loads, calls this, and
+    /// only then stores. Moving one clear ahead of the loads measured 2.83 ms
+    /// against 0.66 on the lm-head's write-back (#99, #101).
     ///
     /// Moments stay fp32 and the whole update is computed in fp32 — bf16 only
     /// ever appears at the write-back, where [`round_master`] decides how the
-    /// discarded mantissa bits are handled.
-    ///
-    /// # Safety
-    /// The caller owns elements `2 * pair` and `2 * pair + 1` of `gradient`,
-    /// `first`, and `second` exclusively.
+    /// discarded mantissa bits are handled. `element` is the pair's first
+    /// global element index, which keys the rounding stream.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn adamw_master_pair(
+    fn adamw_master_pair(
         stored: u32,
-        pair: usize,
-        gradient: &mut DisjointSlice<f32>,
-        first: &mut DisjointSlice<f32>,
-        second: &mut DisjointSlice<f32>,
+        gradients: [f32; 2],
+        first: &mut [f32; 2],
+        second: &mut [f32; 2],
+        element: usize,
         learning_rate: f32,
         beta1: f32,
         beta2: f32,
@@ -670,97 +705,34 @@ pub mod kernels {
         rounding: u32,
         seed: u64,
     ) -> u32 {
-        let mut packed = 0u32;
-        let mut half = 0;
-        while half < 2 {
-            let element = 2 * pair + half;
-            let weight = bf16_bits_to_f32((stored >> (16 * half)) as u16);
-            // SAFETY: the caller's exclusive ownership of this element.
-            let updated = unsafe {
-                let g = gradient.get_unchecked_mut(element);
-                let updated = adamw_element(
-                    weight,
-                    *g,
-                    first.get_unchecked_mut(element),
-                    second.get_unchecked_mut(element),
-                    learning_rate,
-                    beta1,
-                    beta2,
-                    epsilon,
-                    weight_decay,
-                    first_correction,
-                    second_correction,
-                );
-                *g = 0.0;
-                updated
-            };
-            packed |= (round_master(updated, rounding, seed, element) as u32) << (16 * half);
-            half += 1;
-        }
-        packed
-    }
-
-    /// [`adamw_master_pair`] for a gradient that arrives packed in bf16.
-    ///
-    /// # Safety
-    /// As [`adamw_master_pair`], plus exclusive ownership of word `pair` of
-    /// `gradient`.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn adamw_master_pair_packed_grad(
-        stored: u32,
-        pair: usize,
-        gradient: &mut DisjointSlice<u32>,
-        first: &mut DisjointSlice<f32>,
-        second: &mut DisjointSlice<f32>,
-        learning_rate: f32,
-        beta1: f32,
-        beta2: f32,
-        epsilon: f32,
-        weight_decay: f32,
-        first_correction: f32,
-        second_correction: f32,
-        rounding: u32,
-        seed: u64,
-    ) -> u32 {
-        // SAFETY: the caller's exclusive ownership of this word.
-        let gradients = unsafe { *gradient.get_unchecked_mut(pair) };
-
-        let mut packed = 0u32;
-        let mut half = 0;
-        while half < 2 {
-            let element = 2 * pair + half;
-            let g = bf16_bits_to_f32((gradients >> (16 * half)) as u16);
-            let weight = bf16_bits_to_f32((stored >> (16 * half)) as u16);
-            // SAFETY: the caller's exclusive ownership of this element.
-            let updated = unsafe {
-                adamw_element(
-                    weight,
-                    g,
-                    first.get_unchecked_mut(element),
-                    second.get_unchecked_mut(element),
-                    learning_rate,
-                    beta1,
-                    beta2,
-                    epsilon,
-                    weight_decay,
-                    first_correction,
-                    second_correction,
-                )
-            };
-            packed |= (round_master(updated, rounding, seed, element) as u32) << (16 * half);
-            half += 1;
-        }
-        // Clear last. Nothing proves to the compiler that the gradient does
-        // not alias the moments, so a store placed ahead of their loads orders
-        // every one of them behind it and the update loses its memory-level
-        // parallelism: clearing first measured 2.83 ms against 0.66 for the
-        // lm-head's `[3072, 50432]` master (#99).
-        // SAFETY: the caller's exclusive ownership of this word.
-        unsafe {
-            *gradient.get_unchecked_mut(pair) = 0;
-        }
-        packed
+        let low = adamw_element(
+            bf16_bits_to_f32(stored as u16),
+            gradients[0],
+            &mut first[0],
+            &mut second[0],
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+            first_correction,
+            second_correction,
+        );
+        let high = adamw_element(
+            bf16_bits_to_f32((stored >> 16) as u16),
+            gradients[1],
+            &mut first[1],
+            &mut second[1],
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+            first_correction,
+            second_correction,
+        );
+        round_master(low, rounding, seed, element) as u32
+            | ((round_master(high, rounding, seed, element + 1) as u32) << 16)
     }
 
     /// Fused decoupled AdamW over a packed-bf16 master with an fp32 gradient:
@@ -788,30 +760,42 @@ pub mod kernels {
         mut second: DisjointSlice<f32>,
     ) {
         let index = thread::index_1d();
-        let pair = index.get();
+        let element = 2 * index.get();
         let Some(word) = master.get_mut(index) else {
             return;
         };
         // SAFETY: this thread exclusively owns elements 2*pair and 2*pair+1
-        // of every per-element buffer.
-        *word = unsafe {
-            adamw_master_pair(
-                *word,
-                pair,
-                &mut gradient,
-                &mut first,
-                &mut second,
-                learning_rate,
-                beta1,
-                beta2,
-                epsilon,
-                weight_decay,
-                first_correction,
-                second_correction,
-                rounding,
-                seed,
+        // of every per-element buffer. Every load, then every store.
+        let (gradients, mut moment_first, mut moment_second) = unsafe {
+            (
+                load_pair(&mut gradient, element),
+                load_pair(&mut first, element),
+                load_pair(&mut second, element),
             )
         };
+        let packed = adamw_master_pair(
+            *word,
+            gradients,
+            &mut moment_first,
+            &mut moment_second,
+            element,
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+            first_correction,
+            second_correction,
+            rounding,
+            seed,
+        );
+        *word = packed;
+        // SAFETY: as above.
+        unsafe {
+            store_pair(&mut first, element, moment_first);
+            store_pair(&mut second, element, moment_second);
+            store_pair(&mut gradient, element, [0.0, 0.0]);
+        }
     }
 
     /// [`adamw_bf16_master`] for the lm-head, whose weight gradient is produced
@@ -834,29 +818,46 @@ pub mod kernels {
     ) {
         let index = thread::index_1d();
         let pair = index.get();
+        let element = 2 * pair;
         let Some(word) = master.get_mut(index) else {
             return;
         };
         // SAFETY: this thread exclusively owns word `pair` of the packed
-        // gradient and elements 2*pair and 2*pair+1 of both moments.
-        *word = unsafe {
-            adamw_master_pair_packed_grad(
-                *word,
-                pair,
-                &mut gradient,
-                &mut first,
-                &mut second,
-                learning_rate,
-                beta1,
-                beta2,
-                epsilon,
-                weight_decay,
-                first_correction,
-                second_correction,
-                rounding,
-                seed,
+        // gradient and elements 2*pair and 2*pair+1 of both moments. Every
+        // load, then every store.
+        let (gradients, mut moment_first, mut moment_second) = unsafe {
+            (
+                *gradient.get_unchecked_mut(pair),
+                load_pair(&mut first, element),
+                load_pair(&mut second, element),
             )
         };
+        let packed = adamw_master_pair(
+            *word,
+            [
+                bf16_bits_to_f32(gradients as u16),
+                bf16_bits_to_f32((gradients >> 16) as u16),
+            ],
+            &mut moment_first,
+            &mut moment_second,
+            element,
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+            first_correction,
+            second_correction,
+            rounding,
+            seed,
+        );
+        *word = packed;
+        // SAFETY: as above.
+        unsafe {
+            store_pair(&mut first, element, moment_first);
+            store_pair(&mut second, element, moment_second);
+            *gradient.get_unchecked_mut(pair) = 0;
+        }
     }
 
     /// [`adamw_bf16_master`] that emits the master's transpose beside it.
@@ -901,33 +902,49 @@ pub mod kernels {
         let words_per_row = cols as usize / 2;
 
         // A statically bounded walk, so the tile's four words per thread are
-        // independent loads rather than a rolled chain.
+        // independent loads rather than a rolled chain. One word at a time,
+        // and not the whole tile at once: batching all four words' operands
+        // ahead of all four write-backs holds 28 more values live and measured
+        // 18.50 ms against 14.69 on the gate/up master — the round trip it
+        // saves costs less than the occupancy it spends (#99).
         for step in 0..MASTER_TILE_WORDS {
             let local = tid + step * MASTER_TILE_THREADS;
             let row = local / TILE_WORDS_WIDE;
             let word_column = local % TILE_WORDS_WIDE;
             let pair = (tile_row + row) * words_per_row + tile_col / 2 + word_column;
+            let element = 2 * pair;
             // SAFETY: each (tile, local) pair maps to a unique master word and
             // so to a unique pair of elements of every per-element buffer.
+            let (stored, gradients, mut moment_first, mut moment_second) = unsafe {
+                (
+                    *master.get_unchecked_mut(pair),
+                    load_pair(&mut gradient, element),
+                    load_pair(&mut first, element),
+                    load_pair(&mut second, element),
+                )
+            };
+            let packed = adamw_master_pair(
+                stored,
+                gradients,
+                &mut moment_first,
+                &mut moment_second,
+                element,
+                learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+                weight_decay,
+                first_correction,
+                second_correction,
+                rounding,
+                seed,
+            );
+            // SAFETY: as above.
             unsafe {
-                let word = master.get_unchecked_mut(pair);
-                let packed = adamw_master_pair(
-                    *word,
-                    pair,
-                    &mut gradient,
-                    &mut first,
-                    &mut second,
-                    learning_rate,
-                    beta1,
-                    beta2,
-                    epsilon,
-                    weight_decay,
-                    first_correction,
-                    second_correction,
-                    rounding,
-                    seed,
-                );
-                *word = packed;
+                *master.get_unchecked_mut(pair) = packed;
+                store_pair(&mut first, element, moment_first);
+                store_pair(&mut second, element, moment_second);
+                store_pair(&mut gradient, element, [0.0, 0.0]);
                 VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column] = packed & 0xffff;
                 VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column + 1] = packed >> 16;
             }

@@ -15,13 +15,29 @@ use tensor_cpu::CpuTensor;
 mod device;
 use device::{
     CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS,
-    MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK, NORM_TILE_THREADS,
-    NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN, ROUTER_GEMM_THREADS,
-    ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM,
-    ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK,
-    SWIGLU_TILE_THREADS, kernels, rope_table,
+    MOE_ZERO_BINS_BLOCKS, MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS,
+    NORM_TILE_CHUNK, NORM_TILE_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN,
+    ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS,
+    ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, SWIGLU_TILE_BLOCK_ROWS,
+    SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS, kernels, rope_table,
 };
 use tensor_core::bf16;
+
+/// Launch for the dead-slot zeroing checks, clamped the way production clamps
+/// it. The checks pass one block per expert — deliberately fewer than the
+/// capacity — so what they cover is a block striding its expert's dead tail
+/// rather than the one-block-per-slot special case.
+fn zero_dead_bins_config<const E: usize>(blocks_per_expert: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (
+            blocks_per_expert.min(MOE_ZERO_BINS_BLOCKS) as u32,
+            E as u32,
+            1,
+        ),
+        block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
 
 fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
     assert_eq!(actual.len(), expected.len());
@@ -346,11 +362,7 @@ fn check_moe_routing(
         unsafe {
             module.moe_zero_dead_bins(
                 stream,
-                LaunchConfig {
-                    grid_dim: ((E * C) as u32, 1, 1),
-                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                zero_dead_bins_config::<E>(1),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -696,11 +708,7 @@ fn check_moe_routing(
         unsafe {
             module.moe_zero_dead_bins(
                 stream,
-                LaunchConfig {
-                    grid_dim: ((E * C) as u32, 1, 1),
-                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                zero_dead_bins_config::<E>(1),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -739,11 +747,7 @@ fn check_moe_routing(
         unsafe {
             module.moe_zero_dead_bins_bf16(
                 stream,
-                LaunchConfig {
-                    grid_dim: ((E * C) as u32, 1, 1),
-                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                zero_dead_bins_config::<E>(1),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -762,11 +766,7 @@ fn check_moe_routing(
             )?;
             module.moe_zero_dead_bins_bf16(
                 stream,
-                LaunchConfig {
-                    grid_dim: ((E * C) as u32, 1, 1),
-                    block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                zero_dead_bins_config::<E>(1),
                 &counts_dev,
                 D as u32,
                 C as u32,
@@ -860,11 +860,7 @@ fn check_moe_scatter_dy_case<const D: usize>(
         )?;
         module.moe_zero_dead_bins(
             stream,
-            LaunchConfig {
-                grid_dim: ((E * C) as u32, 1, 1),
-                block_dim: (MOE_ZERO_BINS_THREADS as u32, 1, 1),
-                shared_mem_bytes: 0,
-            },
+            zero_dead_bins_config::<E>(1),
             &counts_dev,
             D as u32,
             C as u32,
