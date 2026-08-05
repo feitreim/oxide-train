@@ -231,6 +231,13 @@ pub mod kernels {
         (bits.wrapping_add(round) >> 16) as u16
     }
 
+    /// Two adjacent f32s as the one packed word `convert_f32_to_bf16_pairs`
+    /// would have written for them: low half first, both round to nearest even.
+    #[inline(always)]
+    fn bf16_pair(low: f32, high: f32) -> u32 {
+        f32_to_bf16_bits(low) as u32 | ((f32_to_bf16_bits(high) as u32) << 16)
+    }
+
     #[kernel]
     pub fn rms_norm_forward(
         x: &[f32],
@@ -1014,6 +1021,59 @@ pub mod kernels {
             *output.get_unchecked_mut(base + width + 1) = -k0 * sin + k1 * cos;
             *output.get_unchecked_mut(base + 2 * width) = dv[2 * pair];
             *output.get_unchecked_mut(base + 2 * width + 1) = dv[2 * pair + 1];
+        }
+    }
+
+    /// [`join_group3_rope`] writing the packed-bf16 panel the qkv projection's
+    /// backward GEMMs read, rather than an fp32 one a quantize pass turns into
+    /// it.
+    ///
+    /// Both GEMMs consume that panel out of the same buffer through their own
+    /// descriptors — K-major for the input product, MN-major for the weight
+    /// product — so one packed layout serves both and this kernel is the whole
+    /// of what the quantize did. The arithmetic is [`join_group3_rope`]'s, and
+    /// an fp32 expression stored and reloaded before rounding rounds the same
+    /// as one rounded in registers, so the words are that composition's bit
+    /// for bit.
+    ///
+    /// Each rotated pair is one packed word per group: a group's offset into
+    /// the row is a multiple of `width` and a pair starts at an even column,
+    /// so the couple a thread owns is exactly the couple
+    /// `convert_f32_to_bf16_pairs` would have packed into one word.
+    ///
+    /// # Safety
+    ///
+    /// `dq`, `dk` and `dv` are `[N, heads * head_dim]` and `output` holds at
+    /// least `N * 3 * heads * head_dim / 2` words.
+    #[kernel]
+    pub unsafe fn join_group3_rope_bf16(
+        dq: &[f32],
+        dk: &[f32],
+        dv: &[f32],
+        table: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        head_dim: u32,
+        mut output: DisjointSlice<u32>,
+    ) {
+        let pair = thread::index_1d().get();
+        // Launches round up to whole blocks; excess threads must not write.
+        // `output` is a shared operand buffer sized for the widest linear, so
+        // the input length is what bounds this and not the output's.
+        if 2 * pair >= dq.len() {
+            return;
+        }
+        let half = heads as usize * head_dim as usize / 2;
+        let word = (pair / half) * 3 * half + pair % half;
+        let angle = rope_angle(pair, sequence_length, heads, head_dim);
+        let (cos, sin) = (table[angle], table[angle + 1]);
+        let (q0, q1) = (dq[2 * pair], dq[2 * pair + 1]);
+        let (k0, k1) = (dk[2 * pair], dk[2 * pair + 1]);
+        unsafe {
+            *output.get_unchecked_mut(word) = bf16_pair(q0 * cos + q1 * sin, -q0 * sin + q1 * cos);
+            *output.get_unchecked_mut(word + half) =
+                bf16_pair(k0 * cos + k1 * sin, -k0 * sin + k1 * cos);
+            *output.get_unchecked_mut(word + 2 * half) = bf16_pair(dv[2 * pair], dv[2 * pair + 1]);
         }
     }
 

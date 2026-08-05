@@ -210,7 +210,7 @@ allocated `L` times, scratch once.
 | `acts.attention_logsumexp` | `[N,H]` | 27 MiB | **fp32** — softmax internals |
 | `acts.routing.probabilities`, `gate_weights` | `[N,E]`, `[N,K]` | 11 MiB | **fp32** — router, decision #22 |
 | `scratch.d_model_0..4` | `[N,D]` ×5 | 1.4 GiB | **fp32** — `d_model_1` carries the residual-stream gradient across the whole reverse block loop; bf16 would drop low-order bits `L` times |
-| `scratch.qkv` | `[N,3D]` | 864 MiB | **fp32** — written by a tcgen05 epilogue (#20), and the backward join writes it before the weight GEMM quantizes it |
+| `scratch.qkv` | `[N,3D]` | 864 MiB | **fp32 forward, ✅ bf16 backward** (#91) — the forward keeps it because a tcgen05 epilogue writes it (#20) and the staging pass reads it fp32. The backward gradient panel is a different story and is packed now; see below |
 | `scratch.projection_output` | `[N,D]` | 288 MiB | **fp32** — the o_proj epilogue writes it; the MoE gather no longer stages here, it folds the residual add in and writes the block output directly |
 | `scratch.router_logits`, `dlogits`, `router_dx`, `router_dweight_partials`, `gate_gradients` | — | 314 MiB | **fp32** — router end to end, decision #22, re-affirmed by the #44/#52 determinism constraints |
 | `scratch.attention_dot`, `norm_backward_inv`, `probability_sums` | — | 2.3 MiB | **fp32** — reduction accumulators |
@@ -238,6 +238,36 @@ oracles they are checked against (§11).
 The backward re-staging goes with them: Q/K/V are per-block panels the forward
 already wrote, so only dY — a backward temporary — is staged, and
 `FlashAttentionScratch` holds just it and the correction counts.
+
+#### The backward qkv gradient panel (#91)
+
+The last unfused traversal in the chain. `join_group3_rope` un-rotates dQ/dK,
+joins them with dV, and wrote an fp32 `[N,3D]` panel that
+`GpuGroupedLinear::backward_into` then quantized into `Bf16LinearScratch::rows`
+before either GEMM ran. Pure storage by the question above: one writer, and its
+only consumer rounded it.
+
+`join_group3_rope_bf16` writes those packed words itself and the quantize
+launch is deleted. **One layout serves both readers**: `rows` is a single
+`[N,3D]` row-major packed-bf16 buffer carrying two map sets over the same
+bytes — MN-major for the weight product's `f32_accumulate_transposed`,
+K-major for the input product's `f32_store` — so no descriptor moves and
+nothing forks. `Bf16LinearScratch` is untouched, which is what keeps o_proj
+and the lm-head out of this.
+
+**The rounding count does not change.** The wide panel was already rounded
+exactly once, by that one quantize, and both GEMMs read the single rounded
+buffer; the join now rounds the same fp32 expression in registers instead of
+storing and reloading it first, which is a no-op. So this is an exact
+substitution like #89 and #90, and `--kernel ops` asserts the packed join's
+words equal `rope_backward` ×2 + `join_group3` + round-to-nearest-even at zero
+tolerance rather than at a widened one.
+
+`RowGradient` is how a caller says which it wrote: `Staged` when it filled the
+row operand itself, `Wide` for the fp32 fallback whose register-tiled GEMMs
+read fp32 panels. `scratch.qkv` stays allocated for the forward either way, so
+there is no VRAM change — the win is the deleted quantize (an `[N,3D]` fp32
+read and a bf16 write per block) and the join's own writes halving.
 
 Decision change against the audit's own question: q/k/v hold nothing that is
 accumulated or compared. RoPE is a pointwise rotation, not an accumulation, and

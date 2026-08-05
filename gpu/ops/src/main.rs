@@ -1081,12 +1081,45 @@ fn check_rope(
             stream, pairs, &dy_dev, &dk_dev, &dv_dev, &table, T as u32, H as u32, HD as u32,
             &mut fused,
         )?;
+        let composed_host = composed.to_host_vec(stream)?;
         assert_close(
             "join_group3_rope vs rope_backward + join_group3",
             &fused.to_host_vec(stream)?,
-            &composed.to_host_vec(stream)?,
+            &composed_host,
             0.0,
             0.0,
+        );
+
+        // The packed join substitutes for that composition followed by the
+        // `convert_f32_to_bf16_pairs` the qkv backward used to run over the
+        // whole panel, so its oracle is the composition rounded to nearest
+        // even and packed low half first. There is one rounding here and there
+        // was one before — both backward GEMMs read the single quantized
+        // buffer — so the bytes are equal, not merely close.
+        let mut packed = DeviceBuffer::<u32>::zeroed(stream, N * 3 * D / 2)?;
+        module.join_group3_rope_bf16(
+            stream,
+            pairs,
+            &dy_dev,
+            &dk_dev,
+            &dv_dev,
+            &table,
+            T as u32,
+            H as u32,
+            HD as u32,
+            &mut packed,
+        )?;
+        let quantized: Vec<u32> = composed_host
+            .chunks(2)
+            .map(|couple| {
+                bf16::from_f32(couple[0]).to_bits() as u32
+                    | ((bf16::from_f32(couple[1]).to_bits() as u32) << 16)
+            })
+            .collect();
+        assert_eq!(
+            packed.to_host_vec(stream)?,
+            quantized,
+            "join_group3_rope_bf16 vs quantized rope_backward + join_group3"
         );
         Ok(())
     }
