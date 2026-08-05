@@ -141,8 +141,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = Tcgen05Gemm::load(&context)?;
 
     println!(
-        "model-shape GEMMs, MxKxN, {} clusters persistent (tiles = M/256 * N/256)",
-        gemm::MAX_CLUSTERS
+        "model-shape GEMMs, MxKxN, {} clusters persistent, {} B plan \
+         (tiles = M/256 * N/256)",
+        gemm::MAX_CLUSTERS,
+        gemm::SHARED_BYTES
     );
     #[cfg(feature = "cublas")]
     println!("  denominator: {}", gemm::cublaslt::about());

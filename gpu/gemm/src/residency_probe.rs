@@ -1,6 +1,6 @@
 //! How many CTAs of a persistent cluster launch are *actually* co-resident.
 //!
-//! `MAX_CLUSTERS` is derived from per-CTA resources — `512 / BLOCK_N` tensor
+//! `MAX_CLUSTERS` is derived from per-CTA resources — `512 / ACCUM_COLS` tensor
 //! memory columns, then shared memory, then registers — and the whole
 //! grouped-walk and wave arithmetic in [`super::optimized`] assumes all 148
 //! clusters (296 CTAs, two an SM) run at once. `cuOccupancyMaxActiveClusters`

@@ -1,6 +1,6 @@
 //! Does the persistent grid actually fit on the device? (oxide-train#80)
 //!
-//! `MAX_CLUSTERS = 148` launches 296 CTAs and the kernel's whole wave
+//! `MAX_CLUSTERS` launches two CTAs apiece and the kernel's whole wave
 //! arithmetic — the `grouped` walk's reuse, every "last-wave efficiency" figure
 //! on #80 — assumes they run at once, two an SM. `cuOccupancyMaxActiveClusters`
 //! says **74**. If the driver is right, main has been running two sequential
@@ -51,7 +51,7 @@ const ITERS: usize = 10;
 const HOLD_NS: u64 = 2_000_000;
 
 /// Tensor-memory columns a probe CTA takes, which is the accumulator's
-/// `BLOCK_N` — and the resource `MAX_CLUSTERS` is derived from.
+/// `ACCUM_COLS` — and the resource `MAX_CLUSTERS` is derived from.
 const COLUMNS: u32 = 256;
 
 /// The floor of every shared-memory sweep. Not zero: the probe attaches a
