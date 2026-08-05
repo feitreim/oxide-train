@@ -199,7 +199,7 @@ const CHUNKS: usize = BLOCK_K / 16;
 /// Three was never a statement about how deep a ring the MMA wants; it is what
 /// two CTAs an SM leave room for. Six is 196 608 B of operand ring and the last
 /// depth that fits at [`CTAS_PER_SM`].
-const STAGES: usize = 6;
+pub const STAGES: usize = 6;
 /// One warp per 32 accumulator rows — the band warps, every one of which
 /// drains — plus the producer warp and the MMA warp, which never do.
 pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32 + 64;

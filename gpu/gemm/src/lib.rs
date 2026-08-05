@@ -31,7 +31,7 @@ pub use host::{
     tcgen05_launch_config, tcgen05_launch_config_over,
 };
 pub mod optimized;
-pub use optimized::{GROUP, MAX_CLUSTERS, SHARED_BYTES};
+pub use optimized::{GROUP, MAX_CLUSTERS, SHARED_BYTES, STAGES};
 
 /// What the device keeps co-resident at the shipped launch shape, measured
 /// rather than modelled. Nothing but `bin/residency.rs` and the two entry
