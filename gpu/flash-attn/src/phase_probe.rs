@@ -147,11 +147,11 @@ pub const GAP: usize = 18;
 /// The pass warps' *first* `scored.wait` of an item — the pipeline fill, which
 /// the per-visit [`SCORED`] mean otherwise smears across every visit.
 pub const FILL: usize = 19;
-/// The half of [`EPI`] that is the wait for the item's last gradient MMA. It
-/// has to happen before the item boundary, because `pipeline::run` re-arms the
-/// barrier set there; the rest of [`EPI`] does not, which is the whole of the
-/// deferred-drain question.
-pub const DRAINWAIT: usize = 20;
+/// The **deferred** accumulator drain, at the top of the item after the one it
+/// belongs to. [`EPI`] is what stayed behind — the wait for the last gradient
+/// MMA, which cannot cross the item boundary — and [`FILL`] is the window this
+/// is meant to disappear into.
+pub const DRAIN: usize = 20;
 
 /// Per-CTA tick sums, all in one struct so the instrumented loops stay legible.
 #[derive(Clone, Copy, Default)]
@@ -175,7 +175,7 @@ struct Sums {
     sstore: u64,
     gap: u64,
     fill: u64,
-    drainwait: u64,
+    drain: u64,
     /// The pass warps' last `clock64` of the previous item, so [`GAP`] can be
     /// measured across `pipeline::run`'s own per-item work instead of being
     /// derived by subtracting the columns from the span.
@@ -219,7 +219,7 @@ impl Clocks {
             self.put(SSTORE, sums.sstore / visits);
             self.put(GAP, sums.gap / items);
             self.put(FILL, sums.fill / items);
-            self.put(DRAINWAIT, sums.drainwait / items);
+            self.put(DRAIN, sums.drain / items);
         }
     }
 
@@ -264,10 +264,34 @@ struct BackwardQProbe {
     lse: GlobalRows<F32>,
     dot: GlobalRows<F32>,
     dq: GlobalRows<F32>,
+    staged_row: u32,
+    staged_head: u32,
     sums: Sums,
 }
 
 impl BackwardQProbe {
+    /// `BackwardQStream::drain`, clocked.
+    #[inline(always)]
+    unsafe fn drain(&mut self, band: u32, group: u32, lane: u32) {
+        unsafe {
+            if self.staged_row == UNSTAGED {
+                return;
+            }
+            let opened = clock64();
+            let columns = group * DRAIN_COLUMNS as u32;
+            let dq: OutHalf = self.accumulator.tile_x8(band, columns);
+            store_rows(
+                self.dq,
+                self.staged_row,
+                self.staged_head * HD as u32 + columns,
+                lane,
+                dq,
+            );
+            self.staged_row = UNSTAGED;
+            self.sums.drain += clock64().wrapping_sub(opened);
+        }
+    }
+
     #[inline(always)]
     fn buffer(&self, segment: STmem, key_tile: u32) -> STmem {
         if key_tile & 1 == 0 {
@@ -456,6 +480,7 @@ impl pipeline::Job for BackwardQProbe {
                 if self.sums.items > 0 {
                     self.sums.gap += waited.wrapping_sub(self.sums.ended);
                 }
+                self.drain(band, group, lane);
                 let row = batch * self.t + query_base + band;
                 let mut lse2: Rows = load_row_vec(self.lse, row, head, lane);
                 lse2.scale_assign(LOG2E);
@@ -532,13 +557,10 @@ impl pipeline::Job for BackwardQProbe {
 
                 let waited = clock64();
                 self.shared.accumulated.wait(key_tiles - 1);
-                let drained = clock64();
-                let columns = group * DRAIN_COLUMNS as u32;
-                let dq: OutHalf = self.accumulator.tile_x8(band, columns);
-                store_rows(self.dq, row, head * HD as u32 + columns, lane, dq);
+                self.staged_row = row;
+                self.staged_head = head;
                 let ended = clock64();
                 self.sums.epi += ended.wrapping_sub(waited);
-                self.sums.drainwait += drained.wrapping_sub(waited);
                 self.sums.ended = ended;
             }
             self.sums.items += 1;
@@ -604,12 +626,17 @@ pub unsafe fn backward_q(
             lse: GlobalRows::<F32>::from_raw(logsumexp.as_ptr().cast_mut().cast(), stats),
             dot: GlobalRows::<F32>::from_raw(dot.as_ptr().cast_mut().cast(), stats),
             dq: GlobalRows::<F32>::from_slice(dq, heads as usize * HD),
+            staged_row: UNSTAGED,
+            staged_head: 0,
             sums: Sums::default(),
         };
         let opened = clock64();
         pipeline::run(&mut job, tiles * planes);
+        job.drain(warp_lanes(), warp::warp_id() / DRAIN_WARPS, warp::lane_id());
         let span = clock64().wrapping_sub(opened);
         report(clocks, &job.sums, span, job.warp_id, job.lane);
+        tcgen05_fence_before_thread_sync();
+        thread::sync_threads();
         dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
     }
 }

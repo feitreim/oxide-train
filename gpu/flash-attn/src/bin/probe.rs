@@ -82,7 +82,7 @@ struct Budget {
     sstore: f64,
     gap: f64,
     fill: f64,
-    drainwait: f64,
+    drain: f64,
 }
 
 impl Budget {
@@ -114,7 +114,7 @@ impl Budget {
             sum.sstore += block[probe::SSTORE] as f64;
             sum.gap += block[probe::GAP] as f64;
             sum.fill += block[probe::FILL] as f64;
-            sum.drainwait += block[probe::DRAINWAIT] as f64;
+            sum.drain += block[probe::DRAIN] as f64;
         }
         let ctas = ctas.max(1.0);
         Self {
@@ -138,7 +138,7 @@ impl Budget {
             sstore: sum.sstore / ctas,
             gap: sum.gap / ctas,
             fill: sum.fill / ctas,
-            drainwait: sum.drainwait / ctas,
+            drain: sum.drain / ctas,
         }
     }
 
@@ -217,7 +217,7 @@ impl Budget {
                 "      ISSUE split: TMA   {:>6.0}          SMMA    {:>6.0}         GMMA  \
                  {:>6.0}\n      PASS split:  TREAD {:>6.0}          ARITH   {:>6.0}         \
                  STORE {:>6.0}\n      per item:   FILL  {:>6.0}          GAP     {:>6.0}         \
-                 EPI = wait {:>4.0} + drain {:>4.0}",
+                 EPI {:>6.0}          DRAIN   {:>6.0}",
                 self.tma,
                 self.smma,
                 self.gmma,
@@ -226,8 +226,8 @@ impl Budget {
                 self.sstore,
                 self.fill,
                 self.gap,
-                self.drainwait,
-                self.epi - self.drainwait,
+                self.epi,
+                self.drain,
             );
         }
         println!(
