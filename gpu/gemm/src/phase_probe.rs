@@ -2,10 +2,10 @@
 //! (oxide-train#80 forensics).
 //!
 //! `optimized.rs`'s fp32 store path, copied and instrumented rather than
-//! parameterized: the shipped kernel keeps no counters, no `clock64` and no
-//! extra argument. This module compiles **only** into `src/bin/budget.rs` —
-//! `src/transpose_probe.rs` is the same arrangement — so nothing here reaches
-//! `gemm.ptx` or the model.
+//! parameterized: the shipped kernels keep no counters, no `clock64` and no
+//! extra argument, and this module's [`probe`] reaches the device only through
+//! the two entry points `optimized::kernels` declares for it — which nothing
+//! but `src/bin/budget.rs` loads.
 //!
 //! ## What it answers
 //!
@@ -44,8 +44,7 @@
 use cuda_device::debug::clock64;
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{DisjointSlice, cluster, cluster_launch, kernel, thread, warp};
-use cuda_host::cuda_module;
+use cuda_device::{DisjointSlice, cluster, thread, warp};
 
 use kittens::global::{GlobalRows, store_rows};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
@@ -354,238 +353,165 @@ impl Tile {
     }
 }
 
-#[cuda_module]
-pub mod kernels {
-    use super::*;
+/// `pipeline::run`'s loop, opened up so the item boundary can be timed
+/// apart from the work it separates. Structurally identical: leader-only
+/// inval-then-init, a proxy publish, the boundary, the item's roles, the
+/// tcgen05 fence, the boundary again. Returns the last item plus one, which
+/// is the deferred epilogue's cursor.
+///
+/// # Safety
+/// As `pipeline::run`, plus `clocks` addressing this cluster's block.
+#[inline(always)]
+unsafe fn run<const DRAIN_ON: bool>(tile: &Tile, items: u32, clocks: Clocks) -> u32 {
+    unsafe {
+        let leader_thread = thread::threadIdx_x() == 0;
+        let (warp, is_lane_0) = (warp_id(), lane() == 0);
+        let mut initialized = false;
+        let mut item = cluster::cluster_idx();
+        let mut pending = 0u32;
+        let mut ran = 0u64;
 
-    /// `pipeline::run`'s loop, opened up so the item boundary can be timed
-    /// apart from the work it separates. Structurally identical: leader-only
-    /// inval-then-init, a proxy publish, the boundary, the item's roles, the
-    /// tcgen05 fence, the boundary again. Returns the last item plus one, which
-    /// is the deferred epilogue's cursor.
-    ///
-    /// # Safety
-    /// As `pipeline::run`, plus `clocks` addressing this cluster's block.
-    #[inline(always)]
-    unsafe fn run<const DRAIN_ON: bool>(tile: &Tile, items: u32, clocks: Clocks) -> u32 {
-        unsafe {
-            let leader_thread = thread::threadIdx_x() == 0;
-            let (warp, is_lane_0) = (warp_id(), lane() == 0);
-            let mut initialized = false;
-            let mut item = cluster::cluster_idx();
-            let mut pending = 0u32;
-            let mut ran = 0u64;
+        let (mut pre, mut post, mut work) = (0u64, 0u64, 0u64);
+        let mut acc = 0u64;
+        let mut issue = Sums::default();
+        let mut feed = Sums::default();
+        let mut band = Sums::default();
+        let opened = clock64();
 
-            let (mut pre, mut post, mut work) = (0u64, 0u64, 0u64);
-            let mut acc = 0u64;
-            let mut issue = Sums::default();
-            let mut feed = Sums::default();
-            let mut band = Sums::default();
-            let opened = clock64();
-
-            while item < items {
-                let entered = clock64();
-                if leader_thread {
-                    if initialized {
-                        tile.disarm();
-                    }
-                    tile.arm();
-                    publish_to_async_proxy();
+        while item < items {
+            let entered = clock64();
+            if leader_thread {
+                if initialized {
+                    tile.disarm();
                 }
-                initialized = true;
-                cluster::cluster_sync();
-                let working = clock64();
-                pre += working.wrapping_sub(entered);
+                tile.arm();
+                publish_to_async_proxy();
+            }
+            initialized = true;
+            cluster::cluster_sync();
+            let working = clock64();
+            pre += working.wrapping_sub(entered);
 
-                let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, GROUP);
-                if warp == PRODUCER {
-                    if is_lane_0 {
-                        tile.produce(tile_m, tile_n, &mut feed);
-                    }
-                } else if warp == ISSUER {
-                    if tile.rank == LEADER && is_lane_0 {
-                        let waited = clock64();
-                        tile.acc_free.wait(0);
-                        acc += clock64().wrapping_sub(waited);
-                        tile.multiply(&mut issue);
-                    }
-                } else {
-                    let release = Release {
-                        sem: tile.acc_free.at_rank(LEADER),
-                        live: true,
-                    };
-                    let drained = clock64();
-                    if pending == 0 {
-                        release.now();
-                    } else {
-                        let (row, column) = tile.origin(pending - 1);
-                        tile.out
-                            .drain::<DRAIN_ON>(tile.accumulator, row, column, release);
-                    }
-                    let stored = clock64();
-                    band.span += stored.wrapping_sub(drained) as u32;
-                    tile.done.wait(0);
-                    band.rest += clock64().wrapping_sub(stored) as u32;
+            let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, GROUP);
+            if warp == PRODUCER {
+                if is_lane_0 {
+                    tile.produce(tile_m, tile_n, &mut feed);
                 }
-                pending = item + 1;
-                ran += 1;
-
-                let worked = clock64();
-                work += worked.wrapping_sub(working);
-                tcgen05_fence_before_thread_sync();
-                cluster::cluster_sync();
-                post += clock64().wrapping_sub(worked);
-                item += cluster::num_clusters();
-            }
-            if leader_thread && initialized {
-                tile.disarm();
-            }
-
-            // One SM's clock backs every counter, so only rank `LEADER` writes,
-            // and one lane of each role's warp owns its own slots.
-            if tile.rank == LEADER && is_lane_0 {
-                if warp == ISSUER {
-                    clocks.put(ITEMS, ran);
-                    clocks.put(PRE, pre);
-                    clocks.put(POST, post);
-                    clocks.put(WORK, work);
-                    clocks.put(ACC, acc);
-                    clocks.put(FILL, issue.first as u64);
-                    clocks.put(FEED, issue.rest as u64);
-                    clocks.put(MMA, issue.span as u64);
-                    clocks.put(SPAN, clock64().wrapping_sub(opened));
-                } else if warp == PRODUCER {
-                    clocks.put(PROD, feed.span as u64);
-                    clocks.put(FREE, feed.rest as u64);
-                } else if warp == 0 {
-                    clocks.put(DRAIN, band.span as u64);
-                    clocks.put(DONE, band.rest as u64);
+            } else if warp == ISSUER {
+                if tile.rank == LEADER && is_lane_0 {
+                    let waited = clock64();
+                    tile.acc_free.wait(0);
+                    acc += clock64().wrapping_sub(waited);
+                    tile.multiply(&mut issue);
                 }
-            }
-            pending
-        }
-    }
-
-    /// # Safety
-    /// As `gemm_tcgen05_f32_optimized`, plus `clocks` holding
-    /// [`COUNTERS`]` * MAX_CLUSTERS` zeroed `u64`.
-    #[inline(always)]
-    unsafe fn probe<const DRAIN_ON: bool>(
-        a_map: *const TmaDescriptor,
-        b_map: *const TmaDescriptor,
-        c: &mut DisjointSlice<f32>,
-        clocks: &mut DisjointSlice<u64>,
-        n: i32,
-        k: i32,
-        tiles_m: u32,
-        tiles_n: u32,
-        transposed: u32,
-    ) {
-        unsafe {
-            let shared = shared(SharedPlan::attach());
-            let tile = Tile {
-                a_ring: shared.a_ring,
-                b_ring: shared.b_ring,
-                load: shared.load,
-                free: shared.free,
-                done: shared.done,
-                a_map,
-                b_map,
-                accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, BLOCK_N as u32)),
-                out: Wide {
-                    c: GlobalRows::<F32>::from_raw(c.as_mut_ptr() as *mut u8, n as usize),
-                },
-                tiles_m,
-                tiles_n,
-                k_blocks: k as u32 / BLOCK_K as u32,
-                transposed: transposed != 0,
-                rank: cluster::block_rank(),
-                acc_free: shared.acc_free,
-            };
-            let at = clocks
-                .as_mut_ptr()
-                .add(COUNTERS * cluster::cluster_idx() as usize);
-            let pending = run::<DRAIN_ON>(&tile, tiles_m * tiles_n, Clocks { at });
-            if DRAIN_ON && pending != 0 && warp_id() < DRAIN_WARPS as u32 {
-                let (row, column) = tile.origin(pending - 1);
+            } else {
                 let release = Release {
                     sem: tile.acc_free.at_rank(LEADER),
-                    live: false,
+                    live: true,
                 };
-                tile.out
-                    .drain::<DRAIN_ON>(tile.accumulator, row, column, release);
+                let drained = clock64();
+                if pending == 0 {
+                    release.now();
+                } else {
+                    let (row, column) = tile.origin(pending - 1);
+                    tile.out
+                        .drain::<DRAIN_ON>(tile.accumulator, row, column, release);
+                }
+                let stored = clock64();
+                band.span += stored.wrapping_sub(drained) as u32;
+                tile.done.wait(0);
+                band.rest += clock64().wrapping_sub(stored) as u32;
             }
+            pending = item + 1;
+            ran += 1;
+
+            let worked = clock64();
+            work += worked.wrapping_sub(working);
             tcgen05_fence_before_thread_sync();
             cluster::cluster_sync();
-            dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
+            post += clock64().wrapping_sub(worked);
+            item += cluster::num_clusters();
         }
-    }
+        if leader_thread && initialized {
+            tile.disarm();
+        }
 
-    /// The shipped fp32 store kernel with the stopwatch, computing the same
-    /// `C`, plus a `clocks` block of [`COUNTERS`] `u64` per cluster.
-    ///
-    /// # Safety
-    /// As [`probe`].
-    #[kernel]
-    #[cluster_launch(2, 1, 1)]
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn gemm_probe_f32_store(
-        a_map: *const TmaDescriptor,
-        b_map: *const TmaDescriptor,
-        mut c: DisjointSlice<f32>,
-        mut clocks: DisjointSlice<u64>,
-        n: i32,
-        k: i32,
-        tiles_m: u32,
-        tiles_n: u32,
-        transposed: u32,
-    ) {
-        unsafe {
-            probe::<true>(
-                a_map,
-                b_map,
-                &mut c,
-                &mut clocks,
-                n,
-                k,
-                tiles_m,
-                tiles_n,
-                transposed,
-            )
+        // One SM's clock backs every counter, so only rank `LEADER` writes,
+        // and one lane of each role's warp owns its own slots.
+        if tile.rank == LEADER && is_lane_0 {
+            if warp == ISSUER {
+                clocks.put(ITEMS, ran);
+                clocks.put(PRE, pre);
+                clocks.put(POST, post);
+                clocks.put(WORK, work);
+                clocks.put(ACC, acc);
+                clocks.put(FILL, issue.first as u64);
+                clocks.put(FEED, issue.rest as u64);
+                clocks.put(MMA, issue.span as u64);
+                clocks.put(SPAN, clock64().wrapping_sub(opened));
+            } else if warp == PRODUCER {
+                clocks.put(PROD, feed.span as u64);
+                clocks.put(FREE, feed.rest as u64);
+            } else if warp == 0 {
+                clocks.put(DRAIN, band.span as u64);
+                clocks.put(DONE, band.rest as u64);
+            }
         }
+        pending
     }
+}
 
-    /// [`gemm_probe_f32_store`] with the epilogue deleted — ferro #114's
-    /// `no drain` floor, which writes no `C`.
-    ///
-    /// # Safety
-    /// As [`probe`]; `c` is untouched.
-    #[kernel]
-    #[cluster_launch(2, 1, 1)]
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn gemm_probe_f32_nodrain(
-        a_map: *const TmaDescriptor,
-        b_map: *const TmaDescriptor,
-        mut c: DisjointSlice<f32>,
-        mut clocks: DisjointSlice<u64>,
-        n: i32,
-        k: i32,
-        tiles_m: u32,
-        tiles_n: u32,
-        transposed: u32,
-    ) {
-        unsafe {
-            probe::<false>(
-                a_map,
-                b_map,
-                &mut c,
-                &mut clocks,
-                n,
-                k,
-                tiles_m,
-                tiles_n,
-                transposed,
-            )
+/// # Safety
+/// As `gemm_tcgen05_f32_optimized`, plus `clocks` holding
+/// [`COUNTERS`]` * MAX_CLUSTERS` zeroed `u64`.
+#[inline(always)]
+pub unsafe fn probe<const DRAIN_ON: bool>(
+    a_map: *const TmaDescriptor,
+    b_map: *const TmaDescriptor,
+    c: &mut DisjointSlice<f32>,
+    clocks: &mut DisjointSlice<u64>,
+    n: i32,
+    k: i32,
+    tiles_m: u32,
+    tiles_n: u32,
+    transposed: u32,
+) {
+    unsafe {
+        let shared = shared(SharedPlan::attach());
+        let tile = Tile {
+            a_ring: shared.a_ring,
+            b_ring: shared.b_ring,
+            load: shared.load,
+            free: shared.free,
+            done: shared.done,
+            a_map,
+            b_map,
+            accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, BLOCK_N as u32)),
+            out: Wide {
+                c: GlobalRows::<F32>::from_raw(c.as_mut_ptr() as *mut u8, n as usize),
+            },
+            tiles_m,
+            tiles_n,
+            k_blocks: k as u32 / BLOCK_K as u32,
+            transposed: transposed != 0,
+            rank: cluster::block_rank(),
+            acc_free: shared.acc_free,
+        };
+        let at = clocks
+            .as_mut_ptr()
+            .add(COUNTERS * cluster::cluster_idx() as usize);
+        let pending = run::<DRAIN_ON>(&tile, tiles_m * tiles_n, Clocks { at });
+        if DRAIN_ON && pending != 0 && warp_id() < DRAIN_WARPS as u32 {
+            let (row, column) = tile.origin(pending - 1);
+            let release = Release {
+                sem: tile.acc_free.at_rank(LEADER),
+                live: false,
+            };
+            tile.out
+                .drain::<DRAIN_ON>(tile.accumulator, row, column, release);
         }
+        tcgen05_fence_before_thread_sync();
+        cluster::cluster_sync();
+        dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
     }
 }

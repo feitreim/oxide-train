@@ -30,10 +30,8 @@ use cuda_core::{CudaContext, CudaFunction, CudaStream, DeviceBuffer};
 use gemm::{Tcgen05Gemm, TmaLayout, create_bf16_tma_map, tcgen05_launch_config};
 use half::bf16;
 
-#[path = "../phase_probe.rs"]
-mod device;
-
-use device::kernels;
+use gemm::optimized::kernels;
+use gemm::phase_probe as device;
 
 const WARMUP: usize = 5;
 const ITERS: usize = 20;
@@ -119,10 +117,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let context = CudaContext::new(0)?;
     let stream = context.default_stream();
     let module = Tcgen05Gemm::load(&context)?;
+    // The probe's entry points sit in the shipped module — a binary gets one
+    // device artifact — so this is a second handle on the same kernels, opened
+    // for the two `bin/budget.rs` alone launches.
     let probe = kernels::load(&context)?;
     for name in ["gemm_probe_f32_store", "gemm_probe_f32_nodrain"] {
         let function = probe.as_cuda_module().load_function(name)?;
-        opt_in_dynamic_smem(&function, device::SHARED_BYTES as u32)?;
+        opt_in_dynamic_smem(&function, gemm::SHARED_BYTES as u32)?;
     }
 
     println!(

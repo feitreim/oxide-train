@@ -33,6 +33,11 @@ pub use host::{
 pub mod optimized;
 pub use optimized::{GROUP, MAX_CLUSTERS, SHARED_BYTES};
 
+/// The shipped fp32 store pipeline with a `clock64` on every phase of an item.
+/// Nothing but `bin/budget.rs` and the two entry points `optimized::kernels`
+/// declares for it reach this (oxide-train#80).
+pub mod phase_probe;
+
 /// The denominator `src/bin/bench.rs` divides by. Behind a feature because it
 /// is a link-time dependency on `libcublasLt.so` that nothing else here wants.
 #[cfg(feature = "cublas")]

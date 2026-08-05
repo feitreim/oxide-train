@@ -99,6 +99,8 @@ use kittens::sync::{ClusterSemaphore, Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
 use kittens::{BaseLdtm, RegTile, lane, warp_id};
 
+use super::phase_probe;
+
 /// Rows of the pair tile one rank stages and drains.
 pub const BLOCK_M: usize = 128;
 /// Columns of the pair tile — the widest `cta_group::2` MMA shape there is.
@@ -909,6 +911,80 @@ pub mod kernels {
             pipeline::run(&mut tile, tiles_m * tiles_n);
             drain_last(&tile);
             release(&tile);
+        }
+    }
+
+    /// [`gemm_tcgen05_f32_optimized`] with a stopwatch on each phase of an item
+    /// — oxide-train#80's forensics, whose body is [`phase_probe`]
+    /// and whose only caller is `bin/budget.rs`. It computes the same `C`.
+    ///
+    /// The entry point lives here rather than in a module of its own because a
+    /// binary gets one device artifact: a second `#[cuda_module]` beside this
+    /// one loads, and then every symbol of the other is missing.
+    ///
+    /// # Safety
+    /// As [`gemm_tcgen05_f32_optimized`], plus `clocks` holding
+    /// [`phase_probe::COUNTERS`] zeroed `u64` per cluster.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_probe_f32_store(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        mut c: DisjointSlice<f32>,
+        mut clocks: DisjointSlice<u64>,
+        n: i32,
+        k: i32,
+        tiles_m: u32,
+        tiles_n: u32,
+        transposed: u32,
+    ) {
+        unsafe {
+            phase_probe::probe::<true>(
+                a_map,
+                b_map,
+                &mut c,
+                &mut clocks,
+                n,
+                k,
+                tiles_m,
+                tiles_n,
+                transposed,
+            )
+        }
+    }
+
+    /// [`gemm_probe_f32_store`] with the epilogue deleted — ferro #114's
+    /// `no drain` floor, which writes no `C` and is a timing arm only.
+    ///
+    /// # Safety
+    /// As [`gemm_probe_f32_store`]; `c` is untouched.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_probe_f32_nodrain(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        mut c: DisjointSlice<f32>,
+        mut clocks: DisjointSlice<u64>,
+        n: i32,
+        k: i32,
+        tiles_m: u32,
+        tiles_n: u32,
+        transposed: u32,
+    ) {
+        unsafe {
+            phase_probe::probe::<false>(
+                a_map,
+                b_map,
+                &mut c,
+                &mut clocks,
+                n,
+                k,
+                tiles_m,
+                tiles_n,
+                transposed,
+            )
         }
     }
 }
