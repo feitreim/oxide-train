@@ -136,6 +136,71 @@ pub mod kernels {
         }
     }
 
+    /// One rotated `(x0, x1)` couple, written as the standalone RoPE kernels
+    /// write it so the fused pass and the composition it replaces hand the
+    /// backend the same expression to contract.
+    #[inline(always)]
+    fn rope_pair(x0: f32, x1: f32, cos: f32, sin: f32) -> (f32, f32) {
+        (x0 * cos - x1 * sin, x0 * sin + x1 * cos)
+    }
+
+    #[inline(always)]
+    fn pack_bf16_pair(low: f32, high: f32) -> u32 {
+        f32_to_bf16_rne(low) as u32 | ((f32_to_bf16_rne(high) as u32) << 16)
+    }
+
+    /// De-interleave the fp32 `[B*T, 3 * H * TILE_HD]` qkv projection output
+    /// straight into the three packed-bf16 head panels the tcgen05 attention
+    /// streams with TMA, rotating Q and K on the way through.
+    ///
+    /// This is `split_group3`, two RoPE passes and three
+    /// [`stage_attention_heads_bf16`] launches in one pass over the panel —
+    /// four traversals of the same bytes collapsed into one. Every
+    /// intermediate it drops was fp32 storage between two kernels, and the
+    /// arithmetic is unchanged, so the words it writes are the composition's
+    /// bit for bit.
+    ///
+    /// `table` is `ops::rope_table(sequence_length, TILE_HD)`; `q_scale` folds
+    /// `softmax_scale * log2(e)` into Q's quantization as the unfused staging
+    /// does. One thread per packed output pair, per operand; launch with
+    /// [`stage_heads_config`].
+    #[kernel]
+    pub fn stage_qkv_heads_bf16(
+        qkv: &[f32],
+        table: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        q_scale: f32,
+        mut q: DisjointSlice<u32>,
+        mut k: DisjointSlice<u32>,
+        mut v: DisjointSlice<u32>,
+    ) {
+        const PAIRS_PER_ROW: usize = TILE_HD / 2;
+        let index = thread::index_1d();
+        let word = index.get();
+        let t = sequence_length as usize;
+        let h = heads as usize;
+        let pair = word % PAIRS_PER_ROW;
+        let token = (word / PAIRS_PER_ROW) % t;
+        let plane = word / (PAIRS_PER_ROW * t);
+        let (batch, head) = (plane / h, plane % h);
+        let width = h * TILE_HD;
+        let base = (batch * t + token) * 3 * width + head * TILE_HD + pair * 2;
+        let angle = 2 * (token * PAIRS_PER_ROW + pair);
+        let (cos, sin) = (table[angle], table[angle + 1]);
+        if let Some(slot) = q.get_mut(thread::index_1d()) {
+            let (r0, r1) = rope_pair(qkv[base], qkv[base + 1], cos, sin);
+            *slot = pack_bf16_pair(r0 * q_scale, r1 * q_scale);
+        }
+        if let Some(slot) = k.get_mut(thread::index_1d()) {
+            let (r0, r1) = rope_pair(qkv[base + width], qkv[base + width + 1], cos, sin);
+            *slot = pack_bf16_pair(r0, r1);
+        }
+        if let Some(slot) = v.get_mut(thread::index_1d()) {
+            *slot = pack_bf16_pair(qkv[base + 2 * width], qkv[base + 2 * width + 1]);
+        }
+    }
+
     /// Flash-style causal attention forward using an online softmax.
     #[kernel]
     pub fn flash_attention_forward(
