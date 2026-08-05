@@ -16,8 +16,93 @@ pub const TC_TILE: usize = 128;
 pub const TC_BK: usize = 64;
 /// Optimized CTA-pair output rows.
 pub const TC_M_TILE: usize = 256;
-/// Optimized CTA-pair output columns.
+/// Optimized CTA-pair output columns — the wide tile's.
 pub const TC_N_TILE: usize = 256;
+/// The narrow variant's CTA-pair output columns (oxide-train#80 remedy 3).
+pub const TC_N_NARROW: usize = 128;
+
+/// Which compiled pair tile a launch runs on. Same pipeline, same epilogues,
+/// same 114 816 B shared plan and 148-cluster grid; what moves is the output
+/// tile a work item covers, and with it the wave arithmetic and the TMEM
+/// columns an accumulator pins.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TcTile {
+    /// `[256, 256]` — [`super::optimized`], the shipped kernel. Deep-K rows
+    /// and every square-bench shape stay here.
+    Wide,
+    /// `[256, 128]` — [`super::narrow`], selected where the halved tile
+    /// quantum improves the last wave.
+    Narrow,
+}
+
+impl TcTile {
+    /// Output columns of one work item's pair tile.
+    pub const fn n_tile(self) -> usize {
+        match self {
+            TcTile::Wide => TC_N_TILE,
+            TcTile::Narrow => TC_N_NARROW,
+        }
+    }
+
+    const fn max_clusters(self) -> u32 {
+        match self {
+            TcTile::Wide => super::optimized::MAX_CLUSTERS,
+            TcTile::Narrow => super::narrow::MAX_CLUSTERS,
+        }
+    }
+
+    const fn shared_bytes(self) -> usize {
+        match self {
+            TcTile::Wide => super::optimized::SHARED_BYTES,
+            TcTile::Narrow => super::narrow::SHARED_BYTES,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TcTile::Wide => "[256,256]",
+            TcTile::Narrow => "[256,128]",
+        }
+    }
+}
+
+/// A launch geometry plus the tile it was computed for. The launch adapters
+/// take this rather than a bare `LaunchConfig` because the grid, the shared
+/// envelope, the entry point and `B`'s tensor-map box all follow the tile —
+/// a config applied to the other variant's kernel would be silently wrong in
+/// all four.
+#[derive(Clone, Copy)]
+pub struct Tcgen05Launch {
+    pub tile: TcTile,
+    pub config: LaunchConfig,
+}
+
+/// The pair tile a shape dispatches to.
+///
+/// The rule: prefer the wide tile — it carries 1.5× the arithmetic intensity
+/// (`M·N/(M+N)`: 128 vs 85.3) and won ferro #87's sweep at every square at or
+/// above 2048³ — and take the narrow tile only where it strictly improves the
+/// persistent grid's last-wave efficiency, `tiles / (⌈tiles/148⌉ · 148)`.
+/// Halving the tile doubles the item count, so the comparison reduces to
+/// `2·⌈t/148⌉ > ⌈2t/148⌉`. Equal efficiency keeps the wide tile, which is what
+/// structurally protects the deep-K model rows (0.94–0.97 of cuBLASLt) and
+/// every square-bench shape: their wave math is tile-indifferent, so they
+/// never leave the wide kernel.
+///
+/// Of the training step's fourteen shapes this routes exactly three narrow:
+/// qkv fwd (0.973 → 0.994), gate_up fwd (0.865 → 0.943) and down dW
+/// (0.649 → 0.865). `k` is accepted so a measured K-depth guard has somewhere
+/// to live if the numbers ask for one.
+pub fn tcgen05_tile(m: usize, n: usize, _k: usize) -> TcTile {
+    let clusters = TcTile::Wide.max_clusters() as usize;
+    let tiles = (m / TC_M_TILE) * (n / TC_N_TILE);
+    let waves = |tiles: usize| tiles.div_ceil(clusters);
+    if 2 * waves(tiles) > waves(2 * tiles) {
+        TcTile::Narrow
+    } else {
+        TcTile::Wide
+    }
+}
 /// The K unit callers still test shapes for eligibility against.
 ///
 /// It was a hard requirement when the pipeline was four hand-unrolled stages
@@ -44,30 +129,40 @@ pub const TC_K_PIPELINE: usize = 256;
 /// does not care how the block count divides. `TC_K_PIPELINE` survives as the
 /// *caller-facing* eligibility unit some model shapes are still tested against;
 /// nothing here requires it.
-pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
+pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> Tcgen05Launch {
+    tcgen05_launch_config_tiled(m, n, k, tcgen05_tile(m, n, k))
+}
+
+/// [`tcgen05_launch_config`] at a caller-chosen tile — the benches' instrument
+/// for pricing the two variants against each other on one shape.
+pub fn tcgen05_launch_config_tiled(m: usize, n: usize, k: usize, tile: TcTile) -> Tcgen05Launch {
     assert!(m.is_multiple_of(TC_M_TILE));
     assert!(n.is_multiple_of(TC_N_TILE));
     assert!(k.is_multiple_of(TC_BK));
     assert!(m <= u32::MAX as usize && n <= u32::MAX as usize && k <= u32::MAX as usize);
     let tiles = (m / TC_M_TILE)
-        .checked_mul(n / TC_N_TILE)
+        .checked_mul(n / tile.n_tile())
         .expect("tcgen05 work grid overflow");
-    LaunchConfig {
-        grid_dim: (
-            TC_RANKS * tiles.min(super::MAX_CLUSTERS as usize) as u32,
-            1,
-            1,
-        ),
-        block_dim: (TC_THREADS, 1, 1),
-        shared_mem_bytes: super::SHARED_BYTES as u32,
+    Tcgen05Launch {
+        tile,
+        config: LaunchConfig {
+            grid_dim: (
+                TC_RANKS * tiles.min(tile.max_clusters() as usize) as u32,
+                1,
+                1,
+            ),
+            block_dim: (TC_THREADS, 1, 1),
+            shared_mem_bytes: tile.shared_bytes() as u32,
+        },
     }
 }
 
 /// CTAs of a cluster — the `cluster_launch` dimension, said once.
 const TC_RANKS: u32 = 2;
-/// Threads a CTA launches with: one warp per 32 accumulator rows, and every one
-/// of them drains.
+/// Threads a CTA launches with: one warp per 32 accumulator rows plus the two
+/// role warps — the same 192 in both variants, which the assert holds still.
 const TC_THREADS: u32 = super::optimized::THREADS;
+const _: () = assert!(TC_THREADS == super::narrow::THREADS);
 
 /// Operand orientation, which fixes the TMA box.
 ///
@@ -84,24 +179,97 @@ pub enum TmaLayout {
 }
 
 impl TmaLayout {
+    /// The box the *wide* kernel's `B` stage (and both kernels' `A` stage)
+    /// loads through.
     fn box_dimensions(self) -> [u32; 2] {
         match self {
             TmaLayout::KMajor => [TC_BK as u32, TC_TILE as u32],
             TmaLayout::MnMajor => [TC_BK as u32, TC_BK as u32],
         }
     }
+
+    /// The box the *narrow* kernel's 64-row `B` stage needs, where it differs.
+    ///
+    /// Only the K-major layout does: MN-major boxes are already `[64, 64]`,
+    /// and `A`'s stage is `[128, TC_BK]` under both tiles. `None` means the
+    /// wide descriptor serves both variants.
+    fn narrow_box(self) -> Option<[u32; 2]> {
+        match self {
+            TmaLayout::KMajor => Some([TC_BK as u32, TC_BK as u32]),
+            TmaLayout::MnMajor => None,
+        }
+    }
 }
 
-/// Encode a `SWIZZLE_128B` tensor map over a row-major `[height, width]` bf16
-/// matrix at `base` (a device pointer).
-fn encode_bf16_tma_map(
-    stream: &CudaStream,
-    base: u64,
-    width: usize,
-    height: usize,
-    layout: TmaLayout,
-) -> Result<DeviceBuffer<u64>, Box<dyn Error>> {
-    encode_bf16_tma_map_strided(stream, base, width, height, width, layout)
+/// One operand's tensor maps, as the launch adapters consume them: the wide
+/// descriptor every `A` walk and the wide kernel's `B` walk load through, and
+/// the `[64, 64]`-box twin the narrow kernel's `B` stage needs in the K-major
+/// layout. Built by the map owners' `operand()`; `Copy` so closures can hold
+/// it across timed launches.
+#[derive(Clone, Copy)]
+pub struct TmaOperand {
+    wide: *const TmaDescriptor,
+    narrow: *const TmaDescriptor,
+}
+
+impl TmaOperand {
+    /// The descriptor an `A` operand loads through — box `[TC_BK, 128]`
+    /// K-major or `[64, 64]` MN-major, identical under both tiles.
+    fn a(self) -> *const TmaDescriptor {
+        self.wide
+    }
+
+    /// The descriptor a `B` operand loads through at `tile`.
+    fn b(self, tile: TcTile) -> *const TmaDescriptor {
+        match tile {
+            TcTile::Wide => self.wide,
+            TcTile::Narrow => self.narrow,
+        }
+    }
+}
+
+/// Both variants' descriptors over a row-major `[height, width]` bf16 matrix:
+/// the wide box always, the narrow `[64, 64]` K-major twin where the layout
+/// makes them differ. One extra 128-byte descriptor per K-major operand is the
+/// whole cost of keeping the launch free to dispatch either kernel.
+struct OperandDescriptors {
+    wide: DeviceBuffer<u64>,
+    narrow: Option<DeviceBuffer<u64>>,
+}
+
+impl OperandDescriptors {
+    fn encode(
+        stream: &CudaStream,
+        base: u64,
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        layout: TmaLayout,
+    ) -> Result<Self, Box<dyn Error>> {
+        let wide = encode_bf16_tma_map_strided(stream, base, width, height, row_stride, layout)?;
+        let narrow = match layout.narrow_box() {
+            Some(narrow_box) => Some(encode_bf16_tma_map_boxed(
+                stream, base, width, height, row_stride, narrow_box,
+            )?),
+            None => None,
+        };
+        Ok(Self { wide, narrow })
+    }
+
+    fn operand(&self) -> TmaOperand {
+        let wide = self.wide.cu_deviceptr() as *const TmaDescriptor;
+        TmaOperand {
+            wide,
+            narrow: self
+                .narrow
+                .as_ref()
+                .map_or(wide, |map| map.cu_deviceptr() as *const TmaDescriptor),
+        }
+    }
+
+    fn as_ptr(&self) -> *const TmaDescriptor {
+        self.wide.cu_deviceptr() as *const TmaDescriptor
+    }
 }
 
 /// Encode a bf16 tensor map whose logical rows are prefixes of wider physical
@@ -115,6 +283,27 @@ fn encode_bf16_tma_map_strided(
     row_stride: usize,
     layout: TmaLayout,
 ) -> Result<DeviceBuffer<u64>, Box<dyn Error>> {
+    encode_bf16_tma_map_boxed(
+        stream,
+        base,
+        width,
+        height,
+        row_stride,
+        layout.box_dimensions(),
+    )
+}
+
+/// The encoder itself, at an explicit box — [`TmaLayout::box_dimensions`] for
+/// the wide kernel's stages, [`TmaLayout::narrow_box`] for the narrow
+/// kernel's 64-row `B` stage.
+fn encode_bf16_tma_map_boxed(
+    stream: &CudaStream,
+    base: u64,
+    width: usize,
+    height: usize,
+    row_stride: usize,
+    box_dimensions: [u32; 2],
+) -> Result<DeviceBuffer<u64>, Box<dyn Error>> {
     use cuda_core::sys::{
         CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
@@ -125,15 +314,11 @@ fn encode_bf16_tma_map_strided(
     };
 
     assert!(width.is_multiple_of(TC_BK));
-    assert!(height.is_multiple_of(match layout {
-        TmaLayout::KMajor => TC_TILE,
-        TmaLayout::MnMajor => TC_BK,
-    }));
+    assert!(height.is_multiple_of(box_dimensions[1] as usize));
     assert!(row_stride >= width);
     let mut tensor_map = MaybeUninit::<cuda_core::sys::CUtensorMap>::uninit();
     let global_dimensions = [width as u64, height as u64];
     let global_strides = [(row_stride * 2) as u64];
-    let box_dimensions = layout.box_dimensions();
     let element_strides = [1u32, 1u32];
     let status = unsafe {
         cuTensorMapEncodeTiled(
@@ -184,7 +369,9 @@ fn encode_f32_tma_map(
         cudaError_enum_CUDA_SUCCESS,
     };
 
-    assert!(width.is_multiple_of(TC_N_TILE));
+    // The narrower tile constraint: both variants' `C` widths satisfy it, and
+    // the box below is `[16, 32]` under either.
+    assert!(width.is_multiple_of(TC_N_NARROW));
     assert!(height.is_multiple_of(TC_M_TILE));
     assert!(row_stride >= width);
     let mut tensor_map = MaybeUninit::<cuda_core::sys::CUtensorMap>::uninit();
@@ -221,13 +408,19 @@ fn encode_f32_tma_map(
 /// The map owns only the descriptor. The mapped matrix buffer must outlive all
 /// launches that use this value.
 pub struct Bf16TmaMap<'matrix> {
-    descriptor: DeviceBuffer<u64>,
+    descriptors: OperandDescriptors,
     _matrix: PhantomData<&'matrix DeviceBuffer<u16>>,
 }
 
 impl Bf16TmaMap<'_> {
+    /// The wide descriptor alone — for consumers outside the tcgen05 launch
+    /// adapters, which take [`Bf16TmaMap::operand`] and pick per tile.
     pub fn as_ptr(&self) -> *const TmaDescriptor {
-        self.descriptor.cu_deviceptr() as *const TmaDescriptor
+        self.descriptors.as_ptr()
+    }
+
+    pub fn operand(&self) -> TmaOperand {
+        self.descriptors.operand()
     }
 }
 
@@ -241,7 +434,14 @@ pub fn create_bf16_tma_map<'matrix>(
 ) -> Result<Bf16TmaMap<'matrix>, Box<dyn Error>> {
     assert_eq!(matrix.len(), width * height);
     Ok(Bf16TmaMap {
-        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height, layout)?,
+        descriptors: OperandDescriptors::encode(
+            stream,
+            matrix.cu_deviceptr(),
+            width,
+            height,
+            width,
+            layout,
+        )?,
         _matrix: PhantomData,
     })
 }
@@ -253,12 +453,17 @@ pub fn create_bf16_tma_map<'matrix>(
 /// `unsafe` and the caller promises the mapped allocation outlives every
 /// launch that consumes the map.
 pub struct Bf16PairsTmaMap {
-    descriptor: DeviceBuffer<u64>,
+    descriptors: OperandDescriptors,
 }
 
 impl Bf16PairsTmaMap {
+    /// The wide descriptor alone — see [`Bf16TmaMap::as_ptr`].
     pub fn as_ptr(&self) -> *const TmaDescriptor {
-        self.descriptor.cu_deviceptr() as *const TmaDescriptor
+        self.descriptors.as_ptr()
+    }
+
+    pub fn operand(&self) -> TmaOperand {
+        self.descriptors.operand()
     }
 }
 
@@ -279,7 +484,14 @@ pub unsafe fn create_bf16_pairs_tma_map(
     assert!(width.is_multiple_of(2));
     assert_eq!(matrix.len() * 2, width * height);
     Ok(Bf16PairsTmaMap {
-        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height, layout)?,
+        descriptors: OperandDescriptors::encode(
+            stream,
+            matrix.cu_deviceptr(),
+            width,
+            height,
+            width,
+            layout,
+        )?,
     })
 }
 
@@ -299,7 +511,14 @@ pub unsafe fn create_bf16_pairs_tma_map_prefix(
     assert!(width.is_multiple_of(2));
     assert!(matrix.len() * 2 >= width * height);
     Ok(Bf16PairsTmaMap {
-        descriptor: encode_bf16_tma_map(stream, matrix.cu_deviceptr(), width, height, layout)?,
+        descriptors: OperandDescriptors::encode(
+            stream,
+            matrix.cu_deviceptr(),
+            width,
+            height,
+            width,
+            layout,
+        )?,
     })
 }
 
@@ -347,7 +566,7 @@ pub unsafe fn create_bf16_pairs_tma_map_region(
         .checked_add(byte_offset as u64)
         .expect("bf16 TMA region device pointer overflow");
     Ok(Bf16PairsTmaMap {
-        descriptor: encode_bf16_tma_map_strided(stream, base, width, height, row_stride, layout)?,
+        descriptors: OperandDescriptors::encode(stream, base, width, height, row_stride, layout)?,
     })
 }
 
@@ -355,9 +574,13 @@ pub unsafe fn create_bf16_pairs_tma_map_region(
 /// embedded device artifact.
 pub struct Tcgen05Gemm {
     generated: super::optimized::kernels::LoadedModule,
+    narrow: super::narrow::kernels::LoadedModule,
     optimized: CudaFunction,
     optimized_f32: CudaFunction,
     optimized_f32_accumulate: CudaFunction,
+    narrow_bf16: CudaFunction,
+    narrow_f32: CudaFunction,
+    narrow_f32_accumulate: CudaFunction,
     /// Reduction-store `C` maps, keyed by `(device address, n, m)` and kept
     /// for the module's lifetime. The cache is the lifetime guarantee the
     /// async launch needs — a descriptor built per call would be freed while
@@ -394,6 +617,7 @@ fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dy
 impl Tcgen05Gemm {
     pub fn load(ctx: &std::sync::Arc<CudaContext>) -> Result<Self, Box<dyn Error>> {
         let generated = super::optimized::kernels::load(ctx)?;
+        let narrow = super::narrow::kernels::load(ctx)?;
         let optimized = generated
             .as_cuda_module()
             .load_function("gemm_tcgen05_bf16_optimized")?;
@@ -403,26 +627,51 @@ impl Tcgen05Gemm {
         let optimized_f32_accumulate = generated
             .as_cuda_module()
             .load_function("gemm_tcgen05_f32_accumulate")?;
-        opt_in_dynamic_smem(&optimized, super::SHARED_BYTES as u32)?;
-        opt_in_dynamic_smem(&optimized_f32, super::SHARED_BYTES as u32)?;
-        opt_in_dynamic_smem(&optimized_f32_accumulate, super::SHARED_BYTES as u32)?;
+        let narrow_bf16 = narrow
+            .as_cuda_module()
+            .load_function("gemm_tcgen05_bf16_narrow")?;
+        let narrow_f32 = narrow
+            .as_cuda_module()
+            .load_function("gemm_tcgen05_f32_narrow")?;
+        let narrow_f32_accumulate = narrow
+            .as_cuda_module()
+            .load_function("gemm_tcgen05_f32_accumulate_narrow")?;
+        opt_in_dynamic_smem(&optimized, super::optimized::SHARED_BYTES as u32)?;
+        opt_in_dynamic_smem(&optimized_f32, super::optimized::SHARED_BYTES as u32)?;
+        opt_in_dynamic_smem(
+            &optimized_f32_accumulate,
+            super::optimized::SHARED_BYTES as u32,
+        )?;
+        opt_in_dynamic_smem(&narrow_bf16, super::narrow::SHARED_BYTES as u32)?;
+        opt_in_dynamic_smem(&narrow_f32, super::narrow::SHARED_BYTES as u32)?;
+        opt_in_dynamic_smem(&narrow_f32_accumulate, super::narrow::SHARED_BYTES as u32)?;
         Ok(Self {
             generated,
+            narrow,
             optimized,
             optimized_f32,
             optimized_f32_accumulate,
+            narrow_bf16,
+            narrow_f32,
+            narrow_f32_accumulate,
             c_maps: Mutex::new(HashMap::new()),
         })
     }
 
     /// The loaded kernels, named for `bench_util::enforce_kernel_budgets`.
-    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 3] {
+    pub fn kernels(&self) -> [(&'static str, &CudaFunction); 6] {
         [
             ("gemm_tcgen05_bf16_optimized", &self.optimized),
             ("gemm_tcgen05_f32_optimized", &self.optimized_f32),
             (
                 "gemm_tcgen05_f32_accumulate",
                 &self.optimized_f32_accumulate,
+            ),
+            ("gemm_tcgen05_bf16_narrow", &self.narrow_bf16),
+            ("gemm_tcgen05_f32_narrow", &self.narrow_f32),
+            (
+                "gemm_tcgen05_f32_accumulate_narrow",
+                &self.narrow_f32_accumulate,
             ),
         ]
     }
@@ -456,9 +705,9 @@ impl Tcgen05Gemm {
     unsafe fn launch_f32_accumulate(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<f32>,
         output_offset: usize,
         output_elements: usize,
@@ -472,18 +721,34 @@ impl Tcgen05Gemm {
         assert!(output_end <= output.len());
         let c_map = self.reduce_c_map(stream, output, output_offset, output_elements, n)?;
         let m = output_elements / n as usize;
+        let tiles_m = (m / TC_M_TILE) as u32;
+        let tiles_n = (n as usize / launch.tile.n_tile()) as u32;
+        let transposed = u32::from(layout == TmaLayout::MnMajor);
         unsafe {
-            self.generated.gemm_tcgen05_f32_accumulate(
-                stream,
-                config,
-                a_tma,
-                b_tma,
-                c_map,
-                k as i32,
-                (m / TC_M_TILE) as u32,
-                (n as usize / TC_N_TILE) as u32,
-                u32::from(layout == TmaLayout::MnMajor),
-            )
+            match launch.tile {
+                TcTile::Wide => self.generated.gemm_tcgen05_f32_accumulate(
+                    stream,
+                    launch.config,
+                    a.a(),
+                    b.b(TcTile::Wide),
+                    c_map,
+                    k as i32,
+                    tiles_m,
+                    tiles_n,
+                    transposed,
+                ),
+                TcTile::Narrow => self.narrow.gemm_tcgen05_f32_accumulate_narrow(
+                    stream,
+                    launch.config,
+                    a.a(),
+                    b.b(TcTile::Narrow),
+                    c_map,
+                    k as i32,
+                    tiles_m,
+                    tiles_n,
+                    transposed,
+                ),
+            }
         }
     }
 
@@ -498,20 +763,20 @@ impl Tcgen05Gemm {
     pub unsafe fn store(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<u32>,
         n: u32,
         k: u32,
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05(
-                &self.generated,
+                self,
                 stream,
-                config,
-                a_tma,
-                b_tma,
+                launch,
+                a,
+                b,
                 output,
                 n,
                 k,
@@ -530,20 +795,20 @@ impl Tcgen05Gemm {
     pub unsafe fn accumulate(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<u32>,
         n: u32,
         k: u32,
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05(
-                &self.generated,
+                self,
                 stream,
-                config,
-                a_tma,
-                b_tma,
+                launch,
+                a,
+                b,
                 output,
                 n,
                 k,
@@ -563,9 +828,9 @@ impl Tcgen05Gemm {
     pub unsafe fn f32_store(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<f32>,
         n: u32,
         k: u32,
@@ -573,11 +838,11 @@ impl Tcgen05Gemm {
         let output_elements = output.len();
         unsafe {
             launch_tcgen05_f32(
-                &self.generated,
+                self,
                 stream,
-                config,
-                a_tma,
-                b_tma,
+                launch,
+                a,
+                b,
                 output,
                 0,
                 output_elements,
@@ -599,9 +864,9 @@ impl Tcgen05Gemm {
     pub unsafe fn f32_store_at(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<f32>,
         output_offset: usize,
         output_elements: usize,
@@ -610,11 +875,11 @@ impl Tcgen05Gemm {
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05_f32(
-                &self.generated,
+                self,
                 stream,
-                config,
-                a_tma,
-                b_tma,
+                launch,
+                a,
+                b,
                 output,
                 output_offset,
                 output_elements,
@@ -634,9 +899,9 @@ impl Tcgen05Gemm {
     pub unsafe fn f32_accumulate(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<f32>,
         n: u32,
         k: u32,
@@ -645,9 +910,9 @@ impl Tcgen05Gemm {
         unsafe {
             self.launch_f32_accumulate(
                 stream,
-                config,
-                a_tma,
-                b_tma,
+                launch,
+                a,
+                b,
                 output,
                 0,
                 output_elements,
@@ -668,9 +933,9 @@ impl Tcgen05Gemm {
     pub unsafe fn f32_accumulate_at(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<f32>,
         output_offset: usize,
         output_elements: usize,
@@ -680,9 +945,9 @@ impl Tcgen05Gemm {
         unsafe {
             self.launch_f32_accumulate(
                 stream,
-                config,
-                a_tma,
-                b_tma,
+                launch,
+                a,
+                b,
                 output,
                 output_offset,
                 output_elements,
@@ -705,20 +970,20 @@ impl Tcgen05Gemm {
     pub unsafe fn accumulate_transposed(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<u32>,
         n: u32,
         k: u32,
     ) -> Result<(), DriverError> {
         unsafe {
             launch_tcgen05(
-                &self.generated,
+                self,
                 stream,
-                config,
-                a_tma,
-                b_tma,
+                launch,
+                a,
+                b,
                 output,
                 n,
                 k,
@@ -743,9 +1008,9 @@ impl Tcgen05Gemm {
     pub unsafe fn f32_accumulate_transposed_at(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<f32>,
         output_offset: usize,
         output_elements: usize,
@@ -755,9 +1020,9 @@ impl Tcgen05Gemm {
         unsafe {
             self.launch_f32_accumulate(
                 stream,
-                config,
-                a_tma,
-                b_tma,
+                launch,
+                a,
+                b,
                 output,
                 output_offset,
                 output_elements,
@@ -782,9 +1047,9 @@ impl Tcgen05Gemm {
     pub unsafe fn f32_store_transposed(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<f32>,
         n: u32,
         k: u32,
@@ -792,11 +1057,11 @@ impl Tcgen05Gemm {
         let output_elements = output.len();
         unsafe {
             launch_tcgen05_f32(
-                &self.generated,
+                self,
                 stream,
-                config,
-                a_tma,
-                b_tma,
+                launch,
+                a,
+                b,
                 output,
                 0,
                 output_elements,
@@ -816,9 +1081,9 @@ impl Tcgen05Gemm {
     pub unsafe fn f32_accumulate_transposed(
         &self,
         stream: &CudaStream,
-        config: LaunchConfig,
-        a_tma: *const TmaDescriptor,
-        b_tma: *const TmaDescriptor,
+        launch: Tcgen05Launch,
+        a: TmaOperand,
+        b: TmaOperand,
         output: &mut DeviceBuffer<f32>,
         n: u32,
         k: u32,
@@ -827,9 +1092,9 @@ impl Tcgen05Gemm {
         unsafe {
             self.f32_accumulate_transposed_at(
                 stream,
-                config,
-                a_tma,
-                b_tma,
+                launch,
+                a,
+                b,
                 output,
                 0,
                 output_elements,
@@ -842,11 +1107,11 @@ impl Tcgen05Gemm {
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_tcgen05(
-    module: &super::optimized::kernels::LoadedModule,
+    gemm: &Tcgen05Gemm,
     stream: &CudaStream,
-    config: LaunchConfig,
-    a_tma: *const TmaDescriptor,
-    b_tma: *const TmaDescriptor,
+    launch: Tcgen05Launch,
+    a: TmaOperand,
+    b: TmaOperand,
     output: &mut DeviceBuffer<u32>,
     n: u32,
     k: u32,
@@ -858,30 +1123,48 @@ unsafe fn launch_tcgen05(
         .checked_mul(2)
         .expect("tcgen05 packed output size overflow")
         / n as usize;
+    let tiles_m = (m / TC_M_TILE) as u32;
+    let tiles_n = (n as usize / launch.tile.n_tile()) as u32;
+    let transposed = u32::from(layout == TmaLayout::MnMajor);
     unsafe {
-        module.gemm_tcgen05_bf16_optimized(
-            stream,
-            config,
-            a_tma,
-            b_tma,
-            output,
-            n as i32,
-            k as i32,
-            (m / TC_M_TILE) as u32,
-            (n as usize / TC_N_TILE) as u32,
-            mode,
-            u32::from(layout == TmaLayout::MnMajor),
-        )
+        match launch.tile {
+            TcTile::Wide => gemm.generated.gemm_tcgen05_bf16_optimized(
+                stream,
+                launch.config,
+                a.a(),
+                b.b(TcTile::Wide),
+                output,
+                n as i32,
+                k as i32,
+                tiles_m,
+                tiles_n,
+                mode,
+                transposed,
+            ),
+            TcTile::Narrow => gemm.narrow.gemm_tcgen05_bf16_narrow(
+                stream,
+                launch.config,
+                a.a(),
+                b.b(TcTile::Narrow),
+                output,
+                n as i32,
+                k as i32,
+                tiles_m,
+                tiles_n,
+                mode,
+                transposed,
+            ),
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_tcgen05_f32(
-    module: &super::optimized::kernels::LoadedModule,
+    gemm: &Tcgen05Gemm,
     stream: &CudaStream,
-    config: LaunchConfig,
-    a_tma: *const TmaDescriptor,
-    b_tma: *const TmaDescriptor,
+    launch: Tcgen05Launch,
+    a: TmaOperand,
+    b: TmaOperand,
     output: &mut DeviceBuffer<f32>,
     output_offset: usize,
     output_elements: usize,
@@ -894,19 +1177,37 @@ unsafe fn launch_tcgen05_f32(
         .expect("tcgen05 fp32 output region overflow");
     assert!(output_end <= output.len());
     let m = output_elements / n as usize;
+    let tiles_m = (m / TC_M_TILE) as u32;
+    let tiles_n = (n as usize / launch.tile.n_tile()) as u32;
+    let transposed = u32::from(layout == TmaLayout::MnMajor);
     unsafe {
-        module.gemm_tcgen05_f32_optimized(
-            stream,
-            config,
-            a_tma,
-            b_tma,
-            output,
-            output_offset,
-            n as i32,
-            k as i32,
-            (m / TC_M_TILE) as u32,
-            (n as usize / TC_N_TILE) as u32,
-            u32::from(layout == TmaLayout::MnMajor),
-        )
+        match launch.tile {
+            TcTile::Wide => gemm.generated.gemm_tcgen05_f32_optimized(
+                stream,
+                launch.config,
+                a.a(),
+                b.b(TcTile::Wide),
+                output,
+                output_offset,
+                n as i32,
+                k as i32,
+                tiles_m,
+                tiles_n,
+                transposed,
+            ),
+            TcTile::Narrow => gemm.narrow.gemm_tcgen05_f32_narrow(
+                stream,
+                launch.config,
+                a.a(),
+                b.b(TcTile::Narrow),
+                output,
+                output_offset,
+                n as i32,
+                k as i32,
+                tiles_m,
+                tiles_n,
+                transposed,
+            ),
+        }
     }
 }

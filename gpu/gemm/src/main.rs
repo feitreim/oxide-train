@@ -5,7 +5,8 @@
 use bench_util::{KernelBudget, enforce_kernel_budgets, uniform_vec};
 use cuda_core::{CudaContext, DeviceBuffer};
 use gemm::{
-    Tcgen05Gemm, TmaLayout, create_bf16_tma_map, fp32, fp32_launch_config, tcgen05_launch_config,
+    TcTile, Tcgen05Gemm, TmaLayout, create_bf16_tma_map, fp32, fp32_launch_config,
+    tcgen05_launch_config_tiled,
 };
 use half::bf16;
 
@@ -158,10 +159,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     enforce_kernel_budgets(&module.kernels(), &KERNEL_BUDGETS)?;
 
     check_fp32(&stream, &fp32_module)?;
-    check_tcgen05_bf16(&stream, &module)?;
-    check_tcgen05_bf16_transposed(&stream, &module)?;
-    check_tcgen05_many_items(&stream, &module)?;
-    println!("✓ fp32 and tcgen05 bf16 GEMM store/accumulate parity passed");
+    // Every epilogue and layout, on both compiled pair tiles: the host
+    // dispatches per shape, so parity has to hold wherever the dispatch lands.
+    for tile in [TcTile::Wide, TcTile::Narrow] {
+        check_tcgen05_bf16(&stream, &module, tile)?;
+        check_tcgen05_bf16_transposed(&stream, &module, tile)?;
+        check_tcgen05_many_items(&stream, &module, tile)?;
+    }
+    println!("✓ fp32 and tcgen05 bf16 GEMM store/accumulate parity passed, both tiles");
     Ok(())
 }
 
@@ -192,6 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn check_tcgen05_many_items(
     stream: &cuda_core::CudaStream,
     module: &Tcgen05Gemm,
+    tile: TcTile,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const K: usize = 256;
     const SHAPES: [(usize, usize); 2] = [(4096, 2560), (2816, 3584)];
@@ -203,22 +209,22 @@ fn check_tcgen05_many_items(
         let device_b = DeviceBuffer::from_host(stream, &b_bits)?;
         let a_tma = create_bf16_tma_map(stream, &device_a, K, m, TmaLayout::KMajor)?;
         let b_tma = create_bf16_tma_map(stream, &device_b, K, n, TmaLayout::KMajor)?;
-        let config = tcgen05_launch_config(m, n, K);
+        let config = tcgen05_launch_config_tiled(m, n, K, tile);
 
         let mut store = DeviceBuffer::<u32>::zeroed(stream, m * n / 2)?;
         unsafe {
             module.store(
                 stream,
                 config,
-                a_tma.as_ptr(),
-                b_tma.as_ptr(),
+                a_tma.operand(),
+                b_tma.operand(),
                 &mut store,
                 n as u32,
                 K as u32,
             )
         }?;
         compare_periodic(
-            &format!("tcgen05 bf16 store {m}x{n}x{K}"),
+            &format!("tcgen05 bf16 store {m}x{n}x{K} {}", tile.label()),
             &unpack_bf16(&store.to_host_vec(stream)?),
             m,
             n,
@@ -231,8 +237,8 @@ fn check_tcgen05_many_items(
             module.accumulate(
                 stream,
                 config,
-                a_tma.as_ptr(),
-                b_tma.as_ptr(),
+                a_tma.operand(),
+                b_tma.operand(),
                 &mut store,
                 n as u32,
                 K as u32,
@@ -241,7 +247,7 @@ fn check_tcgen05_many_items(
         let folded = unpack_bf16(&store.to_host_vec(stream)?);
         let halved: Vec<f32> = folded.iter().map(|value| value / 2.0).collect();
         compare_periodic(
-            &format!("tcgen05 bf16 accumulate {m}x{n}x{K}"),
+            &format!("tcgen05 bf16 accumulate {m}x{n}x{K} {}", tile.label()),
             &halved,
             m,
             n,
@@ -331,6 +337,7 @@ fn compare_periodic(
 fn check_tcgen05_bf16_transposed(
     stream: &cuda_core::CudaStream,
     module: &Tcgen05Gemm,
+    tile: TcTile,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const M: usize = 256;
     const N: usize = 256;
@@ -360,9 +367,9 @@ fn check_tcgen05_bf16_transposed(
     unsafe {
         module.f32_accumulate_transposed(
             stream,
-            tcgen05_launch_config(M, N, K),
-            a_tma.as_ptr(),
-            b_tma.as_ptr(),
+            tcgen05_launch_config_tiled(M, N, K, tile),
+            a_tma.operand(),
+            b_tma.operand(),
             &mut accumulate,
             N as u32,
             K as u32,
@@ -503,6 +510,7 @@ fn check_fp32(
 fn check_tcgen05_bf16(
     stream: &cuda_core::CudaStream,
     module: &Tcgen05Gemm,
+    tile: TcTile,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // One full four-stage K pipeline cycle exercises every TMA/MMA stage.
     const M: usize = 256;
@@ -523,15 +531,15 @@ fn check_tcgen05_bf16(
     let device_b = DeviceBuffer::from_host(stream, &b_bits)?;
     let a_tma = create_bf16_tma_map(stream, &device_a, K, M, TmaLayout::KMajor)?;
     let b_tma = create_bf16_tma_map(stream, &device_b, K, N, TmaLayout::KMajor)?;
-    let config = tcgen05_launch_config(M, N, K);
+    let config = tcgen05_launch_config_tiled(M, N, K, tile);
 
     let mut store = DeviceBuffer::<u32>::zeroed(stream, M * N / 2)?;
     unsafe {
         module.store(
             stream,
             config,
-            a_tma.as_ptr(),
-            b_tma.as_ptr(),
+            a_tma.operand(),
+            b_tma.operand(),
             &mut store,
             N as u32,
             K as u32,
@@ -550,8 +558,8 @@ fn check_tcgen05_bf16(
         module.accumulate(
             stream,
             config,
-            a_tma.as_ptr(),
-            b_tma.as_ptr(),
+            a_tma.operand(),
+            b_tma.operand(),
             &mut accumulate,
             N as u32,
             K as u32,
@@ -570,8 +578,8 @@ fn check_tcgen05_bf16(
         module.f32_store(
             stream,
             config,
-            a_tma.as_ptr(),
-            b_tma.as_ptr(),
+            a_tma.operand(),
+            b_tma.operand(),
             &mut f32_store,
             N as u32,
             K as u32,
@@ -590,8 +598,8 @@ fn check_tcgen05_bf16(
         module.f32_accumulate(
             stream,
             config,
-            a_tma.as_ptr(),
-            b_tma.as_ptr(),
+            a_tma.operand(),
+            b_tma.operand(),
             &mut f32_accumulate,
             N as u32,
             K as u32,

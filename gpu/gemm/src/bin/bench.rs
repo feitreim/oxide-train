@@ -145,8 +145,8 @@ fn bench_tcgen05(
             module.store(
                 stream,
                 config,
-                a_tma.as_ptr(),
-                b_tma.as_ptr(),
+                a_tma.operand(),
+                b_tma.operand(),
                 &mut packed,
                 n as u32,
                 k as u32,
@@ -163,8 +163,8 @@ fn bench_tcgen05(
             module.accumulate(
                 stream,
                 config,
-                a_tma.as_ptr(),
-                b_tma.as_ptr(),
+                a_tma.operand(),
+                b_tma.operand(),
                 &mut packed,
                 n as u32,
                 k as u32,
@@ -180,8 +180,8 @@ fn bench_tcgen05(
             module.f32_store(
                 stream,
                 config,
-                a_tma.as_ptr(),
-                b_tma.as_ptr(),
+                a_tma.operand(),
+                b_tma.operand(),
                 &mut wide,
                 n as u32,
                 k as u32,
@@ -194,8 +194,8 @@ fn bench_tcgen05(
             module.f32_accumulate(
                 stream,
                 config,
-                a_tma.as_ptr(),
-                b_tma.as_ptr(),
+                a_tma.operand(),
+                b_tma.operand(),
                 &mut wide,
                 n as u32,
                 k as u32,

@@ -19,7 +19,10 @@
 
 use bench_util::time_gpu_iters;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
-use gemm::{Tcgen05Gemm, TmaLayout, create_bf16_tma_map, tcgen05_launch_config};
+use gemm::{
+    TcTile, Tcgen05Gemm, TmaLayout, create_bf16_tma_map, tcgen05_launch_config,
+    tcgen05_launch_config_tiled,
+};
 use half::bf16;
 use std::sync::Arc;
 
@@ -141,7 +144,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = Tcgen05Gemm::load(&context)?;
 
     println!(
-        "model-shape GEMMs, MxKxN, {} clusters persistent (tiles = M/256 * N/256)",
+        "model-shape GEMMs, MxKxN, {} clusters persistent; the tile column is \
+         the dispatched pair tile (tiles = M/256 * N/tile)",
         gemm::MAX_CLUSTERS
     );
     #[cfg(feature = "cublas")]
@@ -156,8 +160,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "{:<24} {:<11} {:>7} {:>26} {:>26} {:>6}",
-        "shape (MxKxN)", "mode", "tiles", "ours", "cuBLASLt", "ratio"
+        "{:<24} {:<11} {:>7} {:>9} {:>26} {:>26} {:>6}",
+        "shape (MxKxN)", "mode", "tiles", "tile", "ours", "cuBLASLt", "ratio"
     );
     for row in &summary {
         println!("{row}");
@@ -201,8 +205,8 @@ fn decompose(
         module.f32_accumulate_transposed(
             stream,
             config,
-            a_mn.as_ptr(),
-            b_mn.as_ptr(),
+            a_mn.operand(),
+            b_mn.operand(),
             &mut c,
             n as u32,
             k as u32,
@@ -213,8 +217,8 @@ fn decompose(
         module.f32_store_transposed(
             stream,
             config,
-            a_mn.as_ptr(),
-            b_mn.as_ptr(),
+            a_mn.operand(),
+            b_mn.operand(),
             &mut c,
             n as u32,
             k as u32,
@@ -238,8 +242,8 @@ fn decompose(
             module.f32_store(
                 stream,
                 config,
-                a_k.as_ptr(),
-                b_k.as_ptr(),
+                a_k.operand(),
+                b_k.operand(),
                 &mut c,
                 n as u32,
                 k as u32,
@@ -252,8 +256,8 @@ fn decompose(
             module.f32_store_transposed(
                 stream,
                 config,
-                a_mn.as_ptr(),
-                b_mn.as_ptr(),
+                a_mn.operand(),
+                b_mn.operand(),
                 &mut c,
                 n as u32,
                 k as u32,
@@ -266,8 +270,8 @@ fn decompose(
             module.f32_accumulate_transposed(
                 stream,
                 config,
-                a_mn.as_ptr(),
-                b_mn.as_ptr(),
+                a_mn.operand(),
+                b_mn.operand(),
                 &mut c,
                 n as u32,
                 k as u32,
@@ -311,17 +315,27 @@ fn run_case(
         )
     };
     let config = tcgen05_launch_config(m, n, k);
-    let tiles = (m / 256) * (n / 256);
+    // The dispatched tile is what the summary's ratio prices; the other tile
+    // is timed beside it on every row, so a dispatch rule that leaves money on
+    // the table shows up in the same table that would justify changing it.
+    let other_tile = match config.tile {
+        TcTile::Wide => TcTile::Narrow,
+        TcTile::Narrow => TcTile::Wide,
+    };
+    let alt_config = tcgen05_launch_config_tiled(m, n, k, other_tile);
+    let tiles = (m / 256) * (n / config.tile.n_tile());
 
     // One clean launch into a zeroed `C` before anything is timed: the
     // accumulating modes fold, so the agreement check has to know the fold
     // started from zero. The timed launches keep folding into the same buffer,
     // which changes its values and none of its addresses.
-    let (ours, baseline) = match case.mode {
+    let (ours, alt, baseline) = match case.mode {
         Mode::F32Store | Mode::F32AccumulateT => {
             let mut c = DeviceBuffer::<f32>::zeroed(stream, m * n)?;
-            let launch = |c: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn std::error::Error>> {
-                let (a_tma, b_tma) = (a_tma.as_ptr(), b_tma.as_ptr());
+            let launch = |c: &mut DeviceBuffer<f32>,
+                          config: gemm::Tcgen05Launch|
+             -> Result<(), Box<dyn std::error::Error>> {
+                let (a_tma, b_tma) = (a_tma.operand(), b_tma.operand());
                 match case.mode {
                     Mode::F32Store => unsafe {
                         module.f32_store(stream, config, a_tma, b_tma, c, n as u32, k as u32)
@@ -334,15 +348,18 @@ fn run_case(
                 }
                 .map_err(Into::into)
             };
-            launch(&mut c)?;
+            launch(&mut c, config)?;
             let baseline = baseline_f32(stream, &a, &b, &c, case)?;
-            let ours = time_gpu_iters(stream, WARMUP, ITERS, || launch(&mut c))?;
-            (ours, baseline)
+            let ours = time_gpu_iters(stream, WARMUP, ITERS, || launch(&mut c, config))?;
+            let alt = time_gpu_iters(stream, WARMUP, ITERS, || launch(&mut c, alt_config))?;
+            (ours, alt, baseline)
         }
         Mode::Bf16Store | Mode::Bf16AccumulateT => {
             let mut c = DeviceBuffer::<u32>::zeroed(stream, m * n / 2)?;
-            let launch = |c: &mut DeviceBuffer<u32>| -> Result<(), Box<dyn std::error::Error>> {
-                let (a_tma, b_tma) = (a_tma.as_ptr(), b_tma.as_ptr());
+            let launch = |c: &mut DeviceBuffer<u32>,
+                          config: gemm::Tcgen05Launch|
+             -> Result<(), Box<dyn std::error::Error>> {
+                let (a_tma, b_tma) = (a_tma.operand(), b_tma.operand());
                 match case.mode {
                     Mode::Bf16Store => unsafe {
                         module.store(stream, config, a_tma, b_tma, c, n as u32, k as u32)
@@ -355,17 +372,24 @@ fn run_case(
                 }
                 .map_err(Into::into)
             };
-            launch(&mut c)?;
+            launch(&mut c, config)?;
             let baseline = baseline_bf16(stream, &a, &b, &c, case)?;
-            let ours = time_gpu_iters(stream, WARMUP, ITERS, || launch(&mut c))?;
-            (ours, baseline)
+            let ours = time_gpu_iters(stream, WARMUP, ITERS, || launch(&mut c, config))?;
+            let alt = time_gpu_iters(stream, WARMUP, ITERS, || launch(&mut c, alt_config))?;
+            (ours, alt, baseline)
         }
     };
 
     println!(
-        "{}: {m}x{k}x{n} {} ({tiles} tiles)",
+        "{}: {m}x{k}x{n} {} ({tiles} tiles at {})",
         case.name,
-        case.mode.label()
+        case.mode.label(),
+        config.tile.label()
+    );
+    println!(
+        "  {} forced {alt:8.3} ms  {:8.2} TFLOP/s",
+        other_tile.label(),
+        tflops(m, n, k, alt)
     );
     let row = if let Some((theirs, algorithm)) = &baseline {
         println!(
@@ -383,23 +407,33 @@ fn run_case(
             tflops(m, n, k, ours)
         );
         format!(
-            "{:>13.3} ms {:8.2} TF/s {:>13.3} ms {:8.2} TF/s {ratio:>6.3}{flag}",
+            "{:>13.3} ms {:8.2} TF/s {:>13.3} ms {:8.2} TF/s {ratio:>6.3}{flag} | {} {:.3} ms ({:.3})",
             ours,
             tflops(m, n, k, ours),
             theirs,
-            tflops(m, n, k, *theirs)
+            tflops(m, n, k, *theirs),
+            other_tile.label(),
+            alt,
+            theirs / alt,
         )
     } else {
         println!(
             "  ours     {ours:8.3} ms  {:8.2} TFLOP/s",
             tflops(m, n, k, ours)
         );
-        format!("{:>13.3} ms {:8.2} TF/s", ours, tflops(m, n, k, ours))
+        format!(
+            "{:>13.3} ms {:8.2} TF/s | {} {:.3} ms",
+            ours,
+            tflops(m, n, k, ours),
+            other_tile.label(),
+            alt,
+        )
     };
     summary.push(format!(
-        "{:<24} {:<11} {tiles:>7} {row}",
+        "{:<24} {:<11} {tiles:>7} {:>9} {row}",
         format!("{m}x{k}x{n} {}", case.name),
-        case.mode.label()
+        case.mode.label(),
+        config.tile.label()
     ));
     Ok(())
 }
