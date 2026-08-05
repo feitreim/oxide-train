@@ -48,8 +48,8 @@
 //! left over from a CLC schedule it had removed. All of that is gone: the ring
 //! is a [`SharedTileRing`] over a [`SharedPlan`], the schedule is [`Walk`] and
 //! the two item rings, and the epilogue warps are the CTA's four band warps —
-//! joined, since oxide-train#80 remedy 2, by one scheduler warp that produces
-//! and multiplies so the band warps never block the schedule.
+//! joined, since oxide-train#80 remedy 2, by a producer warp and an MMA warp so
+//! the band warps never block the schedule.
 //!
 //! The tile is `[256, 256]` at `STAGES = 3` because ferro-kittens' own sweep
 //! (#87) put it **+11.6% / +21.6%** at 8192³ / 16384³ over `[256, 128]` at the
@@ -72,6 +72,11 @@
 //! epilogue is deferred one item, each drain releases the accumulator's
 //! columns through [`Release`] the moment its last `tcgen05.ld` retires, and
 //! the store tail plus the whole next TMA fill run beside the next MMA.
+//!
+//! What #80's own probe added is *where the drain's time goes*: it is the
+//! **wait per `.x8` issue**, not the store issue, so the release is worth what
+//! the batched lift ([`TmemTile::tile_x8_batched`]) leaves behind it. See
+//! [`Wide`].
 //!
 //! Within a pass the drain keeps the shape #116/#117 measured: TMEM → registers
 //! (`tcgen05.ld.16x256b.x8`) → `stmatrix.m8n8.x4` into a per-warp
