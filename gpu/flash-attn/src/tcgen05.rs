@@ -113,10 +113,32 @@ const HD: usize = 128;
 /// The 64-query forward that filled half of one is what #68 removed.
 const QUERIES: usize = 2 * TILE;
 
-/// Every MMA here is one warpgroup's `M128_N64`. The element type, the fp32
-/// accumulator and the transpose flags are the operand tiles' and the entry
-/// point's own now, so a call states only the shape.
-const MMA_SHAPE: MmaShape = MmaShape::M128_N64;
+/// Shape of every score MMA — `S = Q·Kᵀ`, `dP = dY·Vᵀ`, and the key-parallel
+/// kernel's transposed twins. `N` is the streamed tile's `TILE` keys (or
+/// queries), which is 64, and that is the *only* reason it is 64: a `TILE` of
+/// 128 would make it `M128_N128` and cost the tensor core nothing extra.
+///
+/// It is 43% off the tensor core's rate and it is the roof kernel A sits on.
+/// The cadence probe (`src/bin/probe.rs`, issue #94) measures `M128_N64` at
+/// **55.7 ticks per `M128_N64_K16`-equivalent against `M128_N128`'s 32.0**, and
+/// the tile cannot widen: a 128-key visit needs 256 KiB of shared memory
+/// against `MAX_DYNAMIC_SMEM`'s 227, with the second dS slot as the binding
+/// term.
+const SCORE_SHAPE: MmaShape = MmaShape::M128_N64;
+/// Shape of every HD-wide accumulation — the forward's `O = P·V` and all three
+/// gradient MMAs. **One `N = HD` band, not two `N = 64` ones**: an MN-major B
+/// reaches its second stacked subtile through the descriptor's leading offset,
+/// so one instruction per K chunk covers the whole accumulator
+/// (ferro-kittens#194).
+///
+/// Same products in the same K order as the banded form it replaced, so it is
+/// the same sum bit for bit; what changes is that the tensor core runs at
+/// **32.1 ticks per unit instead of 48.2**, 1.50×, on the same cadence probe.
+const OUTPUT_SHAPE: MmaShape = MmaShape::M128_N128;
+const _: () = assert!(
+    OUTPUT_SHAPE.n as usize == HD && SCORE_SHAPE.n as usize == TILE,
+    "both shapes are the operands' own product: the accumulator is HD wide and a score band is one streamed tile"
+);
 
 /// One `[TILE, HD]` bf16 operand panel as a kittens tile — two stacked
 /// SWIZZLE_128B subtiles, the layout described above. Phase 1 of issue #61
@@ -561,7 +583,7 @@ pub mod kernels {
         q: SharedTile<Bf16, AR, HD, Swizzle128B>,
         k: Panel,
     ) {
-        unsafe { mma_abt(s_tmem, q, k, MMA_SHAPE, false) }
+        unsafe { mma_abt(s_tmem, q, k, SCORE_SHAPE, false) }
     }
 
     /// Elementwise `2^x` accuracy oracle for the standalone parity gate.
@@ -792,10 +814,11 @@ pub mod kernels {
         /// segment, and publish both on one arrival: the register pass reads
         /// them together and there is nothing it could do with one alone.
         ///
-        /// `MMA_SHAPE` is the *band* the accumulator gets, which for a
-        /// `[TILE, HD]` B operand read transposed is its `TILE` rows — the one
-        /// argument no operand can supply, and the one ferro #175 found two
-        /// callers reading as the tile's.
+        /// `SCORE_SHAPE`'s `N` is the streamed panel's `TILE` rows read
+        /// transposed — the one descriptor field no operand can supply. It is
+        /// also this kernel's roof: 64 is the width the tensor core is 43% off
+        /// its rate at, and the tile cannot widen (issue #94, and `probe`'s
+        /// cadence table is the measurement).
         #[inline(always)]
         unsafe fn score_mmas(&self, key_tile: u32) {
             unsafe {
@@ -803,14 +826,14 @@ pub mod kernels {
                     self.buffer(self.scores, key_tile).raw(),
                     self.shared.q,
                     self.shared.k.tile(key_tile),
-                    MMA_SHAPE,
+                    SCORE_SHAPE,
                     false,
                 );
                 mma_abt(
                     self.buffer(self.gradients, key_tile).raw(),
                     self.shared.dy,
                     self.shared.v.tile(key_tile),
-                    MMA_SHAPE,
+                    SCORE_SHAPE,
                     false,
                 );
                 mma::commit(self.shared.scored.sem(key_tile));
@@ -954,7 +977,7 @@ pub mod kernels {
                                 self.accumulator.raw(),
                                 self.shared.ds.tile(key_tile),
                                 self.shared.k.tile(key_tile),
-                                MMA_SHAPE,
+                                OUTPUT_SHAPE,
                                 key_tile != 0,
                             );
                             mma::commit(self.shared.accumulated.sem(key_tile));
@@ -1318,14 +1341,14 @@ pub mod kernels {
                     self.buffer(self.scores, step).raw(),
                     self.shared.k,
                     self.shared.q.tile(step),
-                    MMA_SHAPE,
+                    SCORE_SHAPE,
                     false,
                 );
                 mma_abt(
                     self.buffer(self.gradients, step).raw(),
                     self.shared.v,
                     self.shared.dy.tile(step),
-                    MMA_SHAPE,
+                    SCORE_SHAPE,
                     false,
                 );
                 mma::commit(self.shared.scored.sem(step));
@@ -1443,14 +1466,14 @@ pub mod kernels {
                                 self.dv_acc.raw(),
                                 self.shared.p.tile(step),
                                 self.shared.dy.tile(step),
-                                MMA_SHAPE,
+                                OUTPUT_SHAPE,
                                 accumulate,
                             );
                             mma_ab(
                                 self.dk_acc.raw(),
                                 self.shared.ds.tile(step),
                                 self.shared.q.tile(step),
-                                MMA_SHAPE,
+                                OUTPUT_SHAPE,
                                 accumulate,
                             );
                             mma::commit(self.shared.accumulated.sem(step));
@@ -1936,7 +1959,7 @@ pub mod kernels {
                             self.accumulator.raw(),
                             self.shared.p.tile(key_tile),
                             self.shared.v.tile(key_tile),
-                            MMA_SHAPE,
+                            OUTPUT_SHAPE,
                             key_tile != 0,
                         );
                         mma::commit(self.shared.accumulated.sem(key_tile));

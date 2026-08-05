@@ -147,6 +147,11 @@ pub const GAP: usize = 18;
 /// The pass warps' *first* `scored.wait` of an item — the pipeline fill, which
 /// the per-visit [`SCORED`] mean otherwise smears across every visit.
 pub const FILL: usize = 19;
+/// The half of [`EPI`] that is the wait for the item's last gradient MMA. It
+/// has to happen before the item boundary, because `pipeline::run` re-arms the
+/// barrier set there; the rest of [`EPI`] does not, which is the whole of the
+/// deferred-drain question.
+pub const DRAINWAIT: usize = 20;
 
 /// Per-CTA tick sums, all in one struct so the instrumented loops stay legible.
 #[derive(Clone, Copy, Default)]
@@ -170,6 +175,7 @@ struct Sums {
     sstore: u64,
     gap: u64,
     fill: u64,
+    drainwait: u64,
     /// The pass warps' last `clock64` of the previous item, so [`GAP`] can be
     /// measured across `pipeline::run`'s own per-item work instead of being
     /// derived by subtracting the columns from the span.
@@ -213,6 +219,7 @@ impl Clocks {
             self.put(SSTORE, sums.sstore / visits);
             self.put(GAP, sums.gap / items);
             self.put(FILL, sums.fill / items);
+            self.put(DRAINWAIT, sums.drainwait / items);
         }
     }
 
@@ -296,14 +303,14 @@ impl BackwardQProbe {
                 self.buffer(self.scores, key_tile).raw(),
                 self.shared.q,
                 self.shared.k.tile(key_tile),
-                MMA_SHAPE,
+                SCORE_SHAPE,
                 false,
             );
             mma_abt(
                 self.buffer(self.gradients, key_tile).raw(),
                 self.shared.dy,
                 self.shared.v.tile(key_tile),
-                MMA_SHAPE,
+                SCORE_SHAPE,
                 false,
             );
             mma::commit(self.shared.scored.sem(key_tile));
@@ -433,7 +440,7 @@ impl pipeline::Job for BackwardQProbe {
                             self.accumulator.raw(),
                             self.shared.ds.tile(key_tile),
                             self.shared.k.tile(key_tile),
-                            MMA_SHAPE,
+                            OUTPUT_SHAPE,
                             key_tile != 0,
                         );
                         mma::commit(self.shared.accumulated.sem(key_tile));
@@ -525,11 +532,13 @@ impl pipeline::Job for BackwardQProbe {
 
                 let waited = clock64();
                 self.shared.accumulated.wait(key_tiles - 1);
+                let drained = clock64();
                 let columns = group * DRAIN_COLUMNS as u32;
                 let dq: OutHalf = self.accumulator.tile_x8(band, columns);
                 store_rows(self.dq, row, head * HD as u32 + columns, lane, dq);
                 let ended = clock64();
                 self.sums.epi += ended.wrapping_sub(waited);
+                self.sums.drainwait += drained.wrapping_sub(waited);
                 self.sums.ended = ended;
             }
             self.sums.items += 1;
@@ -666,14 +675,14 @@ impl BackwardKvProbe {
                 self.buffer(self.scores, step).raw(),
                 self.shared.k,
                 self.shared.q.tile(step),
-                MMA_SHAPE,
+                SCORE_SHAPE,
                 false,
             );
             mma_abt(
                 self.buffer(self.gradients, step).raw(),
                 self.shared.v,
                 self.shared.dy.tile(step),
-                MMA_SHAPE,
+                SCORE_SHAPE,
                 false,
             );
             mma::commit(self.shared.scored.sem(step));
@@ -795,14 +804,14 @@ impl pipeline::Job for BackwardKvProbe {
                             self.dv_acc.raw(),
                             self.shared.p.tile(step),
                             self.shared.dy.tile(step),
-                            MMA_SHAPE,
+                            OUTPUT_SHAPE,
                             accumulate,
                         );
                         mma_ab(
                             self.dk_acc.raw(),
                             self.shared.ds.tile(step),
                             self.shared.q.tile(step),
-                            MMA_SHAPE,
+                            OUTPUT_SHAPE,
                             accumulate,
                         );
                         mma::commit(self.shared.accumulated.sem(step));
@@ -1036,48 +1045,52 @@ pub const CADENCE_COUNTERS: usize = CADENCE_VARIANTS * CADENCE_SLOTS;
 /// than carved exactly — one CTA of one warp is not competing for an SM.
 pub const CADENCE_SMEM: usize = QUERIES * HD * 2 + 256 * HD * 2 + 1024;
 
-/// `dQ += dS·K` with **one** `N = HD` band instead of `mma_ab`'s two `N = 64`
-/// ones: the B panel's `mn_walk` reaches columns 64..128 through the
-/// descriptor's leading offset, exactly as `mma_atb` already reaches them, so
-/// the same K chunk covers the whole accumulator in one instruction.
+/// `dQ += dS·K` the way `kittens::mma::mma_ab` walked it before
+/// ferro-kittens#194: one `N = 64` instruction per stacked `B` subtile, into
+/// `tmem + 64 * subtile`.
 ///
-/// Same products in the same K order as `mma_ab`, so it is the same sum.
+/// Kept here, and only here, because the cadence table's point is the
+/// *comparison* — the shipped walk is the wide one now, and a table with one
+/// row is not a measurement of anything.
 ///
 /// # Safety
 ///
-/// As `kittens::mma::mma_ab`, plus: `shape` is `M128_N128` and `tmem` owns the
-/// whole 128-column band.
+/// As `kittens::mma::mma_ab`, plus: `shape` is `M128_N64` and `tmem` owns
+/// `64 * B::SUBTILES` fp32 columns.
 #[inline(always)]
-unsafe fn gradient_mma_wide<const AR: usize, const K: usize, const N: usize>(
+unsafe fn gradient_mma_banded<const AR: usize, const K: usize, const N: usize>(
     tmem: u32,
     a: SharedTile<Bf16, AR, K, Swizzle128B>,
     b: SharedTile<Bf16, K, N, Swizzle128B>,
     accumulate: bool,
 ) {
     unsafe {
-        let walk = b.mn_walk();
         let instruction = Tcgen05InstructionDescriptor::builder()
-            .shape(MmaShape::M128_N128)
+            .shape(MmaShape::M128_N64)
             .element_type(Tcgen05ElementType::BF16)
             .accumulator_type(Tcgen05AccumulatorType::F32)
             .transpose_a(false)
-            .transpose_b(walk.transposed())
+            .transpose_b(true)
             .build()
             .raw();
-        let mut chunk = 0usize;
-        while chunk < K / 16 {
-            // A is K-major and K spans one swizzle atom here (`K == 64`), so
-            // its chunks step 32 bytes along the row — `mma_abt`'s own
-            // `k_major_offset` with the subtile term dropped, which this shape
-            // never reaches.
-            Bf16::mma(
-                tmem,
-                a.operand_descriptor(chunk * 32),
-                walk.chunk_descriptor(chunk),
-                instruction,
-                accumulate || chunk > 0,
-            );
-            chunk += 1;
+        let mut band = 0usize;
+        while band < SharedTile::<Bf16, K, N, Swizzle128B>::SUBTILES {
+            let base = band * SharedTile::<Bf16, K, N, Swizzle128B>::SUBTILE_BYTES;
+            let mut chunk = 0usize;
+            while chunk < K / 16 {
+                // A is K-major and K spans one swizzle atom at this shape, so
+                // its chunks step 32 bytes along the row; B steps 16 rows of
+                // the 128-byte atom.
+                Bf16::mma(
+                    tmem + (band as u32) * 64,
+                    a.operand_descriptor(chunk * 32),
+                    b.operand_descriptor(base + chunk * 16 * 128),
+                    instruction,
+                    accumulate || chunk > 0,
+                );
+                chunk += 1;
+            }
+            band += 1;
         }
     }
 }
@@ -1188,8 +1201,10 @@ pub unsafe fn mma_cadence(rounds: u32, clocks: &mut DisjointSlice<u64>) {
                 mma_abt(tmem, a, b, MmaShape::M128_N256, true)
             );
 
-            // The gradient MMA's shape, both ways: `[QUERIES, TILE]` dS
-            // against a `[TILE, HD]` K panel.
+            // The gradient MMA's shape both ways — `[QUERIES, TILE]` dS
+            // against a `[TILE, HD]` K panel — as two `N = 64` bands and as
+            // the one `N = HD` band the shipped walk is since
+            // ferro-kittens#194.
             let ds = SharedTile::<Bf16, QUERIES, TILE, Swizzle128B>::from_raw(a.base());
             let k = SharedTile::<Bf16, TILE, HD, Swizzle128B>::from_raw(b.base());
             time_walk!(
@@ -1199,7 +1214,7 @@ pub unsafe fn mma_cadence(rounds: u32, clocks: &mut DisjointSlice<u64>) {
                 rounds,
                 sem,
                 6,
-                mma_ab(tmem, ds, k, MmaShape::M128_N64, true)
+                gradient_mma_banded(tmem, ds, k, true)
             );
             time_walk!(
                 clocks,
@@ -1208,7 +1223,7 @@ pub unsafe fn mma_cadence(rounds: u32, clocks: &mut DisjointSlice<u64>) {
                 rounds,
                 sem,
                 8,
-                gradient_mma_wide(tmem, ds, k, true)
+                mma_ab(tmem, ds, k, MmaShape::M128_N128, true)
             );
         }
 
