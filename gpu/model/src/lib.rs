@@ -2060,6 +2060,31 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         Ok(())
     }
 
+    /// Clear both stacked gradients. An AdamW step clears the gradient it
+    /// consumes, so a training loop never calls this; a backward checked on
+    /// its own still needs a way back to a known-zero start.
+    pub fn zero_grad(
+        &mut self,
+        stream: &CudaStream,
+        tensor: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        let mut profiler = NoopProfiler;
+        fill_zero(
+            &mut self.d_gate_up,
+            stream,
+            tensor,
+            &mut profiler,
+            "zero_grad.experts.gate_up",
+        )?;
+        fill_zero(
+            &mut self.d_down,
+            stream,
+            tensor,
+            &mut profiler,
+            "zero_grad.experts.down",
+        )
+    }
+
     /// [`GpuLinear::sync_compute`] over both stacked expert masters.
     pub fn sync_compute(
         &mut self,
