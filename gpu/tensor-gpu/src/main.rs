@@ -343,63 +343,23 @@ fn check_adamw_master_transposed(
         master: Vec<u32>,
         first: Vec<f32>,
         second: Vec<f32>,
-        gradient_zeroed: bool,
-        transposed: Option<Vec<u32>>,
+        gradient: Vec<f32>,
+        transposed: Vec<u32>,
     }
 
-    let mut run = |transposed: bool,
-                   packed_gradient: bool,
-                   rounding: u32|
-     -> Result<Outcome, cuda_core::DriverError> {
+    let mut run = |tiled: bool, rounding: u32| -> Result<Outcome, cuda_core::DriverError> {
         let mut master = DeviceBuffer::from_host(stream, &master_words)?;
         let mut first = DeviceBuffer::from_host(stream, moment.as_slice())?;
         let mut second = DeviceBuffer::from_host(stream, moment.as_slice())?;
-        let mut packed = DeviceBuffer::from_host(stream, &pack_bf16(gradient.as_slice()))?;
         let mut wide = DeviceBuffer::from_host(stream, gradient.as_slice())?;
-        let mut output = DeviceBuffer::<u32>::zeroed(stream, LEN / 2)?;
-        let flat = LaunchConfig::for_num_elems((LEN / 2) as u32);
-        let tiled = master_transpose_config(ROWS, COLS);
+        let mut transposed = DeviceBuffer::<u32>::zeroed(stream, LEN / 2)?;
         // SAFETY: every buffer describes the same [ROWS, COLS] matrix in the
         // dtype its parameter names, and both launches cover it exactly.
         unsafe {
-            match (transposed, packed_gradient) {
-                (false, false) => module.adamw_bf16_master(
+            if tiled {
+                module.adamw_bf16_master_transposed(
                     stream,
-                    flat,
-                    &mut wide,
-                    learning_rate,
-                    beta1,
-                    beta2,
-                    epsilon,
-                    weight_decay,
-                    first_correction,
-                    second_correction,
-                    rounding,
-                    SEED,
-                    &mut master,
-                    &mut first,
-                    &mut second,
-                )?,
-                (false, true) => module.adamw_bf16_master_packed_grad(
-                    stream,
-                    flat,
-                    &mut packed,
-                    learning_rate,
-                    beta1,
-                    beta2,
-                    epsilon,
-                    weight_decay,
-                    first_correction,
-                    second_correction,
-                    rounding,
-                    SEED,
-                    &mut master,
-                    &mut first,
-                    &mut second,
-                )?,
-                (true, false) => module.adamw_bf16_master_transposed(
-                    stream,
-                    tiled,
+                    master_transpose_config(ROWS, COLS),
                     &mut wide,
                     ROWS as u32,
                     COLS as u32,
@@ -415,14 +375,13 @@ fn check_adamw_master_transposed(
                     &mut master,
                     &mut first,
                     &mut second,
-                    &mut output,
-                )?,
-                (true, true) => module.adamw_bf16_master_packed_grad_transposed(
+                    &mut transposed,
+                )?;
+            } else {
+                module.adamw_bf16_master(
                     stream,
-                    tiled,
-                    &mut packed,
-                    ROWS as u32,
-                    COLS as u32,
+                    LaunchConfig::for_num_elems((LEN / 2) as u32),
+                    &mut wide,
                     learning_rate,
                     beta1,
                     beta2,
@@ -435,63 +394,57 @@ fn check_adamw_master_transposed(
                     &mut master,
                     &mut first,
                     &mut second,
-                    &mut output,
-                )?,
+                )?;
             }
         }
-        let consumed = if packed_gradient {
-            packed.to_host_vec(stream)?.iter().all(|&w| w == 0)
-        } else {
-            wide.to_host_vec(stream)?.iter().all(|&g| g == 0.0)
-        };
         Ok(Outcome {
             master: master.to_host_vec(stream)?,
             first: first.to_host_vec(stream)?,
             second: second.to_host_vec(stream)?,
-            gradient_zeroed: consumed,
-            transposed: transposed.then_some(output.to_host_vec(stream)?),
+            gradient: wide.to_host_vec(stream)?,
+            transposed: transposed.to_host_vec(stream)?,
         })
     };
 
-    for (packed_gradient, label) in [(false, "fp32 gradient"), (true, "packed gradient")] {
-        for (rounding, mode) in [
-            (device::MASTER_ROUNDING_NEAREST, "nearest"),
-            (device::MASTER_ROUNDING_STOCHASTIC, "stochastic"),
-        ] {
-            let flat = run(false, packed_gradient, rounding)?;
-            let tiled = run(true, packed_gradient, rounding)?;
-            assert_eq!(
-                flat.master, tiled.master,
-                "fused transpose write-back ({label}, {mode}) is not bit-identical"
-            );
-            assert_eq!(
-                bits(&flat.first),
-                bits(&tiled.first),
-                "fused transpose write-back ({label}, {mode}) moved the first moment"
-            );
-            assert_eq!(
-                bits(&flat.second),
-                bits(&tiled.second),
-                "fused transpose write-back ({label}, {mode}) moved the second moment"
-            );
+    for (rounding, mode) in [
+        (device::MASTER_ROUNDING_NEAREST, "nearest"),
+        (device::MASTER_ROUNDING_STOCHASTIC, "stochastic"),
+    ] {
+        let flat = run(false, rounding)?;
+        let tiled = run(true, rounding)?;
+        assert_eq!(
+            flat.master, tiled.master,
+            "fused transpose write-back ({mode}) is not bit-identical"
+        );
+        assert_eq!(
+            bits(&flat.first),
+            bits(&tiled.first),
+            "fused transpose write-back ({mode}) moved the first moment"
+        );
+        assert_eq!(
+            bits(&flat.second),
+            bits(&tiled.second),
+            "fused transpose write-back ({mode}) moved the second moment"
+        );
+        for outcome in [&flat, &tiled] {
             assert!(
-                flat.gradient_zeroed && tiled.gradient_zeroed,
-                "an AdamW write-back ({label}, {mode}) left its gradient non-zero"
-            );
-
-            let updated = unpack_bf16(&tiled.master);
-            let mut expected = vec![0.0f32; LEN];
-            for row in 0..ROWS {
-                for column in 0..COLS {
-                    expected[column * ROWS + row] = updated[row * COLS + column];
-                }
-            }
-            assert_eq!(
-                tiled.transposed.expect("tiled run emits a transpose"),
-                pack_bf16(&expected),
-                "fused write-back transpose ({label}, {mode}) is not the master's transpose"
+                outcome.gradient.iter().all(|&g| g == 0.0),
+                "an AdamW write-back ({mode}) left the gradient it consumed non-zero"
             );
         }
+
+        let updated = unpack_bf16(&tiled.master);
+        let mut expected = vec![0.0f32; LEN];
+        for row in 0..ROWS {
+            for column in 0..COLS {
+                expected[column * ROWS + row] = updated[row * COLS + column];
+            }
+        }
+        assert_eq!(
+            tiled.transposed,
+            pack_bf16(&expected),
+            "fused write-back transpose ({mode}) is not the master's transpose"
+        );
     }
     Ok(())
 }

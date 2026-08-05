@@ -2666,16 +2666,13 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         stream: &CudaStream,
         kernels: &tensor_kernels::LoadedModule,
     ) -> Result<(), DriverError> {
-        // SAFETY: packed gradients, packed masters, both fp32 moments, and the
-        // `[VP, D]` transpose all describe the same D * VP parameter matrix,
-        // and the launch tiles it exactly.
+        // SAFETY: packed gradients, packed masters, and both fp32 moments all
+        // describe the same D * VP parameter matrix, launched over its pairs.
         unsafe {
-            kernels.adamw_bf16_master_packed_grad_transposed(
+            kernels.adamw_bf16_master_packed_grad(
                 stream,
-                master_transpose_config(D, VP),
+                pairs_config(D * VP / 2),
                 &mut self.dw,
-                D as u32,
-                VP as u32,
                 config.learning_rate,
                 config.beta1,
                 config.beta2,
@@ -2688,6 +2685,31 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
                 self.master.as_words_mut(),
                 moments.first.as_device_buffer_mut(),
                 moments.second.as_device_buffer_mut(),
+            )
+        }
+    }
+
+    /// Re-transpose the master after an optimizer step; the `[D, VP]` operand
+    /// is the master itself and needs nothing.
+    ///
+    /// Alone among the masters the head keeps this as a separate pass. Its
+    /// `[3072, 50432]` shape gives the source a 98 KiB row stride, so a fused
+    /// tile's four operand streams each touch 64 rows 6.4 MiB apart and the
+    /// read side collapses: the fused write-back measured 3.9292 ms against
+    /// 0.6764 + 0.2235 for the split pair (#99).
+    fn sync_compute(
+        &mut self,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        // SAFETY: the master and `w_t` are both D * VP / 2 packed words.
+        unsafe {
+            kernels.transpose_bf16_pairs(
+                stream,
+                transpose_pairs_config(D, VP),
+                self.master.as_words(),
+                D as u32,
+                VP as u32,
                 &mut self.w_t,
             )
         }
@@ -2895,6 +2917,9 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
                 stream,
                 kernels,
             )
+        })?;
+        profiler.measure(stream, "optimizer.lm_head.sync_w_t", || {
+            model.lm_head.sync_compute(stream, kernels)
         })?;
         Ok(())
     }
@@ -3199,6 +3224,9 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize, const
                 stream,
                 kernels,
             )
+        })?;
+        profiler.measure(stream, "optimizer.lm_head.sync_w_t", || {
+            model.lm_head.sync_compute(stream, kernels)
         })
     }
 }
@@ -3681,7 +3709,8 @@ impl<const VOCAB: usize, const VP: usize, const D: usize, const FF: usize>
             ),
             stream,
             tensor,
-        )
+        )?;
+        model.lm_head.sync_compute(stream, tensor)
     }
 }
 
