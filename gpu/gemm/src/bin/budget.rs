@@ -112,7 +112,7 @@ fn sweep(
     geometry: &Geometry,
 ) -> Result<(), Box<dyn Error>> {
     let (m, n) = (geometry.m, geometry.n);
-    let tiles = (m / 256) * (n / 256);
+    let tiles = (m / gemm::TC_M_TILE) * (n / gemm::TC_N_ITEM);
     let waves = tiles as f64 / gemm::MAX_CLUSTERS as f64;
     println!(
         "{}  {tiles} tiles = {waves:.2} waves over {} clusters (last-wave efficiency {:.1}%)",

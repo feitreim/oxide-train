@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bench_fp32(&context, &stream)?;
 
     println!(
-        "bf16 tcgen05 cta_group::2, [256, 256] tile, K=64 x 3 stages, persistent \
+        "bf16 tcgen05 cta_group::2, [256, 128] tile, K=64 x 4 stages, persistent \
          over {} clusters, grouped at {}",
         gemm::MAX_CLUSTERS,
         gemm::GROUP

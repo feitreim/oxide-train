@@ -141,8 +141,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = Tcgen05Gemm::load(&context)?;
 
     println!(
-        "model-shape GEMMs, MxKxN, {} clusters persistent (tiles = M/256 * N/256)",
-        gemm::MAX_CLUSTERS
+        "model-shape GEMMs, MxKxN, {} clusters persistent (tiles = M/{} * N/{})",
+        gemm::MAX_CLUSTERS,
+        gemm::TC_M_TILE,
+        gemm::TC_N_ITEM
     );
     #[cfg(feature = "cublas")]
     println!("  denominator: {}", gemm::cublaslt::about());
@@ -311,7 +313,7 @@ fn run_case(
         )
     };
     let config = tcgen05_launch_config(m, n, k);
-    let tiles = (m / 256) * (n / 256);
+    let tiles = (m / gemm::TC_M_TILE) * (n / gemm::TC_N_ITEM);
 
     // One clean launch into a zeroed `C` before anything is timed: the
     // accumulating modes fold, so the agreement check has to know the fold
