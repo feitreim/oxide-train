@@ -14,12 +14,30 @@
 //! `barrier.cluster` rather than `bar.sync`.
 //!
 //! The grid is **persistent** — [`MAX_CLUSTERS`] clusters, two CTAs an SM — and
-//! one work item is one `[2·BLOCK_M, BLOCK_N]` output tile.
-//! [`pipeline::run`] hands out item indices and [`pipeline::grouped`] maps them
-//! to tiles in blocks of [`GROUP`] tile-rows. K is [`STAGES`] deep over a pair
-//! of tile rings; the TMA fills `load` and the MMA's own commit releases `free`,
-//! so what proves an operand has been read is the accumulator instruction and
-//! not a thread.
+//! one work item is one `[2·BLOCK_M, BLOCK_N]` output tile. Each of the three
+//! roles walks the static strided schedule for itself ([`Walk`]) and
+//! [`pipeline::grouped`] maps an item to a tile in blocks of [`GROUP`]
+//! tile-rows. K is [`STAGES`] deep over a pair of tile rings; the TMA fills
+//! `load` and the MMA's own commit releases `free`, so what proves an operand
+//! has been read is the accumulator instruction and not a thread.
+//!
+//! ## There is no item boundary
+//!
+//! This kernel used to run on [`pipeline::run`], which re-arms every mbarrier
+//! on one thread and takes two `cluster_sync`s per item. oxide-train#80's
+//! forensics priced that at **~6 300 SM ticks an item** — 3.6 µs, K-independent,
+//! and 10% of a K = 3072 item — against a cuBLASLt whose own depth fit has *no*
+//! per-item term at all. So the barriers are armed **once per launch**, the
+//! operand ring is indexed by the **global** K block rather than the item's own,
+//! and the item stream is two semaphore rings deep ([`ITEMS`]): `full` says an
+//! item's MMA chain is complete, `empty` says its accumulator has been read.
+//! Nothing in the loop is cluster-wide, and the producer crosses an item
+//! boundary with [`STAGES`] blocks still in flight.
+//!
+//! The same forensics is why nothing else changed: the steady state measured
+//! **1001 ticks a K block — 97% of the B200's dense bf16 peak, and 8.5% ahead
+//! of cuBLASLt's own slope** — and the pipeline fill measured 160 ticks. Depth,
+//! tile and feed were never the deficit.
 //!
 //! ## What replaced what
 //!
@@ -28,8 +46,8 @@
 //! four-stage pipeline over eight `SharedArray` statics, six warps (a TMA warp,
 //! an MMA warp and four epilogue warps), and an inert two-slot TMEM ping-pong
 //! left over from a CLC schedule it had removed. All of that is gone: the ring
-//! is a [`SharedTileRing`] over a [`SharedPlan`], the schedule is
-//! [`pipeline::run`], and the epilogue warps are the CTA's four band warps —
+//! is a [`SharedTileRing`] over a [`SharedPlan`], the schedule is [`Walk`] and
+//! the two item rings, and the epilogue warps are the CTA's four band warps —
 //! joined, since oxide-train#80 remedy 2, by one scheduler warp that produces
 //! and multiplies so the band warps never block the schedule.
 //!
@@ -52,7 +70,7 @@
 //! double-buffer loses more to its solo feed than the drain costs (ferro
 //! #188's floor). So the cover comes from **inside** the item stream: the
 //! epilogue is deferred one item, each drain releases the accumulator's
-//! columns through `Release` the moment its last `tcgen05.ld` retires, and
+//! columns through [`Release`] the moment its last `tcgen05.ld` retires, and
 //! the store tail plus the whole next TMA fill run beside the next MMA.
 //!
 //! Within a pass the drain keeps the shape #116/#117 measured: TMEM → registers
@@ -85,17 +103,17 @@
 
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{DisjointSlice, cluster, cluster_launch, kernel, warp};
+use cuda_device::{DisjointSlice, cluster, cluster_launch, kernel, thread, warp};
 use cuda_host::cuda_module;
 
 use kittens::epilogue::{StoreRing, Warp};
 use kittens::global::{GlobalRows, accumulate_shared_rows, store_rows, store_shared_rows};
 use kittens::ldst::{scatter_tile, store_tile_x4};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
-use kittens::pipeline::{self, Job};
+use kittens::pipeline;
 use kittens::plan::SharedPlan;
-use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B};
-use kittens::sync::{ClusterSemaphore, Semaphore, SemaphoreRing};
+use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B, publish_to_async_proxy};
+use kittens::sync::{ClusterSemaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
 use kittens::{BaseLdtm, RegTile, lane, warp_id};
 
@@ -137,8 +155,8 @@ const ISSUER: u32 = PRODUCER + 1;
 const STAGE_N: usize = 64;
 /// CTAs of the cluster that share one accumulator and one barrier set.
 ///
-/// Named for the pair rather than `RANKS` so `Job::RANKS` can be written
-/// beside it without either shadowing the other.
+/// Named for the pair rather than `RANKS` because the launch's own rank count
+/// is spelled by `#[cluster_launch]` and these two must agree.
 const CLUSTER_RANKS: u32 = 2;
 const PAIR: u16 = ((1u32 << CLUSTER_RANKS) - 1) as u16;
 const LEADER: u32 = 0;
@@ -174,13 +192,23 @@ pub const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / CLUSTER_RANKS;
 /// #89 — a tile change is a reason to re-run that sweep.
 pub const GROUP: u32 = 8;
 
+/// Items the accumulator handoff holds at once.
+///
+/// Two, and provably enough rather than a margin: the MMA of item `i` waits
+/// `empty(i)`, which a drain arrives at only after `full(i - 1)`, so the issuer
+/// is never more than one item ahead of the epilogue and a slot's previous user
+/// is two items back. One accumulator is what makes that argument short — it is
+/// [`kittens::sync::handoff::depth_needed`]'s chain with the queue removed,
+/// since the schedule is static and no item has to be published.
+const ITEMS: usize = 2;
+
 struct Shared {
     a_ring: Ring,
     b_ring: Ring,
     load: SemaphoreRing<STAGES>,
     free: SemaphoreRing<STAGES>,
-    done: Semaphore,
-    acc_free: Semaphore,
+    full: SemaphoreRing<ITEMS>,
+    empty: SemaphoreRing<ITEMS>,
     tmem_slot: *mut u32,
     plan: SharedPlan,
 }
@@ -191,16 +219,16 @@ const fn shared(at: SharedPlan) -> Shared {
     let (b_ring, at) = at.tile_ring::<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>();
     let (load, at) = at.semaphores::<STAGES>();
     let (free, at) = at.semaphores::<STAGES>();
-    let (done, at) = at.semaphore();
-    let (acc_free, at) = at.semaphore();
+    let (full, at) = at.semaphores::<ITEMS>();
+    let (empty, at) = at.semaphores::<ITEMS>();
     let (tmem_slot, at) = at.tmem_slot();
     Shared {
         a_ring,
         b_ring,
         load,
         free,
-        done,
-        acc_free,
+        full,
+        empty,
         tmem_slot,
         plan: at,
     }
@@ -222,7 +250,7 @@ pub const SHARED_BYTES: usize = staged(shared(SharedPlan::sizing()).plan).1.byte
 
 const _: () = {
     assert!(THREADS == 192 && MAX_CLUSTERS == 148);
-    // `acc_free` costs the plan nothing: the eight bytes land in the
+    // The item rings cost the plan nothing: their thirty-two bytes land in the
     // 128-byte alignment padding in front of the staging tiles.
     assert!(SHARED_BYTES == 114_816 && SHARED_BYTES <= 116_736);
     assert!(
@@ -236,15 +264,13 @@ const _: () = {
 /// The deferred epilogue's whole point (oxide-train#80 remedy 2): the next
 /// item's MMA needs the accumulator's *columns*, not its values in `C`, so a
 /// drain that has retired its last `tcgen05.ld` hands the columns back through
-/// the leader's `acc_free` barrier and issues the stores it still owes behind
-/// the release. Between the fence and the arrival every lane of the warp
-/// synchronizes, so one lane's arrival covers thirty-two lanes' loads.
+/// the leader's `empty` barrier for the *next* item and issues the stores it
+/// still owes behind the release. Between the fence and the arrival every lane
+/// of the warp synchronizes, so one lane's arrival covers thirty-two lanes'
+/// loads.
 #[derive(Clone, Copy)]
 struct Release {
     sem: ClusterSemaphore,
-    /// The teardown drain after the item loop runs on invalidated barriers,
-    /// so it fences and arrives nowhere.
-    live: bool,
 }
 
 impl Release {
@@ -257,7 +283,7 @@ impl Release {
         unsafe {
             tcgen05_fence_before_thread_sync();
             warp::sync_mask(u32::MAX);
-            if self.live && lane() == 0 {
+            if lane() == 0 {
                 self.sem.arrive();
             }
         }
@@ -508,7 +534,6 @@ struct Tile<D: Drain> {
     b_ring: Ring,
     load: SemaphoreRing<STAGES>,
     free: SemaphoreRing<STAGES>,
-    done: Semaphore,
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
     accumulator: Accumulator,
@@ -519,88 +544,242 @@ struct Tile<D: Drain> {
     k_blocks: u32,
     transposed: bool,
     rank: u32,
-    acc_free: Semaphore,
-    /// The item whose accumulator is still in tensor memory, plus one — the
-    /// deferred epilogue's cursor, `0` before the first item. Register state,
-    /// advanced by every thread in lockstep.
-    pending: u32,
+    full: SemaphoreRing<ITEMS>,
+    empty: SemaphoreRing<ITEMS>,
+}
+
+/// The items one cluster owns, in order: the static strided schedule
+/// [`pipeline::run`] used to hand out, now walked by each role for itself.
+///
+/// Every role has to agree on the sequence without a rendezvous, which it does
+/// because the walk is a closed form of the cluster's index and nothing about
+/// it is dynamic. That is the whole reason this kernel needs no item mailbox:
+/// `gemm_sol`'s `SharedCellRing` exists to publish tiles a CLC query hands out,
+/// and these are not handed out.
+#[derive(Clone, Copy)]
+struct Walk {
+    item: u32,
+    items: u32,
+    stride: u32,
+}
+
+impl Walk {
+    #[inline(always)]
+    fn open(items: u32) -> Self {
+        Self {
+            item: cluster::cluster_idx(),
+            items,
+            stride: cluster::num_clusters(),
+        }
+    }
+
+    /// This cluster's next item, and `None` when it has run out.
+    #[inline(always)]
+    fn next(&mut self) -> Option<u32> {
+        if self.item >= self.items {
+            return None;
+        }
+        let item = self.item;
+        self.item += self.stride;
+        Some(item)
+    }
 }
 
 impl<D: Drain> Tile<D> {
+    /// Every TMA this cluster will issue, in one uninterrupted loop.
+    ///
+    /// The ring index is the **global** K block — `sequence * k_blocks + k`,
+    /// carried rather than recomputed — so the only thing between the last
+    /// stage of an item and the first stage of the next is `free`, and the
+    /// producer is [`STAGES`] blocks ahead of the MMA across the item boundary
+    /// exactly as it is inside one. That is the boundary oxide-train#80's
+    /// forensics priced at ~6 300 SM ticks an item: there is nothing left of it
+    /// to pay.
+    ///
     /// # Safety
-    /// One thread of the CTA, once per item.
+    /// One thread of the CTA, once per launch.
     #[inline(always)]
-    unsafe fn produce(&self, tile_m: u32, tile_n: u32) {
+    unsafe fn produce(&self, mut walk: Walk) {
         unsafe {
-            // All four of the pair's tiles complete on the leader's copy of the
-            // stage barrier, and only the leader charges it: `expect_tx` is
-            // `.shared::cta`, so a peer could not charge that barrier even
-            // holding its address. Both ranks derive the same half-stage charge
-            // from the loads they just issued; the leader scales its own by
-            // `RANKS` to cover the peer's, and the peer drops it.
-            let a_line = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank) as i32;
-            let b_line = (BLOCK_N as u32 * tile_n + HALF_N as u32 * self.rank) as i32;
-            let mut k = 0u32;
-            while k < self.k_blocks {
-                self.free.wait_recycled(k);
-                let stage = self.load.sem(k).at_rank(LEADER);
-                let depth = (BLOCK_K as u32 * k) as i32;
-                let (a, b) = (self.a_ring.tile(k), self.b_ring.tile(k));
-                // The map's fast axis dictates the coordinate order: a K-major
-                // operand is one box at `(k, mn)`, an MN-major one a box per
-                // 64-wide subtile at `(mn, k)`. Same transaction bytes either
-                // way, so the charge does not depend on the branch.
-                let bytes = if self.transposed {
-                    MnStage::from_raw(a.base())
-                        .tma_load_2d_arriving_at(self.a_map, a_line, depth, stage)
-                        + MnStage::from_raw(b.base())
-                            .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage)
-                } else {
-                    a.tma_load_2d_arriving_at(self.a_map, depth, a_line, stage)
-                        + b.tma_load_2d_arriving_at(self.b_map, depth, b_line, stage)
-                };
-                if self.rank == LEADER {
-                    self.load
-                        .sem(k)
-                        .expect_tx(bytes.across_ranks(CLUSTER_RANKS));
+            let mut stage_index = 0u32;
+            while let Some(item) = walk.next() {
+                let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP);
+                // All four of the pair's tiles complete on the leader's copy of
+                // the stage barrier, and only the leader charges it:
+                // `expect_tx` is `.shared::cta`, so a peer could not charge that
+                // barrier even holding its address. Both ranks derive the same
+                // half-stage charge from the loads they just issued; the leader
+                // scales its own by `RANKS` to cover the peer's, and the peer
+                // drops it.
+                let a_line = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank) as i32;
+                let b_line = (BLOCK_N as u32 * tile_n + HALF_N as u32 * self.rank) as i32;
+                let mut k = 0u32;
+                while k < self.k_blocks {
+                    self.free.wait_recycled(stage_index);
+                    let stage = self.load.sem(stage_index).at_rank(LEADER);
+                    let depth = (BLOCK_K as u32 * k) as i32;
+                    let (a, b) = (self.a_ring.tile(stage_index), self.b_ring.tile(stage_index));
+                    // The map's fast axis dictates the coordinate order: a
+                    // K-major operand is one box at `(k, mn)`, an MN-major one a
+                    // box per 64-wide subtile at `(mn, k)`. Same transaction
+                    // bytes either way, so the charge does not depend on the
+                    // branch.
+                    let bytes = if self.transposed {
+                        MnStage::from_raw(a.base())
+                            .tma_load_2d_arriving_at(self.a_map, a_line, depth, stage)
+                            + MnStage::from_raw(b.base())
+                                .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage)
+                    } else {
+                        a.tma_load_2d_arriving_at(self.a_map, depth, a_line, stage)
+                            + b.tma_load_2d_arriving_at(self.b_map, depth, b_line, stage)
+                    };
+                    if self.rank == LEADER {
+                        self.load
+                            .sem(stage_index)
+                            .expect_tx(bytes.across_ranks(CLUSTER_RANKS));
+                    }
+                    k += 1;
+                    stage_index += 1;
                 }
-                k += 1;
             }
         }
     }
 
+    /// Every MMA this cluster will issue. An item opens by waiting the
+    /// accumulator `empty` — which the previous item's drain arrives at the
+    /// moment its last `tcgen05.ld` retires — and closes by committing `full`,
+    /// which is what lets the band warps read it.
+    ///
     /// # Safety
-    /// One thread of the leader rank, with the accumulator's previous contents
-    /// already read: only the first stage of an item starts it fresh.
+    /// One thread of the leader rank, once per launch.
     #[inline(always)]
-    unsafe fn multiply(&self) {
+    unsafe fn multiply(&self, mut walk: Walk) {
         unsafe {
-            let mut k = 0u32;
-            while k < self.k_blocks {
-                self.load.wait(k);
-                let (a, b) = (self.a_ring.tile(k), self.b_ring.tile(k));
-                // A select on the walk, not a duplicated MMA chain: an
-                // `OperandWalk` carries its own transpose bit, so both layouts
-                // issue through one loop.
-                let (a_walk, b_walk) = if self.transposed {
-                    (
-                        MnStage::from_raw(a.base()).mn_walk(),
-                        MnStage::from_raw(b.base()).mn_walk(),
-                    )
-                } else {
-                    (a.k_walk(), b.k_walk())
-                };
-                mma_walk_cg2::<Bf16, CHUNKS>(
-                    self.accumulator.raw(),
-                    a_walk,
-                    b_walk,
-                    MmaShape::M256_N256,
-                    k > 0,
-                );
-                commit_multicast_cg2(self.free.sem(k), PAIR);
-                k += 1;
+            let mut sequence = 0u32;
+            let mut stage_index = 0u32;
+            while walk.next().is_some() {
+                self.empty.wait(sequence);
+                let mut k = 0u32;
+                while k < self.k_blocks {
+                    self.load.wait(stage_index);
+                    let (a, b) = (self.a_ring.tile(stage_index), self.b_ring.tile(stage_index));
+                    // A select on the walk, not a duplicated MMA chain: an
+                    // `OperandWalk` carries its own transpose bit, so both
+                    // layouts issue through one loop.
+                    let (a_walk, b_walk) = if self.transposed {
+                        (
+                            MnStage::from_raw(a.base()).mn_walk(),
+                            MnStage::from_raw(b.base()).mn_walk(),
+                        )
+                    } else {
+                        (a.k_walk(), b.k_walk())
+                    };
+                    mma_walk_cg2::<Bf16, CHUNKS>(
+                        self.accumulator.raw(),
+                        a_walk,
+                        b_walk,
+                        MmaShape::M256_N256,
+                        k > 0,
+                    );
+                    commit_multicast_cg2(self.free.sem(stage_index), PAIR);
+                    k += 1;
+                    stage_index += 1;
+                }
+                commit_multicast_cg2(self.full.sem(sequence), PAIR);
+                sequence += 1;
             }
-            commit_multicast_cg2(self.done, PAIR);
+        }
+    }
+
+    /// Every epilogue this cluster will run: wait the item's MMA out, lift the
+    /// band, hand the accumulator's columns to the *next* item through `empty`,
+    /// and store behind the release.
+    ///
+    /// The pre-arrival is the first item's: nothing has written the accumulator
+    /// yet, so its columns are free before the loop starts. It is a plain
+    /// arrival rather than a [`Release`] because there is no `tcgen05.ld` in
+    /// front of it to fence.
+    ///
+    /// # Safety
+    /// Every lane of every band warp of both ranks, once per launch.
+    #[inline(always)]
+    unsafe fn epilogue(&self, mut walk: Walk) {
+        unsafe {
+            if lane() == 0 {
+                self.empty.sem(0).at_rank(LEADER).arrive();
+            }
+            let mut sequence = 0u32;
+            while let Some(item) = walk.next() {
+                self.full.wait(sequence);
+                let (row, column) = self.origin(item);
+                let release = Release {
+                    sem: self.empty.sem(sequence + 1).at_rank(LEADER),
+                };
+                self.out
+                    .drain(self.accumulator, self.stage, row, column, release);
+                sequence += 1;
+            }
+        }
+    }
+
+    /// Arm every barrier for the whole launch, publish the write to the async
+    /// proxy, and rendezvous — the only cluster-wide synchronization the item
+    /// stream has, and it happens once.
+    ///
+    /// # Safety
+    /// Every thread of both ranks, before any role starts.
+    #[inline(always)]
+    unsafe fn arm(&self) {
+        unsafe {
+            if thread::threadIdx_x() == 0 {
+                self.load.init_all(1);
+                self.free.init_all(1);
+                self.full.init_all(1);
+                // One arrival per band warp per rank: the MMA writes both ranks'
+                // tensor memory, so it waits for both ranks' drains.
+                self.empty.init_all(DRAIN_WARPS as u32 * CLUSTER_RANKS);
+                publish_to_async_proxy();
+            }
+            cluster::cluster_sync();
+        }
+    }
+
+    /// # Safety
+    /// Every thread of both ranks, with every role's loop finished.
+    #[inline(always)]
+    unsafe fn retire(&self) {
+        unsafe {
+            tcgen05_fence_before_thread_sync();
+            cluster::cluster_sync();
+            if thread::threadIdx_x() == 0 {
+                self.load.inval_all();
+                self.free.inval_all();
+                self.full.inval_all();
+                self.empty.inval_all();
+            }
+        }
+    }
+
+    /// The three roles, each walking the same static schedule for itself.
+    ///
+    /// # Safety
+    /// Every thread of both ranks, between [`Tile::arm`] and [`Tile::retire`].
+    #[inline(always)]
+    unsafe fn run(&self, items: u32) {
+        unsafe {
+            let walk = Walk::open(items);
+            let warp = warp_id();
+            if warp == PRODUCER {
+                if lane() == 0 {
+                    self.produce(walk);
+                }
+            } else if warp == ISSUER {
+                if self.rank == LEADER && lane() == 0 {
+                    self.multiply(walk);
+                }
+            } else {
+                self.epilogue(walk);
+            }
         }
     }
 
@@ -613,83 +792,6 @@ impl<D: Drain> Tile<D> {
             2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * warp_id(),
             BLOCK_N as u32 * tile_n,
         )
-    }
-}
-
-impl<D: Drain> Job for Tile<D> {
-    const RANKS: u32 = CLUSTER_RANKS;
-
-    /// # Safety
-    /// As [`Semaphore::init`].
-    #[inline(always)]
-    unsafe fn init(&self, _item: u32) {
-        unsafe {
-            self.load.init_all(1);
-            self.free.init_all(1);
-            self.done.init(1);
-            // One arrival per band warp per rank: the MMA writes both ranks'
-            // tensor memory, so it waits for both ranks' drains.
-            self.acc_free.init(DRAIN_WARPS as u32 * CLUSTER_RANKS);
-        }
-    }
-
-    /// # Safety
-    /// As [`Semaphore::inval`].
-    #[inline(always)]
-    unsafe fn inval(&self) {
-        unsafe {
-            self.load.inval_all();
-            self.free.inval_all();
-            self.done.inval();
-            self.acc_free.inval();
-        }
-    }
-
-    /// # Safety
-    /// Every thread of both CTAs of the cluster must enter with the same
-    /// `item`, and the maps must cover the tile it names — and the one before
-    /// it, whose drain this item runs.
-    ///
-    /// The epilogue is **deferred one item** (the load-compute-store-finish
-    /// form `pipeline::Job`'s doc sanctions): the band warps open item `i` by
-    /// draining item `i - 1`'s accumulator, releasing its columns to this
-    /// item's MMA the moment their loads retire, and close it waiting out this
-    /// item's `done` — so the barrier the boundary re-arms has completed
-    /// inside the item that armed it, and what runs beside the MMA is the
-    /// previous drain's store tail plus this item's whole TMA fill.
-    #[inline(always)]
-    unsafe fn work(&mut self, item: u32) {
-        unsafe {
-            let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP);
-            let (warp, lane) = (warp_id(), lane());
-
-            if warp == PRODUCER {
-                if lane == 0 {
-                    self.produce(tile_m, tile_n);
-                }
-            } else if warp == ISSUER {
-                if self.rank == LEADER && lane == 0 {
-                    self.acc_free.wait(0);
-                    self.multiply();
-                }
-            } else {
-                let release = Release {
-                    sem: self.acc_free.at_rank(LEADER),
-                    live: true,
-                };
-                if self.pending == 0 {
-                    // Nothing to read: the first item's accumulator is free
-                    // the moment the barrier says so.
-                    release.now();
-                } else {
-                    let (row, column) = self.origin(self.pending - 1);
-                    self.out
-                        .drain(self.accumulator, self.stage, row, column, release);
-                }
-                self.done.wait(0);
-            }
-            self.pending = item + 1;
-        }
     }
 }
 
@@ -720,7 +822,6 @@ pub mod kernels {
                 b_ring: shared.b_ring,
                 load: shared.load,
                 free: shared.free,
-                done: shared.done,
                 a_map,
                 b_map,
                 accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, BLOCK_N as u32)),
@@ -731,46 +832,27 @@ pub mod kernels {
                 k_blocks,
                 transposed,
                 rank: cluster::block_rank(),
-                acc_free: shared.acc_free,
-                pending: 0,
+                full: shared.full,
+                empty: shared.empty,
             }
         }
     }
 
-    /// Drain the accumulator the deferred epilogue still holds after the item
-    /// loop — the last item's, which `work` waited complete but did not read.
-    /// `pipeline::run` has already invalidated the barriers, so this drain
-    /// releases nothing and nobody waits on it: [`release`]'s own
-    /// `cluster_sync` is what keeps the columns alive until the reads retire.
+    /// Run every item this cluster owns, from the one barrier arming to the
+    /// one teardown — the whole schedule, in the three lines it now is.
     ///
     /// # Safety
-    /// After [`pipeline::run`] returns and before [`release`], every thread.
+    /// Every thread of both ranks, once, with `tile` attached.
     #[inline(always)]
-    unsafe fn drain_last<D: Drain>(tile: &Tile<D>) {
+    unsafe fn sweep<D: Drain>(tile: &Tile<D>, items: u32) {
         unsafe {
-            if tile.pending != 0 && warp_id() < DRAIN_WARPS as u32 {
-                let (row, column) = tile.origin(tile.pending - 1);
-                let release = Release {
-                    sem: tile.acc_free.at_rank(LEADER),
-                    live: false,
-                };
-                tile.out
-                    .drain(tile.accumulator, tile.stage, row, column, release);
-            }
-        }
-    }
-
-    /// # Safety
-    /// Every thread of every rank must arrive, with the accumulator's last
-    /// reader retired.
-    #[inline(always)]
-    unsafe fn release<D: Drain>(tile: &Tile<D>) {
-        unsafe {
-            // The item boundary already retired the pair's reads; this
-            // `cluster_sync` is for the cluster that got no items at all, which
-            // a capped grid can leave having allocated and never looped.
-            tcgen05_fence_before_thread_sync();
-            cluster::cluster_sync();
+            tile.arm();
+            tile.run(items);
+            // `retire`'s `cluster_sync` is also what covers the cluster that got
+            // no items at all, which a capped grid can leave having allocated
+            // and never looped, and what keeps the accumulator's columns alive
+            // until the last drain's reads retire.
+            tile.retire();
             dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
         }
     }
@@ -814,7 +896,7 @@ pub mod kernels {
                 c: GlobalRows::<Bf16>::from_raw(c.as_mut_ptr() as *mut u8, n as usize),
                 fold: mode % 2 == 1,
             };
-            let mut tile = attach(
+            let tile = attach(
                 a_map,
                 b_map,
                 tiles_m,
@@ -823,9 +905,7 @@ pub mod kernels {
                 transposed != 0,
                 out,
             );
-            pipeline::run(&mut tile, tiles_m * tiles_n);
-            drain_last(&tile);
-            release(&tile);
+            sweep(&tile, tiles_m * tiles_n);
         }
     }
 
@@ -856,7 +936,7 @@ pub mod kernels {
             let out = Wide {
                 c: GlobalRows::<F32>::from_raw(c.as_mut_ptr().add(c_offset) as *mut u8, n as usize),
             };
-            let mut tile = attach(
+            let tile = attach(
                 a_map,
                 b_map,
                 tiles_m,
@@ -865,9 +945,7 @@ pub mod kernels {
                 transposed != 0,
                 out,
             );
-            pipeline::run(&mut tile, tiles_m * tiles_n);
-            drain_last(&tile);
-            release(&tile);
+            sweep(&tile, tiles_m * tiles_n);
         }
     }
 
@@ -899,7 +977,7 @@ pub mod kernels {
         transposed: u32,
     ) {
         unsafe {
-            let mut tile = attach(
+            let tile = attach(
                 a_map,
                 b_map,
                 tiles_m,
@@ -908,9 +986,7 @@ pub mod kernels {
                 transposed != 0,
                 Reduce { c_map },
             );
-            pipeline::run(&mut tile, tiles_m * tiles_n);
-            drain_last(&tile);
-            release(&tile);
+            sweep(&tile, tiles_m * tiles_n);
         }
     }
 

@@ -367,15 +367,11 @@ fn phases(
     })?;
 
     // The median cluster, not the mean: the strided schedule leaves a few
-    // clusters one item short and a tail cluster's phases are not the steady
-    // state.
+    // clusters one item short, and the kernel already divided each counter by
+    // the items that cluster ran.
     let median = |slot: usize| -> f64 {
         let mut per_item: Vec<f64> = (0..clusters)
-            .map(|cluster| {
-                let block = &counters[device::COUNTERS * cluster..][..device::COUNTERS];
-                let items = block[device::ITEMS].max(1) as f64;
-                block[slot] as f64 / items
-            })
+            .map(|cluster| counters[device::COUNTERS * cluster + slot] as f64)
             .collect();
         per_item.sort_by(f64::total_cmp);
         per_item[clusters / 2]
@@ -389,23 +385,18 @@ fn phases(
         100.0 * (store - bare) / bare,
         100.0 * (floor - store) / store
     );
-    let item = median(device::PRE) + median(device::WORK) + median(device::POST);
+    let item = median(device::SPAN);
     println!(
-        "    items/cluster {:.1}   item {item:.0} ticks = PRE {:.0} + WORK {:.0} + POST {:.0}   \
-         (loop span/item {:.0})",
+        "    items/cluster {:.0}   item {item:.0} ticks   issuer: ACC {:.0} + MMA {:.0} (of which \
+         FILL {:.0}, FEED {:.0})",
         median(device::ITEMS),
-        median(device::PRE),
-        median(device::WORK),
-        median(device::POST),
-        median(device::SPAN),
-    );
-    println!(
-        "    issuer: ACC {:.0} + MMA {:.0} (of which FILL {:.0}, FEED {:.0})   producer: PROD \
-         {:.0} (FREE {:.0})   band: DRAIN {:.0}, DONE {:.0}",
         median(device::ACC),
         median(device::MMA),
         median(device::FILL),
         median(device::FEED),
+    );
+    println!(
+        "    producer: PROD {:.0} (FREE {:.0})   band: DRAIN {:.0}, DONE {:.0}",
         median(device::PROD),
         median(device::FREE),
         median(device::DRAIN),
@@ -415,16 +406,15 @@ fn phases(
     // which is more honest than assuming a boost clock.
     let per_tick = store * 1_000.0 / (tiles_m * tiles_n) as f64 * clusters as f64 / item;
     println!(
-        "    at {:.4} us/kilotick: PRE {:.2} us, ACC {:.2} us, FILL {:.2} us, FEED {:.2} us, \
-         DRAIN {:.2} us, DONE {:.2} us, POST {:.2} us",
+        "    at {:.4} us/kilotick: ACC {:.2} us, FILL {:.2} us, FEED {:.2} us, DRAIN {:.2} us, \
+         DONE {:.2} us, item {:.2} us",
         per_tick * 1000.0,
-        median(device::PRE) * per_tick,
         median(device::ACC) * per_tick,
         median(device::FILL) * per_tick,
         median(device::FEED) * per_tick,
         median(device::DRAIN) * per_tick,
         median(device::DONE) * per_tick,
-        median(device::POST) * per_tick,
+        item * per_tick,
     );
     Ok(())
 }

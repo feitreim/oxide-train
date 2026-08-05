@@ -13,19 +13,15 @@
 //! while their deep-K siblings reach 0.95–0.97, and the store-vs-fold
 //! decomposition never isolated what shallow K pays extra. Per item the loop is
 //!
-//! ```text
-//!   inval + init (leader thread) → cluster_sync → work → fence → cluster_sync
-//! ```
-//!
-//! and `work` is: the band warps drain item `i-1` and release the accumulator,
-//! the issuer waits that release and walks `k_blocks` MMAs each gated on its
-//! stage's TMA, the producer issues those TMAs. Every one of those waits is a
-//! candidate for the fixed per-item term, and they are separated here:
+//! and each role runs one uninterrupted loop: the band warps wait an item's
+//! MMA out, drain it and release the accumulator to the next item; the issuer
+//! waits that release and walks `k_blocks` MMAs each gated on its stage's TMA;
+//! the producer issues those TMAs across item boundaries. Every one of those
+//! waits is a candidate for the residual per-item term, and they are separated
+//! here:
 //!
 //! | counter | phase |
 //! |---|---|
-//! | [`PRE`] | the leader's `inval`+`init` and the opening `cluster_sync` |
-//! | [`POST`] | the closing tcgen05 fence and `cluster_sync` |
 //! | [`ACC`] | the issuer waiting the previous drain's release |
 //! | [`FILL`] | the issuer waiting stage 0 — the **pipeline fill**, per item |
 //! | [`FEED`] | the issuer waiting stages 1.. — the **steady-state feed stall** |
@@ -51,7 +47,7 @@ use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline;
 use kittens::plan::SharedPlan;
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B, publish_to_async_proxy};
-use kittens::sync::{ClusterSemaphore, Semaphore, SemaphoreRing};
+use kittens::sync::{ClusterSemaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
 use kittens::{BaseLdtm, RegTile, lane, warp_id};
 
@@ -86,9 +82,6 @@ pub const GROUP: u32 = 8;
 pub const COUNTERS: usize = 16;
 /// Items this cluster ran — every other counter divides by it.
 pub const ITEMS: usize = 0;
-pub const PRE: usize = 1;
-pub const POST: usize = 2;
-pub const WORK: usize = 3;
 pub const ACC: usize = 4;
 pub const FILL: usize = 5;
 pub const FEED: usize = 6;
@@ -100,13 +93,15 @@ pub const DONE: usize = 11;
 /// First `clock64` to last, over the whole item loop.
 pub const SPAN: usize = 12;
 
+const ITEMS_DEEP: usize = 2;
+
 struct Shared {
     a_ring: Ring,
     b_ring: Ring,
     load: SemaphoreRing<STAGES>,
     free: SemaphoreRing<STAGES>,
-    done: Semaphore,
-    acc_free: Semaphore,
+    full: SemaphoreRing<ITEMS_DEEP>,
+    empty: SemaphoreRing<ITEMS_DEEP>,
     tmem_slot: *mut u32,
     plan: SharedPlan,
 }
@@ -117,16 +112,16 @@ const fn shared(at: SharedPlan) -> Shared {
     let (b_ring, at) = at.tile_ring::<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>();
     let (load, at) = at.semaphores::<STAGES>();
     let (free, at) = at.semaphores::<STAGES>();
-    let (done, at) = at.semaphore();
-    let (acc_free, at) = at.semaphore();
+    let (full, at) = at.semaphores::<ITEMS_DEEP>();
+    let (empty, at) = at.semaphores::<ITEMS_DEEP>();
     let (tmem_slot, at) = at.tmem_slot();
     Shared {
         a_ring,
         b_ring,
         load,
         free,
-        done,
-        acc_free,
+        full,
+        empty,
         tmem_slot,
         plan: at,
     }
@@ -167,7 +162,6 @@ impl Clocks {
 #[derive(Clone, Copy)]
 struct Release {
     sem: ClusterSemaphore,
-    live: bool,
 }
 
 impl Release {
@@ -176,7 +170,7 @@ impl Release {
         unsafe {
             tcgen05_fence_before_thread_sync();
             warp::sync_mask(u32::MAX);
-            if self.live && lane() == 0 {
+            if lane() == 0 {
                 self.sem.arrive();
             }
         }
@@ -224,7 +218,6 @@ struct Tile {
     b_ring: Ring,
     load: SemaphoreRing<STAGES>,
     free: SemaphoreRing<STAGES>,
-    done: Semaphore,
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
     accumulator: Accumulator,
@@ -234,10 +227,11 @@ struct Tile {
     k_blocks: u32,
     transposed: bool,
     rank: u32,
-    acc_free: Semaphore,
+    full: SemaphoreRing<ITEMS_DEEP>,
+    empty: SemaphoreRing<ITEMS_DEEP>,
 }
 
-/// One role's tick totals, kept in registers across the item loop.
+/// One role's tick totals, kept in registers across its loop.
 #[derive(Clone, Copy, Default)]
 struct Sums {
     span: u32,
@@ -245,81 +239,150 @@ struct Sums {
     rest: u32,
 }
 
+/// `optimized::Walk`, verbatim.
+#[derive(Clone, Copy)]
+struct Walk {
+    item: u32,
+    items: u32,
+    stride: u32,
+}
+
+impl Walk {
+    #[inline(always)]
+    fn open(items: u32) -> Self {
+        Self {
+            item: cluster::cluster_idx(),
+            items,
+            stride: cluster::num_clusters(),
+        }
+    }
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<u32> {
+        if self.item >= self.items {
+            return None;
+        }
+        let item = self.item;
+        self.item += self.stride;
+        Some(item)
+    }
+}
+
 impl Tile {
     /// The producer, with `free.wait_recycled` timed: `sums.span` is the whole
     /// span and `sums.rest` the back-pressure inside it.
     #[inline(always)]
-    unsafe fn produce(&self, tile_m: u32, tile_n: u32, sums: &mut Sums) {
+    unsafe fn produce(&self, mut walk: Walk, sums: &mut Sums) {
         unsafe {
             let opened = clock64();
-            let a_line = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank) as i32;
-            let b_line = (BLOCK_N as u32 * tile_n + HALF_N as u32 * self.rank) as i32;
-            let mut k = 0u32;
-            while k < self.k_blocks {
-                let waited = clock64();
-                self.free.wait_recycled(k);
-                sums.rest += clock64().wrapping_sub(waited) as u32;
-                let stage = self.load.sem(k).at_rank(LEADER);
-                let depth = (BLOCK_K as u32 * k) as i32;
-                let (a, b) = (self.a_ring.tile(k), self.b_ring.tile(k));
-                let bytes = if self.transposed {
-                    MnStage::from_raw(a.base())
-                        .tma_load_2d_arriving_at(self.a_map, a_line, depth, stage)
-                        + MnStage::from_raw(b.base())
-                            .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage)
-                } else {
-                    a.tma_load_2d_arriving_at(self.a_map, depth, a_line, stage)
-                        + b.tma_load_2d_arriving_at(self.b_map, depth, b_line, stage)
-                };
-                if self.rank == LEADER {
-                    self.load
-                        .sem(k)
-                        .expect_tx(bytes.across_ranks(CLUSTER_RANKS));
+            let mut stage_index = 0u32;
+            while let Some(item) = walk.next() {
+                let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP);
+                let a_line = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank) as i32;
+                let b_line = (BLOCK_N as u32 * tile_n + HALF_N as u32 * self.rank) as i32;
+                let mut k = 0u32;
+                while k < self.k_blocks {
+                    let waited = clock64();
+                    self.free.wait_recycled(stage_index);
+                    sums.rest += clock64().wrapping_sub(waited) as u32;
+                    let stage = self.load.sem(stage_index).at_rank(LEADER);
+                    let depth = (BLOCK_K as u32 * k) as i32;
+                    let (a, b) = (self.a_ring.tile(stage_index), self.b_ring.tile(stage_index));
+                    let bytes = if self.transposed {
+                        MnStage::from_raw(a.base())
+                            .tma_load_2d_arriving_at(self.a_map, a_line, depth, stage)
+                            + MnStage::from_raw(b.base())
+                                .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage)
+                    } else {
+                        a.tma_load_2d_arriving_at(self.a_map, depth, a_line, stage)
+                            + b.tma_load_2d_arriving_at(self.b_map, depth, b_line, stage)
+                    };
+                    if self.rank == LEADER {
+                        self.load
+                            .sem(stage_index)
+                            .expect_tx(bytes.across_ranks(CLUSTER_RANKS));
+                    }
+                    k += 1;
+                    stage_index += 1;
                 }
-                k += 1;
             }
             sums.span += clock64().wrapping_sub(opened) as u32;
         }
     }
 
-    /// The MMA chain, with stage 0's wait (`sums.first` — the pipeline fill)
-    /// kept apart from stages 1.. (`sums.rest` — the steady-state feed stall).
-    /// `sums.span` is the whole multiply.
+    /// The MMA chains, with each item's `empty` wait in `acc`, its stage-0 wait
+    /// (the pipeline fill) in `sums.first`, its stages 1.. in `sums.rest`, and
+    /// the multiply itself in `sums.span`.
     #[inline(always)]
-    unsafe fn multiply(&self, sums: &mut Sums) {
+    unsafe fn multiply(&self, mut walk: Walk, acc: &mut u64, sums: &mut Sums) {
         unsafe {
-            let opened = clock64();
-            let mut k = 0u32;
-            while k < self.k_blocks {
+            let mut sequence = 0u32;
+            let mut stage_index = 0u32;
+            while walk.next().is_some() {
                 let waited = clock64();
-                self.load.wait(k);
-                let stalled = clock64().wrapping_sub(waited) as u32;
-                if k == 0 {
-                    sums.first += stalled;
-                } else {
-                    sums.rest += stalled;
+                self.empty.wait(sequence);
+                let opened = clock64();
+                *acc += opened.wrapping_sub(waited);
+                let mut k = 0u32;
+                while k < self.k_blocks {
+                    let waited = clock64();
+                    self.load.wait(stage_index);
+                    let stalled = clock64().wrapping_sub(waited) as u32;
+                    if k == 0 {
+                        sums.first += stalled;
+                    } else {
+                        sums.rest += stalled;
+                    }
+                    let (a, b) = (self.a_ring.tile(stage_index), self.b_ring.tile(stage_index));
+                    let (a_walk, b_walk) = if self.transposed {
+                        (
+                            MnStage::from_raw(a.base()).mn_walk(),
+                            MnStage::from_raw(b.base()).mn_walk(),
+                        )
+                    } else {
+                        (a.k_walk(), b.k_walk())
+                    };
+                    mma_walk_cg2::<Bf16, CHUNKS>(
+                        self.accumulator.raw(),
+                        a_walk,
+                        b_walk,
+                        MmaShape::M256_N256,
+                        k > 0,
+                    );
+                    commit_multicast_cg2(self.free.sem(stage_index), PAIR);
+                    k += 1;
+                    stage_index += 1;
                 }
-                let (a, b) = (self.a_ring.tile(k), self.b_ring.tile(k));
-                let (a_walk, b_walk) = if self.transposed {
-                    (
-                        MnStage::from_raw(a.base()).mn_walk(),
-                        MnStage::from_raw(b.base()).mn_walk(),
-                    )
-                } else {
-                    (a.k_walk(), b.k_walk())
-                };
-                mma_walk_cg2::<Bf16, CHUNKS>(
-                    self.accumulator.raw(),
-                    a_walk,
-                    b_walk,
-                    MmaShape::M256_N256,
-                    k > 0,
-                );
-                commit_multicast_cg2(self.free.sem(k), PAIR);
-                k += 1;
+                commit_multicast_cg2(self.full.sem(sequence), PAIR);
+                sequence += 1;
+                sums.span += clock64().wrapping_sub(opened) as u32;
             }
-            commit_multicast_cg2(self.done, PAIR);
-            sums.span += clock64().wrapping_sub(opened) as u32;
+        }
+    }
+
+    /// The epilogue, with the wait for the item's MMA in `sums.rest` and the
+    /// drain itself in `sums.span`.
+    #[inline(always)]
+    unsafe fn epilogue<const DRAIN_ON: bool>(&self, mut walk: Walk, sums: &mut Sums) {
+        unsafe {
+            if lane() == 0 {
+                self.empty.sem(0).at_rank(LEADER).arrive();
+            }
+            let mut sequence = 0u32;
+            while let Some(item) = walk.next() {
+                let waited = clock64();
+                self.full.wait(sequence);
+                let opened = clock64();
+                sums.rest += opened.wrapping_sub(waited) as u32;
+                let (row, column) = self.origin(item);
+                let release = Release {
+                    sem: self.empty.sem(sequence + 1).at_rank(LEADER),
+                };
+                self.out
+                    .drain::<DRAIN_ON>(self.accumulator, row, column, release);
+                sums.span += clock64().wrapping_sub(opened) as u32;
+                sequence += 1;
+            }
         }
     }
 
@@ -335,135 +398,37 @@ impl Tile {
     #[inline(always)]
     unsafe fn arm(&self) {
         unsafe {
-            self.load.init_all(1);
-            self.free.init_all(1);
-            self.done.init(1);
-            self.acc_free.init(DRAIN_WARPS as u32 * CLUSTER_RANKS);
+            if thread::threadIdx_x() == 0 {
+                self.load.init_all(1);
+                self.free.init_all(1);
+                self.full.init_all(1);
+                self.empty.init_all(DRAIN_WARPS as u32 * CLUSTER_RANKS);
+                publish_to_async_proxy();
+            }
+            cluster::cluster_sync();
         }
     }
 
     #[inline(always)]
-    unsafe fn disarm(&self) {
+    unsafe fn retire(&self) {
         unsafe {
-            self.load.inval_all();
-            self.free.inval_all();
-            self.done.inval();
-            self.acc_free.inval();
-        }
-    }
-}
-
-/// `pipeline::run`'s loop, opened up so the item boundary can be timed
-/// apart from the work it separates. Structurally identical: leader-only
-/// inval-then-init, a proxy publish, the boundary, the item's roles, the
-/// tcgen05 fence, the boundary again. Returns the last item plus one, which
-/// is the deferred epilogue's cursor.
-///
-/// # Safety
-/// As `pipeline::run`, plus `clocks` addressing this cluster's block.
-#[inline(always)]
-unsafe fn run<const DRAIN_ON: bool>(tile: &Tile, items: u32, clocks: Clocks) -> u32 {
-    unsafe {
-        let leader_thread = thread::threadIdx_x() == 0;
-        let (warp, is_lane_0) = (warp_id(), lane() == 0);
-        let mut initialized = false;
-        let mut item = cluster::cluster_idx();
-        let mut pending = 0u32;
-        let mut ran = 0u64;
-
-        let (mut pre, mut post, mut work) = (0u64, 0u64, 0u64);
-        let mut acc = 0u64;
-        let mut issue = Sums::default();
-        let mut feed = Sums::default();
-        let mut band = Sums::default();
-        let opened = clock64();
-
-        while item < items {
-            let entered = clock64();
-            if leader_thread {
-                if initialized {
-                    tile.disarm();
-                }
-                tile.arm();
-                publish_to_async_proxy();
-            }
-            initialized = true;
-            cluster::cluster_sync();
-            let working = clock64();
-            pre += working.wrapping_sub(entered);
-
-            let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, GROUP);
-            if warp == PRODUCER {
-                if is_lane_0 {
-                    tile.produce(tile_m, tile_n, &mut feed);
-                }
-            } else if warp == ISSUER {
-                if tile.rank == LEADER && is_lane_0 {
-                    let waited = clock64();
-                    tile.acc_free.wait(0);
-                    acc += clock64().wrapping_sub(waited);
-                    tile.multiply(&mut issue);
-                }
-            } else {
-                let release = Release {
-                    sem: tile.acc_free.at_rank(LEADER),
-                    live: true,
-                };
-                let drained = clock64();
-                if pending == 0 {
-                    release.now();
-                } else {
-                    let (row, column) = tile.origin(pending - 1);
-                    tile.out
-                        .drain::<DRAIN_ON>(tile.accumulator, row, column, release);
-                }
-                let stored = clock64();
-                band.span += stored.wrapping_sub(drained) as u32;
-                tile.done.wait(0);
-                band.rest += clock64().wrapping_sub(stored) as u32;
-            }
-            pending = item + 1;
-            ran += 1;
-
-            let worked = clock64();
-            work += worked.wrapping_sub(working);
             tcgen05_fence_before_thread_sync();
             cluster::cluster_sync();
-            post += clock64().wrapping_sub(worked);
-            item += cluster::num_clusters();
-        }
-        if leader_thread && initialized {
-            tile.disarm();
-        }
-
-        // One SM's clock backs every counter, so only rank `LEADER` writes,
-        // and one lane of each role's warp owns its own slots.
-        if tile.rank == LEADER && is_lane_0 {
-            if warp == ISSUER {
-                clocks.put(ITEMS, ran);
-                clocks.put(PRE, pre);
-                clocks.put(POST, post);
-                clocks.put(WORK, work);
-                clocks.put(ACC, acc);
-                clocks.put(FILL, issue.first as u64);
-                clocks.put(FEED, issue.rest as u64);
-                clocks.put(MMA, issue.span as u64);
-                clocks.put(SPAN, clock64().wrapping_sub(opened));
-            } else if warp == PRODUCER {
-                clocks.put(PROD, feed.span as u64);
-                clocks.put(FREE, feed.rest as u64);
-            } else if warp == 0 {
-                clocks.put(DRAIN, band.span as u64);
-                clocks.put(DONE, band.rest as u64);
+            if thread::threadIdx_x() == 0 {
+                self.load.inval_all();
+                self.free.inval_all();
+                self.full.inval_all();
+                self.empty.inval_all();
             }
         }
-        pending
     }
 }
 
+/// The shipped schedule with a stopwatch on each role.
+///
 /// # Safety
-/// As `gemm_tcgen05_f32_optimized`, plus `clocks` holding
-/// [`COUNTERS`]` * MAX_CLUSTERS` zeroed `u64`.
+/// As `gemm_tcgen05_f32_optimized`, plus `clocks` holding [`COUNTERS`] zeroed
+/// `u64` per cluster.
 #[inline(always)]
 pub unsafe fn probe<const DRAIN_ON: bool>(
     a_map: *const TmaDescriptor,
@@ -483,7 +448,6 @@ pub unsafe fn probe<const DRAIN_ON: bool>(
             b_ring: shared.b_ring,
             load: shared.load,
             free: shared.free,
-            done: shared.done,
             a_map,
             b_map,
             accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, BLOCK_N as u32)),
@@ -495,23 +459,65 @@ pub unsafe fn probe<const DRAIN_ON: bool>(
             k_blocks: k as u32 / BLOCK_K as u32,
             transposed: transposed != 0,
             rank: cluster::block_rank(),
-            acc_free: shared.acc_free,
+            full: shared.full,
+            empty: shared.empty,
         };
-        let at = clocks
-            .as_mut_ptr()
-            .add(COUNTERS * cluster::cluster_idx() as usize);
-        let pending = run::<DRAIN_ON>(&tile, tiles_m * tiles_n, Clocks { at });
-        if DRAIN_ON && pending != 0 && warp_id() < DRAIN_WARPS as u32 {
-            let (row, column) = tile.origin(pending - 1);
-            let release = Release {
-                sem: tile.acc_free.at_rank(LEADER),
-                live: false,
-            };
-            tile.out
-                .drain::<DRAIN_ON>(tile.accumulator, row, column, release);
+        tile.arm();
+
+        let items = tiles_m * tiles_n;
+        let walk = Walk::open(items);
+        let ran = {
+            let mut counted = Walk::open(items);
+            let mut n = 0u64;
+            while counted.next().is_some() {
+                n += 1;
+            }
+            n
+        };
+        let (warp, is_lane_0) = (warp_id(), lane() == 0);
+        let mut acc = 0u64;
+        let mut issue = Sums::default();
+        let mut feed = Sums::default();
+        let mut band = Sums::default();
+        let opened = clock64();
+        if warp == PRODUCER {
+            if is_lane_0 {
+                tile.produce(walk, &mut feed);
+            }
+        } else if warp == ISSUER {
+            if tile.rank == LEADER && is_lane_0 {
+                tile.multiply(walk, &mut acc, &mut issue);
+            }
+        } else {
+            tile.epilogue::<DRAIN_ON>(walk, &mut band);
         }
-        tcgen05_fence_before_thread_sync();
-        cluster::cluster_sync();
+        let span = clock64().wrapping_sub(opened);
+
+        // One SM's clock backs every counter, so only rank `LEADER` writes, and
+        // one lane of each role's warp owns its own slots.
+        if tile.rank == LEADER && is_lane_0 && ran != 0 {
+            let at = Clocks {
+                at: clocks
+                    .as_mut_ptr()
+                    .add(COUNTERS * cluster::cluster_idx() as usize),
+            };
+            if warp == ISSUER {
+                at.put(ITEMS, ran);
+                at.put(ACC, acc / ran);
+                at.put(FILL, issue.first as u64 / ran);
+                at.put(FEED, issue.rest as u64 / ran);
+                at.put(MMA, issue.span as u64 / ran);
+                at.put(SPAN, span / ran);
+            } else if warp == PRODUCER {
+                at.put(PROD, feed.span as u64 / ran);
+                at.put(FREE, feed.rest as u64 / ran);
+            } else if warp == 0 {
+                at.put(DRAIN, band.span as u64 / ran);
+                at.put(DONE, band.rest as u64 / ran);
+            }
+        }
+
+        tile.retire();
         dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
     }
 }
