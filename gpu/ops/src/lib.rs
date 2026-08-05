@@ -93,7 +93,13 @@ pub const MOE_SCATTER_DY_THREADS: usize = 256;
 
 /// Threads in one block-per-expert routing-probability reduction. Lanes stride
 /// the tokens before a tree reduction, so this must remain a power of two.
-pub const MOE_PROBABILITY_SUMS_THREADS: usize = 256;
+///
+/// One block per expert is only `E` blocks, so the token loop's depth is all
+/// the parallelism there is: `N` runs to 24576 and the trip count is a runtime
+/// value NVVM will not unroll, which leaves each lane one load in flight and
+/// the launch `N / threads` load latencies deep. A full block is 24 of them
+/// rather than 96 (#99).
+pub const MOE_PROBABILITY_SUMS_THREADS: usize = 1024;
 
 /// Threads in one MoE dead-slot zeroing block.
 pub const MOE_ZERO_BINS_THREADS: usize = 256;
