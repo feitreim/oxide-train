@@ -103,17 +103,16 @@ pub mod kernels {
         mut first: DisjointSlice<f32>,
         mut second: DisjointSlice<f32>,
     ) {
-        let index = thread::index_1d();
-        let Some(gradient) = gradient.get_mut(index) else {
+        let Some(gradient) = gradient.get_mut(thread::index_1d()) else {
             return;
         };
-        let Some(parameter) = parameter.get_mut(index) else {
+        let Some(parameter) = parameter.get_mut(thread::index_1d()) else {
             return;
         };
-        let Some(first) = first.get_mut(index) else {
+        let Some(first) = first.get_mut(thread::index_1d()) else {
             return;
         };
-        let Some(second) = second.get_mut(index) else {
+        let Some(second) = second.get_mut(thread::index_1d()) else {
             return;
         };
 
