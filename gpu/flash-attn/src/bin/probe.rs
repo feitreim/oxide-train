@@ -72,6 +72,7 @@ struct Budget {
     stat: f64,
     pass: f64,
     sync: f64,
+    idle: f64,
     epi: f64,
     span: f64,
 }
@@ -95,6 +96,7 @@ impl Budget {
             sum.stat += block[probe::STAT] as f64;
             sum.pass += block[probe::PASS] as f64;
             sum.sync += block[probe::SYNC] as f64;
+            sum.idle += block[probe::IDLE] as f64;
             sum.epi += block[probe::EPI] as f64;
             sum.span += block[probe::SPAN] as f64;
         }
@@ -110,15 +112,21 @@ impl Budget {
             stat: sum.stat / ctas,
             pass: sum.pass / ctas,
             sync: sum.sync / ctas,
+            idle: sum.idle / ctas,
             epi: sum.epi / ctas,
             span: sum.span / ctas,
         }
     }
 
-    fn leader(&self) -> f64 {
-        self.feed + self.recycle + self.issue
+    /// The issue warp's whole tile, its wait at the shared barrier included.
+    fn issuer(&self) -> f64 {
+        self.feed + self.recycle + self.issue + self.idle
     }
 
+    /// The pass warps' whole tile, their wait at the same barrier included.
+    /// The two roles meet there every tile, so these two should agree — and
+    /// which of `IDLE` and `SYNC` carries the slack says which role is the
+    /// critical path.
     fn warpgroup(&self) -> f64 {
         self.scored + self.grad + self.stat + self.pass + self.sync
     }
@@ -147,12 +155,12 @@ impl Budget {
         // account for the visit, and a low one says something outside both
         // columns does.
         let ns_per_visit = shipped_ms * 1.0e6 / (visits_total / 148.0);
-        let ghz = (self.warpgroup() + self.leader()) / ns_per_visit;
+        let ghz = self.warpgroup() / ns_per_visit;
         println!(
-            "    warpgroup {:>7.0} ticks/visit   leader {:>7.0}   span/item {:>8.0}   \
+            "    pass warps {:>7.0} ticks/visit   issue warp {:>7.0}   span/item {:>8.0}   \
              residual/item {:>7.0}",
             self.warpgroup(),
-            self.leader(),
+            self.issuer(),
             self.span,
             self.residual(),
         );
@@ -172,9 +180,9 @@ impl Budget {
             share(self.sync),
         );
         println!(
-            "      leader:    FEED   {:>6.0}          RECYCLE {:>6.0}         ISSUE {:>6.0}\
-             \n      per item:  EPI    {:>6.0}",
-            self.feed, self.recycle, self.issue, self.epi,
+            "      issue warp: FEED  {:>6.0}          RECYCLE {:>6.0}         ISSUE {:>6.0}   \
+             IDLE {:>6.0}\n      per item:   EPI   {:>6.0}",
+            self.feed, self.recycle, self.issue, self.idle, self.epi,
         );
         println!(
             "      shipped ns/visit {ns_per_visit:.0} at 1 CTA/SM over 148 SMs \

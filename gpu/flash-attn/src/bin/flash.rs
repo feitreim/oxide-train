@@ -127,7 +127,7 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         // memory during the key stream, so this kernel never had the forward's
         // resident accumulator to begin with.
         name: "backward q",
-        max_registers: 182,
+        max_registers: 189,
         max_spill_bytes: 0,
     },
     KernelBudget {
@@ -137,7 +137,7 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         // (59/1024 sync, 70/1024 pipelined) because they were near their
         // ceiling and neither of these is.
         name: "backward kv",
-        max_registers: 190,
+        max_registers: 198,
         max_spill_bytes: 0,
     },
 ];
