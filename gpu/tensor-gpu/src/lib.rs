@@ -26,6 +26,13 @@ const TILE_ELEMENTS: usize = TILE * TILE;
 pub const TRANSPOSE_TILE: usize = 64;
 const TRANSPOSE_THREADS: usize = 256;
 const TRANSPOSE_WORDS: usize = TRANSPOSE_TILE * TRANSPOSE_TILE / 2;
+/// Threads in the fused AdamW write-back that also emits the transpose. Wider
+/// than the plain transpose so each thread carries four packed words rather
+/// than eight: the update holds a gradient, both moments, and the master word
+/// live per word, and four is what keeps the statically bounded walk off
+/// `.local`.
+const MASTER_TILE_THREADS: usize = 512;
+const MASTER_TILE_WORDS: usize = TRANSPOSE_WORDS / MASTER_TILE_THREADS;
 
 #[cuda_module]
 pub mod kernels {
@@ -78,9 +85,13 @@ pub mod kernels {
     }
 
     /// Fused decoupled AdamW update over one flat parameter buffer.
+    ///
+    /// The gradient is cleared as it is consumed, so the parameter it belongs
+    /// to needs no separate zeroing pass before the next backward accumulates
+    /// into it.
     #[kernel]
     pub fn adamw(
-        gradient: &[f32],
+        mut gradient: DisjointSlice<f32>,
         learning_rate: f32,
         beta1: f32,
         beta2: f32,
@@ -92,23 +103,34 @@ pub mod kernels {
         mut first: DisjointSlice<f32>,
         mut second: DisjointSlice<f32>,
     ) {
-        let i = thread::index_1d().get();
-        let Some(parameter) = parameter.get_mut(thread::index_1d()) else {
+        let index = thread::index_1d();
+        let Some(gradient) = gradient.get_mut(index) else {
             return;
         };
-        let Some(first) = first.get_mut(thread::index_1d()) else {
+        let Some(parameter) = parameter.get_mut(index) else {
             return;
         };
-        let Some(second) = second.get_mut(thread::index_1d()) else {
+        let Some(first) = first.get_mut(index) else {
+            return;
+        };
+        let Some(second) = second.get_mut(index) else {
             return;
         };
 
-        *first = beta1 * *first + (1.0 - beta1) * gradient[i];
-        *second = beta2 * *second + (1.0 - beta2) * gradient[i] * gradient[i];
-        let first_hat = *first * first_correction;
-        let second_hat = *second * second_correction;
-        let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * *parameter;
-        *parameter -= learning_rate * update;
+        *parameter = adamw_element(
+            *parameter,
+            *gradient,
+            first,
+            second,
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+            first_correction,
+            second_correction,
+        );
+        *gradient = 0.0;
     }
 
     /// Muon's EMA momentum update: `m = beta * m + (1 - beta) * g`.
@@ -334,6 +356,35 @@ pub mod kernels {
             let draw = (splitmix64(seed.wrapping_add(element as u64)) >> 32) as u32;
             (value.to_bits().wrapping_add(draw & 0xffff) >> 16) as u16
         }
+    }
+
+    /// One decoupled-AdamW element: advance both moments in place and return
+    /// the updated weight.
+    ///
+    /// Every AdamW kernel routes through this, so the update expression and
+    /// its fp32 evaluation order exist exactly once no matter which dtype the
+    /// weight is stored in or which layout the write-back emits.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn adamw_element(
+        weight: f32,
+        gradient: f32,
+        first: &mut f32,
+        second: &mut f32,
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+        first_correction: f32,
+        second_correction: f32,
+    ) -> f32 {
+        *first = beta1 * *first + (1.0 - beta1) * gradient;
+        *second = beta2 * *second + (1.0 - beta2) * gradient * gradient;
+        let first_hat = *first * first_correction;
+        let second_hat = *second * second_correction;
+        let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * weight;
+        weight - learning_rate * update
     }
 
     /// [`fill`] for packed storage, used to zero packed-bf16 gradients.
@@ -591,16 +642,135 @@ pub mod kernels {
         }
     }
 
-    /// Fused decoupled AdamW over a packed-bf16 master with an fp32 gradient:
-    /// one thread owns one pair.
+    /// One packed master pair's worth of AdamW: update both elements of
+    /// `stored` from the fp32 gradients this thread owns, clear those
+    /// gradients, and return the rounded write-back word.
     ///
     /// Moments stay fp32 and the whole update is computed in fp32 — bf16 only
     /// ever appears at the write-back, where [`round_master`] decides how the
-    /// discarded mantissa bits are handled. Beside that rounding the arithmetic
-    /// is [`adamw`] exactly.
+    /// discarded mantissa bits are handled.
+    ///
+    /// # Safety
+    /// The caller owns elements `2 * pair` and `2 * pair + 1` of `gradient`,
+    /// `first`, and `second` exclusively.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn adamw_master_pair(
+        stored: u32,
+        pair: usize,
+        gradient: &mut DisjointSlice<f32>,
+        first: &mut DisjointSlice<f32>,
+        second: &mut DisjointSlice<f32>,
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+        first_correction: f32,
+        second_correction: f32,
+        rounding: u32,
+        seed: u64,
+    ) -> u32 {
+        let mut packed = 0u32;
+        let mut half = 0;
+        while half < 2 {
+            let element = 2 * pair + half;
+            let weight = bf16_bits_to_f32((stored >> (16 * half)) as u16);
+            // SAFETY: the caller's exclusive ownership of this element.
+            let updated = unsafe {
+                let g = gradient.get_unchecked_mut(element);
+                let updated = adamw_element(
+                    weight,
+                    *g,
+                    first.get_unchecked_mut(element),
+                    second.get_unchecked_mut(element),
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    epsilon,
+                    weight_decay,
+                    first_correction,
+                    second_correction,
+                );
+                *g = 0.0;
+                updated
+            };
+            packed |= (round_master(updated, rounding, seed, element) as u32) << (16 * half);
+            half += 1;
+        }
+        packed
+    }
+
+    /// [`adamw_master_pair`] for a gradient that arrives packed in bf16.
+    ///
+    /// # Safety
+    /// As [`adamw_master_pair`], plus exclusive ownership of word `pair` of
+    /// `gradient`.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn adamw_master_pair_packed_grad(
+        stored: u32,
+        pair: usize,
+        gradient: &mut DisjointSlice<u32>,
+        first: &mut DisjointSlice<f32>,
+        second: &mut DisjointSlice<f32>,
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+        first_correction: f32,
+        second_correction: f32,
+        rounding: u32,
+        seed: u64,
+    ) -> u32 {
+        // SAFETY: the caller's exclusive ownership of this word.
+        let gradients = unsafe {
+            let word = gradient.get_unchecked_mut(pair);
+            let gradients = *word;
+            *word = 0;
+            gradients
+        };
+
+        let mut packed = 0u32;
+        let mut half = 0;
+        while half < 2 {
+            let element = 2 * pair + half;
+            let g = bf16_bits_to_f32((gradients >> (16 * half)) as u16);
+            let weight = bf16_bits_to_f32((stored >> (16 * half)) as u16);
+            // SAFETY: the caller's exclusive ownership of this element.
+            let updated = unsafe {
+                adamw_element(
+                    weight,
+                    g,
+                    first.get_unchecked_mut(element),
+                    second.get_unchecked_mut(element),
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    epsilon,
+                    weight_decay,
+                    first_correction,
+                    second_correction,
+                )
+            };
+            packed |= (round_master(updated, rounding, seed, element) as u32) << (16 * half);
+            half += 1;
+        }
+        packed
+    }
+
+    /// Fused decoupled AdamW over a packed-bf16 master with an fp32 gradient:
+    /// one thread owns one pair.
+    ///
+    /// For a master that also backs a transposed compute operand, use
+    /// [`adamw_bf16_master_transposed`] instead — it emits both layouts from
+    /// this same write-back rather than reading the master back to transpose
+    /// it. Beside the bf16 rounding the arithmetic is [`adamw`] exactly, and
+    /// the gradient is cleared as it is consumed either way.
     #[kernel]
     pub fn adamw_bf16_master(
-        gradient: &[f32],
+        mut gradient: DisjointSlice<f32>,
         learning_rate: f32,
         beta1: f32,
         beta2: f32,
@@ -619,37 +789,33 @@ pub mod kernels {
         let Some(word) = master.get_mut(index) else {
             return;
         };
-        let stored = *word;
-
-        let mut packed = 0u32;
-        let mut half = 0;
-        while half < 2 {
-            let element = 2 * pair + half;
-            let g = gradient[element];
-            let mut weight = bf16_bits_to_f32((stored >> (16 * half)) as u16);
-            // SAFETY: this thread exclusively owns elements 2*pair and
-            // 2*pair+1 of every per-element buffer.
-            unsafe {
-                let first = first.get_unchecked_mut(element);
-                let second = second.get_unchecked_mut(element);
-                *first = beta1 * *first + (1.0 - beta1) * g;
-                *second = beta2 * *second + (1.0 - beta2) * g * g;
-                let first_hat = *first * first_correction;
-                let second_hat = *second * second_correction;
-                let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * weight;
-                weight -= learning_rate * update;
-            }
-            packed |= (round_master(weight, rounding, seed, element) as u32) << (16 * half);
-            half += 1;
-        }
-        *word = packed;
+        // SAFETY: this thread exclusively owns elements 2*pair and 2*pair+1
+        // of every per-element buffer.
+        *word = unsafe {
+            adamw_master_pair(
+                *word,
+                pair,
+                &mut gradient,
+                &mut first,
+                &mut second,
+                learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+                weight_decay,
+                first_correction,
+                second_correction,
+                rounding,
+                seed,
+            )
+        };
     }
 
     /// [`adamw_bf16_master`] for the lm-head, whose weight gradient is produced
     /// in packed bf16 straight out of the tcgen05 accumulate epilogue.
     #[kernel]
     pub fn adamw_bf16_master_packed_grad(
-        gradient: &[u32],
+        mut gradient: DisjointSlice<u32>,
         learning_rate: f32,
         beta1: f32,
         beta2: f32,
@@ -668,31 +834,204 @@ pub mod kernels {
         let Some(word) = master.get_mut(index) else {
             return;
         };
-        let stored = *word;
-        let gradient = gradient[pair];
+        // SAFETY: this thread exclusively owns word `pair` of the packed
+        // gradient and elements 2*pair and 2*pair+1 of both moments.
+        *word = unsafe {
+            adamw_master_pair_packed_grad(
+                *word,
+                pair,
+                &mut gradient,
+                &mut first,
+                &mut second,
+                learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+                weight_decay,
+                first_correction,
+                second_correction,
+                rounding,
+                seed,
+            )
+        };
+    }
 
-        let mut packed = 0u32;
-        let mut half = 0;
-        while half < 2 {
-            let element = 2 * pair + half;
-            let g = bf16_bits_to_f32((gradient >> (16 * half)) as u16);
-            let mut weight = bf16_bits_to_f32((stored >> (16 * half)) as u16);
-            // SAFETY: this thread exclusively owns elements 2*pair and
-            // 2*pair+1 of every per-element buffer.
+    /// [`adamw_bf16_master`] that emits the master's transpose beside it.
+    ///
+    /// A master that backs a tcgen05 compute operand needs both layouts, and
+    /// the row-major operand *is* the master (#57, #58). Rather than write the
+    /// master and then read the whole thing back to transpose it, this walks
+    /// the `TRANSPOSE_TILE` square tile of [`transpose_bf16_pairs`], runs the
+    /// update on the tile, and stages the rounded result in shared memory so
+    /// both global stores are coalesced. The master read the standalone
+    /// transpose pass performed disappears entirely.
+    ///
+    /// Launch with [`master_transpose_config`]; both dimensions must be
+    /// multiples of `TRANSPOSE_TILE`.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn adamw_bf16_master_transposed(
+        mut gradient: DisjointSlice<f32>,
+        rows: u32,
+        cols: u32,
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+        first_correction: f32,
+        second_correction: f32,
+        rounding: u32,
+        seed: u64,
+        mut master: DisjointSlice<u32>,
+        mut first: DisjointSlice<f32>,
+        mut second: DisjointSlice<f32>,
+        mut transposed: DisjointSlice<u32>,
+    ) {
+        static mut VALUES: SharedArray<u32, { TRANSPOSE_TILE * (TRANSPOSE_TILE + 1) }> =
+            SharedArray::UNINIT;
+        const TILE_WORDS_WIDE: usize = TRANSPOSE_TILE / 2;
+
+        let tid = thread::threadIdx_x() as usize;
+        let tile_row = thread::blockIdx_y() as usize * TRANSPOSE_TILE;
+        let tile_col = thread::blockIdx_x() as usize * TRANSPOSE_TILE;
+        let words_per_row = cols as usize / 2;
+
+        // A statically bounded walk, so the tile's four words per thread are
+        // independent loads rather than a rolled chain.
+        for step in 0..MASTER_TILE_WORDS {
+            let local = tid + step * MASTER_TILE_THREADS;
+            let row = local / TILE_WORDS_WIDE;
+            let word_column = local % TILE_WORDS_WIDE;
+            let pair = (tile_row + row) * words_per_row + tile_col / 2 + word_column;
+            // SAFETY: each (tile, local) pair maps to a unique master word and
+            // so to a unique pair of elements of every per-element buffer.
             unsafe {
-                let first = first.get_unchecked_mut(element);
-                let second = second.get_unchecked_mut(element);
-                *first = beta1 * *first + (1.0 - beta1) * g;
-                *second = beta2 * *second + (1.0 - beta2) * g * g;
-                let first_hat = *first * first_correction;
-                let second_hat = *second * second_correction;
-                let update = first_hat / (second_hat.sqrt() + epsilon) + weight_decay * weight;
-                weight -= learning_rate * update;
+                let word = master.get_unchecked_mut(pair);
+                let packed = adamw_master_pair(
+                    *word,
+                    pair,
+                    &mut gradient,
+                    &mut first,
+                    &mut second,
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    epsilon,
+                    weight_decay,
+                    first_correction,
+                    second_correction,
+                    rounding,
+                    seed,
+                );
+                *word = packed;
+                VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column] = packed & 0xffff;
+                VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column + 1] = packed >> 16;
             }
-            packed |= (round_master(weight, rounding, seed, element) as u32) << (16 * half);
-            half += 1;
         }
-        *word = packed;
+        thread::sync_threads();
+
+        let output_words_per_row = rows as usize / 2;
+        for step in 0..MASTER_TILE_WORDS {
+            let local = tid + step * MASTER_TILE_THREADS;
+            // Output word [c, p] packs source elements [2p, c] and [2p+1, c].
+            let output_row = local / TILE_WORDS_WIDE;
+            let word_column = local % TILE_WORDS_WIDE;
+            let (low, high) = unsafe {
+                (
+                    VALUES[(2 * word_column) * (TRANSPOSE_TILE + 1) + output_row],
+                    VALUES[(2 * word_column + 1) * (TRANSPOSE_TILE + 1) + output_row],
+                )
+            };
+            let global =
+                (tile_col + output_row) * output_words_per_row + tile_row / 2 + word_column;
+            // SAFETY: each (tile, local) pair maps to a unique output word.
+            unsafe {
+                *transposed.get_unchecked_mut(global) = low | (high << 16);
+            }
+        }
+    }
+
+    /// [`adamw_bf16_master_transposed`] for the lm-head's packed-bf16 gradient.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn adamw_bf16_master_packed_grad_transposed(
+        mut gradient: DisjointSlice<u32>,
+        rows: u32,
+        cols: u32,
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        weight_decay: f32,
+        first_correction: f32,
+        second_correction: f32,
+        rounding: u32,
+        seed: u64,
+        mut master: DisjointSlice<u32>,
+        mut first: DisjointSlice<f32>,
+        mut second: DisjointSlice<f32>,
+        mut transposed: DisjointSlice<u32>,
+    ) {
+        static mut VALUES: SharedArray<u32, { TRANSPOSE_TILE * (TRANSPOSE_TILE + 1) }> =
+            SharedArray::UNINIT;
+        const TILE_WORDS_WIDE: usize = TRANSPOSE_TILE / 2;
+
+        let tid = thread::threadIdx_x() as usize;
+        let tile_row = thread::blockIdx_y() as usize * TRANSPOSE_TILE;
+        let tile_col = thread::blockIdx_x() as usize * TRANSPOSE_TILE;
+        let words_per_row = cols as usize / 2;
+
+        for step in 0..MASTER_TILE_WORDS {
+            let local = tid + step * MASTER_TILE_THREADS;
+            let row = local / TILE_WORDS_WIDE;
+            let word_column = local % TILE_WORDS_WIDE;
+            let pair = (tile_row + row) * words_per_row + tile_col / 2 + word_column;
+            // SAFETY: as `adamw_bf16_master_transposed`, with the gradient
+            // owned one packed word per master word.
+            unsafe {
+                let word = master.get_unchecked_mut(pair);
+                let packed = adamw_master_pair_packed_grad(
+                    *word,
+                    pair,
+                    &mut gradient,
+                    &mut first,
+                    &mut second,
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    epsilon,
+                    weight_decay,
+                    first_correction,
+                    second_correction,
+                    rounding,
+                    seed,
+                );
+                *word = packed;
+                VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column] = packed & 0xffff;
+                VALUES[row * (TRANSPOSE_TILE + 1) + 2 * word_column + 1] = packed >> 16;
+            }
+        }
+        thread::sync_threads();
+
+        let output_words_per_row = rows as usize / 2;
+        for step in 0..MASTER_TILE_WORDS {
+            let local = tid + step * MASTER_TILE_THREADS;
+            let output_row = local / TILE_WORDS_WIDE;
+            let word_column = local % TILE_WORDS_WIDE;
+            let (low, high) = unsafe {
+                (
+                    VALUES[(2 * word_column) * (TRANSPOSE_TILE + 1) + output_row],
+                    VALUES[(2 * word_column + 1) * (TRANSPOSE_TILE + 1) + output_row],
+                )
+            };
+            let global =
+                (tile_col + output_row) * output_words_per_row + tile_row / 2 + word_column;
+            // SAFETY: each (tile, local) pair maps to a unique output word.
+            unsafe {
+                *transposed.get_unchecked_mut(global) = low | (high << 16);
+            }
+        }
     }
 
     /// One-block reduction. Threads accumulate grid-stride partial sums before
@@ -1084,11 +1423,12 @@ impl<S: Shape> GpuBf16Tensor<S> {
     }
 
     /// One fused AdamW step: fp32 gradient and moments in, one rounded bf16
-    /// write-back out. `seed` is `tensor_core::rng::stream_seed(step, id)`.
+    /// write-back out, and the gradient left zeroed for the next backward.
+    /// `seed` is `tensor_core::rng::stream_seed(step, id)`.
     #[allow(clippy::too_many_arguments)]
     pub fn adamw_step(
         &mut self,
-        gradient: &GpuTensor<f32, S>,
+        gradient: &mut GpuTensor<f32, S>,
         moments: &mut GpuAdamWMoments<S>,
         config: MasterAdamW,
         stream: &CudaStream,
@@ -1100,7 +1440,7 @@ impl<S: Shape> GpuBf16Tensor<S> {
             module.adamw_bf16_master(
                 stream,
                 pairs_config(Self::WORDS),
-                gradient.as_device_buffer(),
+                gradient.as_device_buffer_mut(),
                 config.learning_rate,
                 config.beta1,
                 config.beta2,
@@ -1113,6 +1453,50 @@ impl<S: Shape> GpuBf16Tensor<S> {
                 &mut self.words,
                 moments.first.as_device_buffer_mut(),
                 moments.second.as_device_buffer_mut(),
+            )
+        }
+    }
+
+    /// [`Self::adamw_step`] for a master that also backs a transposed compute
+    /// operand: the same write-back stores `transposed` as `[cols, rows]`, so
+    /// no pass reads the master back to transpose it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adamw_step_transposed(
+        &mut self,
+        gradient: &mut GpuTensor<f32, S>,
+        moments: &mut GpuAdamWMoments<S>,
+        config: MasterAdamW,
+        rows: usize,
+        cols: usize,
+        transposed: &mut DeviceBuffer<u32>,
+        stream: &CudaStream,
+        module: &kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        assert_eq!(rows * cols, Self::LEN);
+        assert_eq!(transposed.len(), Self::WORDS);
+        // SAFETY: master, gradient, and both moments describe the same
+        // [rows, cols] matrix, `transposed` holds its packed transpose, and
+        // the launch tiles that matrix exactly.
+        unsafe {
+            module.adamw_bf16_master_transposed(
+                stream,
+                master_transpose_config(rows, cols),
+                gradient.as_device_buffer_mut(),
+                rows as u32,
+                cols as u32,
+                config.learning_rate,
+                config.beta1,
+                config.beta2,
+                config.epsilon,
+                config.weight_decay,
+                config.first_correction,
+                config.second_correction,
+                config.rounding,
+                config.seed,
+                &mut self.words,
+                moments.first.as_device_buffer_mut(),
+                moments.second.as_device_buffer_mut(),
+                transposed,
             )
         }
     }
@@ -1246,6 +1630,15 @@ pub fn transpose_pairs_config(rows: usize, cols: usize) -> LaunchConfig {
     }
 }
 
+/// [`transpose_pairs_config`]'s tiling for the fused AdamW write-back, which
+/// carries the same tile on a wider block.
+pub fn master_transpose_config(rows: usize, cols: usize) -> LaunchConfig {
+    LaunchConfig {
+        block_dim: (MASTER_TILE_THREADS as u32, 1, 1),
+        ..transpose_pairs_config(rows, cols)
+    }
+}
+
 fn gemm_config<const M: usize, const N: usize>() -> LaunchConfig {
     assert!(TILE * TILE <= 1024);
     assert!(M <= u32::MAX as usize && N <= u32::MAX as usize);
@@ -1340,10 +1733,12 @@ impl<S: Shape> GpuTensor<f32, S> {
         }
     }
 
+    /// One AdamW step over an fp32 parameter, leaving the gradient it consumed
+    /// zeroed for the next backward.
     #[allow(clippy::too_many_arguments)]
     pub fn adamw_step(
         &mut self,
-        gradient: &Self,
+        gradient: &mut Self,
         moments: &mut GpuAdamWMoments<S>,
         learning_rate: f32,
         beta1: f32,
@@ -1360,7 +1755,7 @@ impl<S: Shape> GpuTensor<f32, S> {
             module.adamw(
                 stream,
                 elementwise_config::<S>(),
-                gradient.as_device_buffer(),
+                gradient.as_device_buffer_mut(),
                 learning_rate,
                 beta1,
                 beta2,

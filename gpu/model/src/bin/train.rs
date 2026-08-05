@@ -168,7 +168,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let inputs: &[usize; N] = inputs.as_slice().try_into().expect("length N");
         let targets: &[usize; N] = targets.as_slice().try_into().expect("length N");
 
-        gpu.zero_grad(&stream, &tensor)?;
+        // Gradients are already zero: allocation zeroes them and every AdamW
+        // write-back clears the gradient it consumed.
         let aux_coefficient = optimizer.aux_coefficient();
         gpu.forward(
             inputs,
