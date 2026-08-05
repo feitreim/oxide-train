@@ -1227,6 +1227,25 @@ pub mod kernels {
         }
     }
 
+    /// What one `tcgen05.mma` costs the warp that issues it, as a function of
+    /// `N` — the measurement that says whether kernel A's issue column is the
+    /// tensor core's throughput or a per-instruction toll (issue #94).
+    ///
+    /// One CTA, one warp, no work items and no operand traffic: it stages two
+    /// zeroed panels once and then times chained walks into a resident
+    /// accumulator. Body in [`super::phase_probe::mma_cadence`].
+    ///
+    /// # Safety
+    ///
+    /// Launch as `host::Tcgen05Flash::mma_cadence` does: one CTA of 32 threads
+    /// with `host::CADENCE_SMEM_BYTES` dynamic shared memory, `clocks` holding
+    /// `phase_probe::CADENCE_COUNTERS` zeroed `u64`.
+    #[kernel]
+    #[launch_bounds(32, 1)]
+    pub unsafe fn mma_cadence(rounds: u32, mut clocks: DisjointSlice<u64>) {
+        unsafe { phase_probe::mma_cadence(rounds, &mut clocks) }
+    }
+
     /// The key-parallel backward as a [`pipeline::Job`]: one work item is a
     /// (key block, head, batch), and everything the query-parallel stream does
     /// by row this does by column.

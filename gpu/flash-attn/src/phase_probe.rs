@@ -61,13 +61,16 @@ use cuda_device::tcgen05::{tcgen05_fence_after_thread_sync, tcgen05_fence_before
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cluster, thread, warp};
 
+use cuda_device::tcgen05::{
+    Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor,
+};
 use kittens::global::{GlobalRows, load_col_vec, load_row_vec, store_rows};
 use kittens::ldst::store_tile;
 use kittens::mma::{self, mma_ab, mma_abt};
 use kittens::pipeline;
 use kittens::plan::SharedPlan;
 use kittens::reg::Exp2Hw;
-use kittens::shared::F32;
+use kittens::shared::{F32, MmaElement};
 use kittens::tmem::{alloc_block, dealloc_block, warp_lanes};
 
 use super::*;
@@ -80,7 +83,7 @@ const SCALE: f32 = 0.088_388_35;
 const LOG2E: f32 = 1.442_695_04;
 
 /// `u64` counters one CTA owns.
-pub const COUNTERS: usize = 16;
+pub const COUNTERS: usize = 24;
 
 /// Key-tile (kernel A) or query-tile (kernel B) visits this CTA made.
 pub const VISITS: usize = 0;
@@ -115,6 +118,36 @@ pub const EPI: usize = 10;
 /// First `clock64` to last.
 pub const SPAN: usize = 11;
 
+// --- The issue warp's [`ISSUE`], split by what it is issuing (kernel A). ---
+// `TMA + SMMA + GMMA == ISSUE`, so the split is a partition and not a sample.
+/// The issue warp's TMA issue — `load_kv`'s two `tma_load`s and the
+/// `expect_tx` that charges them, plus the item head's four `tma_load_at`.
+pub const TMA: usize = 13;
+/// The issue warp's score-MMA issue: the two `mma_abt` walks (eight chained
+/// `tcgen05.mma` each, `M128_N64`) and their shared commit.
+pub const SMMA: usize = 14;
+/// The issue warp's gradient-MMA issue: `dQ += dS·K`, one `mma_ab` walk of two
+/// `N=64` bands × four K chunks, and its commit.
+pub const GMMA: usize = 15;
+
+// --- The pass warps' [`PASS`], split the same way (kernel A). ---
+// `TREAD + ARITH + SSTORE == PASS`, with `ARITH` by subtraction.
+/// The pass warps inside `TmemTile::tile` — the `tcgen05.ld` of a
+/// `SCORE_CHUNK` of the score band and of the gradient band, each of which is
+/// four `.16x256b` issues with a `tcgen05.wait::ld` after every one of them.
+pub const TREAD: usize = 16;
+/// The pass warps inside `store_tile` — the bf16 convert and the swizzled
+/// shared-memory store of the finished dS chunk.
+pub const SSTORE: usize = 17;
+/// The pass warps **between** items: everything `pipeline::run` does around
+/// `work` — the two block boundaries, the leader's barrier inval/init and the
+/// proxy fence. The `residual` the report derives, measured rather than
+/// subtracted.
+pub const GAP: usize = 18;
+/// The pass warps' *first* `scored.wait` of an item — the pipeline fill, which
+/// the per-visit [`SCORED`] mean otherwise smears across every visit.
+pub const FILL: usize = 19;
+
 /// Per-CTA tick sums, all in one struct so the instrumented loops stay legible.
 #[derive(Clone, Copy, Default)]
 struct Sums {
@@ -130,6 +163,17 @@ struct Sums {
     epi: u64,
     visits: u64,
     items: u64,
+    tma: u64,
+    smma: u64,
+    gmma: u64,
+    tread: u64,
+    sstore: u64,
+    gap: u64,
+    fill: u64,
+    /// The pass warps' last `clock64` of the previous item, so [`GAP`] can be
+    /// measured across `pipeline::run`'s own per-item work instead of being
+    /// derived by subtracting the columns from the span.
+    ended: u64,
 }
 
 /// This CTA's counter block.
@@ -165,6 +209,10 @@ impl Clocks {
             self.put(SYNC, sums.sync / visits);
             self.put(EPI, sums.epi / items);
             self.put(SPAN, span / items);
+            self.put(TREAD, sums.tread / visits);
+            self.put(SSTORE, sums.sstore / visits);
+            self.put(GAP, sums.gap / items);
+            self.put(FILL, sums.fill / items);
         }
     }
 
@@ -181,6 +229,9 @@ impl Clocks {
             self.put(RECYCLE, sums.recycle / visits);
             self.put(ISSUE, sums.issue / visits);
             self.put(IDLE, sums.idle / visits);
+            self.put(TMA, sums.tma / visits);
+            self.put(SMMA, sums.smma / visits);
+            self.put(GMMA, sums.gmma / visits);
         }
     }
 }
@@ -340,7 +391,9 @@ impl pipeline::Job for BackwardQProbe {
                 let opened = clock64();
                 self.sums.feed += opened.wrapping_sub(waited);
                 self.score_mmas(0);
-                self.sums.issue += clock64().wrapping_sub(opened);
+                let issued = clock64().wrapping_sub(opened);
+                self.sums.issue += issued;
+                self.sums.smma += issued;
             }
 
             if issuing {
@@ -354,7 +407,9 @@ impl pipeline::Job for BackwardQProbe {
                             let opened = clock64();
                             self.sums.recycle += opened.wrapping_sub(waited);
                             self.load_kv(refill, plane as i32);
-                            self.sums.issue += clock64().wrapping_sub(opened);
+                            let issued = clock64().wrapping_sub(opened);
+                            self.sums.issue += issued;
+                            self.sums.tma += issued;
                         }
                         if key_tile + 1 < key_tiles {
                             let waited = clock64();
@@ -362,7 +417,9 @@ impl pipeline::Job for BackwardQProbe {
                             let opened = clock64();
                             self.sums.feed += opened.wrapping_sub(waited);
                             self.score_mmas(key_tile + 1);
-                            self.sums.issue += clock64().wrapping_sub(opened);
+                            let issued = clock64().wrapping_sub(opened);
+                            self.sums.issue += issued;
+                            self.sums.smma += issued;
                         }
                     }
                     let at = clock64();
@@ -380,13 +437,18 @@ impl pipeline::Job for BackwardQProbe {
                             key_tile != 0,
                         );
                         mma::commit(self.shared.accumulated.sem(key_tile));
-                        self.sums.issue += clock64().wrapping_sub(synced);
+                        let issued = clock64().wrapping_sub(synced);
+                        self.sums.issue += issued;
+                        self.sums.gmma += issued;
                     }
                     self.sums.visits += 1;
                     key_tile += 1;
                 }
             } else {
                 let waited = clock64();
+                if self.sums.items > 0 {
+                    self.sums.gap += waited.wrapping_sub(self.sums.ended);
+                }
                 let row = batch * self.t + query_base + band;
                 let mut lse2: Rows = load_row_vec(self.lse, row, head, lane);
                 lse2.scale_assign(LOG2E);
@@ -399,6 +461,9 @@ impl pipeline::Job for BackwardQProbe {
                     self.shared.scored.wait(key_tile);
                     let scored_at = clock64();
                     self.sums.scored += scored_at.wrapping_sub(waited);
+                    if key_tile == 0 {
+                        self.sums.fill += scored_at.wrapping_sub(waited);
+                    }
                     if key_tile >= GRADIENT_STAGES as u32 {
                         self.shared
                             .accumulated
@@ -416,7 +481,13 @@ impl pipeline::Job for BackwardQProbe {
                     let mut column = group * PASS_COLUMNS;
                     let last = column + PASS_COLUMNS;
                     while column < last {
+                        // Five stops rather than one, because the question this
+                        // loop is asked is which of its three kinds of work the
+                        // pass floor is: the `tcgen05.ld` pair, the register
+                        // arithmetic between them, or the swizzled store.
+                        let read_from = clock64();
                         let mut dscore: ScoreChunk = scores.tile(band, column);
+                        let scored_read = clock64();
                         if masked {
                             dscore.make_causal_at(
                                 lane,
@@ -427,11 +498,18 @@ impl pipeline::Job for BackwardQProbe {
                         }
                         dscore.sub_row_assign(lse2);
                         dscore.unary_map_assign::<Exp2Hw>();
+                        let grad_from = clock64();
                         let mut dp: ScoreChunk = gradients.tile(band, column);
+                        let grad_read = clock64();
                         dp.sub_row_assign(dots);
                         dscore.mul_assign(dp);
                         dscore.scale_assign(SCALE);
+                        let store_from = clock64();
                         store_tile(ds, band, column, lane, dscore);
+                        let stored = clock64();
+                        self.sums.tread +=
+                            scored_read.wrapping_sub(read_from) + grad_read.wrapping_sub(grad_from);
+                        self.sums.sstore += stored.wrapping_sub(store_from);
                         column += SCORE_CHUNK as u32;
                     }
                     let passed = clock64();
@@ -450,7 +528,9 @@ impl pipeline::Job for BackwardQProbe {
                 let columns = group * DRAIN_COLUMNS as u32;
                 let dq: OutHalf = self.accumulator.tile_x8(band, columns);
                 store_rows(self.dq, row, head * HD as u32 + columns, lane, dq);
-                self.sums.epi += clock64().wrapping_sub(waited);
+                let ended = clock64();
+                self.sums.epi += ended.wrapping_sub(waited);
+                self.sums.ended = ended;
             }
             self.sums.items += 1;
         }
@@ -913,6 +993,230 @@ unsafe fn report(clocks: &mut DisjointSlice<u64>, sums: &Sums, span: u64, warp_i
             at.write_pass(sums, span);
         } else if warp_id == ISSUE_WARP {
             at.write_issue(sums);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The MMA cadence probe: what one `tcgen05.mma` costs the issuing warp, and
+// how that cost moves with `N`.
+// ---------------------------------------------------------------------------
+//
+// The phase budget says kernel A's issue warp spends ~1 700 ticks a visit
+// pushing 24 `M128_N64` instructions — ~70 ticks each against a ~26-tick
+// full-rate figure. Two readings fit that number and they want opposite
+// remedies:
+//
+// - **Back-pressure.** The tensor core is busy and the issuing thread stalls
+//   on a full MMA queue. Then the cost is per *unit of work*, a wider `N`
+//   halves it for the same instruction count, and a second issue warp buys
+//   nothing.
+// - **Issue overhead.** Each instruction costs the front end a fixed toll
+//   whatever its shape. Then the cost is per *instruction*, a wider `N` is
+//   free work, and a second issuer would help too.
+//
+// This kernel separates them by holding everything but `N` fixed: the same
+// eight chained K=16 MMAs over the same `[128, 128]` A operand, with a B
+// operand of 64, 128 and 256 rows. Under back-pressure the three cost the same
+// per unit of work; under a fixed toll they cost the same per instruction. It
+// also runs kernel A's gradient MMA both ways — `mma_ab`'s two `N=64` bands
+// against one `N=128` band off the same tile's `mn_walk` — which is the same
+// question asked at the shape a remedy would actually take.
+
+/// Variants the cadence probe times.
+pub const CADENCE_VARIANTS: usize = 5;
+/// `u64` per variant: sustained issue ticks, sustained ticks to retirement,
+/// one drained chain's round trip, and the instructions the variant issued.
+pub const CADENCE_SLOTS: usize = 4;
+/// Counters the cadence probe writes.
+pub const CADENCE_COUNTERS: usize = CADENCE_VARIANTS * CADENCE_SLOTS;
+
+/// Bytes the cadence probe's shared plan takes: the two operand panels, plus
+/// room for the completion ring and the TMEM staging word. Rounded up rather
+/// than carved exactly — one CTA of one warp is not competing for an SM.
+pub const CADENCE_SMEM: usize = QUERIES * HD * 2 + 256 * HD * 2 + 1024;
+
+/// `dQ += dS·K` with **one** `N = HD` band instead of `mma_ab`'s two `N = 64`
+/// ones: the B panel's `mn_walk` reaches columns 64..128 through the
+/// descriptor's leading offset, exactly as `mma_atb` already reaches them, so
+/// the same K chunk covers the whole accumulator in one instruction.
+///
+/// Same products in the same K order as `mma_ab`, so it is the same sum.
+///
+/// # Safety
+///
+/// As `kittens::mma::mma_ab`, plus: `shape` is `M128_N128` and `tmem` owns the
+/// whole 128-column band.
+#[inline(always)]
+unsafe fn gradient_mma_wide<const AR: usize, const K: usize, const N: usize>(
+    tmem: u32,
+    a: SharedTile<Bf16, AR, K, Swizzle128B>,
+    b: SharedTile<Bf16, K, N, Swizzle128B>,
+    accumulate: bool,
+) {
+    unsafe {
+        let walk = b.mn_walk();
+        let instruction = Tcgen05InstructionDescriptor::builder()
+            .shape(MmaShape::M128_N128)
+            .element_type(Tcgen05ElementType::BF16)
+            .accumulator_type(Tcgen05AccumulatorType::F32)
+            .transpose_a(false)
+            .transpose_b(walk.transposed())
+            .build()
+            .raw();
+        let mut chunk = 0usize;
+        while chunk < K / 16 {
+            // A is K-major and K spans one swizzle atom here (`K == 64`), so
+            // its chunks step 32 bytes along the row — `mma_abt`'s own
+            // `k_major_offset` with the subtile term dropped, which this shape
+            // never reaches.
+            Bf16::mma(
+                tmem,
+                a.operand_descriptor(chunk * 32),
+                walk.chunk_descriptor(chunk),
+                instruction,
+                accumulate || chunk > 0,
+            );
+            chunk += 1;
+        }
+    }
+}
+
+/// One warp's timing of `rounds` chained walks, written into `clocks` at
+/// `variant`.
+///
+/// A macro and not a function: the walk is a different call at every variant
+/// and the device backend gets no closures out of this file.
+///
+/// The pipe is drained before the sustained window opens, so the window is the
+/// steady state and the trailing wait is what the last chain still owed.
+macro_rules! time_walk {
+    ($clocks:expr, $variant:expr, $instructions:expr, $rounds:expr, $sem:expr, $at:expr, $walk:expr) => {{
+        // A drained pipe first: one chain, committed and waited, so the
+        // sustained window below opens with nothing outstanding and this
+        // number is the shape's own latency.
+        let opened = clock64();
+        $walk;
+        mma::commit($sem.sem($at));
+        $sem.wait($at);
+        let latency = clock64().wrapping_sub(opened);
+
+        let started = clock64();
+        let mut round = 0u32;
+        while round < $rounds {
+            $walk;
+            round += 1;
+        }
+        let issued = clock64();
+        mma::commit($sem.sem($at + 1));
+        $sem.wait($at + 1);
+        let retired = clock64();
+
+        let out = $clocks.as_mut_ptr().add($variant * CADENCE_SLOTS);
+        *out = issued.wrapping_sub(started);
+        *out.add(1) = retired.wrapping_sub(started);
+        *out.add(2) = latency;
+        *out.add(3) = ($instructions as u64) * $rounds as u64;
+    }};
+}
+
+/// Time one `tcgen05.mma` chain per variant, from a single warp of a single
+/// CTA — the body of `tcgen05::kernels::mma_cadence`.
+///
+/// # Safety
+///
+/// One CTA of 32 threads, `CADENCE_SMEM` dynamic shared bytes, and `clocks`
+/// holding [`CADENCE_COUNTERS`] zeroed `u64`.
+#[inline(always)]
+pub unsafe fn mma_cadence(rounds: u32, clocks: &mut DisjointSlice<u64>) {
+    unsafe {
+        let at = SharedPlan::attach();
+        let (a, at) = at.tile::<Bf16, QUERIES, HD, Swizzle128B>();
+        let (b, at) = at.tile::<Bf16, 256, HD, Swizzle128B>();
+        let (sem, at) = at.semaphores::<16>();
+        let (tmem_slot, _) = at.tmem_slot();
+
+        // Operand *values* are irrelevant to a cadence, but a shared tile that
+        // was never written can hold anything, and "anything" includes bit
+        // patterns whose timing is not the timing of a number. Zero both.
+        let words = a.base().cast::<u32>();
+        let total = (QUERIES * HD + 256 * HD) / 2;
+        let mut i = thread::threadIdx_x() as usize;
+        while i < total {
+            *words.add(i) = 0;
+            i += 32;
+        }
+
+        let tmem = alloc_block(tmem_slot, BACKWARD_TMEM_COLUMNS);
+        if thread::threadIdx_x() == 0 {
+            sem.init_all(1);
+        }
+        fence_proxy_async_shared_cta();
+        thread::sync_threads();
+
+        if thread::threadIdx_x() == 0 {
+            // The score MMA's shape at three widths. Same A, same eight K=16
+            // chunks, same instruction count — only the B operand's row count
+            // and the accumulator band move.
+            let b64 = SharedTile::<Bf16, TILE, HD, Swizzle128B>::from_raw(b.base());
+            let b128 = SharedTile::<Bf16, QUERIES, HD, Swizzle128B>::from_raw(b.base());
+            time_walk!(
+                clocks,
+                0,
+                8,
+                rounds,
+                sem,
+                0,
+                mma_abt(tmem, a, b64, MmaShape::M128_N64, true)
+            );
+            time_walk!(
+                clocks,
+                1,
+                8,
+                rounds,
+                sem,
+                2,
+                mma_abt(tmem, a, b128, MmaShape::M128_N128, true)
+            );
+            time_walk!(
+                clocks,
+                2,
+                8,
+                rounds,
+                sem,
+                4,
+                mma_abt(tmem, a, b, MmaShape::M128_N256, true)
+            );
+
+            // The gradient MMA's shape, both ways: `[QUERIES, TILE]` dS
+            // against a `[TILE, HD]` K panel.
+            let ds = SharedTile::<Bf16, QUERIES, TILE, Swizzle128B>::from_raw(a.base());
+            let k = SharedTile::<Bf16, TILE, HD, Swizzle128B>::from_raw(b.base());
+            time_walk!(
+                clocks,
+                3,
+                8,
+                rounds,
+                sem,
+                6,
+                mma_ab(tmem, ds, k, MmaShape::M128_N64, true)
+            );
+            time_walk!(
+                clocks,
+                4,
+                4,
+                rounds,
+                sem,
+                8,
+                gradient_mma_wide(tmem, ds, k, true)
+            );
+        }
+
+        tcgen05_fence_before_thread_sync();
+        thread::sync_threads();
+        dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
+        if thread::threadIdx_x() == 0 {
+            sem.inval_all();
         }
     }
 }

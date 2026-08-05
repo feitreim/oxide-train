@@ -22,6 +22,9 @@ pub const FLASH_SUBTILE_HD: usize = 64;
 const TILE_BYTES: usize = FLASH_TILE * FLASH_HD * 2;
 /// Dynamic shared bytes of the score_mma probe: A panel plus B panel.
 pub const PROBE_DYNAMIC_SMEM_BYTES: u32 = (2 * TILE_BYTES) as u32;
+/// Dynamic shared bytes of the MMA cadence probe: its `[128, HD]` A panel and
+/// the `[256, HD]` B panel the three widths are read out of.
+pub const CADENCE_SMEM_BYTES: u32 = super::tcgen05::phase_probe::CADENCE_SMEM as u32;
 /// Dynamic shared bytes of the query-parallel backward — **exactly** the
 /// kernel's own plan, for the reason the forward's is exact. Neither backward
 /// kernel can reach two CTAs an SM (both take all 512 tensor-memory columns),
@@ -255,6 +258,8 @@ impl Tcgen05Flash {
         let transpose_probe = module.load_function("transpose_b_probe")?;
         let backward_q_probe = module.load_function("flash_backward_q_probe")?;
         let backward_kv_probe = module.load_function("flash_backward_kv_probe")?;
+        let cadence = module.load_function("mma_cadence")?;
+        opt_in_dynamic_smem(&cadence, CADENCE_SMEM_BYTES)?;
         opt_in_dynamic_smem(&forward, FLASH_FORWARD_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_q, FLASH_BACKWARD_Q_SMEM_BYTES)?;
         opt_in_dynamic_smem(&backward_kv, FLASH_BACKWARD_KV_SMEM_BYTES)?;
@@ -268,6 +273,32 @@ impl Tcgen05Flash {
             backward_kv,
             sm_count: device_sm_count(ctx)?,
         })
+    }
+
+    /// Time one chained `tcgen05.mma` walk per shape variant, from a single
+    /// warp of a single CTA.
+    ///
+    /// # Safety
+    ///
+    /// `clocks` holds `tcgen05::phase_probe::CADENCE_COUNTERS` zeroed `u64`.
+    pub unsafe fn mma_cadence(
+        &self,
+        stream: &CudaStream,
+        rounds: u32,
+        clocks: &mut DeviceBuffer<u64>,
+    ) -> Result<(), DriverError> {
+        unsafe {
+            self.generated.mma_cadence(
+                stream,
+                LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: CADENCE_SMEM_BYTES,
+                },
+                rounds,
+                clocks,
+            )
+        }
     }
 
     /// [`Self::backward_q`] with the phase stopwatch, writing
