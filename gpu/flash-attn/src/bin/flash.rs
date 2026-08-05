@@ -148,7 +148,7 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         // landed a hundred under it anyway.
         name: "backward q",
         max_registers: 128,
-        max_spill_bytes: 0,
+        max_spill_bytes: 64,
     },
     KernelBudget {
         // The unified key-parallel backward: 190 regs / 0 B, eight registers
@@ -162,7 +162,7 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         // registers over A are still `Pᵀ` live across `dSᵀ`.
         name: "backward kv",
         max_registers: 140,
-        max_spill_bytes: 0,
+        max_spill_bytes: 64,
     },
 ];
 

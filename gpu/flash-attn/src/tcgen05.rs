@@ -418,14 +418,15 @@ const DRAIN_WARPS: u32 = QUERIES as u32 / 32;
 /// is 90.4% (kernel A) and 89.2% (kernel B) of the pass warps' column, and the
 /// issue warp idles 946 / 4 004 ticks a visit waiting for them. There is
 /// nothing else in the visit to take.
-const PASS_GROUPS: u32 = 2;
+const PASS_GROUPS: u32 = 4;
 const _: () = assert!(PASS_GROUPS.is_power_of_two() && TILE as u32 % (PASS_GROUPS * 8) == 0);
 /// Columns of the score band one pass warpgroup owns, and of the accumulator
 /// band it drains. Both stay whole multiples of the chunk and drain widths, so
 /// no warp ever holds a partial one.
 const PASS_COLUMNS: u32 = TILE as u32 / PASS_GROUPS;
-const DRAIN_COLUMNS: usize = HD / PASS_GROUPS as usize;
-const _: () = assert!(PASS_COLUMNS as usize % SCORE_CHUNK == 0 && DRAIN_COLUMNS == TILE);
+const DRAIN_SPLIT: u32 = if PASS_GROUPS < 2 { PASS_GROUPS } else { 2 };
+const DRAIN_COLUMNS: usize = HD / DRAIN_SPLIT as usize;
+const _: () = assert!(PASS_COLUMNS as usize % SCORE_CHUNK == 0 && DRAIN_COLUMNS % 64 == 0);
 /// Warps of either backward kernel that run the register pass.
 const PASS_WARPS: u32 = PASS_GROUPS * DRAIN_WARPS;
 /// The warp that issues every TMA and every MMA, and runs no pass.
@@ -455,7 +456,7 @@ pub const FLASH_BACKWARD_BLOCK: usize = PASS_WARPS as usize * 32 + 32;
 /// threads, so ptxas' budget is `65536 / 288` = 227 per thread against the
 /// 409 it had at 160 — the pass split's own cost, and the reason the drain
 /// below went from a `[32, 128]` band to a `[32, 64]` one.
-const _: () = assert!(FLASH_BACKWARD_BLOCK == 288);
+const _: () = assert!(FLASH_BACKWARD_BLOCK == 544);
 
 /// Base-2 slack a tile's row max may climb above the O segment's reference
 /// before the warpgroup forces a correction (SWEEP knob). P values reach at
@@ -1047,9 +1048,11 @@ pub mod kernels {
                     // has 227 registers a thread, and a `[32, 128]` fp32 band
                     // is 128 of them live at once in the one place this kernel
                     // holds a whole value.
-                    let columns = group * DRAIN_COLUMNS as u32;
-                    let dq: OutHalf = self.accumulator.tile_x8(band, columns);
-                    store_rows(self.dq, row, head * HD as u32 + columns, lane, dq);
+                    if group < DRAIN_SPLIT {
+                        let columns = group * DRAIN_COLUMNS as u32;
+                        let dq: OutHalf = self.accumulator.tile_x8(band, columns);
+                        store_rows(self.dq, row, head * HD as u32 + columns, lane, dq);
+                    }
                 }
             }
         }
@@ -1086,7 +1089,7 @@ pub mod kernels {
     /// `softmax_scale * log2(e)` and dY staged raw, `logsumexp[B*T, H]` and
     /// `dot[B*T, H]` fp32 read-only, fp32 `dq[B*T, H*HD]` written.
     #[kernel]
-    #[launch_bounds(288, 1)]
+    #[launch_bounds(544, 1)]
     pub unsafe fn flash_backward_q(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -1152,7 +1155,7 @@ pub mod kernels {
     /// [`super::phase_probe::COUNTERS`] zeroed `u64` per CTA of the grid.
     #[allow(clippy::too_many_arguments)]
     #[kernel]
-    #[launch_bounds(288, 1)]
+    #[launch_bounds(544, 1)]
     pub unsafe fn flash_backward_q_probe(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -1190,7 +1193,7 @@ pub mod kernels {
     /// As [`flash_backward_kv`], plus `clocks` as in [`flash_backward_q_probe`].
     #[allow(clippy::too_many_arguments)]
     #[kernel]
-    #[launch_bounds(288, 1)]
+    #[launch_bounds(544, 1)]
     pub unsafe fn flash_backward_kv_probe(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,
@@ -1510,11 +1513,13 @@ pub mod kernels {
                     self.shared.accumulated.wait(steps - 1);
                     // Both accumulators drain the way kernel A's one does: this
                     // warpgroup's `DRAIN_COLUMNS`, at its own column offset.
-                    let columns = group * DRAIN_COLUMNS as u32;
-                    let dv: OutHalf = self.dv_acc.tile_x8(band, columns);
-                    store_rows(self.dv, row, head * HD as u32 + columns, lane, dv);
-                    let dk: OutHalf = self.dk_acc.tile_x8(band, columns);
-                    store_rows(self.dk, row, head * HD as u32 + columns, lane, dk);
+                    if group < DRAIN_SPLIT {
+                        let columns = group * DRAIN_COLUMNS as u32;
+                        let dv: OutHalf = self.dv_acc.tile_x8(band, columns);
+                        store_rows(self.dv, row, head * HD as u32 + columns, lane, dv);
+                        let dk: OutHalf = self.dk_acc.tile_x8(band, columns);
+                        store_rows(self.dk, row, head * HD as u32 + columns, lane, dk);
+                    }
                 }
             }
         }
@@ -1543,7 +1548,7 @@ pub mod kernels {
     /// columns where kernel A takes 384 — and why neither can reach two CTAs an
     /// SM at any shared-memory plan.
     #[kernel]
-    #[launch_bounds(288, 1)]
+    #[launch_bounds(544, 1)]
     pub unsafe fn flash_backward_kv(
         q_tma: *const TmaDescriptor,
         k_tma: *const TmaDescriptor,

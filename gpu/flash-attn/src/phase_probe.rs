@@ -447,9 +447,11 @@ impl pipeline::Job for BackwardQProbe {
 
                 let waited = clock64();
                 self.shared.accumulated.wait(key_tiles - 1);
-                let columns = group * DRAIN_COLUMNS as u32;
-                let dq: OutHalf = self.accumulator.tile_x8(band, columns);
-                store_rows(self.dq, row, head * HD as u32 + columns, lane, dq);
+                if group < DRAIN_SPLIT {
+                    let columns = group * DRAIN_COLUMNS as u32;
+                    let dq: OutHalf = self.accumulator.tile_x8(band, columns);
+                    store_rows(self.dq, row, head * HD as u32 + columns, lane, dq);
+                }
                 self.sums.epi += clock64().wrapping_sub(waited);
             }
             self.sums.items += 1;
@@ -802,11 +804,13 @@ impl pipeline::Job for BackwardKvProbe {
 
                 let waited = clock64();
                 self.shared.accumulated.wait(steps - 1);
-                let columns = group * DRAIN_COLUMNS as u32;
-                let dv: OutHalf = self.dv_acc.tile_x8(band, columns);
-                store_rows(self.dv, row, head * HD as u32 + columns, lane, dv);
-                let dk: OutHalf = self.dk_acc.tile_x8(band, columns);
-                store_rows(self.dk, row, head * HD as u32 + columns, lane, dk);
+                if group < DRAIN_SPLIT {
+                    let columns = group * DRAIN_COLUMNS as u32;
+                    let dv: OutHalf = self.dv_acc.tile_x8(band, columns);
+                    store_rows(self.dv, row, head * HD as u32 + columns, lane, dv);
+                    let dk: OutHalf = self.dk_acc.tile_x8(band, columns);
+                    store_rows(self.dk, row, head * HD as u32 + columns, lane, dk);
+                }
                 self.sums.epi += clock64().wrapping_sub(waited);
             }
             self.sums.items += 1;
