@@ -125,13 +125,17 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 /// split, so every shipped GEMM kernel now carries no depot at all.
 // The deferred-drain epilogue (oxide-train#80 remedy 2) holds registers past
 // its last `tcgen05.ld` — that hold is the overlap, since the accumulator is
-// released to the next item's MMA while the held bands' stores still issue —
-// so every ceiling moved up: bf16 82 → 137 and the reduce 80 → 127 (each a
-// one-pass hoist), the fp32 store 102 → 118 (no hoist; its two-band form
-// measured 181, past the ~170 the register file grants 12 warps an SM, and
-// paid the 2 → 1 CTA cliff — model_shapes f32 rows at 0.46–0.53). A priced
-// trade, not a leak: at these counts residency stays tensor-memory-bound at
-// 2 CTAs/SM.
+// released to a later item's MMA while the held bands' stores still issue — so
+// every ceiling moved up: bf16 82 → 137 and the reduce 80 → 127 (each a
+// one-pass hoist), the fp32 store 102 → 118 → 168 (the half-row lift).
+//
+// The accumulator ping-pong is what one CTA an SM bought, and it costs **one
+// register**: the accumulate entry point's 145 → 146 is the `sequence % SLOTS`
+// the drain now carries, and the other two did not move at all. So the
+// register file is no longer the term it was — at one CTA an SM a thread is
+// granted the architecture's 255 rather than the ~170 twelve warps left it, and
+// the ceiling that closed #83's two-band hoist is gone. These three counts are
+// what the kernel *asks for*, not what it may have.
 const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
         name: "gemm_tcgen05_bf16_optimized",
@@ -145,7 +149,7 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_accumulate",
-        max_registers: 145,
+        max_registers: 146,
         max_spill_bytes: 0,
     },
 ];
