@@ -167,8 +167,17 @@ const KERNEL_BUDGETS: [KernelBudget; 3] = [
         // point the pair is pushed. Kernel A's own 128 does not move — its
         // one gradient MMA was never the binding value there — and neither
         // does the forward's.
+        //
+        // **138 -> 142 at the deferred drain** (#94), still zero spill and
+        // still 85 under ptxas' `65536/288` = 227 allowance. Four registers is
+        // the staged `(row, head)` pair plus the address arithmetic they feed,
+        // live across the item where the drain used to compute them from
+        // locals it was about to discard. Kernel A paid the same four when it
+        // deferred its own drain in #100 and stayed at 128 because it had them
+        // to spare; this kernel's peak liveness is `Pᵀ` held across forming
+        // `dSᵀ`, which the drain does not touch, so the four land on top.
         name: "backward kv",
-        max_registers: 138,
+        max_registers: 142,
         max_spill_bytes: 0,
     },
 ];

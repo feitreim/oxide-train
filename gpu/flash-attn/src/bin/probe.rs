@@ -83,6 +83,9 @@ struct Budget {
     gap: f64,
     fill: f64,
     drain: f64,
+    ewait: f64,
+    etread: f64,
+    estore: f64,
 }
 
 impl Budget {
@@ -115,6 +118,9 @@ impl Budget {
             sum.gap += block[probe::GAP] as f64;
             sum.fill += block[probe::FILL] as f64;
             sum.drain += block[probe::DRAIN] as f64;
+            sum.ewait += block[probe::EWAIT] as f64;
+            sum.etread += block[probe::ETREAD] as f64;
+            sum.estore += block[probe::ESTORE] as f64;
         }
         let ctas = ctas.max(1.0);
         Self {
@@ -139,6 +145,9 @@ impl Budget {
             gap: sum.gap / ctas,
             fill: sum.fill / ctas,
             drain: sum.drain / ctas,
+            ewait: sum.ewait / ctas,
+            etread: sum.etread / ctas,
+            estore: sum.estore / ctas,
         }
     }
 
@@ -208,26 +217,38 @@ impl Budget {
              IDLE {:>6.0}\n      per item:   EPI   {:>6.0}",
             self.feed, self.recycle, self.issue, self.idle, self.epi,
         );
-        // The two splits, printed only where the probe fills them (kernel A).
-        // `TMA + SMMA + GMMA` partitions `ISSUE` and `TREAD + ARITH + SSTORE`
-        // partitions `PASS`, so each line is a decomposition and not a sample.
+        // The three splits. `TMA + SMMA + GMMA` partitions `ISSUE`,
+        // `TREAD + ARITH + SSTORE` partitions `PASS`, and
+        // `EWAIT + ETREAD + ESTORE` partitions `EPI + DRAIN` — each line is a
+        // decomposition and not a sample. Each prints only where the probe
+        // fills it: kernel B's pass split is off by default because there its
+        // stops are not free (`phase_probe::KV_PASS_SPLIT`).
         if self.smma > 0.0 {
-            let arith = self.pass - self.tread - self.sstore;
             println!(
-                "      ISSUE split: TMA   {:>6.0}          SMMA    {:>6.0}         GMMA  \
-                 {:>6.0}\n      PASS split:  TREAD {:>6.0}          ARITH   {:>6.0}         \
-                 STORE {:>6.0}\n      per item:   FILL  {:>6.0}          GAP     {:>6.0}         \
-                 EPI {:>6.0}          DRAIN   {:>6.0}",
-                self.tma,
-                self.smma,
-                self.gmma,
+                "      ISSUE split: TMA   {:>6.0}          SMMA    {:>6.0}         GMMA  {:>6.0}",
+                self.tma, self.smma, self.gmma,
+            );
+        }
+        if self.tread > 0.0 {
+            println!(
+                "      PASS split:  TREAD {:>6.0}          ARITH   {:>6.0}         STORE {:>6.0}",
                 self.tread,
-                arith,
+                self.pass - self.tread - self.sstore,
                 self.sstore,
+            );
+        }
+        if self.smma > 0.0 {
+            println!(
+                "      per item:   FILL  {:>6.0}          GAP     {:>6.0}         EPI {:>6.0}   \
+                 DRAIN {:>6.0}\n      EPI split:   EWAIT {:>6.0}          ETREAD  {:>6.0}       \
+                 ESTORE {:>6.0}",
                 self.fill,
                 self.gap,
                 self.epi,
                 self.drain,
+                self.ewait,
+                self.etread,
+                self.estore,
             );
         }
         println!(

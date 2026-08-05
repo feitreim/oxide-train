@@ -36,7 +36,7 @@
 //! | [`STAT`] | the per-tile statistic loads (`load_row_vec` per item, `load_col_vec` per chunk) |
 //! | [`PASS`] | the register pass — mask, `exp2`, the `dP − D` product, the packed store |
 //! | [`SYNC`] | the proxy fence and the one block barrier per tile |
-//! | [`EPI`] | the trailing accumulator wait and the `store_rows` drain, per item |
+//! | [`EPI`] | the trailing accumulator wait, per item — the drain that used to follow it is [`DRAIN`] |
 //! | [`SPAN`] | first `clock64` to last, over the whole persistent loop |
 //!
 //! Every counter but [`SPAN`], [`EPI`] and [`ITEMS`] is divided by the CTA's
@@ -82,6 +82,30 @@ const LN2: f32 = 0.693_147_18;
 const SCALE: f32 = 0.088_388_35;
 const LOG2E: f32 = 1.442_695_04;
 
+/// Whether kernel B's register pass is clocked *inside* its chunk loop, for
+/// the [`TREAD`] / [`SSTORE`] split.
+///
+/// **Off, because in this kernel that split is not free.** `clock64` is an S2R
+/// and the issue warp shares a sub-partition with two pass warps, so seven
+/// stops a chunk cost kernel B 8.9% against its shipped self and — worse —
+/// moved 1 600 ticks a visit out of the issue warp's [`IDLE`] and into its MMA
+/// issue, which reads as a budget that has nothing to do with the shipped
+/// kernel's. Kernel A's same split costs 3.4% and stays on.
+///
+/// Turned on, it answers one question and is quoted as its own run: kernel B's
+/// pass is `TREAD 241 + ARITH 2660 + STORE 449` against kernel A's
+/// `254 + 1252 + 318`, so the ~1 000 ticks B's pass carries over A's are the
+/// **column-indexed arithmetic**, not the second `store_tile`.
+const KV_PASS_SPLIT: bool = false;
+
+/// `clock64` under a compile-time switch: a zero when the switch is off, so
+/// the differences the counters accumulate are zeros and the reads themselves
+/// are not in the instruction stream at all.
+#[inline(always)]
+fn stamp<const ON: bool>() -> u64 {
+    if ON { clock64() } else { 0 }
+}
+
 /// `u64` counters one CTA owns.
 pub const COUNTERS: usize = 24;
 
@@ -113,7 +137,8 @@ pub const SYNC: usize = 9;
 /// two is near zero and the other is the slack; which one says whether the
 /// tile is issue-bound or pass-bound.
 pub const IDLE: usize = 12;
-/// The trailing drain, per item.
+/// The item's trailing accumulator wait — what stayed behind when the drain
+/// moved to the top of the next item. Per item.
 pub const EPI: usize = 10;
 /// First `clock64` to last.
 pub const SPAN: usize = 11;
@@ -153,6 +178,19 @@ pub const FILL: usize = 19;
 /// is meant to disappear into.
 pub const DRAIN: usize = 20;
 
+// --- [`EPI`] split, per item. `EWAIT + ETREAD + ESTORE == EPI` wherever the
+// drain still sits at the bottom of its own item; once it is deferred the last
+// two move into [`DRAIN`] and [`EPI`] is [`EWAIT`] alone. ---
+/// The epilogue's wait for the last gradient MMA of the item. The one term that
+/// cannot cross the item boundary, because `pipeline::run` re-arms the barrier
+/// set there.
+pub const EWAIT: usize = 21;
+/// The epilogue's `tile_x8` — the accumulator's `tcgen05.ld` into registers.
+/// Two bands in kernel B (dV and dK), one in kernel A.
+pub const ETREAD: usize = 22;
+/// The epilogue's `store_rows` — the fp32 band out to global memory.
+pub const ESTORE: usize = 23;
+
 /// Per-CTA tick sums, all in one struct so the instrumented loops stay legible.
 #[derive(Clone, Copy, Default)]
 struct Sums {
@@ -176,6 +214,9 @@ struct Sums {
     gap: u64,
     fill: u64,
     drain: u64,
+    ewait: u64,
+    etread: u64,
+    estore: u64,
     /// The pass warps' last `clock64` of the previous item, so [`GAP`] can be
     /// measured across `pipeline::run`'s own per-item work instead of being
     /// derived by subtracting the columns from the span.
@@ -220,6 +261,9 @@ impl Clocks {
             self.put(GAP, sums.gap / items);
             self.put(FILL, sums.fill / items);
             self.put(DRAIN, sums.drain / items);
+            self.put(EWAIT, sums.ewait / items);
+            self.put(ETREAD, sums.etread / items);
+            self.put(ESTORE, sums.estore / items);
         }
     }
 
@@ -280,6 +324,7 @@ impl BackwardQProbe {
             let opened = clock64();
             let columns = group * DRAIN_COLUMNS as u32;
             let dq: OutHalf = self.accumulator.tile_x8(band, columns);
+            let read = clock64();
             store_rows(
                 self.dq,
                 self.staged_row,
@@ -288,7 +333,10 @@ impl BackwardQProbe {
                 dq,
             );
             self.staged_row = UNSTAGED;
-            self.sums.drain += clock64().wrapping_sub(opened);
+            let done = clock64();
+            self.sums.drain += done.wrapping_sub(opened);
+            self.sums.etread += read.wrapping_sub(opened);
+            self.sums.estore += done.wrapping_sub(read);
         }
     }
 
@@ -561,6 +609,7 @@ impl pipeline::Job for BackwardQProbe {
                 self.staged_head = head;
                 let ended = clock64();
                 self.sums.epi += ended.wrapping_sub(waited);
+                self.sums.ewait += ended.wrapping_sub(waited);
                 self.sums.ended = ended;
             }
             self.sums.items += 1;
@@ -663,10 +712,39 @@ struct BackwardKvProbe {
     dot: GlobalRows<F32>,
     dk: GlobalRows<F32>,
     dv: GlobalRows<F32>,
+    staged_row: u32,
+    staged_head: u32,
     sums: Sums,
 }
 
 impl BackwardKvProbe {
+    /// `BackwardKvStream::drain`, clocked — the two bands split so [`ETREAD`]
+    /// and [`ESTORE`] read the same way here as they did when the drain still
+    /// sat at the bottom of its own item.
+    #[inline(always)]
+    unsafe fn drain(&mut self, band: u32, group: u32, lane: u32) {
+        unsafe {
+            if self.staged_row == UNSTAGED {
+                return;
+            }
+            let opened = clock64();
+            let columns = group * DRAIN_COLUMNS as u32;
+            let column = self.staged_head * HD as u32 + columns;
+            let dv: OutHalf = self.dv_acc.tile_x8(band, columns);
+            let dv_read = clock64();
+            store_rows(self.dv, self.staged_row, column, lane, dv);
+            let dv_stored = clock64();
+            let dk: OutHalf = self.dk_acc.tile_x8(band, columns);
+            let dk_read = clock64();
+            store_rows(self.dk, self.staged_row, column, lane, dk);
+            self.staged_row = UNSTAGED;
+            let ended = clock64();
+            self.sums.drain += ended.wrapping_sub(opened);
+            self.sums.etread += dv_read.wrapping_sub(opened) + dk_read.wrapping_sub(dv_stored);
+            self.sums.estore += dv_stored.wrapping_sub(dv_read) + ended.wrapping_sub(dk_read);
+        }
+    }
+
     #[inline(always)]
     fn buffer(&self, segment: STmem, step: u32) -> STmem {
         if step & 1 == 0 {
@@ -794,7 +872,9 @@ impl pipeline::Job for BackwardKvProbe {
                 let opened = clock64();
                 self.sums.feed += opened.wrapping_sub(waited);
                 self.score_mmas(0);
-                self.sums.issue += clock64().wrapping_sub(opened);
+                let issued = clock64().wrapping_sub(opened);
+                self.sums.issue += issued;
+                self.sums.smma += issued;
             }
 
             if issuing {
@@ -808,7 +888,9 @@ impl pipeline::Job for BackwardKvProbe {
                             let opened = clock64();
                             self.sums.recycle += opened.wrapping_sub(waited);
                             self.load_qdy(refill, key_base + refill * TILE as u32, plane as i32);
-                            self.sums.issue += clock64().wrapping_sub(opened);
+                            let issued = clock64().wrapping_sub(opened);
+                            self.sums.issue += issued;
+                            self.sums.tma += issued;
                         }
                         if step + 1 < steps {
                             let waited = clock64();
@@ -816,7 +898,9 @@ impl pipeline::Job for BackwardKvProbe {
                             let opened = clock64();
                             self.sums.feed += opened.wrapping_sub(waited);
                             self.score_mmas(step + 1);
-                            self.sums.issue += clock64().wrapping_sub(opened);
+                            let issued = clock64().wrapping_sub(opened);
+                            self.sums.issue += issued;
+                            self.sums.smma += issued;
                         }
                     }
                     let at = clock64();
@@ -842,12 +926,18 @@ impl pipeline::Job for BackwardKvProbe {
                             accumulate,
                         );
                         mma::commit(self.shared.accumulated.sem(step));
-                        self.sums.issue += clock64().wrapping_sub(synced);
+                        let issued = clock64().wrapping_sub(synced);
+                        self.sums.issue += issued;
+                        self.sums.gmma += issued;
                     }
                     self.sums.visits += 1;
                     step += 1;
                 }
             } else {
+                if self.sums.items > 0 {
+                    self.sums.gap += clock64().wrapping_sub(self.sums.ended);
+                }
+                self.drain(band, group, lane);
                 let row = batch * self.t + key_base + band;
                 let mut step = 0u32;
                 while step < steps {
@@ -856,6 +946,9 @@ impl pipeline::Job for BackwardKvProbe {
                     self.shared.scored.wait(step);
                     let scored_at = clock64();
                     self.sums.scored += scored_at.wrapping_sub(waited);
+                    if step == 0 {
+                        self.sums.fill += scored_at.wrapping_sub(waited);
+                    }
                     if step >= GRADIENT_STAGES as u32 {
                         self.shared.accumulated.wait(step - GRADIENT_STAGES as u32);
                     }
@@ -884,7 +977,18 @@ impl pipeline::Job for BackwardKvProbe {
                         let dots: Cols = load_col_vec(self.dot, query, head, lane);
                         stat += clock64().wrapping_sub(at);
 
+                        // Seven stops rather than three, for kernel A's reason
+                        // and one more: this pass reads the same two segments A
+                        // does but stores *twice*, so the question is whether
+                        // the extra ~1000 ticks it carries over A's are the
+                        // second `store_tile` or the column-indexed arithmetic.
+                        // Behind [`KV_PASS_SPLIT`], which is off: here the
+                        // stops cost 8.9% and redistribute the issue warp's
+                        // budget, so they are a separate run and not the
+                        // instrument.
+                        let read_from = stamp::<KV_PASS_SPLIT>();
                         let mut probability: ScoreChunk = scores.tile(band, column);
+                        let scored_read = stamp::<KV_PASS_SPLIT>();
                         if masked {
                             probability.make_causal_t_at(
                                 lane,
@@ -895,13 +999,22 @@ impl pipeline::Job for BackwardKvProbe {
                         }
                         probability.sub_col_assign(lse2);
                         probability.unary_map_assign::<Exp2Hw>();
+                        let p_from = stamp::<KV_PASS_SPLIT>();
                         store_tile(p, band, column, lane, probability);
+                        let p_stored = stamp::<KV_PASS_SPLIT>();
 
                         let mut dpt: ScoreChunk = gradients.tile(band, column);
+                        let grad_read = stamp::<KV_PASS_SPLIT>();
                         dpt.sub_col_assign(dots);
                         probability.mul_assign(dpt);
                         probability.scale_assign(LN2);
+                        let ds_from = stamp::<KV_PASS_SPLIT>();
                         store_tile(ds, band, column, lane, probability);
+                        let ds_stored = stamp::<KV_PASS_SPLIT>();
+                        self.sums.tread += scored_read.wrapping_sub(read_from)
+                            + grad_read.wrapping_sub(p_stored);
+                        self.sums.sstore += p_stored.wrapping_sub(p_from)
+                            + ds_stored.wrapping_sub(ds_from);
                         column += SCORE_CHUNK as u32;
                     }
                     let passed = clock64();
@@ -918,12 +1031,12 @@ impl pipeline::Job for BackwardKvProbe {
 
                 let waited = clock64();
                 self.shared.accumulated.wait(steps - 1);
-                let columns = group * DRAIN_COLUMNS as u32;
-                let dv: OutHalf = self.dv_acc.tile_x8(band, columns);
-                store_rows(self.dv, row, head * HD as u32 + columns, lane, dv);
-                let dk: OutHalf = self.dk_acc.tile_x8(band, columns);
-                store_rows(self.dk, row, head * HD as u32 + columns, lane, dk);
-                self.sums.epi += clock64().wrapping_sub(waited);
+                self.staged_row = row;
+                self.staged_head = head;
+                let ended = clock64();
+                self.sums.epi += ended.wrapping_sub(waited);
+                self.sums.ewait += ended.wrapping_sub(waited);
+                self.sums.ended = ended;
             }
             self.sums.items += 1;
         }
@@ -992,12 +1105,17 @@ pub unsafe fn backward_kv(
             dot: GlobalRows::<F32>::from_raw(dot.as_ptr().cast_mut().cast(), stats),
             dk: GlobalRows::<F32>::from_slice(dk, heads as usize * HD),
             dv: GlobalRows::<F32>::from_slice(dv, heads as usize * HD),
+            staged_row: UNSTAGED,
+            staged_head: 0,
             sums: Sums::default(),
         };
         let opened = clock64();
         pipeline::run(&mut job, tiles * planes);
+        job.drain(warp_lanes(), warp::warp_id() / DRAIN_WARPS, warp::lane_id());
         let span = clock64().wrapping_sub(opened);
         report(clocks, &job.sums, span, job.warp_id, job.lane);
+        tcgen05_fence_before_thread_sync();
+        thread::sync_threads();
         dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
     }
 }
