@@ -23,7 +23,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 mod device;
 use device::{
     CLASSIFIER_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_THREADS,
-    SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_THREADS, kernels,
+    SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_THREADS, kernels, rope_table,
 };
 
 /// Rows the norms are timed at — the training config's `B * T`.
@@ -254,11 +254,13 @@ fn bench_swiglu(
 
 /// RoPE forward.
 ///
-/// The reason this has no tile row: a tile pass moves the same bytes with the
-/// same arithmetic in it, and the arithmetic is a `powf`, a `sin` and a `cos`
-/// per element. This rate against SwiGLU's directly above — comparable traffic,
-/// one `exp` in it — is what says the transcendentals and not the memory are
-/// what this kernel is waiting on, and a tile shape cannot move that (#70).
+/// #70 read this row against SwiGLU's — comparable traffic, one `exp` in it —
+/// and concluded the `powf`/`sin`/`cos` *per element* and not the memory was
+/// what the kernel waited on. Those angles depend only on `(position, pair)`,
+/// so they now come from a 1 MiB host-built table and this row is bandwidth
+/// again. The traffic denominator counts only the rotated tensor: the table is
+/// re-read `N * H / T` times and lives in L2, so charging it as compulsory
+/// would flatter the rate.
 fn bench_rope(
     stream: &std::sync::Arc<CudaStream>,
     module: &kernels::LoadedModule,
@@ -268,14 +270,16 @@ fn bench_rope(
     const HD: usize = 128;
 
     let x = DeviceBuffer::from_host(stream, &uniform_vec(N * D, 7))?;
+    let table = DeviceBuffer::from_host(stream, &rope_table(T, HD))?;
     let mut y = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
     let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
-        // SAFETY: both buffers are N x D and D is H * HD.
+        // SAFETY: both buffers are N x D, D is H * HD, and the table matches.
         unsafe {
             module.rope_forward(
                 stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
+                LaunchConfig::for_num_elems((N * D / 2) as u32),
                 &x,
+                &table,
                 T as u32,
                 H as u32,
                 HD as u32,

@@ -3652,6 +3652,9 @@ struct GpuBlockScratch<
     /// ascending partition order by `router_backward_weight_merge`.
     router_dweight_partials: GpuTensor<f32, Rank3<{ dense_device::ROUTER_WGRAD_SPLITS }, E, D>>,
     experts: GpuExpertScratch<E, C, D, FF>,
+    /// `[T, HD/2]` `(cos, sin)` couples, uploaded once. Shared by every block
+    /// and every step: RoPE's angles depend only on `(position, pair)`.
+    rope_table: DeviceBuffer<f32>,
     d_model_0: GpuTensor<f32, Rank2<N, D>>,
     d_model_1: GpuTensor<f32, Rank2<N, D>>,
     d_model_2: GpuTensor<f32, Rank2<N, D>>,
@@ -3670,7 +3673,7 @@ impl<
     const C: usize,
 > GpuBlockScratch<N, D, H, FF, E, K, C>
 {
-    fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+    fn new(stream: &CudaStream, sequence_length: usize) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             qkv: GpuTensor::zeros(stream)?,
             projection_output: GpuTensor::zeros(stream)?,
@@ -3682,6 +3685,10 @@ impl<
             router_dx: GpuTensor::zeros(stream)?,
             router_dweight_partials: GpuTensor::zeros(stream)?,
             experts: GpuExpertScratch::new(stream)?,
+            rope_table: DeviceBuffer::from_host(
+                stream,
+                &dense_device::rope_table(sequence_length, D / H),
+            )?,
             d_model_0: GpuTensor::zeros(stream)?,
             d_model_1: GpuTensor::zeros(stream)?,
             d_model_2: GpuTensor::zeros(stream)?,
@@ -3782,7 +3789,7 @@ impl<
             block_acts: (0..L)
                 .map(|_| GpuBlockActs::new(stream))
                 .collect::<Result<_, _>>()?,
-            block_scratch: GpuBlockScratch::new(stream)?,
+            block_scratch: GpuBlockScratch::new(stream, T)?,
             final_input: GpuTensor::zeros(stream)?,
             final_normalized: GpuTensor::zeros(stream)?,
             head_input,
@@ -3930,6 +3937,8 @@ pub struct GpuDenseWorkspace<
     logits_mn_tma: Bf16PairsTmaMap,
     linear_scratch: LinearScratch<N, D, FF>,
     flash_scratch: Option<FlashAttentionScratch<N, T, D, H>>,
+    /// See `GpuBlockScratch::rope_table`.
+    rope_table: DeviceBuffer<f32>,
     norm_backward_inv: GpuTensor<f32, Rank1<N>>,
     losses: GpuTensor<f32, Rank1<N>>,
     loss_sum: GpuTensor<f32, Rank1<1>>,
@@ -4006,6 +4015,7 @@ impl<
             } else {
                 None
             },
+            rope_table: DeviceBuffer::from_host(stream, &dense_device::rope_table(T, D / H))?,
             norm_backward_inv: GpuTensor::zeros(stream)?,
             losses: GpuTensor::zeros(stream)?,
             loss_sum: GpuTensor::zeros(stream)?,
@@ -4195,7 +4205,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         rope_into::<N, T, D, H, HD, P>(
             &acts.q,
             &mut scratch.d_model_0,
-            false,
+            &scratch.rope_table,
             stream,
             dense,
             profiler,
@@ -4205,7 +4215,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         rope_into::<N, T, D, H, HD, P>(
             &acts.k,
             &mut scratch.d_model_0,
-            false,
+            &scratch.rope_table,
             stream,
             dense,
             profiler,
@@ -4645,32 +4655,21 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             flash_bf16,
             profiler,
         )?;
-        rope_into::<N, T, D, H, HD, P>(
-            &scratch.d_model_1,
-            &mut scratch.d_model_0,
-            true,
-            stream,
-            dense,
-            profiler,
-            "backward.q_rope",
-        )?;
-        rope_into::<N, T, D, H, HD, P>(
-            &scratch.d_model_3,
-            &mut scratch.d_model_1,
-            true,
-            stream,
-            dense,
-            profiler,
-            "backward.k_rope",
-        )?;
+        // dQ, dK and dV go straight into the joined panel, un-rotated on the
+        // way: the two `backward.*_rope` passes this used to need are the
+        // join's own arithmetic now.
+        // SAFETY: the three gradients are [N, D] and qkv holds N * 3 * D.
         profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
-            dense.join_group3(
+            dense.join_group3_rope(
                 stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                scratch.d_model_0.as_device_buffer(),
+                LaunchConfig::for_num_elems((N * D / 2) as u32),
                 scratch.d_model_1.as_device_buffer(),
+                scratch.d_model_3.as_device_buffer(),
                 scratch.d_model_4.as_device_buffer(),
-                D as u32,
+                &scratch.rope_table,
+                T as u32,
+                H as u32,
+                HD as u32,
                 scratch.qkv.as_device_buffer_mut(),
             )
         })?;
@@ -5309,7 +5308,7 @@ impl<
             rope_into::<N, T, D, H, HD, P>(
                 &workspace.q,
                 &mut workspace.d_model_0,
-                false,
+                &workspace.rope_table,
                 stream,
                 dense,
                 profiler,
@@ -5319,7 +5318,7 @@ impl<
             rope_into::<N, T, D, H, HD, P>(
                 &workspace.k,
                 &mut workspace.d_model_0,
-                false,
+                &workspace.rope_table,
                 stream,
                 dense,
                 profiler,
@@ -5644,32 +5643,19 @@ impl<
                 flash_bf16,
                 profiler,
             )?;
-            rope_into::<N, T, D, H, HD, P>(
-                &workspace.d_model_1,
-                &mut workspace.d_model_0,
-                true,
-                stream,
-                dense,
-                profiler,
-                "backward.q_rope",
-            )?;
-            rope_into::<N, T, D, H, HD, P>(
-                &workspace.d_model_3,
-                &mut workspace.d_model_1,
-                true,
-                stream,
-                dense,
-                profiler,
-                "backward.k_rope",
-            )?;
+            // See the MoE block backward: the inverse rotation is the join's.
+            // SAFETY: the three gradients are [N, D] and qkv holds N * 3 * D.
             profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
-                dense.join_group3(
+                dense.join_group3_rope(
                     stream,
-                    LaunchConfig::for_num_elems((N * D) as u32),
-                    workspace.d_model_0.as_device_buffer(),
+                    LaunchConfig::for_num_elems((N * D / 2) as u32),
                     workspace.d_model_1.as_device_buffer(),
+                    workspace.d_model_3.as_device_buffer(),
                     workspace.d_model_4.as_device_buffer(),
-                    D as u32,
+                    &workspace.rope_table,
+                    T as u32,
+                    H as u32,
+                    HD as u32,
                     workspace.qkv.as_device_buffer_mut(),
                 )
             })?;
@@ -5771,40 +5757,26 @@ fn rope_into<
 >(
     x: &GpuTensor<f32, Rank2<N, D>>,
     y: &mut GpuTensor<f32, Rank2<N, D>>,
-    backward: bool,
+    table: &DeviceBuffer<f32>,
     stream: &CudaStream,
     kernels: &dense_kernels::LoadedModule,
     profiler: &mut P,
     name: &'static str,
 ) -> Result<(), DriverError> {
-    if backward {
-        // SAFETY: all buffers contain N * D elements and config matches them.
-        profiler.measure(stream, name, || unsafe {
-            kernels.rope_backward(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                x.as_device_buffer(),
-                T as u32,
-                H as u32,
-                HD as u32,
-                y.as_device_buffer_mut(),
-            )
-        })?;
-    } else {
-        // SAFETY: all buffers contain N * D elements and config matches them.
-        profiler.measure(stream, name, || unsafe {
-            kernels.rope_forward(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                x.as_device_buffer(),
-                T as u32,
-                H as u32,
-                HD as u32,
-                y.as_device_buffer_mut(),
-            )
-        })?;
-    }
-    Ok(())
+    // SAFETY: all buffers contain N * D elements, and the launch is one thread
+    // per rotated pair.
+    profiler.measure(stream, name, || unsafe {
+        kernels.rope_forward(
+            stream,
+            LaunchConfig::for_num_elems((N * D / 2) as u32),
+            x.as_device_buffer(),
+            table,
+            T as u32,
+            H as u32,
+            HD as u32,
+            y.as_device_buffer_mut(),
+        )
+    })
 }
 
 /// Attention forward dispatch: tile-aligned shapes stage packed-bf16 head

@@ -154,6 +154,32 @@ pub const SWIGLU_TILE_BLOCK_ROWS: usize = SWIGLU_TILE_ROWS * SWIGLU_TILE_WARPS;
 /// which is the guard every vectorized row walk below checks.
 pub const QUAD_LANES: usize = 4;
 
+/// The RoPE cos/sin table for one sequence: `[sequence_length, head_dim / 2]`
+/// entries of `(cos, sin)`, laid out so a rotated pair reads one adjacent
+/// `f32` couple.
+///
+/// The rotation kernels used to recompute `powf`, `sin` and `cos` per element,
+/// which is what they were waiting on rather than memory (#70). The angles are
+/// a function of `(position, pair)` only — `sequence_length * head_dim` floats,
+/// 1 MiB at the training shape — so they are built once and read from L2.
+///
+/// Built on the *host*, with the same expression `nn::Rope` uses, so one set of
+/// angles serves the CPU reference and every device consumer instead of
+/// comparing libdevice's `sinf` against the host's.
+pub fn rope_table(sequence_length: usize, head_dim: usize) -> Vec<f32> {
+    assert_eq!(head_dim % 2, 0, "RoPE head dimension must be even");
+    let mut table = Vec::with_capacity(sequence_length * head_dim);
+    for position in 0..sequence_length {
+        for pair in 0..head_dim / 2 {
+            let frequency = 10_000.0f32.powf(-((2 * pair) as f32) / head_dim as f32);
+            let (sin, cos) = (position as f32 * frequency).sin_cos();
+            table.push(cos);
+            table.push(sin);
+        }
+    }
+    table
+}
+
 /// One warp's slice of a row band, [`NORM_TILE_CHUNK`] columns wide.
 type NormChunk = RegTile<NORM_TILE_ROWS, NORM_TILE_CHUNK, BaseLdtm>;
 
@@ -944,6 +970,53 @@ pub mod kernels {
         }
     }
 
+    /// [`join_group3`] with RoPE's transposed rotation folded into the first
+    /// two groups.
+    ///
+    /// Attention backward hands out gradients for the *rotated* Q and K, which
+    /// the qkv projection wants un-rotated. Doing that on the way into the
+    /// joined panel replaces three passes over `[N, D]` triples with one: the
+    /// arithmetic is [`rope_backward`]'s, elementwise and in fp32, so the
+    /// result is the composition's bit for bit.
+    ///
+    /// One thread per rotated pair; `width` is `heads * head_dim`.
+    ///
+    /// # Safety
+    ///
+    /// `dq`, `dk` and `dv` are `[N, heads * head_dim]` and `output` is
+    /// `[N, 3 * heads * head_dim]`.
+    #[kernel]
+    pub unsafe fn join_group3_rope(
+        dq: &[f32],
+        dk: &[f32],
+        dv: &[f32],
+        table: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        head_dim: u32,
+        mut output: DisjointSlice<f32>,
+    ) {
+        let pair = thread::index_1d().get();
+        // Launches round up to whole blocks; excess threads must not write.
+        if 6 * pair >= output.len() {
+            return;
+        }
+        let width = heads as usize * head_dim as usize;
+        let base = (pair / (width / 2)) * 3 * width + 2 * (pair % (width / 2));
+        let angle = rope_angle(pair, sequence_length, heads, head_dim);
+        let (cos, sin) = (table[angle], table[angle + 1]);
+        let (q0, q1) = (dq[2 * pair], dq[2 * pair + 1]);
+        let (k0, k1) = (dk[2 * pair], dk[2 * pair + 1]);
+        unsafe {
+            *output.get_unchecked_mut(base) = q0 * cos + q1 * sin;
+            *output.get_unchecked_mut(base + 1) = -q0 * sin + q1 * cos;
+            *output.get_unchecked_mut(base + width) = k0 * cos + k1 * sin;
+            *output.get_unchecked_mut(base + width + 1) = -k0 * sin + k1 * cos;
+            *output.get_unchecked_mut(base + 2 * width) = dv[2 * pair];
+            *output.get_unchecked_mut(base + 2 * width + 1) = dv[2 * pair + 1];
+        }
+    }
+
     #[kernel]
     pub fn embedding_forward(weight: &[u32], tokens: &[u32], dim: u32, mut y: DisjointSlice<f32>) {
         let index = thread::index_1d();
@@ -1595,61 +1668,71 @@ pub mod kernels {
         }
     }
 
+    /// Index of a rotated pair's `(cos, sin)` couple in a [`rope_table`].
+    ///
+    /// `pair` counts rotated pairs across the whole `[N, heads * head_dim]`
+    /// row, and pairs never straddle a head, so the head falls out of the
+    /// modulus without ever being named.
+    #[inline(always)]
+    fn rope_angle(pair: usize, sequence_length: u32, heads: u32, head_dim: u32) -> usize {
+        let half = head_dim as usize / 2;
+        let position = (pair / (heads as usize * half)) % sequence_length as usize;
+        2 * (position * half + pair % half)
+    }
+
+    /// RoPE forward over `[N, heads * head_dim]`, one thread per rotated pair.
+    ///
+    /// # Safety
+    ///
+    /// `y` and `x` hold the same element count and `table` is a
+    /// [`rope_table`] for this `sequence_length` and `head_dim`.
     #[kernel]
-    pub fn rope_forward(
+    pub unsafe fn rope_forward(
         x: &[f32],
+        table: &[f32],
         sequence_length: u32,
         heads: u32,
         head_dim: u32,
         mut y: DisjointSlice<f32>,
     ) {
-        let index = thread::index_1d();
-        let i = index.get();
-        if let Some(slot) = y.get_mut(index) {
-            let hd = head_dim as usize;
-            let col = i % hd;
-            let row = i / (heads as usize * hd);
-            let position = row % sequence_length as usize;
-            let pair = col / 2;
-            let frequency = 10_000.0f32.powf(-((2 * pair) as f32) / head_dim as f32);
-            let angle = position as f32 * frequency;
-            let sin = angle.sin();
-            let cos = angle.cos();
-            let base = i - col % 2;
-            *slot = if col % 2 == 0 {
-                x[base] * cos - x[base + 1] * sin
-            } else {
-                x[base] * sin + x[base + 1] * cos
-            };
+        let pair = thread::index_1d().get();
+        // Launches round up to whole blocks; excess threads must not write.
+        if 2 * pair + 1 >= y.len() {
+            return;
+        }
+        let angle = rope_angle(pair, sequence_length, heads, head_dim);
+        let (cos, sin) = (table[angle], table[angle + 1]);
+        let (x0, x1) = (x[2 * pair], x[2 * pair + 1]);
+        unsafe {
+            *y.get_unchecked_mut(2 * pair) = x0 * cos - x1 * sin;
+            *y.get_unchecked_mut(2 * pair + 1) = x0 * sin + x1 * cos;
         }
     }
 
+    /// RoPE backward: the transposed rotation, same pair per thread.
+    ///
+    /// # Safety
+    ///
+    /// As [`rope_forward`].
     #[kernel]
-    pub fn rope_backward(
+    pub unsafe fn rope_backward(
         dy: &[f32],
+        table: &[f32],
         sequence_length: u32,
         heads: u32,
         head_dim: u32,
         mut dx: DisjointSlice<f32>,
     ) {
-        let index = thread::index_1d();
-        let i = index.get();
-        if let Some(slot) = dx.get_mut(index) {
-            let hd = head_dim as usize;
-            let col = i % hd;
-            let row = i / (heads as usize * hd);
-            let position = row % sequence_length as usize;
-            let pair = col / 2;
-            let frequency = 10_000.0f32.powf(-((2 * pair) as f32) / head_dim as f32);
-            let angle = position as f32 * frequency;
-            let sin = angle.sin();
-            let cos = angle.cos();
-            let base = i - col % 2;
-            *slot = if col % 2 == 0 {
-                dy[base] * cos + dy[base + 1] * sin
-            } else {
-                -dy[base] * sin + dy[base + 1] * cos
-            };
+        let pair = thread::index_1d().get();
+        if 2 * pair + 1 >= dx.len() {
+            return;
+        }
+        let angle = rope_angle(pair, sequence_length, heads, head_dim);
+        let (cos, sin) = (table[angle], table[angle + 1]);
+        let (d0, d1) = (dy[2 * pair], dy[2 * pair + 1]);
+        unsafe {
+            *dx.get_unchecked_mut(2 * pair) = d0 * cos + d1 * sin;
+            *dx.get_unchecked_mut(2 * pair + 1) = -d0 * sin + d1 * cos;
         }
     }
 
