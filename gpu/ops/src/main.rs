@@ -19,7 +19,7 @@ use device::{
     NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN, ROUTER_GEMM_THREADS,
     ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM,
     ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK,
-    SWIGLU_TILE_THREADS, kernels,
+    SWIGLU_TILE_THREADS, kernels, rope_table,
 };
 use tensor_core::bf16;
 
@@ -1008,13 +1008,15 @@ fn check_rope(
         let cpu_dx = cpu.backward((), dy.clone());
         let x_dev = DeviceBuffer::from_host(stream, x.as_slice())?;
         let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+        let table = DeviceBuffer::from_host(stream, &rope_table(T, HD))?;
         let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
         let mut dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
 
         module.rope_forward(
             stream,
-            LaunchConfig::for_num_elems((N * D) as u32),
+            LaunchConfig::for_num_elems((N * D / 2) as u32),
             &x_dev,
+            &table,
             T as u32,
             H as u32,
             HD as u32,
@@ -1022,8 +1024,9 @@ fn check_rope(
         )?;
         module.rope_backward(
             stream,
-            LaunchConfig::for_num_elems((N * D) as u32),
+            LaunchConfig::for_num_elems((N * D / 2) as u32),
             &dy_dev,
+            &table,
             T as u32,
             H as u32,
             HD as u32,
@@ -1042,6 +1045,48 @@ fn check_rope(
             cpu_dx.as_slice(),
             2e-6,
             2e-6,
+        );
+
+        // The fused backward join is a substitution for `rope_backward` twice
+        // followed by `join_group3`, so the oracle it owes parity to is that
+        // composition — and it owes it exactly, not to a tolerance.
+        let dk = CpuTensor::<f32, Rank2<N, D>>::uniform(12);
+        let dv = CpuTensor::<f32, Rank2<N, D>>::uniform(13);
+        let dk_dev = DeviceBuffer::from_host(stream, dk.as_slice())?;
+        let dv_dev = DeviceBuffer::from_host(stream, dv.as_slice())?;
+        let mut dk_rotated = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+        let mut composed = DeviceBuffer::<f32>::zeroed(stream, N * 3 * D)?;
+        let mut fused = DeviceBuffer::<f32>::zeroed(stream, N * 3 * D)?;
+        let pairs = LaunchConfig::for_num_elems((N * D / 2) as u32);
+        module.rope_backward(
+            stream,
+            pairs,
+            &dk_dev,
+            &table,
+            T as u32,
+            H as u32,
+            HD as u32,
+            &mut dk_rotated,
+        )?;
+        module.join_group3(
+            stream,
+            LaunchConfig::for_num_elems((N * D) as u32),
+            &dx_dev,
+            &dk_rotated,
+            &dv_dev,
+            D as u32,
+            &mut composed,
+        )?;
+        module.join_group3_rope(
+            stream, pairs, &dy_dev, &dk_dev, &dv_dev, &table, T as u32, H as u32, HD as u32,
+            &mut fused,
+        )?;
+        assert_close(
+            "join_group3_rope vs rope_backward + join_group3",
+            &fused.to_host_vec(stream)?,
+            &composed.to_host_vec(stream)?,
+            0.0,
+            0.0,
         );
         Ok(())
     }
