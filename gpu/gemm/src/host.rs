@@ -45,19 +45,29 @@ pub const TC_K_PIPELINE: usize = 256;
 /// *caller-facing* eligibility unit some model shapes are still tested against;
 /// nothing here requires it.
 pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
+    tcgen05_launch_config_over(m, n, k, super::MAX_CLUSTERS)
+}
+
+/// [`tcgen05_launch_config`] over a stated number of clusters rather than the
+/// device's.
+///
+/// The kernel reads its own grid — `Walk::open` strides by
+/// `cluster::num_clusters()` — so any width computes the same `C`, and the only
+/// thing that changes is how many items a cluster takes. That makes the grid a
+/// *measuring instrument*: if the device runs `MAX_CLUSTERS` in one wave,
+/// halving the grid doubles the time; if it was already running two waves,
+/// halving it changes nothing. `bin/residency.rs` is the caller.
+pub fn tcgen05_launch_config_over(m: usize, n: usize, k: usize, clusters: u32) -> LaunchConfig {
     assert!(m.is_multiple_of(TC_M_TILE));
     assert!(n.is_multiple_of(TC_N_TILE));
     assert!(k.is_multiple_of(TC_BK));
     assert!(m <= u32::MAX as usize && n <= u32::MAX as usize && k <= u32::MAX as usize);
+    assert!(clusters > 0);
     let tiles = (m / TC_M_TILE)
         .checked_mul(n / TC_N_TILE)
         .expect("tcgen05 work grid overflow");
     LaunchConfig {
-        grid_dim: (
-            TC_RANKS * tiles.min(super::MAX_CLUSTERS as usize) as u32,
-            1,
-            1,
-        ),
+        grid_dim: (TC_RANKS * tiles.min(clusters as usize) as u32, 1, 1),
         block_dim: (TC_THREADS, 1, 1),
         shared_mem_bytes: super::SHARED_BYTES as u32,
     }

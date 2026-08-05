@@ -9,6 +9,7 @@
 #   SANITIZE=synccheck ./run.sh gemm  # compute-sanitizer (memcheck/racecheck/synccheck/initcheck)
 #   BASELINE=gemm_baseline ./run.sh gemm  # CUDA C++ baseline (gpu/<k>/baselines/<name>.cu)
 #   BASELINE_REF=<git-ref> ./run.sh <k> profile  # same-container A/B vs a pushed ref
+#   NCU=1 ./run.sh gemm cublas_decode # run a binary under Nsight Compute
 #   PTX=1 ./run.sh gemm               # dump the generated PTX
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -23,6 +24,7 @@ args=(--kernel "$kernel")
 [[ -n "${SWEEP:-}" ]] && args+=(--sweep "$SWEEP")
 [[ -n "${SANITIZE:-}" ]] && args+=(--sanitize "$SANITIZE")
 [[ -n "${BASELINE:-}" ]] && args+=(--baseline "$BASELINE")
+[[ -n "${NCU:-}" ]] && args+=(--ncu)
 [[ -n "${PTX:-}" ]] && args+=(--ptx)
 [[ -n "${SHARD:-}" ]] && args+=(--shard "$SHARD")
 [[ -n "${STEPS:-}" ]] && args+=(--steps "$STEPS")
