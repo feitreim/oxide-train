@@ -720,6 +720,113 @@ fn check_shape(
     }
 }
 
+/// The fused rotate-and-stage pass against the composition it substitutes for.
+///
+/// `stage_qkv_heads_bf16` replaces `split_group3` + two `rope_forward` passes +
+/// three `stage_attention_heads_bf16` launches. Everything it drops was fp32
+/// storage between two kernels, so the substitution owes exact parity — every
+/// staged word, not a tolerance — and that is what is asserted here. The
+/// unfused kernels keep their own bit-exact CPU mirror above; this gate is the
+/// third tier of the chain (SPEC §11).
+fn check_fused_staging(
+    stream: &CudaStream,
+    flash_module: &flash::kernels::LoadedModule,
+    naive_module: &naive::kernels::LoadedModule,
+    b: usize,
+    t: usize,
+    h: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: every launch below is sized from the same (b, t, h) shape as the
+    // buffers it reads and writes.
+    unsafe {
+        let (n, d) = (b * t, h * HD);
+        let words = n * d / 2;
+        let qkv = DeviceBuffer::from_host(stream, &uniform_vec(n * 3 * d, 181))?;
+        let table = DeviceBuffer::from_host(stream, &naive::rope_table(t, HD))?;
+        let q_scale = LOG2_E / (HD as f32).sqrt();
+        let elements = LaunchConfig::for_num_elems((n * d) as u32);
+        let pairs = LaunchConfig::for_num_elems(words as u32);
+        let staging = flash::stage_heads_config(n, h, HD);
+
+        let mut split_q = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut split_k = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut split_v = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        naive_module.split_group3(
+            stream,
+            elements,
+            &qkv,
+            d as u32,
+            &mut split_q,
+            &mut split_k,
+            &mut split_v,
+        )?;
+        let mut rotated_q = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        let mut rotated_k = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
+        naive_module.rope_forward(
+            stream,
+            pairs,
+            &split_q,
+            &table,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut rotated_q,
+        )?;
+        naive_module.rope_forward(
+            stream,
+            pairs,
+            &split_k,
+            &table,
+            t as u32,
+            h as u32,
+            HD as u32,
+            &mut rotated_k,
+        )?;
+
+        let mut fused_q = DeviceBuffer::<u32>::zeroed(stream, words)?;
+        let mut fused_k = DeviceBuffer::<u32>::zeroed(stream, words)?;
+        let mut fused_v = DeviceBuffer::<u32>::zeroed(stream, words)?;
+        flash_module.stage_qkv_heads_bf16(
+            stream,
+            staging,
+            &qkv,
+            &table,
+            t as u32,
+            h as u32,
+            q_scale,
+            &mut fused_q,
+            &mut fused_k,
+            &mut fused_v,
+        )?;
+
+        for (name, operand, scale, fused) in [
+            ("q", &rotated_q, q_scale, &fused_q),
+            ("k", &rotated_k, 1.0, &fused_k),
+            ("v", &split_v, 1.0, &fused_v),
+        ] {
+            let mut expected = DeviceBuffer::<u32>::zeroed(stream, words)?;
+            flash_module.stage_attention_heads_bf16(
+                stream,
+                staging,
+                operand,
+                t as u32,
+                h as u32,
+                scale,
+                &mut expected,
+            )?;
+            let (got, want) = (fused.to_host_vec(stream)?, expected.to_host_vec(stream)?);
+            for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g, w,
+                    "fused {name} staging word {i} at [{b},{t},{h}]: \
+                     {g:#010x} vs split+rope+stage {w:#010x}"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(HD.is_power_of_two() && HD <= flash::MAX_HEAD_DIM);
     assert_eq!(HD, flash::TILE_HD);
@@ -766,6 +873,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         4,
     )?;
     println!("✓ tcgen05 forward parity passed on tile-aligned shapes");
+    for (b, t, h) in [(1, 128, 2), (2, 256, 3), (1, 1024, 4)] {
+        check_fused_staging(&stream, &flash_module, &naive_module, b, t, h)?;
+    }
+    println!("✓ fused qkv rotate-and-stage matches split + rope + stage exactly");
     check_tcgen05_backward_shape(
         &stream,
         &flash_module,

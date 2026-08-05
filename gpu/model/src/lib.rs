@@ -757,20 +757,81 @@ fn tcgen05_attention_eligible(t: usize, head_dim: usize) -> bool {
     t.is_multiple_of(FLASH_QUERIES) && head_dim == FLASH_HD
 }
 
-/// Staged packed-bf16 attention operands for the tcgen05 forward (issue
-/// #35): one `[B*H, T, 64]` head-panel buffer per operand, their TMA maps,
-/// and the per-workstream correction-count output. Allocated only when the
-/// shape fits the tcgen05 contract (`T` tile-aligned, `HD == 64`); other
-/// shapes stay on the fp32 tiled forward.
+/// One operand's packed-bf16 `[B*H, T, HD]` head panel and the TMA map that
+/// streams it.
+struct StagedHeads {
+    words: DeviceBuffer<u32>,
+    tma: FlashHeadTmaMap,
+}
+
+impl StagedHeads {
+    fn new(
+        stream: &CudaStream,
+        words: usize,
+        sequence_length: usize,
+        planes: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        let words = DeviceBuffer::zeroed(stream, words)?;
+        // SAFETY: the mapped buffer lives beside its map and is never
+        // reallocated.
+        let tma = unsafe { create_flash_head_tma_map(stream, &words, sequence_length, planes)? };
+        Ok(Self { words, tma })
+    }
+}
+
+/// Where a block keeps Q, K and V between the projection and attention.
+///
+/// The tcgen05 path never wants them fp32. Its only consumers are the two
+/// flash passes, which stream packed-bf16 head panels, so the projection's
+/// fp32 panel is rotated and quantized straight into those panels once and
+/// read twice — the fp32 triple, the split that filled it, the two rotation
+/// passes and the backward's re-staging all go away with it (SPEC §7.1).
+/// Shapes the tcgen05 kernels do not cover keep the fp32 triple its oracle
+/// kernels read.
+enum AttentionOperands<const N: usize, const D: usize> {
+    Staged {
+        q: StagedHeads,
+        k: StagedHeads,
+        v: StagedHeads,
+    },
+    Wide {
+        q: GpuTensor<f32, Rank2<N, D>>,
+        k: GpuTensor<f32, Rank2<N, D>>,
+        v: GpuTensor<f32, Rank2<N, D>>,
+    },
+}
+
+impl<const N: usize, const D: usize> AttentionOperands<N, D> {
+    fn new(
+        stream: &CudaStream,
+        sequence_length: usize,
+        heads: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        if !tcgen05_attention_eligible(sequence_length, D / heads) {
+            return Ok(Self::Wide {
+                q: GpuTensor::zeros(stream)?,
+                k: GpuTensor::zeros(stream)?,
+                v: GpuTensor::zeros(stream)?,
+            });
+        }
+        let planes = N / sequence_length * heads;
+        let panel = || StagedHeads::new(stream, N * D / 2, sequence_length, planes);
+        Ok(Self::Staged {
+            q: panel()?,
+            k: panel()?,
+            v: panel()?,
+        })
+    }
+}
+
+/// The backward's staged dY panel and the per-workstream correction-count
+/// output, shared across blocks.
+///
+/// Q/K/V are not here any more: they are per-block saved activations that the
+/// forward already staged (see [`AttentionOperands`]). dY is not — it is a
+/// backward temporary, so one buffer serves every block.
 struct FlashAttentionScratch<const N: usize, const T: usize, const D: usize, const H: usize> {
-    q: DeviceBuffer<u32>,
-    k: DeviceBuffer<u32>,
-    v: DeviceBuffer<u32>,
-    dy: DeviceBuffer<u32>,
-    q_tma: FlashHeadTmaMap,
-    k_tma: FlashHeadTmaMap,
-    v_tma: FlashHeadTmaMap,
-    dy_tma: FlashHeadTmaMap,
+    dy: StagedHeads,
     correction_counts: DeviceBuffer<u32>,
 }
 
@@ -778,30 +839,9 @@ impl<const N: usize, const T: usize, const D: usize, const H: usize>
     FlashAttentionScratch<N, T, D, H>
 {
     fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
-        let q = DeviceBuffer::zeroed(stream, N * D / 2)?;
-        let k = DeviceBuffer::zeroed(stream, N * D / 2)?;
-        let v = DeviceBuffer::zeroed(stream, N * D / 2)?;
-        // The backward gradient kernels stream dY the same way the forward
-        // streams K/V; scratch is shared across layers, so both passes
-        // re-stage into these buffers.
-        let dy = DeviceBuffer::zeroed(stream, N * D / 2)?;
-        // SAFETY: the mapped buffers live in this scratch beside their maps
-        // and are never reallocated.
-        let q_tma = unsafe { create_flash_head_tma_map(stream, &q, T, N / T * H)? };
-        let k_tma = unsafe { create_flash_head_tma_map(stream, &k, T, N / T * H)? };
-        let v_tma = unsafe { create_flash_head_tma_map(stream, &v, T, N / T * H)? };
-        let dy_tma = unsafe { create_flash_head_tma_map(stream, &dy, T, N / T * H)? };
-        let correction_counts = DeviceBuffer::zeroed(stream, correction_count_len(N / T, T, H))?;
         Ok(Self {
-            q,
-            k,
-            v,
-            dy,
-            q_tma,
-            k_tma,
-            v_tma,
-            dy_tma,
-            correction_counts,
+            dy: StagedHeads::new(stream, N * D / 2, T, N / T * H)?,
+            correction_counts: DeviceBuffer::zeroed(stream, correction_count_len(N / T, T, H))?,
         })
     }
 }
@@ -3591,9 +3631,7 @@ struct GpuBlockActs<
 > {
     input: GpuTensor<f32, Rank2<N, D>>,
     attention_normalized: GpuTensor<f32, Rank2<N, D>>,
-    q: GpuTensor<f32, Rank2<N, D>>,
-    k: GpuTensor<f32, Rank2<N, D>>,
-    v: GpuTensor<f32, Rank2<N, D>>,
+    attention: AttentionOperands<N, D>,
     attended: GpuTensor<f32, Rank2<N, D>>,
     attention_logsumexp: GpuTensor<f32, Rank2<N, H>>,
     ffn_input: GpuTensor<f32, Rank2<N, D>>,
@@ -3612,13 +3650,11 @@ impl<
     const C: usize,
 > GpuBlockActs<N, D, H, FF, E, K, C>
 {
-    fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+    fn new(stream: &CudaStream, sequence_length: usize) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             input: GpuTensor::zeros(stream)?,
             attention_normalized: GpuTensor::zeros(stream)?,
-            q: GpuTensor::zeros(stream)?,
-            k: GpuTensor::zeros(stream)?,
-            v: GpuTensor::zeros(stream)?,
+            attention: AttentionOperands::new(stream, sequence_length, H)?,
             attended: GpuTensor::zeros(stream)?,
             attention_logsumexp: GpuTensor::zeros(stream)?,
             ffn_input: GpuTensor::zeros(stream)?,
@@ -3787,7 +3823,7 @@ impl<
             staging: [InputStaging::new(stream)?, InputStaging::new(stream)?],
             next_staging: 0,
             block_acts: (0..L)
-                .map(|_| GpuBlockActs::new(stream))
+                .map(|_| GpuBlockActs::new(stream, T))
                 .collect::<Result<_, _>>()?,
             block_scratch: GpuBlockScratch::new(stream, T)?,
             final_input: GpuTensor::zeros(stream)?,
@@ -3913,9 +3949,7 @@ pub struct GpuDenseWorkspace<
     attention_input: GpuTensor<f32, Rank2<N, D>>,
     attention_normalized: GpuTensor<f32, Rank2<N, D>>,
     qkv: GpuTensor<f32, Rank3<N, 3, D>>,
-    q: GpuTensor<f32, Rank2<N, D>>,
-    k: GpuTensor<f32, Rank2<N, D>>,
-    v: GpuTensor<f32, Rank2<N, D>>,
+    attention: AttentionOperands<N, D>,
     attended: GpuTensor<f32, Rank2<N, D>>,
     attention_logsumexp: GpuTensor<f32, Rank2<N, H>>,
     attention_dot: GpuTensor<f32, Rank2<N, H>>,
@@ -3987,9 +4021,7 @@ impl<
             attention_input: GpuTensor::zeros(stream)?,
             attention_normalized: GpuTensor::zeros(stream)?,
             qkv: GpuTensor::zeros(stream)?,
-            q: GpuTensor::zeros(stream)?,
-            k: GpuTensor::zeros(stream)?,
-            v: GpuTensor::zeros(stream)?,
+            attention: AttentionOperands::new(stream, T, H)?,
             attended: GpuTensor::zeros(stream)?,
             attention_logsumexp: GpuTensor::zeros(stream)?,
             attention_dot: GpuTensor::zeros(stream)?,
@@ -4190,42 +4222,18 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             profiler,
             "forward.qkv_proj.gemm",
         )?;
-        // SAFETY: qkv contains three contiguous N * D groups.
-        profiler.measure(stream, "forward.qkv_proj.split", || unsafe {
-            dense.split_group3(
-                stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
-                scratch.qkv.as_device_buffer(),
-                D as u32,
-                acts.q.as_device_buffer_mut(),
-                acts.k.as_device_buffer_mut(),
-                acts.v.as_device_buffer_mut(),
-            )
-        })?;
-        rope_into::<N, T, D, H, HD, P>(
-            &acts.q,
+        stage_attention_operands::<N, T, D, H, HD, P>(
+            &scratch.qkv,
+            &mut acts.attention,
             &mut scratch.d_model_0,
             &scratch.rope_table,
             stream,
             dense,
+            flash,
             profiler,
-            "forward.q_rope",
         )?;
-        std::mem::swap(&mut acts.q, &mut scratch.d_model_0);
-        rope_into::<N, T, D, H, HD, P>(
-            &acts.k,
-            &mut scratch.d_model_0,
-            &scratch.rope_table,
-            stream,
-            dense,
-            profiler,
-            "forward.k_rope",
-        )?;
-        std::mem::swap(&mut acts.k, &mut scratch.d_model_0);
         flash_attention_forward_into::<N, T, D, H, HD, P>(
-            &acts.q,
-            &acts.k,
-            &acts.v,
+            &acts.attention,
             &mut acts.attended,
             &mut acts.attention_logsumexp,
             flash_scratch.as_deref_mut(),
@@ -4639,9 +4647,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
         )?;
         flash_attention_backward_into::<N, T, D, H, HD, P>(
-            &acts.q,
-            &acts.k,
-            &acts.v,
+            &acts.attention,
             &acts.attended,
             &acts.attention_logsumexp,
             &mut scratch.attention_dot,
@@ -5294,41 +5300,18 @@ impl<
                 profiler,
                 "forward.qkv_proj.gemm",
             )?;
-            profiler.measure(stream, "forward.qkv_proj.split", || {
-                dense.split_group3(
-                    stream,
-                    LaunchConfig::for_num_elems((N * D) as u32),
-                    workspace.qkv.as_device_buffer(),
-                    D as u32,
-                    workspace.q.as_device_buffer_mut(),
-                    workspace.k.as_device_buffer_mut(),
-                    workspace.v.as_device_buffer_mut(),
-                )
-            })?;
-            rope_into::<N, T, D, H, HD, P>(
-                &workspace.q,
+            stage_attention_operands::<N, T, D, H, HD, P>(
+                &workspace.qkv,
+                &mut workspace.attention,
                 &mut workspace.d_model_0,
                 &workspace.rope_table,
                 stream,
                 dense,
+                flash,
                 profiler,
-                "forward.q_rope",
             )?;
-            std::mem::swap(&mut workspace.q, &mut workspace.d_model_0);
-            rope_into::<N, T, D, H, HD, P>(
-                &workspace.k,
-                &mut workspace.d_model_0,
-                &workspace.rope_table,
-                stream,
-                dense,
-                profiler,
-                "forward.k_rope",
-            )?;
-            std::mem::swap(&mut workspace.k, &mut workspace.d_model_0);
             flash_attention_forward_into::<N, T, D, H, HD, P>(
-                &workspace.q,
-                &workspace.k,
-                &workspace.v,
+                &workspace.attention,
                 &mut workspace.attended,
                 &mut workspace.attention_logsumexp,
                 workspace.flash_scratch.as_mut(),
@@ -5627,9 +5610,7 @@ impl<
                 ["backward.o_proj.weight_gemm", "backward.o_proj.input_gemm"],
             )?;
             flash_attention_backward_into::<N, T, D, H, HD, P>(
-                &workspace.q,
-                &workspace.k,
-                &workspace.v,
+                &workspace.attention,
                 &workspace.attended,
                 &workspace.attention_logsumexp,
                 &mut workspace.attention_dot,
@@ -5779,10 +5760,96 @@ fn rope_into<
     })
 }
 
-/// Attention forward dispatch: tile-aligned shapes stage packed-bf16 head
-/// panels and run the persistent tcgen05 forward (issue #35 phase 3); other
-/// shapes stay on the fp32 tiled kernel. Both paths write the same fp32
-/// `y`/natural-log LSE contract, so the (still fp32) backward is oblivious.
+/// Q, K and V out of the projection's fp32 `[N, 3D]` panel and into whatever
+/// this shape's attention reads.
+///
+/// The staged path does it in one pass — split, rotate, scale, quantize and
+/// relayout head-major — where the fp32 path still needs the split and two
+/// rotation passes it always did. `rotated` is a scratch `[N, D]` the fp32
+/// path rotates through and the staged path never touches.
+#[allow(clippy::too_many_arguments)]
+fn stage_attention_operands<
+    const N: usize,
+    const T: usize,
+    const D: usize,
+    const H: usize,
+    const HD: usize,
+    P: KernelProfiler,
+>(
+    qkv: &GpuTensor<f32, Rank3<N, 3, D>>,
+    operands: &mut AttentionOperands<N, D>,
+    rotated: &mut GpuTensor<f32, Rank2<N, D>>,
+    table: &DeviceBuffer<f32>,
+    stream: &CudaStream,
+    dense: &dense_kernels::LoadedModule,
+    flash: &flash_kernels::LoadedModule,
+    profiler: &mut P,
+) -> Result<(), DriverError> {
+    match operands {
+        AttentionOperands::Staged { q, k, v } => {
+            // Fold softmax_scale * log2(e) into Q so the kernel's softmax is
+            // base-2 native; K/V quantize unscaled.
+            let q_scale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
+            // SAFETY: the panel is [N, 3D] and the three staged buffers match
+            // the N/T/H/HD attention layout.
+            profiler.measure(stream, "forward.attention.stage_qkv", || unsafe {
+                flash.stage_qkv_heads_bf16(
+                    stream,
+                    flash_device::stage_heads_config(N, H, HD),
+                    qkv.as_device_buffer(),
+                    table,
+                    T as u32,
+                    H as u32,
+                    q_scale,
+                    &mut q.words,
+                    &mut k.words,
+                    &mut v.words,
+                )
+            })
+        }
+        AttentionOperands::Wide { q, k, v } => {
+            // SAFETY: qkv contains three contiguous N * D groups.
+            profiler.measure(stream, "forward.qkv_proj.split", || unsafe {
+                dense.split_group3(
+                    stream,
+                    LaunchConfig::for_num_elems((N * D) as u32),
+                    qkv.as_device_buffer(),
+                    D as u32,
+                    q.as_device_buffer_mut(),
+                    k.as_device_buffer_mut(),
+                    v.as_device_buffer_mut(),
+                )
+            })?;
+            rope_into::<N, T, D, H, HD, P>(
+                q,
+                rotated,
+                table,
+                stream,
+                dense,
+                profiler,
+                "forward.q_rope",
+            )?;
+            std::mem::swap(q, rotated);
+            rope_into::<N, T, D, H, HD, P>(
+                k,
+                rotated,
+                table,
+                stream,
+                dense,
+                profiler,
+                "forward.k_rope",
+            )?;
+            std::mem::swap(k, rotated);
+            Ok(())
+        }
+    }
+}
+
+/// Attention forward dispatch: tile-aligned shapes read the packed-bf16 head
+/// panels the qkv staging pass wrote and run the persistent tcgen05 forward
+/// (issue #35 phase 3); other shapes stay on the fp32 tiled kernel. Both paths
+/// write the same fp32 `y`/natural-log LSE contract, so the (still fp32)
+/// backward is oblivious.
 #[allow(clippy::too_many_arguments)]
 fn flash_attention_forward_into<
     const N: usize,
@@ -5792,9 +5859,7 @@ fn flash_attention_forward_into<
     const HD: usize,
     P: KernelProfiler,
 >(
-    q: &GpuTensor<f32, Rank2<N, D>>,
-    k: &GpuTensor<f32, Rank2<N, D>>,
-    v: &GpuTensor<f32, Rank2<N, D>>,
+    operands: &AttentionOperands<N, D>,
     output: &mut GpuTensor<f32, Rank2<N, D>>,
     logsumexp: &mut GpuTensor<f32, Rank2<N, H>>,
     scratch: Option<&mut FlashAttentionScratch<N, T, D, H>>,
@@ -5803,101 +5868,72 @@ fn flash_attention_forward_into<
     flash_bf16: &Tcgen05Flash,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
-    if let Some(scratch) = scratch {
-        // Fold softmax_scale * log2(e) into Q so the kernel's softmax is
-        // base-2 native; K/V quantize unscaled.
-        let q_scale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
-        // SAFETY: staged buffers match the N/T/H/HD attention layout.
-        profiler.measure(stream, "forward.attention.stage_bf16", || unsafe {
-            let config = flash_device::stage_heads_config(N, H, HD);
-            kernels.stage_attention_heads_bf16(
-                stream,
-                config,
-                q.as_device_buffer(),
-                T as u32,
-                H as u32,
-                q_scale,
-                &mut scratch.q,
-            )?;
-            kernels.stage_attention_heads_bf16(
-                stream,
-                config,
-                k.as_device_buffer(),
-                T as u32,
-                H as u32,
-                1.0,
-                &mut scratch.k,
-            )?;
-            kernels.stage_attention_heads_bf16(
-                stream,
-                config,
-                v.as_device_buffer(),
-                T as u32,
-                H as u32,
-                1.0,
-                &mut scratch.v,
-            )
-        })?;
-        profiler.measure(stream, "forward.attention.flash", || unsafe {
-            flash_bf16.forward(
-                stream,
-                flash_host::flash_forward_config(N / T, T, H, flash_bf16.sm_count()),
-                scratch.q_tma.as_ptr(),
-                scratch.k_tma.as_ptr(),
-                scratch.v_tma.as_ptr(),
-                T as u32,
-                H as u32,
-                (N / T) as u32,
-                output.as_device_buffer_mut(),
-                logsumexp.as_device_buffer_mut(),
-                &mut scratch.correction_counts,
-            )
-        })
-    } else if HD == flash_device::TILE_HD {
-        // SAFETY: tiled config is selected only for its specialized head width.
-        profiler.measure(stream, "forward.attention.flash", || unsafe {
-            kernels.flash_attention_forward_tiled(
-                stream,
-                flash_forward_config::<N, T, H, HD>(),
-                q.as_device_buffer(),
-                k.as_device_buffer(),
-                v.as_device_buffer(),
-                T as u32,
-                H as u32,
-                output.as_device_buffer_mut(),
-                logsumexp.as_device_buffer_mut(),
-            )
-        })
-    } else {
+    match operands {
+        AttentionOperands::Staged { q, k, v } => {
+            let scratch = scratch.expect("staged operands allocate the flash scratch beside them");
+            // SAFETY: the panels and their maps match the N/T/H/HD layout.
+            profiler.measure(stream, "forward.attention.flash", || unsafe {
+                flash_bf16.forward(
+                    stream,
+                    flash_host::flash_forward_config(N / T, T, H, flash_bf16.sm_count()),
+                    q.tma.as_ptr(),
+                    k.tma.as_ptr(),
+                    v.tma.as_ptr(),
+                    T as u32,
+                    H as u32,
+                    (N / T) as u32,
+                    output.as_device_buffer_mut(),
+                    logsumexp.as_device_buffer_mut(),
+                    &mut scratch.correction_counts,
+                )
+            })
+        }
+        AttentionOperands::Wide { q, k, v } if HD == flash_device::TILE_HD => {
+            // SAFETY: tiled config is selected only for its specialized head width.
+            profiler.measure(stream, "forward.attention.flash", || unsafe {
+                kernels.flash_attention_forward_tiled(
+                    stream,
+                    flash_forward_config::<N, T, H, HD>(),
+                    q.as_device_buffer(),
+                    k.as_device_buffer(),
+                    v.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    output.as_device_buffer_mut(),
+                    logsumexp.as_device_buffer_mut(),
+                )
+            })
+        }
         // Head widths neither flash generation specializes on fall back to
         // the per-row oracle kernels: correct for any power-of-two `HD` up to
         // `MAX_HEAD_DIM`, but serial over keys — a stopgap until the tcgen05
         // flash learns this head width.
-        // SAFETY: per-row config covers N * H rows with HD lanes.
-        profiler.measure(stream, "forward.attention.flash", || unsafe {
-            kernels.flash_attention_forward(
-                stream,
-                per_row_flash_config::<N, H, HD>(),
-                q.as_device_buffer(),
-                k.as_device_buffer(),
-                v.as_device_buffer(),
-                T as u32,
-                H as u32,
-                HD as u32,
-                output.as_device_buffer_mut(),
-                logsumexp.as_device_buffer_mut(),
-            )
-        })
+        AttentionOperands::Wide { q, k, v } => {
+            // SAFETY: per-row config covers N * H rows with HD lanes.
+            profiler.measure(stream, "forward.attention.flash", || unsafe {
+                kernels.flash_attention_forward(
+                    stream,
+                    per_row_flash_config::<N, H, HD>(),
+                    q.as_device_buffer(),
+                    k.as_device_buffer(),
+                    v.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    HD as u32,
+                    output.as_device_buffer_mut(),
+                    logsumexp.as_device_buffer_mut(),
+                )
+            })
+        }
     }
 }
 
-/// Attention backward dispatch (issue #35 phase 4): tile-aligned shapes
-/// re-stage the packed-bf16 head panels (scratch is shared across layers, so
-/// the forward-time staging is stale by backward time) and run the tcgen05
-/// query-parallel dQ and key-parallel dK/dV kernels; other shapes stay on the
-/// fp32 tiled kernels. Both paths first run the fp32 `backward_dot` over the
-/// forward `y` — the tcgen05 kernels consume the same `Σ dy·y` and the saved
-/// natural-log LSE as read-only device slices.
+/// Attention backward dispatch (issue #35 phase 4): tile-aligned shapes stage
+/// dY into the shared scratch, read the forward's per-block Q/K/V panels, and
+/// run the tcgen05 query-parallel dQ and key-parallel dK/dV kernels; other
+/// shapes stay on the fp32 tiled kernels. Both paths first run the fp32
+/// `backward_dot` over the forward `y` — the tcgen05 kernels consume the same
+/// `Σ dy·y` and the saved natural-log LSE as read-only device slices.
 #[allow(clippy::too_many_arguments)]
 fn flash_attention_backward_into<
     const N: usize,
@@ -5907,9 +5943,7 @@ fn flash_attention_backward_into<
     const HD: usize,
     P: KernelProfiler,
 >(
-    q: &GpuTensor<f32, Rank2<N, D>>,
-    k: &GpuTensor<f32, Rank2<N, D>>,
-    v: &GpuTensor<f32, Rank2<N, D>>,
+    operands: &AttentionOperands<N, D>,
     output: &GpuTensor<f32, Rank2<N, D>>,
     logsumexp: &GpuTensor<f32, Rank2<N, H>>,
     softmax_dot: &mut GpuTensor<f32, Rank2<N, H>>,
@@ -5934,158 +5968,131 @@ fn flash_attention_backward_into<
             softmax_dot.as_device_buffer_mut(),
         )
     })?;
-    if let Some(scratch) = scratch {
-        // Fold softmax_scale * log2(e) into Q so scores are base-2 native;
-        // K/V/dY quantize unscaled. Re-staged because the shared scratch may
-        // hold another layer's forward panels by now.
-        let q_scale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
-        // SAFETY: staged buffers match the N/T/H/HD attention layout.
-        profiler.measure(stream, "backward.attention.stage_bf16", || unsafe {
-            let config = flash_device::stage_heads_config(N, H, HD);
-            kernels.stage_attention_heads_bf16(
-                stream,
-                config,
-                q.as_device_buffer(),
-                T as u32,
-                H as u32,
-                q_scale,
-                &mut scratch.q,
-            )?;
-            kernels.stage_attention_heads_bf16(
-                stream,
-                config,
-                k.as_device_buffer(),
-                T as u32,
-                H as u32,
-                1.0,
-                &mut scratch.k,
-            )?;
-            kernels.stage_attention_heads_bf16(
-                stream,
-                config,
-                v.as_device_buffer(),
-                T as u32,
-                H as u32,
-                1.0,
-                &mut scratch.v,
-            )?;
-            kernels.stage_attention_heads_bf16(
-                stream,
-                config,
-                dy.as_device_buffer(),
-                T as u32,
-                H as u32,
-                1.0,
-                &mut scratch.dy,
-            )
-        })?;
-        profiler.measure(stream, "backward.attention.flash_q", || unsafe {
-            flash_bf16.backward_q(
-                stream,
-                flash_host::flash_backward_q_config(N / T, T, H, flash_bf16.sm_count()),
-                scratch.q_tma.as_ptr(),
-                scratch.k_tma.as_ptr(),
-                scratch.v_tma.as_ptr(),
-                scratch.dy_tma.as_ptr(),
-                logsumexp.as_device_buffer(),
-                softmax_dot.as_device_buffer(),
-                T as u32,
-                H as u32,
-                (N / T) as u32,
-                dq.as_device_buffer_mut(),
-            )
-        })?;
-        profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
-            flash_bf16.backward_kv(
-                stream,
-                flash_host::flash_backward_kv_config(N / T, T, H, flash_bf16.sm_count()),
-                scratch.q_tma.as_ptr(),
-                scratch.k_tma.as_ptr(),
-                scratch.v_tma.as_ptr(),
-                scratch.dy_tma.as_ptr(),
-                logsumexp.as_device_buffer(),
-                softmax_dot.as_device_buffer(),
-                T as u32,
-                H as u32,
-                (N / T) as u32,
-                dk.as_device_buffer_mut(),
-                dv.as_device_buffer_mut(),
-            )
-        })?;
-        Ok(())
-    } else if HD == flash_device::TILE_HD {
-        // SAFETY: tiled config is selected only for its specialized head width.
-        profiler.measure(stream, "backward.attention.flash_q", || unsafe {
-            kernels.flash_attention_backward_q_tiled(
-                stream,
-                flash_backward_q_config::<N, T, H, HD>(),
-                q.as_device_buffer(),
-                k.as_device_buffer(),
-                v.as_device_buffer(),
-                dy.as_device_buffer(),
-                logsumexp.as_device_buffer(),
-                softmax_dot.as_device_buffer(),
-                T as u32,
-                H as u32,
-                dq.as_device_buffer_mut(),
-            )
-        })?;
-        // SAFETY: tiled config is selected only for its specialized head width.
-        profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
-            kernels.flash_attention_backward_kv_tiled(
-                stream,
-                flash_backward_kv_config::<N, T, H, HD>(),
-                q.as_device_buffer(),
-                k.as_device_buffer(),
-                v.as_device_buffer(),
-                dy.as_device_buffer(),
-                logsumexp.as_device_buffer(),
-                softmax_dot.as_device_buffer(),
-                T as u32,
-                H as u32,
-                dk.as_device_buffer_mut(),
-                dv.as_device_buffer_mut(),
-            )
-        })?;
-        Ok(())
-    } else {
+    match operands {
+        AttentionOperands::Staged { q, k, v } => {
+            let scratch = scratch.expect("staged operands allocate the flash scratch beside them");
+            // Q, K and V were staged once by the forward and are this block's
+            // saved activations; only dY, a backward temporary sharing one
+            // buffer across blocks, is staged here.
+            // SAFETY: staged buffers match the N/T/H/HD attention layout.
+            profiler.measure(stream, "backward.attention.stage_bf16", || unsafe {
+                kernels.stage_attention_heads_bf16(
+                    stream,
+                    flash_device::stage_heads_config(N, H, HD),
+                    dy.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    1.0,
+                    &mut scratch.dy.words,
+                )
+            })?;
+            profiler.measure(stream, "backward.attention.flash_q", || unsafe {
+                flash_bf16.backward_q(
+                    stream,
+                    flash_host::flash_backward_q_config(N / T, T, H, flash_bf16.sm_count()),
+                    q.tma.as_ptr(),
+                    k.tma.as_ptr(),
+                    v.tma.as_ptr(),
+                    scratch.dy.tma.as_ptr(),
+                    logsumexp.as_device_buffer(),
+                    softmax_dot.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    (N / T) as u32,
+                    dq.as_device_buffer_mut(),
+                )
+            })?;
+            profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
+                flash_bf16.backward_kv(
+                    stream,
+                    flash_host::flash_backward_kv_config(N / T, T, H, flash_bf16.sm_count()),
+                    q.tma.as_ptr(),
+                    k.tma.as_ptr(),
+                    v.tma.as_ptr(),
+                    scratch.dy.tma.as_ptr(),
+                    logsumexp.as_device_buffer(),
+                    softmax_dot.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    (N / T) as u32,
+                    dk.as_device_buffer_mut(),
+                    dv.as_device_buffer_mut(),
+                )
+            })
+        }
+        AttentionOperands::Wide { q, k, v } if HD == flash_device::TILE_HD => {
+            // SAFETY: tiled config is selected only for its specialized head width.
+            profiler.measure(stream, "backward.attention.flash_q", || unsafe {
+                kernels.flash_attention_backward_q_tiled(
+                    stream,
+                    flash_backward_q_config::<N, T, H, HD>(),
+                    q.as_device_buffer(),
+                    k.as_device_buffer(),
+                    v.as_device_buffer(),
+                    dy.as_device_buffer(),
+                    logsumexp.as_device_buffer(),
+                    softmax_dot.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    dq.as_device_buffer_mut(),
+                )
+            })?;
+            // SAFETY: tiled config is selected only for its specialized head width.
+            profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
+                kernels.flash_attention_backward_kv_tiled(
+                    stream,
+                    flash_backward_kv_config::<N, T, H, HD>(),
+                    q.as_device_buffer(),
+                    k.as_device_buffer(),
+                    v.as_device_buffer(),
+                    dy.as_device_buffer(),
+                    logsumexp.as_device_buffer(),
+                    softmax_dot.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    dk.as_device_buffer_mut(),
+                    dv.as_device_buffer_mut(),
+                )
+            })
+        }
         // Per-row oracle fallback; see the forward dispatch for the contract.
-        // SAFETY: per-row config covers N * H rows with HD lanes.
-        profiler.measure(stream, "backward.attention.flash_q", || unsafe {
-            kernels.flash_attention_backward_q(
-                stream,
-                per_row_flash_config::<N, H, HD>(),
-                q.as_device_buffer(),
-                k.as_device_buffer(),
-                v.as_device_buffer(),
-                output.as_device_buffer(),
-                dy.as_device_buffer(),
-                logsumexp.as_device_buffer(),
-                T as u32,
-                H as u32,
-                HD as u32,
-                dq.as_device_buffer_mut(),
-            )
-        })?;
-        // SAFETY: per-row config covers N * H rows with HD lanes.
-        profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
-            kernels.flash_attention_backward_kv(
-                stream,
-                per_row_flash_config::<N, H, HD>(),
-                q.as_device_buffer(),
-                k.as_device_buffer(),
-                v.as_device_buffer(),
-                output.as_device_buffer(),
-                dy.as_device_buffer(),
-                logsumexp.as_device_buffer(),
-                T as u32,
-                H as u32,
-                HD as u32,
-                dk.as_device_buffer_mut(),
-                dv.as_device_buffer_mut(),
-            )
-        })?;
-        Ok(())
+        AttentionOperands::Wide { q, k, v } => {
+            // SAFETY: per-row config covers N * H rows with HD lanes.
+            profiler.measure(stream, "backward.attention.flash_q", || unsafe {
+                kernels.flash_attention_backward_q(
+                    stream,
+                    per_row_flash_config::<N, H, HD>(),
+                    q.as_device_buffer(),
+                    k.as_device_buffer(),
+                    v.as_device_buffer(),
+                    output.as_device_buffer(),
+                    dy.as_device_buffer(),
+                    logsumexp.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    HD as u32,
+                    dq.as_device_buffer_mut(),
+                )
+            })?;
+            // SAFETY: per-row config covers N * H rows with HD lanes.
+            profiler.measure(stream, "backward.attention.flash_kv", || unsafe {
+                kernels.flash_attention_backward_kv(
+                    stream,
+                    per_row_flash_config::<N, H, HD>(),
+                    q.as_device_buffer(),
+                    k.as_device_buffer(),
+                    v.as_device_buffer(),
+                    output.as_device_buffer(),
+                    dy.as_device_buffer(),
+                    logsumexp.as_device_buffer(),
+                    T as u32,
+                    H as u32,
+                    HD as u32,
+                    dk.as_device_buffer_mut(),
+                    dv.as_device_buffer_mut(),
+                )
+            })
+        }
     }
 }
 

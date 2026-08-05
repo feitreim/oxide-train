@@ -205,7 +205,7 @@ allocated `L` times, scratch once.
 | `acts.ffn_input` | `[N,D]` | 3.4 GiB | **fp32** — same, plus it is a residual summand |
 | `acts.ffn_normalized` | `[N,D]` | 3.4 GiB | **fp32** — router logits and `router_backward_weight_split` read it; router is fp32 end to end (decision #22) |
 | `acts.attention_normalized` | `[N,D]` | 3.4 GiB | **fp32 for now** — both consumers (qkv forward, qkv weight-grad) do quantize it, so it is a genuine candidate, but it shares `Bf16LinearScratch` with the lm-head and o_proj; deferred to a follow-up rather than mixed into the expert-bin work |
-| `acts.q`, `acts.k`, `acts.v` | `[N,D]` ×3 | 10.1 GiB | **fp32 for now** — flash re-stages them into `FlashAttentionScratch` as bf16, so they are candidates, but the backward re-reads all three and RoPE writes `q`/`k`; deferred with `attention_normalized` |
+| `acts.q`, `acts.k`, `acts.v` | `[N,D]` ×3 | 10.1 GiB | ✅ **bf16**, as the staged head panels themselves (#88) — see below |
 | `acts.attended` | `[N,D]` | 3.4 GiB | **fp32 for now** — same family as above |
 | `acts.attention_logsumexp` | `[N,H]` | 27 MiB | **fp32** — softmax internals |
 | `acts.routing.probabilities`, `gate_weights` | `[N,E]`, `[N,K]` | 11 MiB | **fp32** — router, decision #22 |
@@ -214,6 +214,37 @@ allocated `L` times, scratch once.
 | `scratch.projection_output` | `[N,D]` | 288 MiB | **fp32** — the o_proj epilogue writes it; the MoE gather no longer stages here, it folds the residual add in and writes the block output directly |
 | `scratch.router_logits`, `dlogits`, `router_dx`, `router_dweight_partials`, `gate_gradients` | — | 314 MiB | **fp32** — router end to end, decision #22, re-affirmed by the #44/#52 determinism constraints |
 | `scratch.attention_dot`, `norm_backward_inv`, `probability_sums` | — | 2.3 MiB | **fp32** — reduction accumulators |
+
+#### Attention operands (#88)
+
+The `q`/`k`/`v` deferral above resolved the way the expert panels did, one step
+further: their only consumers *were* the flash staging pass, so the buffers are
+now the staged packed-bf16 head panels rather than an fp32 triple that gets
+quantized into them. `GpuBlockActs::attention` is an `AttentionOperands` enum —
+`Staged` for the tcgen05 contract (`T` tile-aligned, `HD == 128`), `Wide` for
+every other shape, whose fp32 oracle kernels still read `[N,D]` triples and
+still take the split and the two rotation passes.
+
+On the staged path the whole chain from the projection to the flash operand is
+one pass: `stage_qkv_heads_bf16` reads the fp32 `[N,3D]` panel and writes the
+three head-major bf16 panels, rotating Q and K from a precomputed cos/sin table
+and folding Q's `softmax_scale · log2(e)` in. It substitutes for
+`split_group3` + two `rope_forward` passes + three `stage_attention_heads_bf16`
+launches, and every intermediate it drops was fp32 storage between two kernels,
+so it is that composition's output bit for bit — `--kernel flash-attn` asserts
+exactly that at three tile-aligned shapes. The unfused kernels stay as the
+oracles they are checked against (§11).
+
+The backward re-staging goes with them: Q/K/V are per-block panels the forward
+already wrote, so only dY — a backward temporary — is staged, and
+`FlashAttentionScratch` holds just it and the correction counts.
+
+Decision change against the audit's own question: q/k/v hold nothing that is
+accumulated or compared. RoPE is a pointwise rotation, not an accumulation, and
+it now happens *before* the single rounding rather than between two of them —
+the fp32 roundtrip that used to sit in the middle existed only to be recast.
+Nothing else reads the panels; the CPU-parity reference compares the model's
+fp32 outputs, not its attention operands.
 
 #### Rejections
 
@@ -252,7 +283,8 @@ Deferred with evidence: `attention_normalized`, `q`/`k`/`v` and `attended`
 qkv/o_proj GEMMs and the flash staging all quantize them — but they share
 `Bf16LinearScratch` with the lm-head and `FlashAttentionScratch` with the
 attention backward, so they need their own follow-up rather than riding on the
-expert-bin work.
+expert-bin work. `q`/`k`/`v` took that follow-up in #88 (above);
+`attention_normalized` and `attended` are still open.
 
 ## 8. Optimizers
 
