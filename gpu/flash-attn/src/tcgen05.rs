@@ -465,6 +465,12 @@ const fn forward_plan(at: SharedPlan) -> Forward {
 /// running-max recurrence stays NaN-free.
 const MASKED_SCORE: f32 = -1.0e30;
 
+/// The two backward kernels with a stopwatch on every phase — a child module so
+/// that it sees the plans and the tile contract without either becoming crate
+/// surface. Reached only by the `probe` bin, through the entry points below.
+#[path = "phase_probe.rs"]
+pub mod phase_probe;
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -1034,6 +1040,87 @@ pub mod kernels {
             };
             pipeline::run(&mut job, tiles * planes);
             dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
+        }
+    }
+
+    /// [`flash_backward_q`] with a stopwatch on every phase of a key-tile
+    /// visit, whose body is [`super::phase_probe`] and whose only caller is
+    /// `src/bin/probe.rs`.
+    ///
+    /// # Safety
+    ///
+    /// As [`flash_backward_q`], plus `clocks` holding
+    /// [`super::phase_probe::COUNTERS`] zeroed `u64` per CTA of the grid.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(128, 1)]
+    pub unsafe fn flash_backward_q_probe(
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &[f32],
+        dot: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        batches: u32,
+        mut dq: DisjointSlice<f32>,
+        mut clocks: DisjointSlice<u64>,
+    ) {
+        unsafe {
+            phase_probe::backward_q(
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                logsumexp,
+                dot,
+                sequence_length,
+                heads,
+                batches,
+                &mut dq,
+                &mut clocks,
+            )
+        }
+    }
+
+    /// [`flash_backward_kv`] with the same stopwatch.
+    ///
+    /// # Safety
+    ///
+    /// As [`flash_backward_kv`], plus `clocks` as in [`flash_backward_q_probe`].
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(128, 1)]
+    pub unsafe fn flash_backward_kv_probe(
+        q_tma: *const TmaDescriptor,
+        k_tma: *const TmaDescriptor,
+        v_tma: *const TmaDescriptor,
+        dy_tma: *const TmaDescriptor,
+        logsumexp: &[f32],
+        dot: &[f32],
+        sequence_length: u32,
+        heads: u32,
+        batches: u32,
+        mut dk: DisjointSlice<f32>,
+        mut dv: DisjointSlice<f32>,
+        mut clocks: DisjointSlice<u64>,
+    ) {
+        unsafe {
+            phase_probe::backward_kv(
+                q_tma,
+                k_tma,
+                v_tma,
+                dy_tma,
+                logsumexp,
+                dot,
+                sequence_length,
+                heads,
+                batches,
+                &mut dk,
+                &mut dv,
+                &mut clocks,
+            )
         }
     }
 
