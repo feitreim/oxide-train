@@ -130,6 +130,10 @@ pub const BLOCK_M: usize = 128;
 pub const BLOCK_N: usize = 256;
 /// Columns of `B` one rank stages: the pair's tile, split down the middle.
 const HALF_N: usize = BLOCK_N / 2;
+/// Columns of `B` one rank feeds to **one** `M256_N128` chain: half of that
+/// again, because an `M256_N128` reads `N / 2` columns from each rank of the
+/// pair where an `M256_N256` reads `N / 2` of a twice-wider `N`.
+const HALF_B: usize = HALF_N / 2;
 /// One 128-byte swizzle atom of bf16, and the only width
 /// [`SharedTile::k_walk`] accepts — so `BLOCK_K` and [`STAGES`] are a
 /// factorization of the shared budget rather than two free axes.
@@ -175,6 +179,15 @@ type Stage = SharedTile<Bf16, BLOCK_M, BLOCK_K, Swizzle128B>;
 /// so a rank's 128 MN values arrive as two boxes rather than one.
 type MnStage = SharedTile<Bf16, BLOCK_K, BLOCK_M, Swizzle128B>;
 type Ring = SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
+/// The `B` rows one `M256_N128` chain reads from a rank: half a [`Stage`],
+/// K-major or MN-major, and the same bytes either way — so one offset walks
+/// both layouts to the second chain's operand.
+type BHalf = SharedTile<Bf16, HALF_B, BLOCK_K, Swizzle128B>;
+type MnBHalf = SharedTile<Bf16, BLOCK_K, HALF_B, Swizzle128B>;
+const _: () = assert!(
+    BHalf::BYTES == MnBHalf::BYTES,
+    "one offset reaches the second chain's B under either walk"
+);
 type StageTile = SharedTile<Bf16, 32, STAGE_N, Swizzle128B>;
 type StageRun = SharedTileRing<Bf16, 32, STAGE_N, Swizzle128B, DRAIN_WARPS>;
 type Band = RegTile<32, STAGE_N, BaseLdtm>;
@@ -650,7 +663,7 @@ impl<D: Drain> Tile<D> {
                 // scales its own by `RANKS` to cover the peer's, and the peer
                 // drops it.
                 let a_line = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank) as i32;
-                let b_line = (BLOCK_N as u32 * tile_n + HALF_N as u32 * self.rank) as i32;
+                let b_line = (BLOCK_N as u32 * tile_n + HALF_B as u32 * self.rank) as i32;
                 let mut k = 0u32;
                 while k < self.k_blocks {
                     self.free.wait_recycled(stage_index);
@@ -662,14 +675,25 @@ impl<D: Drain> Tile<D> {
                     // box per 64-wide subtile at `(mn, k)`. Same transaction
                     // bytes either way, so the charge does not depend on the
                     // branch.
+                    // `B` arrives as two half-boxes rather than one box: the
+                    // first chain's columns then the second's, which is what
+                    // makes the accumulator's 256 columns come out in `C`'s
+                    // order despite each chain interleaving the two ranks.
+                    let b_half = |half: usize| b.base().add(half * BHalf::BYTES);
+                    let b_at = |half: u32| b_line + (HALF_N as u32 * half) as i32;
                     let bytes = if self.transposed {
                         MnStage::from_raw(a.base())
                             .tma_load_2d_arriving_at(self.a_map, a_line, depth, stage)
-                            + MnStage::from_raw(b.base())
-                                .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage)
+                            + MnBHalf::from_raw(b_half(0))
+                                .tma_load_2d_arriving_at(self.b_map, b_at(0), depth, stage)
+                            + MnBHalf::from_raw(b_half(1))
+                                .tma_load_2d_arriving_at(self.b_map, b_at(1), depth, stage)
                     } else {
                         a.tma_load_2d_arriving_at(self.a_map, depth, a_line, stage)
-                            + b.tma_load_2d_arriving_at(self.b_map, depth, b_line, stage)
+                            + BHalf::from_raw(b_half(0))
+                                .tma_load_2d_arriving_at(self.b_map, depth, b_at(0), stage)
+                            + BHalf::from_raw(b_half(1))
+                                .tma_load_2d_arriving_at(self.b_map, depth, b_at(1), stage)
                     };
                     if self.rank == LEADER {
                         self.load
@@ -704,21 +728,40 @@ impl<D: Drain> Tile<D> {
                     // A select on the walk, not a duplicated MMA chain: an
                     // `OperandWalk` carries its own transpose bit, so both
                     // layouts issue through one loop.
-                    let (a_walk, b_walk) = if self.transposed {
-                        (
-                            MnStage::from_raw(a.base()).mn_walk(),
-                            MnStage::from_raw(b.base()).mn_walk(),
-                        )
+                    let a_walk = if self.transposed {
+                        MnStage::from_raw(a.base()).mn_walk()
                     } else {
-                        (a.k_walk(), b.k_walk())
+                        a.k_walk()
                     };
-                    mma_walk_cg2::<Bf16, CHUNKS>(
-                        self.accumulator.raw(),
-                        a_walk,
-                        b_walk,
-                        MmaShape::M256_N256,
-                        k > 0,
-                    );
+                    // Two `M256_N128` chains over column sub-ranges of the one
+                    // accumulator, where this used to issue one `M256_N256`.
+                    // Same operands, same bytes, same tile: what changes is that
+                    // each column half completes on its own instruction, which
+                    // is the precondition for ever draining one of them while
+                    // the other still accumulates (oxide-train#80's increment
+                    // A). This probe issues them back to back, so it prices the
+                    // *split itself* with nothing else moved.
+                    // Spelled out rather than looped, for the reason ferro #166
+                    // gave the mover walks: a runtime half index homes the walk.
+                    let chain = |half: usize| {
+                        let at = b.base().add(half * BHalf::BYTES);
+                        let b_walk = if self.transposed {
+                            MnBHalf::from_raw(at).mn_walk()
+                        } else {
+                            BHalf::from_raw(at).k_walk()
+                        };
+                        mma_walk_cg2::<Bf16, CHUNKS>(
+                            self.accumulator
+                                .columns_right((HALF_N * half) as u32)
+                                .raw(),
+                            a_walk,
+                            b_walk,
+                            MmaShape::M256_N128,
+                            k > 0,
+                        );
+                    };
+                    chain(0);
+                    chain(1);
                     commit_multicast_cg2(self.free.sem(stage_index), PAIR);
                     k += 1;
                     stage_index += 1;
