@@ -2561,6 +2561,13 @@ impl<const D: usize, const VP: usize> GpuBf16Head<D, VP> {
         &self.dw
     }
 
+    /// [`Self::dw_words`] for a check that has to put a gradient back after an
+    /// AdamW step consumed and cleared it.
+    #[allow(dead_code)]
+    pub fn dw_words_mut(&mut self) -> &mut DeviceBuffer<u32> {
+        &mut self.dw
+    }
+
     /// Packed-bf16 `[VP, D]` transposed compute weights. Parity-test accessor:
     /// binaries other than the parity check see it as dead code.
     #[allow(dead_code)]
