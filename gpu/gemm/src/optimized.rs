@@ -137,7 +137,15 @@ pub const BLOCK_K: usize = 64;
 /// K=16 chunks one stage chains, both layouts alike.
 const CHUNKS: usize = BLOCK_K / 16;
 /// Ring depth. 3 → 2 is −11.8% / −7.3% at unchanged residency (ferro #87).
-const STAGES: usize = 3;
+///
+/// **Six, at one CTA an SM** — the configuration oxide-train#80 measured
+/// cuBLASLt running, once CUPTI read its launches instead of its opaque
+/// algorithm indices. Its kernel is `nvjet_tst_128x256_64x6_2x1_2cta`: our tile
+/// exactly (`[256, 256]` over a `cta_group::2` pair, `BLOCK_K = 64`), our
+/// cluster exactly, and 213 280 B of shared memory for **six** K stages at
+/// **one** CTA an SM. Three is what two CTAs an SM leave room for, and it was
+/// never a statement about how deep a ring the MMA wants.
+const STAGES: usize = 6;
 /// One warp per 32 accumulator rows — the band warps, every one of which
 /// drains — plus the producer warp and the MMA warp, which never do.
 pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32 + 64;
@@ -188,11 +196,19 @@ const _: () = assert!(
     "one ring serves both operand walks"
 );
 
-/// SMs on a B200, and the CTAs of one a `BLOCK_N = 256` accumulator admits:
-/// `512 / BLOCK_N` tensor-memory columns, which binds before shared memory
-/// does.
+/// SMs on a B200, and the CTAs of one this kernel admits.
+///
+/// At `STAGES = 3` the binding term was tensor memory — `512 / BLOCK_N` columns
+/// — and shared memory was never consulted. At six stages the ring alone is
+/// 196 608 B and **shared memory binds first**: one CTA an SM, which is what
+/// buys the six stages in the first place. The trade is priced in
+/// [`SHARED_BYTES`], and measured on `model_shapes` rather than argued —
+/// oxide-train#80's residency probe established that 148 clusters of two CTAs
+/// really were resident, so this is a *deliberate* halving of the CTA count
+/// against a ring twice as deep, 256 tensor-memory columns left unused, and a
+/// register file a thread no longer shares.
 const SMS: u32 = 148;
-const CTAS_PER_SM: u32 = (512 / BLOCK_N) as u32;
+const CTAS_PER_SM: u32 = 1;
 pub const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / CLUSTER_RANKS;
 
 /// [`pipeline::grouped`]'s width, swept at this tile shape by ferro-kittens
@@ -248,18 +264,19 @@ const fn staged(at: SharedPlan) -> (StageRun, SharedPlan) {
 }
 
 /// Dynamic shared memory both entry points declare. It has to stay at or under
-/// the 116 736 B an SM's 233 472 leaves a CTA at [`CTAS_PER_SM`].
+/// the 232 448 B an SM's 233 472 leaves a CTA at [`CTAS_PER_SM`] — the device's
+/// own `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`, read rather than assumed.
 ///
 /// The fp32 epilogue never touches the staging run and declares it anyway,
-/// which costs nothing: tensor memory already pins residency at two, so those
-/// 16 424 B buy the bf16 drain its shape and take nothing from the other.
+/// which costs nothing at one CTA an SM: the ring is what pins residency, so
+/// those 16 424 B buy the bf16 drain its shape and take nothing from the other.
 pub const SHARED_BYTES: usize = staged(shared(SharedPlan::sizing()).plan).1.bytes();
 
 const _: () = {
-    assert!(THREADS == 192 && MAX_CLUSTERS == 148);
+    assert!(THREADS == 192 && MAX_CLUSTERS == 74);
     // The item rings cost the plan nothing: their thirty-two bytes land in the
     // 128-byte alignment padding in front of the staging tiles.
-    assert!(SHARED_BYTES == 114_816 && SHARED_BYTES <= 116_736);
+    assert!(SHARED_BYTES <= 232_448);
     assert!(
         BLOCK_N == 4 * STAGE_N,
         "the staged drains spell their four passes out to hoist the loads ahead of the stores"
