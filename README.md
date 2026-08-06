@@ -173,6 +173,71 @@ trusting the mode name. The line to answer is the **+12.4%** one.
 `mode="max-autotune"` was not run: the escalation only continues while the
 trainer is still ahead, and it stopped being ahead at `torch.compile()`.
 
+### The rematch at B=32
+
+The table above pits a B=16 trainer against a B=16 baseline, and both halves of
+that have since moved. #108–#114 cut the trainer's cost per unit of batch from
+5.33 GiB to 3.39, #117 spent the room on `B = 32`, and `main` now reports
+**92,718 tokens/s / 41.17% MFU**. Re-running the baseline at the matched batch,
+same policy, same shard, same window, all three tiers in one container:
+
+```bash
+modal run modal_app.py::pytorch_baseline --tiers ",default,reduce-overhead" --batches 32
+```
+
+| Tier | tokens/s | MFU | vs trainer | peak VRAM | CUDA graphs | compile |
+| --- | --- | --- | --- | --- | --- | --- |
+| trainer (`bin/train.rs`, `c5a3b1a`) | 92,718 | 41.17% | — | 174.05 GiB | no | — |
+| PyTorch eager | — | — | — | **out of memory** | — | — |
+| `torch.compile()` | **93,634** | **41.58%** | **+0.99%** | **150.1 GiB** | no | 102.4 s |
+| `torch.compile(mode="reduce-overhead")` | 94,348 | 41.89% | +1.76% | 150.0 GiB | **yes** | 34.2 s |
+
+174 of 174 moments fp32 again, the parameter count asserted term by term again,
+loss 11.17 → 8.48 on the real shard.
+
+**The trainer did not cross.** It closed 11.4 points of a 12.4-point gap and
+stopped 0.99% short. Against the conservative same-container number from #117
+(90,718) the gap is 3.2%. Both point estimates put `torch.compile()` ahead, so
+by the standing rule `mode="max-autotune"` **stays locked** — it is still unrun,
+and the next thing that unlocks it is a trainer that beats 93,634.
+
+That 0.99% deserves its caveat rather than a victory lap in either direction: it
+is *below* the 1.4% spread #117 measured between two containers running the same
+trainer binary, and the trainer's number comes from that PR's container while
+these come from today's. At matched batch the two are a coin-flip that the coin
+has not landed on. What is not a coin-flip is the direction of travel — +12.4%
+to +0.99% is the whole of the interesting result.
+
+Two things did change sign or shape:
+
+- **Eager no longer fits.** It reached 174.48 GiB of the card's 178.35 and died
+  allocating 6.14 more. Its footprint was already the largest row in the B=16
+  table and the batch doubled underneath it. An OOM is a measurement.
+- **`reduce-overhead` is now 0.76% *ahead* of default**, where at B=16 it was
+  0.4% behind. Both margins are sub-1% on an 11-step window, so this is a sign
+  flip inside the noise rather than graphs suddenly paying — and it remains
+  excluded from the headline for the same reason as before, that the trainer has
+  no CUDA graphs and cuda-oxide cannot give it any. Inductor was asked, not
+  trusted: `cuda_graphs=False` for default, `True` here.
+
+Memory scales almost exactly as the trainer's does: 95.5 → 150.1 GiB over
+16 → 32 is **3.41 GiB per unit of batch**, against the trainer's measured 3.39.
+So the 24 GiB of headroom PyTorch has at B=32 is all intercept and none of it
+slope — 40.9 GiB fixed against the trainer's 65.5. Part of that is real and
+already named above: bf16 gradients on the 50 matrix parameters save ~8.8 GiB
+that the trainer spends on fp32. The rest is not a like-for-like subtraction,
+because `max_memory_allocated()` counts what the caching allocator handed out
+and not the CUDA context or cuBLAS workspaces sitting beside it, so the two
+intercepts are not measured by the same instrument. The slopes are, and they
+agree.
+
+The two numbers are not from one container, and the harness cannot make them be:
+`torch_baseline` is the only Modal function on `torch_image`, every trainer
+entrypoint runs on the kernel image, and neither image contains the other's
+toolchain. Pairing them in one container means one image carrying both torch and
+the whole cuda-oxide backend, which is the multi-gigabyte tax this baseline was
+split out to avoid.
+
 ### Stock autocast policy (`--masters fp32`), kept for the record
 
 fp32 masters under bf16 autocast with `AdamW(fused=True)` — the default a
