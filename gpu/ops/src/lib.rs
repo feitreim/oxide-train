@@ -91,7 +91,7 @@ pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
 /// power of two.
 pub const MOE_SCATTER_DY_THREADS: usize = 256;
 
-/// Threads in one block-per-expert routing-probability reduction. Lanes stride
+/// Threads in one block-per-expert auxiliary-loss term reduction. Lanes stride
 /// the tokens before a tree reduction, so this must remain a power of two.
 ///
 /// One block per expert is only `E` blocks, so the token loop's depth is all
@@ -99,7 +99,11 @@ pub const MOE_SCATTER_DY_THREADS: usize = 256;
 /// value NVVM will not unroll, which leaves each lane one load in flight and
 /// the launch `N / threads` load latencies deep. A full block is 24 of them
 /// rather than 96 (#99).
-pub const MOE_PROBABILITY_SUMS_THREADS: usize = 1024;
+pub const MOE_AUX_TERMS_THREADS: usize = 1024;
+
+/// Threads in the single-block loss tail. Lanes stride the per-token losses
+/// before a tree reduction, so this must remain a power of two.
+pub const LOSS_TAIL_THREADS: usize = 1024;
 
 /// Threads in one MoE dead-slot zeroing block.
 pub const MOE_ZERO_BINS_THREADS: usize = 256;
@@ -2710,38 +2714,55 @@ pub mod kernels {
         }
     }
 
-    /// Parallel token reduction for each expert's mean routing probability.
+    /// One expert's addend to one layer's Switch-style load-balancing loss:
+    /// `E · assignment_fraction · mean_probability`, so a layer's whole
+    /// auxiliary loss is the sum of its `E` terms and the model's is the sum
+    /// of the whole `[L, E]` buffer.
     ///
     /// One block owns an expert, and so owns that expert's slot outright: lanes
     /// accumulate strided token slices, a tree reduction combines them, and
-    /// lane 0 stores. Accumulating the lanes with same-address atomics instead
-    /// needed the buffer pre-zeroed by a `fill` launch per layer, serialized
-    /// [`MOE_PROBABILITY_SUMS_THREADS`] adds on one word, and left the summation
-    /// order — and so the reported auxiliary loss — dependent on their arrival
-    /// order (#99). The auxiliary *gradient* never reads this: `router_backward`
-    /// derives it from the assignment counts.
+    /// lane 0 weights the mean and stores. Accumulating the lanes with
+    /// same-address atomics instead needed the buffer pre-zeroed by a `fill`
+    /// launch per layer, serialized [`MOE_AUX_TERMS_THREADS`] adds on one word,
+    /// and left the summation order — and so the reported auxiliary loss —
+    /// dependent on their arrival order (#99). Leaving a term per
+    /// `(layer, expert)` keeps that property while letting one launch at the
+    /// end of the forward fold every layer's loss into the scalar at once. The
+    /// auxiliary *gradient* never reads this: `router_backward` derives it from
+    /// the assignment counts.
     #[kernel]
-    pub unsafe fn moe_probability_sums(
+    pub unsafe fn moe_aux_terms(
         probabilities: &[f32],
+        assignment_counts: &[u32],
         tokens: u32,
         experts: u32,
-        mut probability_sums: DisjointSlice<f32>,
+        top_k: u32,
+        layer: u32,
+        mut aux_terms: DisjointSlice<f32>,
     ) {
-        static mut SUMS: SharedArray<f32, MOE_PROBABILITY_SUMS_THREADS> = SharedArray::UNINIT;
+        static mut SUMS: SharedArray<f32, MOE_AUX_TERMS_THREADS> = SharedArray::UNINIT;
 
         let expert = thread::blockIdx_x() as usize;
         let lane = thread::threadIdx_x() as usize;
         let n = tokens as usize;
         let e = experts as usize;
+        let k = top_k as usize;
+        let term = layer as usize * e + expert;
         // Uniform over the block, so no lane reaches a barrier the rest skip.
-        if expert >= e || expert >= probability_sums.len() || probabilities.len() < n * e {
+        if expert >= e
+            || n == 0
+            || k == 0
+            || term >= aux_terms.len()
+            || expert >= assignment_counts.len()
+            || probabilities.len() < n * e
+        {
             return;
         }
         let mut sum = 0.0f32;
         let mut token = lane;
         while token < n {
             sum += probabilities[token * e + expert];
-            token += MOE_PROBABILITY_SUMS_THREADS;
+            token += MOE_AUX_TERMS_THREADS;
         }
 
         // SAFETY: each lane owns its own slot of the block's scratch.
@@ -2749,7 +2770,7 @@ pub mod kernels {
             SUMS[lane] = sum;
         }
         thread::sync_threads();
-        let mut stride = MOE_PROBABILITY_SUMS_THREADS / 2;
+        let mut stride = MOE_AUX_TERMS_THREADS / 2;
         while stride > 0 {
             if lane < stride {
                 // SAFETY: the surviving half of the lanes own disjoint slots.
@@ -2761,41 +2782,78 @@ pub mod kernels {
             stride /= 2;
         }
         if lane == 0 {
-            // SAFETY: this block exclusively owns `expert`.
+            let assignment_fraction = assignment_counts[expert] as f32 / (n * k) as f32;
+            // SAFETY: this block exclusively owns `(layer, expert)`.
             unsafe {
-                *probability_sums.get_unchecked_mut(expert) = SUMS[0];
+                *aux_terms.get_unchecked_mut(term) =
+                    e as f32 * assignment_fraction * (SUMS[0] / n as f32);
             }
         }
     }
 
-    /// Add the weighted Switch-style load-balancing loss to the scalar training
-    /// loss from the already-reduced expert probability sums.
+    /// The scalar training loss: mean per-token cross entropy plus every
+    /// layer's weighted auxiliary loss.
+    ///
+    /// One block. Lanes reduce the per-token losses grid-stride, a tree
+    /// reduction combines them, and lane 0 folds in the terms
+    /// [`moe_aux_terms`] left behind, summed in layer-major order so the
+    /// reported loss does not depend on which block wrote which term. This is
+    /// the whole loss tail: it replaces a `sum`, a `scale` and one
+    /// single-threaded auxiliary launch per layer — kernels whose cost was
+    /// almost entirely their launch. A model without experts leaves `aux_terms`
+    /// zero and gets the plain mean.
     #[kernel]
-    pub unsafe fn moe_aux_loss(
-        probability_sums: &[f32],
-        assignment_counts: &[u32],
+    pub unsafe fn loss_mean_with_aux(
+        losses: &[f32],
         tokens: u32,
-        experts: u32,
-        top_k: u32,
+        aux_terms: &[f32],
         coefficient: f32,
         mut loss: DisjointSlice<f32>,
     ) {
-        if thread::index_1d().get() != 0 || loss.is_empty() {
-            return;
-        }
+        static mut PARTIALS: SharedArray<f32, LOSS_TAIL_THREADS> = SharedArray::UNINIT;
+
+        let lane = thread::threadIdx_x() as usize;
         let n = tokens as usize;
-        let e = experts as usize;
-        let k = top_k as usize;
-        if n == 0 || e == 0 || k == 0 || probability_sums.len() < e || assignment_counts.len() < e {
+        // Uniform over the block, so no lane reaches a barrier the rest skip.
+        if thread::blockDim_x() as usize != LOSS_TAIL_THREADS
+            || n == 0
+            || losses.len() < n
+            || loss.is_empty()
+        {
             return;
         }
-        let mut auxiliary = 0.0f32;
-        for expert in 0..e {
-            let assignment_fraction = assignment_counts[expert] as f32 / (n * k) as f32;
-            auxiliary += assignment_fraction * probability_sums[expert] / n as f32;
+        let mut partial = 0.0f32;
+        let mut token = lane;
+        while token < n {
+            partial += losses[token];
+            token += LOSS_TAIL_THREADS;
         }
+
+        // SAFETY: each lane owns its own slot of the block's scratch.
         unsafe {
-            *loss.get_unchecked_mut(0) += coefficient * e as f32 * auxiliary;
+            PARTIALS[lane] = partial;
+        }
+        thread::sync_threads();
+        let mut stride = LOSS_TAIL_THREADS / 2;
+        while stride > 0 {
+            if lane < stride {
+                // SAFETY: the surviving half of the lanes own disjoint slots.
+                unsafe {
+                    PARTIALS[lane] += PARTIALS[lane + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if lane == 0 {
+            let mut auxiliary = 0.0f32;
+            for term in 0..aux_terms.len() {
+                auxiliary += aux_terms[term];
+            }
+            // SAFETY: the single surviving lane of the single block stores.
+            unsafe {
+                *loss.get_unchecked_mut(0) = PARTIALS[0] / n as f32 + coefficient * auxiliary;
+            }
         }
     }
 

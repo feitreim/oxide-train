@@ -213,7 +213,7 @@ allocated `L` times, scratch once.
 | `scratch.qkv` | `[N,3D]` | 864 MiB | **fp32 forward, ✅ bf16 backward** (#91) — the forward keeps it because a tcgen05 epilogue writes it (#20) and the staging pass reads it fp32. The backward gradient panel is a different story and is packed now; see below |
 | `scratch.projection_output` | `[N,D]` | 288 MiB | **fp32** — the o_proj epilogue writes it; the MoE gather no longer stages here, it folds the residual add in and writes the block output directly |
 | `scratch.router_logits`, `dlogits`, `router_dx`, `router_dweight_partials`, `gate_gradients` | — | 314 MiB | **fp32** — router end to end, decision #22, re-affirmed by the #44/#52 determinism constraints |
-| `scratch.attention_dot`, `norm_backward_inv`, `probability_sums` | — | 2.3 MiB | **fp32** — reduction accumulators |
+| `scratch.attention_dot`, `norm_backward_inv`, `aux_terms` | — | 2.3 MiB | **fp32** — reduction accumulators |
 
 #### Attention operands (#88)
 

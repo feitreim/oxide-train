@@ -276,6 +276,25 @@ fn moe_assign_config<const E: usize>() -> LaunchConfig {
     }
 }
 
+fn moe_aux_terms_config<const E: usize>() -> LaunchConfig {
+    assert!(dense_device::MOE_AUX_TERMS_THREADS.is_power_of_two());
+    assert!(E <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (E as u32, 1, 1),
+        block_dim: (dense_device::MOE_AUX_TERMS_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn loss_tail_config() -> LaunchConfig {
+    assert!(dense_device::LOSS_TAIL_THREADS.is_power_of_two());
+    LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (dense_device::LOSS_TAIL_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 /// Launch for a router GEMM producing an `[m, n]` output: one lane per element
 /// of a `[ROUTER_GEMM_BM, ROUTER_GEMM_BN]` output tile.
 fn router_gemm_config(m: usize, n: usize) -> LaunchConfig {
@@ -421,47 +440,6 @@ fn fill_zero<S: Shape, P: KernelProfiler>(
             stream,
             elementwise_config::<S>(),
             0.0,
-            output.as_device_buffer_mut(),
-        )
-    })
-}
-
-fn sum_into<S: Shape, P: KernelProfiler>(
-    input: &GpuTensor<f32, S>,
-    output: &mut GpuTensor<f32, Rank1<1>>,
-    stream: &CudaStream,
-    kernels: &tensor_kernels::LoadedModule,
-    profiler: &mut P,
-    name: &'static str,
-) -> Result<(), DriverError> {
-    // SAFETY: the reduction config and scalar output satisfy the kernel contract.
-    profiler.measure(stream, name, || unsafe {
-        kernels.sum(
-            stream,
-            reduction_config(),
-            input.as_device_buffer(),
-            S::NUM_ELEMENTS as u32,
-            output.as_device_buffer_mut(),
-        )
-    })
-}
-
-fn scale_into<S: Shape, P: KernelProfiler>(
-    input: &GpuTensor<f32, S>,
-    factor: f32,
-    output: &mut GpuTensor<f32, S>,
-    stream: &CudaStream,
-    kernels: &tensor_kernels::LoadedModule,
-    profiler: &mut P,
-    name: &'static str,
-) -> Result<(), DriverError> {
-    // SAFETY: launch dimensions come from S and both buffers have shape S.
-    profiler.measure(stream, name, || unsafe {
-        kernels.scale(
-            stream,
-            elementwise_config::<S>(),
-            input.as_device_buffer(),
-            factor,
             output.as_device_buffer_mut(),
         )
     })
@@ -4050,7 +4028,6 @@ struct GpuBlockScratch<
     projection_output: GpuTensor<f32, Rank2<N, D>>,
     attention_dot: GpuTensor<f32, Rank2<N, H>>,
     router_logits: GpuTensor<f32, Rank2<N, E>>,
-    probability_sums: GpuTensor<f32, Rank1<E>>,
     gate_gradients: GpuTensor<f32, Rank2<N, K>>,
     dlogits: GpuTensor<f32, Rank2<N, E>>,
     router_dx: GpuTensor<f32, Rank2<N, D>>,
@@ -4096,7 +4073,6 @@ impl<
             projection_output: GpuTensor::zeros(stream)?,
             attention_dot: GpuTensor::zeros(stream)?,
             router_logits: GpuTensor::zeros(stream)?,
-            probability_sums: GpuTensor::zeros(stream)?,
             gate_gradients: GpuTensor::zeros(stream)?,
             dlogits: GpuTensor::zeros(stream)?,
             router_dx: GpuTensor::zeros(stream)?,
@@ -4167,7 +4143,11 @@ pub struct GpuMoeWorkspace<
     linear_scratch: LinearScratch<N, D, FF>,
     flash_scratch: Option<FlashAttentionScratch<N, T, D, H>>,
     losses: GpuTensor<f32, Rank1<N>>,
-    loss_sum: GpuTensor<f32, Rank1<1>>,
+    /// Every block's per-expert addend to its load-balancing loss, written
+    /// once per layer and summed into the scalar loss by the tail reduction.
+    /// One buffer for the whole model, so the single-threaded launch that used
+    /// to add each layer's loss on its own is one launch that adds them all.
+    aux_terms: GpuTensor<f32, Rank2<L, E>>,
     loss: GpuTensor<f32, Rank1<1>>,
 }
 
@@ -4220,7 +4200,7 @@ impl<
                 None
             },
             losses: GpuTensor::zeros(stream)?,
-            loss_sum: GpuTensor::zeros(stream)?,
+            aux_terms: GpuTensor::zeros(stream)?,
             loss: GpuTensor::zeros(stream)?,
         })
     }
@@ -4354,7 +4334,10 @@ pub struct GpuDenseWorkspace<
     rope_table: DeviceBuffer<f32>,
     norm_backward_inv: GpuTensor<f32, Rank1<N>>,
     losses: GpuTensor<f32, Rank1<N>>,
-    loss_sum: GpuTensor<f32, Rank1<1>>,
+    /// A dense model has no experts and so no load-balancing loss, but the
+    /// loss tail is shared with the MoE model and reads a term buffer. This
+    /// one is zeroed at allocation and never written.
+    aux_terms: GpuTensor<f32, Rank1<1>>,
     loss: GpuTensor<f32, Rank1<1>>,
     d_model_0: GpuTensor<f32, Rank2<N, D>>,
     d_model_1: GpuTensor<f32, Rank2<N, D>>,
@@ -4424,7 +4407,7 @@ impl<
             rope_table: DeviceBuffer::from_host(stream, &dense_device::rope_table(T, D / H))?,
             norm_backward_inv: GpuTensor::zeros(stream)?,
             losses: GpuTensor::zeros(stream)?,
-            loss_sum: GpuTensor::zeros(stream)?,
+            aux_terms: GpuTensor::zeros(stream)?,
             loss: GpuTensor::zeros(stream)?,
             d_model_0: GpuTensor::zeros(stream)?,
             d_model_1: GpuTensor::zeros(stream)?,
@@ -5319,6 +5302,24 @@ impl<
                     profiler,
                 )?;
             }
+            // Each block leaves its `E` load-balancing addends in its row of
+            // `aux_terms`. No pre-fill: every row is stored, not accumulated
+            // into, and the loss tail below sums them all in one launch.
+            for (layer, acts) in workspace.block_acts.iter().enumerate() {
+                profiler.measure(stream, "forward.router.aux_terms", || unsafe {
+                    dense.moe_aux_terms(
+                        stream,
+                        moe_aux_terms_config::<E>(),
+                        acts.routing.probabilities.as_device_buffer(),
+                        acts.routing.assignment_counts.as_device_buffer(),
+                        N as u32,
+                        E as u32,
+                        K as u32,
+                        layer as u32,
+                        workspace.aux_terms.as_device_buffer_mut(),
+                    )
+                })?;
+            }
             self.final_norm.forward_into(
                 &workspace.final_input,
                 &mut workspace.final_normalized,
@@ -5343,48 +5344,13 @@ impl<
                 &workspace.logits,
                 &workspace.targets,
                 &mut workspace.losses,
-                &mut workspace.loss_sum,
+                workspace.aux_terms.as_device_buffer(),
+                aux_coefficient,
                 &mut workspace.loss,
                 stream,
-                tensor,
                 dense,
                 profiler,
-            )?;
-            for acts in &workspace.block_acts {
-                // No pre-fill: `moe_probability_sums` stores each expert's sum
-                // rather than accumulating into the slot.
-                profiler.measure(stream, "forward.router.aux_probability_sums", || unsafe {
-                    dense.moe_probability_sums(
-                        stream,
-                        LaunchConfig {
-                            grid_dim: (E as u32, 1, 1),
-                            block_dim: (dense_device::MOE_PROBABILITY_SUMS_THREADS as u32, 1, 1),
-                            shared_mem_bytes: 0,
-                        },
-                        acts.routing.probabilities.as_device_buffer(),
-                        N as u32,
-                        E as u32,
-                        workspace
-                            .block_scratch
-                            .probability_sums
-                            .as_device_buffer_mut(),
-                    )
-                })?;
-                profiler.measure(stream, "forward.router.aux_loss", || unsafe {
-                    dense.moe_aux_loss(
-                        stream,
-                        LaunchConfig::for_num_elems(1),
-                        workspace.block_scratch.probability_sums.as_device_buffer(),
-                        acts.routing.assignment_counts.as_device_buffer(),
-                        N as u32,
-                        E as u32,
-                        K as u32,
-                        aux_coefficient,
-                        workspace.loss.as_device_buffer_mut(),
-                    )
-                })?;
-            }
-            Ok(())
+            )
         }
     }
 
@@ -5817,10 +5783,10 @@ impl<
                 &workspace.logits,
                 &workspace.targets,
                 &mut workspace.losses,
-                &mut workspace.loss_sum,
+                workspace.aux_terms.as_device_buffer(),
+                0.0,
                 &mut workspace.loss,
                 stream,
-                tensor,
                 dense,
                 profiler,
             )
@@ -6666,15 +6632,23 @@ fn swiglu_backward_into<const N: usize, const FF: usize, P: KernelProfiler>(
     Ok(())
 }
 
+/// The loss tail: per-token cross entropy, then the one reduction that turns
+/// it into the scalar training loss.
+///
+/// `aux_terms` holds every layer's per-expert load-balancing addend, already
+/// written by `moe_aux_terms`; a model without experts leaves it zero.
+/// Folding the auxiliary terms into the mean is what
+/// keeps this tail at two launches instead of the classifier plus a `sum`, a
+/// `scale` and one single-threaded launch per layer.
 #[allow(clippy::too_many_arguments)]
 fn cross_entropy_into<const N: usize, const VOCAB: usize, const VP: usize, P: KernelProfiler>(
     logits: &DeviceBuffer<u32>,
     targets: &GpuTensor<u32, Rank1<N>>,
     losses: &mut GpuTensor<f32, Rank1<N>>,
-    loss_sum: &mut GpuTensor<f32, Rank1<1>>,
+    aux_terms: &DeviceBuffer<f32>,
+    aux_coefficient: f32,
     loss: &mut GpuTensor<f32, Rank1<1>>,
     stream: &CudaStream,
-    tensor: &tensor_kernels::LoadedModule,
     dense: &dense_kernels::LoadedModule,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
@@ -6691,23 +6665,18 @@ fn cross_entropy_into<const N: usize, const VOCAB: usize, const VP: usize, P: Ke
             losses.as_device_buffer_mut(),
         )
     })?;
-    sum_into(
-        losses,
-        loss_sum,
-        stream,
-        tensor,
-        profiler,
-        "forward.loss.reduction",
-    )?;
-    scale_into(
-        loss_sum,
-        1.0 / N as f32,
-        loss,
-        stream,
-        tensor,
-        profiler,
-        "forward.loss.mean",
-    )
+    // SAFETY: one block reduces the N losses and reads every auxiliary term.
+    profiler.measure(stream, "forward.loss.mean", || unsafe {
+        dense.loss_mean_with_aux(
+            stream,
+            loss_tail_config(),
+            losses.as_device_buffer(),
+            N as u32,
+            aux_terms,
+            aux_coefficient,
+            loss.as_device_buffer_mut(),
+        )
+    })
 }
 
 fn cross_entropy_backward_into<
