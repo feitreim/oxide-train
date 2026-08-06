@@ -635,6 +635,53 @@ impl Tcgen05Gemm {
                 k,
                 0,
                 TmaLayout::KMajor,
+                1,
+            )
+        }
+    }
+
+    /// The packed-bf16 twin of [`Tcgen05Gemm::f32_store_batched`]: `experts`
+    /// equal-shaped `C = A·Bᵀ` in one launch, stacked row-wise in one packed
+    /// allocation.
+    ///
+    /// The expert is the item space's outermost axis and its `C` band is
+    /// `tiles_m` tile-rows down, exactly as in the fp32 form — the packed
+    /// epilogue never sees the batching, because the only thing that differs
+    /// is the row `origin` derives. So a bin panel that is bf16 *and* batched
+    /// needs no new epilogue, only this entry point.
+    ///
+    /// # Safety
+    ///
+    /// As [`Tcgen05Gemm::store`] for every expert, with `output` holding
+    /// exactly `experts` `m * n / 2`-word matrices and both maps that long.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn store_batched(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: &Bf16PairsTmaMaps,
+        b_tma: &Bf16PairsTmaMaps,
+        output: &mut DeviceBuffer<u32>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        let experts = a_tma.experts();
+        assert_eq!(experts, b_tma.experts());
+        let output_elements = output.len() * 2;
+        assert_batched_output(output_elements, experts, n);
+        unsafe {
+            launch_tcgen05(
+                &self.generated,
+                stream,
+                config,
+                a_tma.as_ptr(),
+                b_tma.as_ptr(),
+                output,
+                n,
+                k,
+                0,
+                TmaLayout::KMajor,
+                experts,
             )
         }
     }
@@ -667,6 +714,7 @@ impl Tcgen05Gemm {
                 k,
                 1,
                 TmaLayout::KMajor,
+                1,
             )
         }
     }
@@ -846,6 +894,7 @@ impl Tcgen05Gemm {
                 k,
                 1,
                 TmaLayout::MnMajor,
+                1,
             )
         }
     }
@@ -1059,6 +1108,10 @@ fn assert_batched_output(elements: usize, experts: usize, n: u32) {
     assert!(rows.is_multiple_of(TC_M_TILE));
 }
 
+/// `experts` divides the output the way [`launch_tcgen05_f32`]'s does, into
+/// the per-expert `m` that the tile-row count and the `C` stride both come
+/// from. Unlike the fp32 twin there is no offset: every packed caller writes
+/// the whole allocation, one matrix or a whole stack of them.
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_tcgen05(
     module: &super::optimized::kernels::LoadedModule,
@@ -1071,11 +1124,13 @@ unsafe fn launch_tcgen05(
     k: u32,
     mode: u32,
     layout: TmaLayout,
+    experts: usize,
 ) -> Result<(), DriverError> {
     let m = output
         .len()
         .checked_mul(2)
         .expect("tcgen05 packed output size overflow")
+        / experts
         / n as usize;
     unsafe {
         module.gemm_tcgen05_bf16_optimized(
@@ -1090,6 +1145,7 @@ unsafe fn launch_tcgen05(
             (n as usize / TC_N_TILE) as u32,
             mode,
             u32::from(layout == TmaLayout::MnMajor),
+            experts as u32,
         )
     }
 }

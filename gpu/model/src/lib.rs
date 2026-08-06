@@ -1555,6 +1555,59 @@ pub enum ExpertPanel {
     Wide(DeviceBuffer<f32>),
 }
 
+/// A capacity-bin buffer a GEMM epilogue writes and only pointwise kernels
+/// read: the interleaved `[E, C, 2, FF]` gate/up activation and the down
+/// projection's `[E, C, D]` output.
+///
+/// Neither is ever a GEMM *operand*, so unlike [`ExpertPanel`] this carries no
+/// descriptors at all — only the dtype its one writer and its readers agree
+/// on. `Packed` wherever the tcgen05 epilogue writes the whole stack itself
+/// ([`Tcgen05Gemm::store_batched`]); `Wide` on the non-aligned oracle path,
+/// whose register-tiled GEMM writes fp32.
+///
+/// These two are the largest saved activations a block owns — 2.75 GiB a block
+/// at the trained shape — and they stayed fp32 through #108 only because the
+/// packed GEMM had no way to write one bin of a stacked allocation. Since
+/// #112 the stack *is* the launch, so the packed epilogue needs no offset to
+/// reach a bin: the expert is an item-space axis and the batched store is the
+/// entry point.
+pub enum ExpertBins {
+    Packed(DeviceBuffer<u32>),
+    Wide(DeviceBuffer<f32>),
+}
+
+impl ExpertBins {
+    fn new(stream: &CudaStream, elements: usize, packed: bool) -> Result<Self, DriverError> {
+        if !packed {
+            return Ok(Self::Wide(DeviceBuffer::zeroed(stream, elements)?));
+        }
+        assert!(
+            elements.is_multiple_of(2),
+            "packed expert bins need an even element count"
+        );
+        Ok(Self::Packed(DeviceBuffer::zeroed(stream, elements / 2)?))
+    }
+
+    /// The fp32 buffer the oracle path writes and reads. Packed bins only ever
+    /// exist alongside packed panels, so every caller that reaches this has
+    /// already taken the non-aligned arm.
+    fn wide_mut(&mut self) -> &mut DeviceBuffer<f32> {
+        match self {
+            Self::Wide(values) => values,
+            Self::Packed(_) => panic!("packed expert bins have no fp32 copy"),
+        }
+    }
+
+    /// Host copy in element order, widening a packed buffer. Parity-gate entry
+    /// point; it synchronizes the stream.
+    pub fn to_host(&self, stream: &CudaStream) -> Result<Vec<f32>, DriverError> {
+        match self {
+            Self::Wide(values) => values.to_host_vec(stream),
+            Self::Packed(words) => Ok(unpack_bf16_pairs(&words.to_host_vec(stream)?)),
+        }
+    }
+}
+
 /// Packed-bf16 panel storage plus the per-expert descriptors addressing it as
 /// a GEMM row operand (`k_maps`) and as a weight-gradient operand (`mn_maps`).
 pub struct PackedExpertPanel {
@@ -1690,7 +1743,7 @@ fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
     input: &ExpertPanel,
     weights: &DeviceBuffer<u32>,
     compute: Option<&StackedBf16Weights>,
-    output: &mut DeviceBuffer<f32>,
+    output: &mut ExpertBins,
     input_width: usize,
     output_width: usize,
     staging: &mut Option<ExpertFp32Scratch>,
@@ -1707,17 +1760,31 @@ fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
         // One launch for all E experts: the panels are stacked `[E, C, width]`
         // and the descriptors are indexed by expert, so the host loop that
         // dispatched E identically shaped GEMMs is the kernel's outermost item
-        // axis instead (#107 A9).
+        // axis instead (#107 A9). The bins' dtype picks the epilogue and
+        // nothing else — batching and store width are independent, so both
+        // arms are the same launch with a different `C`.
         profiler.measure(stream, name, || unsafe {
-            tcgen05.f32_store_batched(
-                stream,
-                tcgen05_batched_launch_config(C, output_width, input_width, E),
-                &input.k_maps,
-                &compute.transposed_maps,
-                output,
-                output_width as u32,
-                input_width as u32,
-            )
+            let config = tcgen05_batched_launch_config(C, output_width, input_width, E);
+            match output {
+                ExpertBins::Packed(words) => tcgen05.store_batched(
+                    stream,
+                    config,
+                    &input.k_maps,
+                    &compute.transposed_maps,
+                    words,
+                    output_width as u32,
+                    input_width as u32,
+                ),
+                ExpertBins::Wide(values) => tcgen05.f32_store_batched(
+                    stream,
+                    config,
+                    &input.k_maps,
+                    &compute.transposed_maps,
+                    values,
+                    output_width as u32,
+                    input_width as u32,
+                ),
+            }
         })
     } else {
         let fp32_scratch = staging
@@ -1756,7 +1823,7 @@ fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
                     )?;
                 }
                 copy_device_region(
-                    output,
+                    output.wide_mut(),
                     expert * C * output_width,
                     &fp32_scratch.c,
                     0,
@@ -2016,7 +2083,7 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             bin_input,
             self.gate_up.as_words(),
             self.gate_up_compute.as_ref(),
-            gate_up.as_device_buffer_mut(),
+            gate_up,
             D,
             2 * FF,
             &mut scratch.fp32_staging,
@@ -2028,32 +2095,36 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
             "forward.experts.gate_up_gemm",
         )?;
         // SAFETY: `gate_up` holds E * C interleaved rows of 2 * FF elements,
-        // and each arm launches over the element count its own output dtype
-        // packs them into; the packed arm's FF is tcgen05-aligned, hence a
-        // multiple of QUAD_LANES.
+        // and each arm launches over the element count its own dtype packs
+        // them into; the packed arm's FF is tcgen05-aligned, hence a multiple
+        // of QUAD_LANES. Panel and bins share the alignment gate, so the two
+        // Packed halves and the two Wide halves are the only pairings.
         profiler.measure(stream, "forward.experts.swiglu", || unsafe {
-            match activated {
-                ExpertPanel::Packed(panel) => dense.swiglu_forward_interleaved_bf16(
-                    stream,
-                    LaunchConfig::for_num_elems((E * C * FF / QUAD_LANES) as u32),
-                    gate_up.as_device_buffer(),
-                    FF as u32,
-                    &mut panel.words,
-                ),
-                ExpertPanel::Wide(values) => dense.swiglu_forward_interleaved(
-                    stream,
-                    LaunchConfig::for_num_elems((E * C * FF) as u32),
-                    gate_up.as_device_buffer(),
-                    FF as u32,
-                    values,
-                ),
+            match (gate_up, activated) {
+                (ExpertBins::Packed(bins), ExpertPanel::Packed(panel)) => dense
+                    .swiglu_forward_interleaved_packed(
+                        stream,
+                        LaunchConfig::for_num_elems((E * C * FF / QUAD_LANES) as u32),
+                        bins,
+                        FF as u32,
+                        &mut panel.words,
+                    ),
+                (ExpertBins::Wide(bins), ExpertPanel::Wide(values)) => dense
+                    .swiglu_forward_interleaved(
+                        stream,
+                        LaunchConfig::for_num_elems((E * C * FF) as u32),
+                        bins,
+                        FF as u32,
+                        values,
+                    ),
+                _ => panic!("expert bins and panels share one alignment gate"),
             }
         })?;
         expert_linear_forward::<E, C, P>(
             &acts.activated,
             self.down.as_words(),
             self.down_compute.as_ref(),
-            acts.bin_output.as_device_buffer_mut(),
+            &mut acts.bin_output,
             FF,
             D,
             &mut scratch.fp32_staging,
@@ -2132,26 +2203,31 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
         // join pass that merged them never exist.
         // SAFETY: `gate_up` holds E * C interleaved rows of 2 * FF elements,
         // `d_activated` E * C * FF, and each arm launches over the element
-        // count its own output dtype packs them into; the packed arm's FF is
-        // tcgen05-aligned, hence a multiple of QUAD_LANES.
+        // count its own dtype packs them into; the packed arm's FF is
+        // tcgen05-aligned, hence a multiple of QUAD_LANES. The saved panel and
+        // its gradient share the alignment gate, so they are always both
+        // packed or both wide.
         profiler.measure(stream, "backward.experts.swiglu", || unsafe {
-            match d_gate_up {
-                ExpertPanel::Packed(panel) => dense.swiglu_backward_interleaved_bf16(
-                    stream,
-                    LaunchConfig::for_num_elems((E * C * FF / QUAD_LANES) as u32),
-                    acts.gate_up.as_device_buffer(),
-                    d_activated.as_device_buffer(),
-                    FF as u32,
-                    &mut panel.words,
-                ),
-                ExpertPanel::Wide(values) => dense.swiglu_backward_interleaved(
-                    stream,
-                    LaunchConfig::for_num_elems((E * C * FF) as u32),
-                    acts.gate_up.as_device_buffer(),
-                    d_activated.as_device_buffer(),
-                    FF as u32,
-                    values,
-                ),
+            match (&acts.gate_up, d_gate_up) {
+                (ExpertBins::Packed(bins), ExpertPanel::Packed(panel)) => dense
+                    .swiglu_backward_interleaved_packed(
+                        stream,
+                        LaunchConfig::for_num_elems((E * C * FF / QUAD_LANES) as u32),
+                        bins,
+                        d_activated.as_device_buffer(),
+                        FF as u32,
+                        &mut panel.words,
+                    ),
+                (ExpertBins::Wide(bins), ExpertPanel::Wide(values)) => dense
+                    .swiglu_backward_interleaved(
+                        stream,
+                        LaunchConfig::for_num_elems((E * C * FF) as u32),
+                        bins,
+                        d_activated.as_device_buffer(),
+                        FF as u32,
+                        values,
+                    ),
+                _ => panic!("expert bins and panels share one alignment gate"),
             }
         })?;
         expert_linear_backward::<E, C, P>(
@@ -2291,16 +2367,21 @@ impl<const E: usize, const D: usize, const FF: usize> GpuExpertFfn<E, D, FF> {
 /// them and every block in a deep model owns its own copy.
 ///
 /// `gate_up` is the interleaved `[E, C, 2, FF]` gate/up activation the fused
-/// GEMM writes; it stays fp32 for the SwiGLU pointwise math, as does
-/// `bin_output` for the gate-gradient dot product. `bin_input` and
-/// `activated` are packed bf16 because every reader of those two is a tcgen05
-/// operand (SPEC §7.1). The fp32 buffers occupy `4 * E * C * (D + 2 * FF)`
-/// bytes plus `2 * E * C * (D + FF)` packed.
+/// GEMM writes and SwiGLU reads; `bin_output` is the down projection's
+/// `[E, C, D]` output, read by the gather's combine and by the backward's
+/// gate-gradient dot product. Neither is a GEMM operand, so both are
+/// [`ExpertBins`]; `bin_input` and `activated` are [`ExpertPanel`]s because
+/// every reader of those two is a tcgen05 operand and needs descriptors
+/// (SPEC §7.1).
+///
+/// All four are packed bf16 wherever the experts are tcgen05-aligned, so the
+/// whole set occupies `2 * E * C * (2 * D + 3 * FF)` bytes; the non-aligned
+/// oracle keeps all four wide at twice that.
 pub struct GpuExpertActs<const E: usize, const C: usize, const D: usize, const FF: usize> {
     pub bin_input: ExpertPanel,
-    gate_up: GpuTensor<f32, Rank4<E, C, 2, FF>>,
+    gate_up: ExpertBins,
     activated: ExpertPanel,
-    pub bin_output: GpuTensor<f32, Rank3<E, C, D>>,
+    pub bin_output: ExpertBins,
 }
 
 impl<const E: usize, const C: usize, const D: usize, const FF: usize> GpuExpertActs<E, C, D, FF> {
@@ -2311,9 +2392,9 @@ impl<const E: usize, const C: usize, const D: usize, const FF: usize> GpuExpertA
         let aligned = expert_tcgen05_aligned::<C, D, FF>();
         Ok(Self {
             bin_input: ExpertPanel::new(stream, E, C, D, aligned)?,
-            gate_up: GpuTensor::zeros(stream)?,
+            gate_up: ExpertBins::new(stream, E * C * 2 * FF, aligned)?,
             activated: ExpertPanel::new(stream, E, C, FF, aligned)?,
-            bin_output: GpuTensor::zeros(stream)?,
+            bin_output: ExpertBins::new(stream, E * C * D, aligned)?,
         })
     }
 }
@@ -4809,12 +4890,16 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         // The gather folds the ffn residual add in, writing the block output
         // directly instead of an intermediate a separate add pass re-reads.
         // SAFETY: routing indices and slots were produced for the same N/K/C shape.
+        // Packed bins only exist where the experts are tcgen05-aligned, which
+        // puts `D` on `TC_N_TILE` and so on `QUAD_LANES`: the packed arm needs
+        // no word-wise twin, and the `D % QUAD_LANES` split is the oracle's
+        // alone.
         profiler.measure(stream, "forward.router.gather", || unsafe {
-            if D.is_multiple_of(QUAD_LANES) {
-                dense.moe_gather_combine_add_quad_bf16(
+            match &acts.experts.bin_output {
+                ExpertBins::Packed(bins) => dense.moe_gather_combine_add_quad_packed(
                     stream,
                     LaunchConfig::for_num_elems((N * D / QUAD_LANES) as u32),
-                    acts.experts.bin_output.as_device_buffer(),
+                    bins,
                     acts.routing.selected_experts.as_device_buffer(),
                     acts.routing.gate_weights.as_device_buffer(),
                     acts.routing.slots.as_device_buffer(),
@@ -4823,12 +4908,25 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                     K as u32,
                     C as u32,
                     output.as_device_buffer_mut(),
-                )
-            } else {
-                dense.moe_gather_combine_add_bf16(
+                ),
+                ExpertBins::Wide(bins) if D.is_multiple_of(QUAD_LANES) => dense
+                    .moe_gather_combine_add_quad_bf16(
+                        stream,
+                        LaunchConfig::for_num_elems((N * D / QUAD_LANES) as u32),
+                        bins,
+                        acts.routing.selected_experts.as_device_buffer(),
+                        acts.routing.gate_weights.as_device_buffer(),
+                        acts.routing.slots.as_device_buffer(),
+                        acts.ffn_input.as_device_buffer(),
+                        D as u32,
+                        K as u32,
+                        C as u32,
+                        output.as_device_buffer_mut(),
+                    ),
+                ExpertBins::Wide(bins) => dense.moe_gather_combine_add_bf16(
                     stream,
                     Bf16Acts::<N, D>::words_config(),
-                    acts.experts.bin_output.as_device_buffer(),
+                    bins,
                     acts.routing.selected_experts.as_device_buffer(),
                     acts.routing.gate_weights.as_device_buffer(),
                     acts.routing.slots.as_device_buffer(),
@@ -4837,7 +4935,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                     K as u32,
                     C as u32,
                     output.as_device_buffer_mut(),
-                )
+                ),
             }
         })
     }
@@ -4909,19 +5007,18 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                 },
             },
         )?;
-        let bin_output = acts.experts.bin_output.as_device_buffer();
         let selected = acts.routing.selected_experts.as_device_buffer();
         let gates = acts.routing.gate_weights.as_device_buffer();
         let slots = acts.routing.slots.as_device_buffer();
-        profiler.measure(
-            stream,
-            "backward.router.scatter_dy",
-            || match &mut expert_scratch.d_bin_output {
-                ExpertPanel::Packed(panel) => unsafe {
-                    dense.moe_scatter_dy_bf16(
+        // The saved output and its gradient share the alignment gate, so the
+        // dot product's operand and the scatter's target are the same dtype.
+        profiler.measure(stream, "backward.router.scatter_dy", || {
+            match (&acts.experts.bin_output, &mut expert_scratch.d_bin_output) {
+                (ExpertBins::Packed(bins), ExpertPanel::Packed(panel)) => unsafe {
+                    dense.moe_scatter_dy_packed(
                         stream,
                         moe_scatter_dy_config(N * K),
-                        bin_output,
+                        bins,
                         d_model_1.as_device_buffer(),
                         selected,
                         gates,
@@ -4933,11 +5030,11 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                         gate_gradients.as_device_buffer_mut(),
                     )
                 },
-                ExpertPanel::Wide(values) => unsafe {
+                (ExpertBins::Wide(bins), ExpertPanel::Wide(values)) => unsafe {
                     dense.moe_scatter_dy(
                         stream,
                         moe_scatter_dy_config(N * K),
-                        bin_output,
+                        bins,
                         d_model_1.as_device_buffer(),
                         selected,
                         gates,
@@ -4949,8 +5046,9 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                         gate_gradients.as_device_buffer_mut(),
                     )
                 },
-            },
-        )?;
+                _ => panic!("expert bins and panels share one alignment gate"),
+            }
+        })?;
         self.experts.backward_profiled(
             &acts.experts,
             &mut scratch.experts,

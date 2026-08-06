@@ -1061,6 +1061,14 @@ pub mod kernels {
     /// product is the item count. A grouped item map has to know how many tile
     /// *rows* there are, so `tiles_m` is a parameter rather than a quotient.
     ///
+    /// `experts` is the batching axis, as in [`gemm_tcgen05_f32_optimized`]:
+    /// that many consecutive descriptors at each map and that many consecutive
+    /// `[m, n]` matrices in `c`. The expert reaches the epilogue only through
+    /// the row [`TileState::origin`] derives, so a packed `C` batches on the
+    /// same terms an fp32 one does, with no packed-specific geometry — and
+    /// with no base-pointer offset, because a batched launch writes the whole
+    /// stack rather than being aimed at one matrix of it.
+    ///
     /// # Safety
     /// [`attach`]'s, plus: `c` must hold `n` columns for every row the walk
     /// reaches, and the grid must be a whole number of clusters — see
@@ -1078,6 +1086,7 @@ pub mod kernels {
         tiles_n: u32,
         mode: u32,
         transposed: u32,
+        experts: u32,
     ) {
         unsafe {
             // Packed pairs: the slice's storage word is two elements wide, so
@@ -1095,7 +1104,7 @@ pub mod kernels {
                 transposed != 0,
                 out,
             );
-            sweep(&tile, tiles_m * tiles_n);
+            sweep(&tile, experts * tiles_m * tiles_n);
         }
     }
 
