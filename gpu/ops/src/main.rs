@@ -14,12 +14,13 @@ use tensor_cpu::CpuTensor;
 #[path = "lib.rs"]
 mod device;
 use device::{
-    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS,
-    MOE_ZERO_BINS_BLOCKS, MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS,
-    NORM_TILE_CHUNK, NORM_TILE_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN,
-    ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS,
-    ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, SWIGLU_TILE_BLOCK_ROWS,
-    SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS, kernels, rope_table,
+    CLASSIFIER_THREADS, LOSS_TAIL_THREADS, MOE_ASSIGN_THREADS, MOE_AUX_TERMS_THREADS,
+    MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS, MOE_ZERO_BINS_BLOCKS, MOE_ZERO_BINS_THREADS,
+    NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK, NORM_TILE_THREADS,
+    NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN, ROUTER_GEMM_THREADS,
+    ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM,
+    ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK,
+    SWIGLU_TILE_THREADS, kernels, rope_table,
 };
 use tensor_core::bf16;
 
@@ -79,6 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_group_split_join(&stream, &module)?;
     eprintln!("[ops] checking moe_routing");
     check_moe_routing(&stream, &module)?;
+    eprintln!("[ops] checking loss tail");
+    check_loss_tail(&stream, &module)?;
 
     println!("✓ ops forward/backward parity checks passed");
     Ok(())
@@ -2186,6 +2189,112 @@ fn check_cross_entropy_case<const N: usize, const C: usize>(
             cpu_dx.as_slice(),
             5e-6,
             2e-5,
+        );
+        Ok(())
+    }
+}
+
+/// The loss tail: every layer's auxiliary terms, then the one reduction that
+/// turns the per-token losses and those terms into the scalar training loss.
+///
+/// The model parity gate compares the same scalar against the CPU reference,
+/// but at a tolerance wide enough to hide the auxiliary term entirely: a
+/// load-balancing loss that vanished, or that landed in another layer's row,
+/// would pass it. This check is tight enough to see either.
+fn check_loss_tail(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const L: usize = 3;
+    const E: usize = 4;
+    const K: usize = 2;
+    const N: usize = 517;
+    const COEFFICIENT: f32 = 0.02;
+
+    // SAFETY: every buffer is allocated from L, E, K and N, and each launch
+    // covers exactly the shape its arguments describe.
+    unsafe {
+        let probabilities: [CpuTensor<f32, Rank2<N, E>>; L] =
+            std::array::from_fn(|layer| CpuTensor::uniform(7 + layer as u64));
+        // Distinct per layer, so a term stored in the wrong row shows up.
+        let counts: [[u32; E]; L] = std::array::from_fn(|layer| {
+            std::array::from_fn(|expert| (((layer * E + expert) * 37) % (N * K / E)) as u32)
+        });
+        let losses = CpuTensor::<f32, Rank1<N>>::uniform(11);
+
+        // Held for the whole sequence: the launches below are stream-ordered
+        // and the frees a scoped buffer would do are not.
+        let probabilities_dev = probabilities
+            .iter()
+            .map(|layer| DeviceBuffer::from_host(stream, layer.as_slice()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let counts_dev = counts
+            .iter()
+            .map(|layer| DeviceBuffer::from_host(stream, layer))
+            .collect::<Result<Vec<_>, _>>()?;
+        let losses_dev = DeviceBuffer::from_host(stream, losses.as_slice())?;
+        let mut aux_terms = DeviceBuffer::<f32>::zeroed(stream, L * E)?;
+        let mut loss = DeviceBuffer::<f32>::zeroed(stream, 1)?;
+
+        for layer in 0..L {
+            module.moe_aux_terms(
+                stream,
+                LaunchConfig {
+                    grid_dim: (E as u32, 1, 1),
+                    block_dim: (MOE_AUX_TERMS_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &probabilities_dev[layer],
+                &counts_dev[layer],
+                N as u32,
+                E as u32,
+                K as u32,
+                layer as u32,
+                &mut aux_terms,
+            )?;
+        }
+        module.loss_mean_with_aux(
+            stream,
+            LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (LOSS_TAIL_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &losses_dev,
+            N as u32,
+            &aux_terms,
+            COEFFICIENT,
+            &mut loss,
+        )?;
+
+        let mut expected_terms = Vec::with_capacity(L * E);
+        for layer in 0..L {
+            for expert in 0..E {
+                let mean = (0..N)
+                    .map(|token| probabilities[layer].as_slice()[token * E + expert] as f64)
+                    .sum::<f64>()
+                    / N as f64;
+                let assignment_fraction = counts[layer][expert] as f64 / (N * K) as f64;
+                expected_terms.push((E as f64 * assignment_fraction * mean) as f32);
+            }
+        }
+        let expected_loss = (losses.as_slice().iter().map(|&v| v as f64).sum::<f64>() / N as f64
+            + COEFFICIENT as f64 * expected_terms.iter().map(|&v| v as f64).sum::<f64>())
+            as f32;
+
+        assert_close(
+            "moe auxiliary terms",
+            &aux_terms.to_host_vec(stream)?,
+            &expected_terms,
+            1e-7,
+            1e-5,
+        );
+        assert_close(
+            "loss mean with auxiliary",
+            &loss.to_host_vec(stream)?,
+            &[expected_loss],
+            1e-6,
+            1e-5,
         );
         Ok(())
     }
