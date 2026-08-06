@@ -73,15 +73,33 @@ pub const ROUTER_INPUT_BN: usize = ROUTER_INPUT_THREADS * ROUTER_INPUT_COLUMNS;
 
 /// Threads in one router weight-gradient partition block.
 pub const ROUTER_WGRAD_THREADS: usize = 256;
-/// Model rows each router weight-gradient lane owns. The lane holds their
-/// `[E]` accumulators in registers, so one coalesced `x` load feeds `E` FMAs.
-pub const ROUTER_WGRAD_ROWS: usize = 4;
+/// Model rows each router weight-gradient lane owns: both halves of one packed
+/// `x` word, so a warp's load is a full 128-byte sector and the lane holds
+/// `ROWS * E` accumulators in registers.
+pub const ROUTER_WGRAD_ROWS: usize = 2;
 /// Model rows one router weight-gradient block owns.
 pub const ROUTER_WGRAD_BM: usize = ROUTER_WGRAD_THREADS * ROUTER_WGRAD_ROWS;
+/// Tokens a lane loads before it multiplies any of them.
+///
+/// The token loop's trip count is a runtime value NVVM will not unroll, so this
+/// is the only thing putting more than one `x` load in flight per lane — the
+/// same fact `MOE_PROBABILITY_SUMS_THREADS` records, and the reason this kernel
+/// used to run at a tenth of memory rate.
+///
+/// The staged values land in a `.local` depot because the multiply loop that
+/// reads them stays rolled, and that is the faster arrangement: `#[unroll]`ing
+/// it folds the depot away into 128 straight-line FMAs and measured **4.3205 ms
+/// against 3.1397** over the step's twelve launches. The depot is L1-resident
+/// and the registers it saves are what keep the warps that hide the loads.
+pub const ROUTER_WGRAD_TOKENS: usize = 8;
 /// Contiguous token partitions the router weight gradient is split into. Each
 /// partition is summed by one block and the partitions are merged in ascending
 /// order, which fixes the reduction order independently of block scheduling.
-pub const ROUTER_WGRAD_SPLITS: usize = 256;
+///
+/// It also sizes the `[SPLITS, E, D]` partial buffer the merge reads back, so
+/// it is worth no more than it buys: `D * SPLITS * TOKENS` loads in flight is
+/// already past memory rate at 64, where 256 cost four times the partials.
+pub const ROUTER_WGRAD_SPLITS: usize = 64;
 
 /// Sentinel written by deterministic MoE binning for a capacity-dropped pair.
 pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
@@ -4005,19 +4023,33 @@ pub mod kernels {
     }
 
     /// One contiguous token partition of the router weight gradient
-    /// `dweight[D,E] = x[N,D]^T dlogits[N,E]`, written to
+    /// `dweight[D,E] = x[N,D]ᵀ·dlogits[N,E]`, written to
     /// `partials[SPLITS, E, D]` for `router_backward_weight_merge` to sum.
     ///
     /// `D*E` is far too few outputs to fill the machine on its own, so the
-    /// token dimension is split across blocks. A block owns
-    /// `ROUTER_WGRAD_BM` model rows of one partition, lane-major so each `x`
-    /// read is a full coalesced sector, and each lane keeps `[E]` accumulators
-    /// per owned row in registers: one `x` load feeds `E` FMAs and the gate row
-    /// is a warp-uniform broadcast shared by the whole register tile.
+    /// token dimension is split across blocks: a block owns `ROUTER_WGRAD_BM`
+    /// model rows of one partition, lane-major so each `x` read is a full
+    /// coalesced sector, and each lane keeps the `[E]` accumulators of the two
+    /// rows it owns in registers — one load feeds `2 * E` FMAs against a gate
+    /// row the whole warp shares.
+    ///
+    /// Two things keep the token walk at memory rate, and both are about loads
+    /// sharing a basic block: the shape is validated once up front so the walk
+    /// indexes unchecked, and `ROUTER_WGRAD_TOKENS` of them are issued before
+    /// any is multiplied. Guarding each load instead — a bounds check, an
+    /// `expert < e` test — puts every one in a block of its own, which is one
+    /// load in flight per warp and was a tenth of the achievable bandwidth.
     ///
     /// The reduction order is fixed: a lane owns its outputs alone and sums its
     /// partition in ascending token order, and the merge sums partitions in
-    /// ascending order. No lane, block, or launch ordering can perturb it.
+    /// ascending order. No lane, block, or launch ordering can perturb it,
+    /// which is what the checkpoint-resume gate holds the trajectory to.
+    ///
+    /// # Safety
+    ///
+    /// `x` must hold `tokens * dim` elements, `dlogits` `tokens * experts` and
+    /// `partials` `SPLITS * experts * dim`; `dim` must be even. Each is
+    /// checked, and a launch that fails any of them writes nothing.
     #[kernel]
     pub unsafe fn router_backward_weight_split(
         x: &[f32],
@@ -4027,76 +4059,93 @@ pub mod kernels {
         dim: u32,
         mut partials: DisjointSlice<f32>,
     ) {
-        let tid = thread::threadIdx_x() as usize;
-        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS {
-            return;
-        }
         let n = tokens as usize;
         let e = experts as usize;
         let d = dim as usize;
-        if e == 0 || e > ROUTER_MAX_EXPERTS || d == 0 || n * d > x.len() || n * e > dlogits.len() {
+        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS
+            || e == 0
+            || e > ROUTER_MAX_EXPERTS
+            || !d.is_multiple_of(ROUTER_WGRAD_ROWS)
+            || n * d > x.len()
+            || n * e > dlogits.len()
+            || ROUTER_WGRAD_SPLITS * e * d > partials.len()
+        {
             return;
         }
-        let split = thread::blockIdx_y() as usize;
-        let row_base = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM + tid;
-        if (split + 1) * e * d > partials.len() {
+        let row = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM
+            + thread::threadIdx_x() as usize * ROUTER_WGRAD_ROWS;
+        if row >= d {
             return;
         }
 
         let partition = n.div_ceil(ROUTER_WGRAD_SPLITS);
+        let split = thread::blockIdx_y() as usize;
         let token_end = ((split + 1) * partition).min(n);
         let mut token = (split * partition).min(n);
 
-        let mut accumulators = [[0.0f32; ROUTER_MAX_EXPERTS]; ROUTER_WGRAD_ROWS];
+        let mut low = [0.0f32; ROUTER_MAX_EXPERTS];
+        let mut high = [0.0f32; ROUTER_MAX_EXPERTS];
         while token < token_end {
-            let mut gates = [0.0f32; ROUTER_MAX_EXPERTS];
-            let mut expert = 0usize;
-            while expert < ROUTER_MAX_EXPERTS {
-                gates[expert] = if expert < e {
-                    dlogits[token * e + expert]
-                } else {
-                    0.0
-                };
-                expert += 1;
+            let mut lows = [0.0f32; ROUTER_WGRAD_TOKENS];
+            let mut highs = [0.0f32; ROUTER_WGRAD_TOKENS];
+            let mut step = 0usize;
+            while step < ROUTER_WGRAD_TOKENS {
+                // The tail rereads the partition's last token and multiplies
+                // it by zero. Clamping costs one select; branching would cost
+                // the load its place in this block.
+                let index = (token + step).min(token_end - 1);
+                let keep = if token + step < token_end { 1.0 } else { 0.0 };
+                let base = index * d + row;
+                unsafe {
+                    lows[step] = *x.get_unchecked(base) * keep;
+                    highs[step] = *x.get_unchecked(base + 1) * keep;
+                }
+                step += 1;
             }
 
-            let row_offset = token * d;
-            let mut slot = 0usize;
-            while slot < ROUTER_WGRAD_ROWS {
-                let row = row_base + slot * ROUTER_WGRAD_THREADS;
-                let value = if row < d { x[row_offset + row] } else { 0.0 };
+            let mut step = 0usize;
+            while step < ROUTER_WGRAD_TOKENS {
+                let gate_base = (token + step).min(token_end - 1) * e;
                 let mut expert = 0usize;
                 while expert < ROUTER_MAX_EXPERTS {
-                    accumulators[slot][expert] += value * gates[expert];
+                    let held = expert < e;
+                    let gate = unsafe {
+                        *dlogits.get_unchecked(gate_base + if held { expert } else { 0 })
+                    };
+                    let gate = if held { gate } else { 0.0 };
+                    low[expert] += lows[step] * gate;
+                    high[expert] += highs[step] * gate;
                     expert += 1;
                 }
-                slot += 1;
+                step += 1;
             }
-            token += 1;
+            token += ROUTER_WGRAD_TOKENS;
         }
 
-        let mut slot = 0usize;
-        while slot < ROUTER_WGRAD_ROWS {
-            let row = row_base + slot * ROUTER_WGRAD_THREADS;
-            if row < d {
-                let mut expert = 0usize;
-                while expert < e {
-                    unsafe {
-                        *partials.get_unchecked_mut((split * e + expert) * d + row) =
-                            accumulators[slot][expert];
-                    }
-                    expert += 1;
+        // The lane's two rows are adjacent in `partials`, so each expert's
+        // pair of stores is one contiguous run per warp.
+        let base = split * e * d + row;
+        let mut expert = 0usize;
+        while expert < ROUTER_MAX_EXPERTS {
+            if expert < e {
+                unsafe {
+                    *partials.get_unchecked_mut(base + expert * d) = low[expert];
+                    *partials.get_unchecked_mut(base + expert * d + 1) = high[expert];
                 }
             }
-            slot += 1;
+            expert += 1;
         }
     }
 
     /// [`router_backward_weight_split`] reading its saved input packed.
     ///
-    /// The partition boundaries, the per-lane register tile and the ascending
-    /// reduction order are the twin's, so this stays as deterministic as it
-    /// was; only the `x` load widens.
+    /// The pair of rows a lane owns is the pair a packed word already holds, so
+    /// the widening is free and the load is the same one instruction.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`router_backward_weight_split`], with `x` holding
+    /// `tokens * dim / 2` packed words.
     #[kernel]
     pub unsafe fn router_backward_weight_split_bf16(
         x: &[u32],
@@ -4106,77 +4155,76 @@ pub mod kernels {
         dim: u32,
         mut partials: DisjointSlice<f32>,
     ) {
-        let tid = thread::threadIdx_x() as usize;
-        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS {
-            return;
-        }
         let n = tokens as usize;
         let e = experts as usize;
         let d = dim as usize;
-        if e == 0
+        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS
+            || e == 0
             || e > ROUTER_MAX_EXPERTS
-            || d == 0
+            || !d.is_multiple_of(ROUTER_WGRAD_ROWS)
             || n * d > x.len() * 2
             || n * e > dlogits.len()
+            || ROUTER_WGRAD_SPLITS * e * d > partials.len()
         {
             return;
         }
-        let split = thread::blockIdx_y() as usize;
-        let row_base = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM + tid;
-        if (split + 1) * e * d > partials.len() {
+        let row = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM
+            + thread::threadIdx_x() as usize * ROUTER_WGRAD_ROWS;
+        if row >= d {
             return;
         }
 
         let partition = n.div_ceil(ROUTER_WGRAD_SPLITS);
+        let split = thread::blockIdx_y() as usize;
         let token_end = ((split + 1) * partition).min(n);
         let mut token = (split * partition).min(n);
 
-        let mut accumulators = [[0.0f32; ROUTER_MAX_EXPERTS]; ROUTER_WGRAD_ROWS];
+        let mut low = [0.0f32; ROUTER_MAX_EXPERTS];
+        let mut high = [0.0f32; ROUTER_MAX_EXPERTS];
         while token < token_end {
-            let mut gates = [0.0f32; ROUTER_MAX_EXPERTS];
-            let mut expert = 0usize;
-            while expert < ROUTER_MAX_EXPERTS {
-                gates[expert] = if expert < e {
-                    dlogits[token * e + expert]
-                } else {
-                    0.0
-                };
-                expert += 1;
+            let mut lows = [0.0f32; ROUTER_WGRAD_TOKENS];
+            let mut highs = [0.0f32; ROUTER_WGRAD_TOKENS];
+            let mut step = 0usize;
+            while step < ROUTER_WGRAD_TOKENS {
+                let index = (token + step).min(token_end - 1);
+                let keep = if token + step < token_end { 1.0 } else { 0.0 };
+                let halves = bf16_halves(unsafe { *x.get_unchecked((index * d + row) / 2) });
+                lows[step] = halves[0] * keep;
+                highs[step] = halves[1] * keep;
+                step += 1;
             }
 
-            let row_offset = token * d;
-            let mut slot = 0usize;
-            while slot < ROUTER_WGRAD_ROWS {
-                let row = row_base + slot * ROUTER_WGRAD_THREADS;
-                let value = if row < d {
-                    bf16_at(x, row_offset + row)
-                } else {
-                    0.0
-                };
+            let mut step = 0usize;
+            while step < ROUTER_WGRAD_TOKENS {
+                let gate_base = (token + step).min(token_end - 1) * e;
                 let mut expert = 0usize;
                 while expert < ROUTER_MAX_EXPERTS {
-                    accumulators[slot][expert] += value * gates[expert];
+                    let held = expert < e;
+                    let gate = unsafe {
+                        *dlogits.get_unchecked(gate_base + if held { expert } else { 0 })
+                    };
+                    let gate = if held { gate } else { 0.0 };
+                    low[expert] += lows[step] * gate;
+                    high[expert] += highs[step] * gate;
                     expert += 1;
                 }
-                slot += 1;
+                step += 1;
             }
-            token += 1;
+            token += ROUTER_WGRAD_TOKENS;
         }
 
-        let mut slot = 0usize;
-        while slot < ROUTER_WGRAD_ROWS {
-            let row = row_base + slot * ROUTER_WGRAD_THREADS;
-            if row < d {
-                let mut expert = 0usize;
-                while expert < e {
-                    unsafe {
-                        *partials.get_unchecked_mut((split * e + expert) * d + row) =
-                            accumulators[slot][expert];
-                    }
-                    expert += 1;
+        // The lane's two rows are adjacent in `partials`, so each expert's
+        // pair of stores is one contiguous run per warp.
+        let base = split * e * d + row;
+        let mut expert = 0usize;
+        while expert < ROUTER_MAX_EXPERTS {
+            if expert < e {
+                unsafe {
+                    *partials.get_unchecked_mut(base + expert * d) = low[expert];
+                    *partials.get_unchecked_mut(base + expert * d + 1) = high[expert];
                 }
             }
-            slot += 1;
+            expert += 1;
         }
     }
 
