@@ -1492,8 +1492,9 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
 /// `[experts * rows, columns]` matrix, likewise one strided descriptor per
 /// expert, which avoids an allocation or a transpose launch each.
 ///
-/// The descriptors sit in one allocation apiece rather than one each, because
-/// that is what a batched launch indexes by expert (#107 A9).
+/// The descriptors live in one allocation for all experts rather than one
+/// each, which is what lets a batched launch reach expert `e`'s operand by
+/// striding the base pointer (#107 A9).
 struct StackedBf16Weights {
     transposed: DeviceBuffer<u32>,
     normal_maps: Bf16PairsTmaMaps,

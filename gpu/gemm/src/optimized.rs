@@ -694,9 +694,6 @@ struct Tile<D: Drain> {
     rank: u32,
     full: SemaphoreRing<ITEMS>,
     empty: SemaphoreRing<ITEMS>,
-    /// Equal-shaped GEMMs this launch covers, stacked in memory: `1` is a
-    /// plain launch and the whole batching apparatus is `expert = 0`.
-    experts: u32,
 }
 
 /// The items one cluster owns, in order: the static strided schedule
@@ -1005,7 +1002,6 @@ pub mod kernels {
         tiles_n: u32,
         k_blocks: u32,
         transposed: bool,
-        experts: u32,
         out: D,
     ) -> Tile<D> {
         unsafe {
@@ -1028,7 +1024,6 @@ pub mod kernels {
                 rank: cluster::block_rank(),
                 full: shared.full,
                 empty: shared.empty,
-                experts,
             }
         }
     }
@@ -1098,7 +1093,6 @@ pub mod kernels {
                 tiles_n,
                 k as u32 / BLOCK_K as u32,
                 transposed != 0,
-                1,
                 out,
             );
             sweep(&tile, tiles_m * tiles_n);
@@ -1111,9 +1105,15 @@ pub mod kernels {
     /// [`gemm_tcgen05_f32_accumulate`], which folds at the copy engine instead
     /// of here.
     ///
+    /// `experts` is the batching axis: `a_map` and `b_map` point at that many
+    /// consecutive descriptors and `c` holds that many consecutive `[m, n]`
+    /// matrices, so one launch covers what was a host loop over equal-shaped
+    /// GEMMs (the MoE expert linears, oxide-train#107 A9). `1` is a plain
+    /// launch and costs it a divide an item.
+    ///
     /// # Safety
-    /// As [`gemm_tcgen05_bf16_optimized`], with `c_offset..c_offset + m * n`
-    /// inside `c`.
+    /// As [`gemm_tcgen05_bf16_optimized`], with `c_offset..c_offset +
+    /// experts * m * n` inside `c` and `experts` live descriptors at each map.
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     #[allow(clippy::too_many_arguments)]
@@ -1140,7 +1140,6 @@ pub mod kernels {
                 tiles_n,
                 k as u32 / BLOCK_K as u32,
                 transposed != 0,
-                experts,
                 out,
             );
             sweep(&tile, experts * tiles_m * tiles_n);
@@ -1157,6 +1156,11 @@ pub mod kernels {
     /// gradient allocation — all live in `c_map`, so the kernel takes no `C`
     /// slice at all; the box is `[16, 32]` fp32 under SWIZZLE_128B, the shape
     /// [`Reduce`]'s staging tile stores through.
+    ///
+    /// `experts` batches as it does in [`gemm_tcgen05_f32_optimized`], and
+    /// `c_map` describes every expert's gradient at once: the stacked
+    /// `[experts * m, n]` matrix, which is what the expert's `m` tile-rows of
+    /// `C` are an offset into.
     ///
     /// # Safety
     /// As [`gemm_tcgen05_bf16_optimized`] for the operand maps; `c_map` must
@@ -1183,7 +1187,6 @@ pub mod kernels {
                 tiles_n,
                 k as u32 / BLOCK_K as u32,
                 transposed != 0,
-                experts,
                 Reduce { c_map },
             );
             sweep(&tile, experts * tiles_m * tiles_n);
