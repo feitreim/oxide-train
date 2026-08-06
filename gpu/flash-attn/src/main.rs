@@ -11,7 +11,7 @@
 //! the device staging kernel bit-exactly against a CPU mirror. The fp32 and
 //! tcgen05 kernels load from one embedded pure-PTX artifact.
 
-use bench_util::uniform_vec;
+use bench_util::{function_profile, uniform_vec};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 
 #[path = "lib.rs"]
@@ -827,6 +827,119 @@ fn check_fused_staging(
     }
 }
 
+/// What ptxas gave the fused dY pass and the two kernels it replaces.
+///
+/// Fusion raises liveness, and a kernel that crosses an occupancy step can
+/// lose on the clock while winning on traffic. The driver is asked directly,
+/// at each kernel's own block width, rather than inferred from the diff.
+fn report_dy_dot_residency(
+    flash_module: &flash::kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let module = flash_module.as_cuda_module();
+    println!("dY pass residency (registers/thread, spill bytes, blocks/SM)");
+    for (name, block_threads) in [
+        ("stage_attention_heads_bf16", 256),
+        ("flash_attention_backward_dot_bf16", HD as u32),
+        ("stage_attention_dy_dot_bf16", 256),
+    ] {
+        let function = module.load_function(name)?;
+        let profile = function_profile(&function)?;
+        let blocks = function.max_active_blocks_per_multiprocessor(block_threads, 0)?;
+        println!(
+            "  {name:<34} {:>4} {:>6} {blocks:>4} at {block_threads} threads",
+            profile.registers, profile.spill_bytes,
+        );
+    }
+    Ok(())
+}
+
+/// `stage_attention_dy_dot_bf16` against the two kernels it replaces.
+///
+/// The staged panel is the same arithmetic on the same bytes and the dot's
+/// butterfly walks the same pairings as the twin's shared-memory tree, so this
+/// substitution owes exact parity in both outputs — every staged word and
+/// every dot bit — and that is what is asserted here.
+fn check_fused_dy_dot(
+    stream: &CudaStream,
+    flash_module: &flash::kernels::LoadedModule,
+    b: usize,
+    t: usize,
+    h: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: every launch below is sized from the same (b, t, h) shape as the
+    // buffers it reads and writes.
+    unsafe {
+        let (n, d) = (b * t, h * HD);
+        let words = n * d / 2;
+        let host_dy = uniform_vec(n * d, 907);
+        let host_y = uniform_vec(n * d, 613);
+        let packed_y: Vec<u32> = host_y
+            .chunks_exact(2)
+            .map(|pair| f32_to_bf16_rne(pair[0]) as u32 | ((f32_to_bf16_rne(pair[1]) as u32) << 16))
+            .collect();
+        let dy = DeviceBuffer::from_host(stream, &host_dy)?;
+        let y = DeviceBuffer::from_host(stream, &packed_y)?;
+
+        let mut want_staged = DeviceBuffer::<u32>::zeroed(stream, words)?;
+        flash_module.stage_attention_heads_bf16(
+            stream,
+            flash::stage_heads_config(n, h, HD),
+            &dy,
+            t as u32,
+            h as u32,
+            1.0,
+            &mut want_staged,
+        )?;
+        let mut want_dot = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        flash_module.flash_attention_backward_dot_bf16(
+            stream,
+            flash::dot_config(n, h, HD),
+            &dy,
+            &y,
+            HD as u32,
+            &mut want_dot,
+        )?;
+
+        let mut got_staged = DeviceBuffer::<u32>::zeroed(stream, words)?;
+        let mut got_dot = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        flash_module.stage_attention_dy_dot_bf16(
+            stream,
+            flash::stage_dy_dot_config(n, h, HD),
+            &dy,
+            &y,
+            t as u32,
+            h as u32,
+            &mut got_staged,
+            &mut got_dot,
+        )?;
+
+        for (i, (&g, &w)) in got_staged
+            .to_host_vec(stream)?
+            .iter()
+            .zip(&want_staged.to_host_vec(stream)?)
+            .enumerate()
+        {
+            assert_eq!(
+                g, w,
+                "fused dy staging word {i} at [{b},{t},{h}]: {g:#010x} vs stage {w:#010x}"
+            );
+        }
+        for (i, (&g, &w)) in got_dot
+            .to_host_vec(stream)?
+            .iter()
+            .zip(&want_dot.to_host_vec(stream)?)
+            .enumerate()
+        {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "fused dy dot {i} at [{b},{t},{h}]: {g} vs backward_dot {w}"
+            );
+        }
+        Ok(())
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(HD.is_power_of_two() && HD <= flash::MAX_HEAD_DIM);
     assert_eq!(HD, flash::TILE_HD);
@@ -877,6 +990,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         check_fused_staging(&stream, &flash_module, &naive_module, b, t, h)?;
     }
     println!("✓ fused qkv rotate-and-stage matches split + rope + stage exactly");
+    for (b, t, h) in [(1, 128, 2), (2, 256, 3), (1, 1024, 4)] {
+        check_fused_dy_dot(&stream, &flash_module, b, t, h)?;
+    }
+    println!("✓ fused dy stage-and-dot matches stage + backward_dot exactly");
+    report_dy_dot_residency(&flash_module)?;
     check_tcgen05_backward_shape(
         &stream,
         &flash_module,
