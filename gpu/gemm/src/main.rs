@@ -136,15 +136,23 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 // granted the architecture's 255 rather than the ~170 twelve warps left it, and
 // the ceiling that closed #83's two-band hoist is gone. These three counts are
 // what the kernel *asks for*, not what it may have.
+//
+// oxide-train#122's `#[launch_bounds(192, 1)]` raised two of them — bf16
+// 132 → 160 and the fp32 store 168 → 172, the reduce unmoved — at zero spill
+// and zero frame throughout. That direction is the point rather than a cost: an
+// undeclared entry leaves ptxas guessing at a block it might be launched in,
+// and a `.maxntid` of exactly 192 is what lets the allocator spend the file
+// this kernel's one CTA an SM actually owns. Residency does not move, because
+// at 192 threads even 255 registers is one CTA.
 const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
         name: "gemm_tcgen05_bf16_optimized",
-        max_registers: 132,
+        max_registers: 160,
         max_spill_bytes: 0,
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_optimized",
-        max_registers: 168,
+        max_registers: 172,
         max_spill_bytes: 0,
     },
     KernelBudget {
