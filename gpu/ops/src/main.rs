@@ -13,6 +13,7 @@ use tensor_cpu::CpuTensor;
 // as a module so this binary's embedded artifact contains the kernels.
 #[path = "lib.rs"]
 mod device;
+use device::reference::kernels as reference_kernels;
 use device::{
     CLASSIFIER_THREADS, LOSS_TAIL_THREADS, MOE_ASSIGN_THREADS, MOE_AUX_TERMS_THREADS,
     MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS, MOE_ZERO_BINS_BLOCKS, MOE_ZERO_BINS_THREADS,
@@ -55,31 +56,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
+    let reference = reference_kernels::load(&ctx)?;
 
     eprintln!("[ops] checking rms_norm");
-    check_rms_norm(&stream, &module)?;
+    check_rms_norm(&stream, &reference)?;
     eprintln!("[ops] checking rms_norm tiles");
-    check_rms_norm_tile(&stream, &module)?;
+    check_rms_norm_tile(&stream, &reference)?;
     eprintln!("[ops] checking swiglu");
-    check_swiglu(&stream, &module)?;
+    check_swiglu(&stream, &reference)?;
     eprintln!("[ops] checking swiglu tiles");
-    check_swiglu_tile(&stream, &module)?;
+    check_swiglu_tile(&stream, &reference)?;
     eprintln!("[ops] checking swiglu interleaved");
-    check_swiglu_interleaved(&stream, &module)?;
+    check_swiglu_interleaved(&stream, &module, &reference)?;
     eprintln!("[ops] checking embedding");
-    check_embedding(&stream, &module)?;
+    check_embedding(&stream, &module, &reference)?;
     eprintln!("[ops] checking cross_entropy");
-    check_cross_entropy(&stream, &module)?;
+    check_cross_entropy(&stream, &reference)?;
     eprintln!("[ops] checking classifier_bf16");
-    check_classifier_bf16(&stream, &module)?;
+    check_classifier_bf16(&stream, &module, &reference)?;
     eprintln!("[ops] checking rope");
-    check_rope(&stream, &module)?;
+    check_rope(&stream, &module, &reference)?;
     eprintln!("[ops] checking attention");
     check_attention(&stream, &module)?;
     eprintln!("[ops] checking group_split_join");
-    check_group_split_join(&stream, &module)?;
+    check_group_split_join(&stream, &module, &reference)?;
     eprintln!("[ops] checking moe_routing");
-    check_moe_routing(&stream, &module)?;
+    check_moe_routing(&stream, &module, &reference)?;
     eprintln!("[ops] checking loss tail");
     check_loss_tail(&stream, &module)?;
 
@@ -91,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn check_moe_routing(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: every launch in this check derives its buffer sizes and launch
     // geometry from the N/D/FF/E/K/C constants below.
@@ -184,7 +187,7 @@ fn check_moe_routing(
         let mut output_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
 
         unsafe {
-            module.router_logits(
+            reference.router_logits(
                 stream,
                 LaunchConfig {
                     grid_dim: (
@@ -213,7 +216,7 @@ fn check_moe_routing(
                 &mut selected_dev,
                 &mut gates_dev,
             )?;
-            module.moe_bin_assign(
+            reference.moe_bin_assign(
                 stream,
                 LaunchConfig {
                     grid_dim: (E as u32, 1, 1),
@@ -243,7 +246,7 @@ fn check_moe_routing(
                 &mut slots_dev,
                 &mut counts_dev,
             )?;
-            module.moe_scatter(
+            reference.moe_scatter(
                 stream,
                 LaunchConfig::for_num_elems((N * K * D) as u32),
                 &x_dev,
@@ -255,7 +258,7 @@ fn check_moe_routing(
                 &mut expert_input_dev,
             )?;
         }
-        module.moe_gather_combine(
+        reference.moe_gather_combine(
             stream,
             LaunchConfig::for_num_elems((N * D) as u32),
             &expert_output_dev,
@@ -308,7 +311,7 @@ fn check_moe_routing(
             "MoE scatter must preserve accepted rows and zero-fill unused slots"
         );
         let mut roundtrip_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
-        module.moe_gather_combine(
+        reference.moe_gather_combine(
             stream,
             LaunchConfig::for_num_elems((N * D) as u32),
             &expert_input_dev,
@@ -430,7 +433,7 @@ fn check_moe_routing(
             .collect();
         let expert_input_gradient_dev = DeviceBuffer::from_host(stream, &expert_input_gradient)?;
         let mut expert_dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
-        module.moe_gather_dx(
+        reference.moe_gather_dx(
             stream,
             LaunchConfig::for_num_elems((N * D) as u32),
             &expert_input_gradient_dev,
@@ -503,7 +506,7 @@ fn check_moe_routing(
                 &mut router_dx_dev,
             )?;
         }
-        module.router_backward_weight(
+        reference.router_backward_weight(
             stream,
             LaunchConfig::for_num_elems((D * E) as u32),
             &x_dev,
@@ -522,7 +525,7 @@ fn check_moe_routing(
             shared_mem_bytes: 0,
         };
         unsafe {
-            module.router_backward_weight_split(
+            reference.router_backward_weight_split(
                 stream,
                 router_wgrad_config,
                 &x_dev,
@@ -551,7 +554,7 @@ fn check_moe_routing(
         // fixed schedule: relaunching must reproduce the gradient bit for bit.
         let mut repeat_dweight_dev = DeviceBuffer::<f32>::zeroed(stream, D * E)?;
         unsafe {
-            module.router_backward_weight_split(
+            reference.router_backward_weight_split(
                 stream,
                 router_wgrad_config,
                 &x_dev,
@@ -604,7 +607,7 @@ fn check_moe_routing(
             .map(|(&base, &combined)| base + combined)
             .collect();
         let mut combine_add_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
-        module.moe_gather_combine_add(
+        reference.moe_gather_combine_add(
             stream,
             LaunchConfig::for_num_elems((N * D) as u32),
             &expert_output_dev,
@@ -626,7 +629,7 @@ fn check_moe_routing(
         );
         let mut combine_add_quad_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
         unsafe {
-            module.moe_gather_combine_add_quad(
+            reference.moe_gather_combine_add_quad(
                 stream,
                 LaunchConfig::for_num_elems((N * D / 4) as u32),
                 &expert_output_dev,
@@ -708,7 +711,7 @@ fn check_moe_routing(
                 C as u32,
                 &mut poisoned_bins_dev,
             )?;
-            module.moe_scatter(
+            reference.moe_scatter(
                 stream,
                 LaunchConfig::for_num_elems((N * K * D) as u32),
                 &x_dev,
@@ -747,7 +750,7 @@ fn check_moe_routing(
                 C as u32,
                 &mut packed_pair_dev,
             )?;
-            module.moe_scatter_bf16(
+            reference.moe_scatter_bf16(
                 stream,
                 LaunchConfig::for_num_elems((N * K * D / 2) as u32),
                 &x_dev,
@@ -766,7 +769,7 @@ fn check_moe_routing(
                 C as u32,
                 &mut packed_quad_dev,
             )?;
-            module.moe_scatter_bf16_quad(
+            reference.moe_scatter_bf16_quad(
                 stream,
                 LaunchConfig::for_num_elems((N * K * D / 4) as u32),
                 &x_dev,
@@ -1044,6 +1047,7 @@ fn check_moe_tie_routing(
 fn check_rope(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: all device buffers and launches use the same N/T/D/H/HD shape.
     unsafe {
@@ -1073,7 +1077,7 @@ fn check_rope(
             HD as u32,
             &mut y_dev,
         )?;
-        module.rope_backward(
+        reference.rope_backward(
             stream,
             LaunchConfig::for_num_elems((N * D / 2) as u32),
             &dy_dev,
@@ -1109,7 +1113,7 @@ fn check_rope(
         let mut composed = DeviceBuffer::<f32>::zeroed(stream, N * 3 * D)?;
         let mut fused = DeviceBuffer::<f32>::zeroed(stream, N * 3 * D)?;
         let pairs = LaunchConfig::for_num_elems((N * D / 2) as u32);
-        module.rope_backward(
+        reference.rope_backward(
             stream,
             pairs,
             &dk_dev,
@@ -1119,7 +1123,7 @@ fn check_rope(
             HD as u32,
             &mut dk_rotated,
         )?;
-        module.join_group3(
+        reference.join_group3(
             stream,
             LaunchConfig::for_num_elems((N * D) as u32),
             &dx_dev,
@@ -1304,7 +1308,7 @@ fn check_attention(
 #[allow(unused_unsafe)]
 fn check_rms_norm(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
-    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: all device buffers and launches use the same N x D shape.
     unsafe {
@@ -1325,7 +1329,7 @@ fn check_rms_norm(
         let mut dx_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
         let mut dw_dev = DeviceBuffer::<f32>::zeroed(stream, D)?;
 
-        module.rms_norm_forward(
+        reference.rms_norm_forward(
             stream,
             LaunchConfig::for_num_elems((N * D) as u32),
             &x_dev,
@@ -1334,7 +1338,7 @@ fn check_rms_norm(
             D as u32,
             &mut y_dev,
         )?;
-        module.rms_norm_backward_x(
+        reference.rms_norm_backward_x(
             stream,
             LaunchConfig::for_num_elems((N * D) as u32),
             &x_dev,
@@ -1344,7 +1348,7 @@ fn check_rms_norm(
             D as u32,
             &mut dx_dev,
         )?;
-        module.rms_norm_backward_weight(
+        reference.rms_norm_backward_weight(
             stream,
             LaunchConfig::for_num_elems(D as u32),
             &x_dev,
@@ -1383,7 +1387,7 @@ fn check_rms_norm(
         let mut y_fast_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
         let mut dx_fast_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
         let mut dw_fast_dev = DeviceBuffer::<f32>::zeroed(stream, D)?;
-        module.rms_norm_row_inv(
+        reference.rms_norm_row_inv(
             stream,
             LaunchConfig {
                 grid_dim: (N as u32, 1, 1),
@@ -1395,7 +1399,7 @@ fn check_rms_norm(
             D as u32,
             &mut inv_dev,
         )?;
-        module.rms_norm_forward_fast(
+        reference.rms_norm_forward_fast(
             stream,
             LaunchConfig {
                 grid_dim: (N as u32, 1, 1),
@@ -1408,7 +1412,7 @@ fn check_rms_norm(
             D as u32,
             &mut y_fast_dev,
         )?;
-        module.rms_norm_backward_x_fast(
+        reference.rms_norm_backward_x_fast(
             stream,
             LaunchConfig {
                 grid_dim: (N as u32, 1, 1),
@@ -1424,7 +1428,7 @@ fn check_rms_norm(
             &mut inv_fast_dev,
         )?;
         unsafe {
-            module.rms_norm_backward_weight_fast(
+            reference.rms_norm_backward_weight_fast(
                 stream,
                 LaunchConfig {
                     grid_dim: (
@@ -1484,7 +1488,7 @@ fn check_rms_norm(
 /// columns divide by every `NORM_TILE_CHUNK` up to 64.
 fn check_rms_norm_tile(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
-    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: every buffer and launch below uses the same N x D shape, and N is
     // a multiple of NORM_TILE_BLOCK_ROWS and D of NORM_TILE_CHUNK.
@@ -1503,7 +1507,7 @@ fn check_rms_norm_tile(
         let weight_dev = DeviceBuffer::from_host(stream, weight.as_slice())?;
         let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
 
-        module.rms_norm_forward_tile(
+        reference.rms_norm_forward_tile(
             stream,
             LaunchConfig {
                 grid_dim: ((N / NORM_TILE_BLOCK_ROWS) as u32, 1, 1),
@@ -1535,7 +1539,7 @@ fn check_rms_norm_tile(
 /// loudly.
 fn check_swiglu_tile(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
-    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: every buffer is ROWS x COLUMNS, ROWS is a multiple of
     // SWIGLU_TILE_BLOCK_ROWS and COLUMNS of SWIGLU_TILE_CHUNK, and both
@@ -1566,8 +1570,8 @@ fn check_swiglu_tile(
 
         let mut shipped = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
         let mut tiled = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
-        module.swiglu_forward(stream, flat, &gate_dev, &up_dev, &mut shipped)?;
-        module.swiglu_forward_tile(
+        reference.swiglu_forward(stream, flat, &gate_dev, &up_dev, &mut shipped)?;
+        reference.swiglu_forward_tile(
             stream,
             tiles,
             &gate_dev,
@@ -1583,8 +1587,8 @@ fn check_swiglu_tile(
             rtol,
         );
 
-        module.swiglu_backward_gate(stream, flat, &gate_dev, &up_dev, &dy_dev, &mut shipped)?;
-        module.swiglu_backward_gate_tile(
+        reference.swiglu_backward_gate(stream, flat, &gate_dev, &up_dev, &dy_dev, &mut shipped)?;
+        reference.swiglu_backward_gate_tile(
             stream,
             tiles,
             &gate_dev,
@@ -1601,8 +1605,8 @@ fn check_swiglu_tile(
             rtol,
         );
 
-        module.swiglu_backward_up(stream, flat, &gate_dev, &dy_dev, &mut shipped)?;
-        module.swiglu_backward_up_tile(
+        reference.swiglu_backward_up(stream, flat, &gate_dev, &dy_dev, &mut shipped)?;
+        reference.swiglu_backward_up_tile(
             stream,
             tiles,
             &gate_dev,
@@ -1624,16 +1628,18 @@ fn check_swiglu_tile(
 fn check_classifier_bf16(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Odd real vocabulary exercises the packed tail; the second case covers a
     // multi-iteration lane stride.
-    check_classifier_bf16_case::<5, 13, 16>(stream, module)?;
-    check_classifier_bf16_case::<3, 517, 520>(stream, module)
+    check_classifier_bf16_case::<5, 13, 16>(stream, module, reference)?;
+    check_classifier_bf16_case::<3, 517, 520>(stream, module, reference)
 }
 
 fn check_classifier_bf16_case<const N: usize, const C: usize, const CP: usize>(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: CP is validated as an even padded width, and every buffer and
     // launch is allocated from N, C, and CP.
@@ -1668,7 +1674,7 @@ fn check_classifier_bf16_case<const N: usize, const C: usize, const CP: usize>(
         let rounded_dev = DeviceBuffer::from_host(stream, &rounded)?;
         let mut oracle_losses = DeviceBuffer::<f32>::zeroed(stream, N)?;
         let mut oracle_dlogits = DeviceBuffer::from_host(stream, &rounded)?;
-        module.fused_classifier_forward(
+        reference.fused_classifier_forward(
             stream,
             classifier_config,
             &rounded_dev,
@@ -1677,7 +1683,7 @@ fn check_classifier_bf16_case<const N: usize, const C: usize, const CP: usize>(
             C as u32,
             &mut oracle_losses,
         )?;
-        module.fused_classifier_backward_in_place(
+        reference.fused_classifier_backward_in_place(
             stream,
             classifier_config,
             &targets_dev,
@@ -1744,7 +1750,7 @@ fn check_classifier_bf16_case<const N: usize, const C: usize, const CP: usize>(
 
 fn check_swiglu(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
-    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: each input and output has LEN elements and each launch covers LEN.
     unsafe {
@@ -1762,14 +1768,14 @@ fn check_swiglu(
         let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
         let mut dgate_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
         let mut dup_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
-        module.swiglu_forward(
+        reference.swiglu_forward(
             stream,
             LaunchConfig::for_num_elems(LEN as u32),
             &gate_dev,
             &up_dev,
             &mut y_dev,
         )?;
-        module.swiglu_backward_gate(
+        reference.swiglu_backward_gate(
             stream,
             LaunchConfig::for_num_elems(LEN as u32),
             &gate_dev,
@@ -1777,7 +1783,7 @@ fn check_swiglu(
             &dy_dev,
             &mut dgate_dev,
         )?;
-        module.swiglu_backward_up(
+        reference.swiglu_backward_up(
             stream,
             LaunchConfig::for_num_elems(LEN as u32),
             &gate_dev,
@@ -1818,17 +1824,19 @@ fn check_swiglu(
 fn check_swiglu_interleaved(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // FF = 5 exercises the fp32 oracle arm alone; FF = 8 is quad-aligned so
     // the packed-bf16 arms run too.
-    check_swiglu_interleaved_case::<3, 5>(stream, module)?;
-    check_swiglu_interleaved_case::<4, 8>(stream, module)
+    check_swiglu_interleaved_case::<3, 5>(stream, module, reference)?;
+    check_swiglu_interleaved_case::<4, 8>(stream, module, reference)
 }
 
 #[allow(unused_unsafe)]
 fn check_swiglu_interleaved_case<const ROWS: usize, const FF: usize>(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: every launch covers exactly the element count its output dtype
     // packs the `ROWS x FF` (or interleaved `ROWS x 2FF`) rectangle into, and
@@ -1860,8 +1868,8 @@ fn check_swiglu_interleaved_case<const ROWS: usize, const FF: usize>(
         let mut y_ref_dev = DeviceBuffer::<f32>::zeroed(stream, ROWS * FF)?;
         let mut dgate_ref_dev = DeviceBuffer::<f32>::zeroed(stream, ROWS * FF)?;
         let mut dup_ref_dev = DeviceBuffer::<f32>::zeroed(stream, ROWS * FF)?;
-        module.swiglu_forward(stream, flat, &gate_dev, &up_dev, &mut y_ref_dev)?;
-        module.swiglu_backward_gate(
+        reference.swiglu_forward(stream, flat, &gate_dev, &up_dev, &mut y_ref_dev)?;
+        reference.swiglu_backward_gate(
             stream,
             flat,
             &gate_dev,
@@ -1869,7 +1877,7 @@ fn check_swiglu_interleaved_case<const ROWS: usize, const FF: usize>(
             &dy_dev,
             &mut dgate_ref_dev,
         )?;
-        module.swiglu_backward_up(stream, flat, &gate_dev, &dy_dev, &mut dup_ref_dev)?;
+        reference.swiglu_backward_up(stream, flat, &gate_dev, &dy_dev, &mut dup_ref_dev)?;
         let y_ref = y_ref_dev.to_host_vec(stream)?;
         let dgate_ref = dgate_ref_dev.to_host_vec(stream)?;
         let dup_ref = dup_ref_dev.to_host_vec(stream)?;
@@ -1955,6 +1963,7 @@ fn check_swiglu_interleaved_case<const ROWS: usize, const FF: usize>(
 fn check_embedding(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: token, embedding, and gradient buffers are allocated from the
     // same N/V/D constants used by every launch.
@@ -1987,7 +1996,7 @@ fn check_embedding(
         let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
         let mut dw_dev = DeviceBuffer::<f32>::zeroed(stream, V * D)?;
         let mut dw_scatter_dev = DeviceBuffer::<f32>::zeroed(stream, V * D)?;
-        module.embedding_forward(
+        reference.embedding_forward(
             stream,
             LaunchConfig::for_num_elems((N * D) as u32),
             &weight_dev,
@@ -1995,7 +2004,7 @@ fn check_embedding(
             D as u32,
             &mut y_dev,
         )?;
-        module.embedding_backward(
+        reference.embedding_backward(
             stream,
             LaunchConfig::for_num_elems((V * D) as u32),
             &tokens_dev,
@@ -2046,6 +2055,7 @@ fn check_embedding(
 fn check_group_split_join(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const ROWS: usize = 7;
     const WIDTH: usize = 13;
@@ -2091,7 +2101,7 @@ fn check_group_split_join(
     // SAFETY: the three parts are disjoint [ROWS, WIDTH] tensors and the
     // output holds exactly ROWS * 3 * WIDTH elements.
     unsafe {
-        module.join_group3(
+        reference.join_group3(
             stream,
             elems,
             &first,
@@ -2112,7 +2122,7 @@ fn check_group_split_join(
     let packed2_dev = DeviceBuffer::from_host(stream, packed2.as_slice())?;
     // SAFETY: the packed input and two outputs match ROWS x WIDTH.
     unsafe {
-        module.split_group2(
+        reference.split_group2(
             stream,
             elems,
             &packed2_dev,
@@ -2137,7 +2147,7 @@ fn check_group_split_join(
     // SAFETY: both parts are disjoint [ROWS, WIDTH] tensors and the output
     // holds exactly ROWS * 2 * WIDTH elements.
     unsafe {
-        module.join_group2(stream, elems, &first, &second, WIDTH as u32, &mut joined2)?;
+        reference.join_group2(stream, elems, &first, &second, WIDTH as u32, &mut joined2)?;
     }
     assert_close(
         "join_group2",
@@ -2151,15 +2161,15 @@ fn check_group_split_join(
 
 fn check_cross_entropy(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
-    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    check_cross_entropy_case::<5, 13>(stream, module)?;
-    check_cross_entropy_case::<5, 517>(stream, module)
+    check_cross_entropy_case::<5, 13>(stream, reference)?;
+    check_cross_entropy_case::<5, 517>(stream, reference)
 }
 
 fn check_cross_entropy_case<const N: usize, const C: usize>(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
-    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: logits, probabilities, gradients, targets, and launch geometry
     // all use the same N x C dimensions.
@@ -2181,14 +2191,14 @@ fn check_cross_entropy_case<const N: usize, const C: usize>(
         let mut dlogits_dev = DeviceBuffer::<f32>::zeroed(stream, N * C)?;
         let mut fused_losses_dev = DeviceBuffer::<f32>::zeroed(stream, N)?;
         let mut fused_dlogits_dev = DeviceBuffer::from_host(stream, logits.as_slice())?;
-        module.softmax_forward(
+        reference.softmax_forward(
             stream,
             LaunchConfig::for_num_elems((N * C) as u32),
             &logits_dev,
             C as u32,
             &mut probabilities_dev,
         )?;
-        module.cross_entropy_loss(
+        reference.cross_entropy_loss(
             stream,
             LaunchConfig::for_num_elems(N as u32),
             &logits_dev,
@@ -2197,7 +2207,7 @@ fn check_cross_entropy_case<const N: usize, const C: usize>(
             C as u32,
             &mut losses_dev,
         )?;
-        module.softmax_cross_entropy_backward(
+        reference.softmax_cross_entropy_backward(
             stream,
             LaunchConfig::for_num_elems((N * C) as u32),
             &probabilities_dev,
@@ -2212,7 +2222,7 @@ fn check_cross_entropy_case<const N: usize, const C: usize>(
             block_dim: (CLASSIFIER_THREADS as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        module.fused_classifier_forward(
+        reference.fused_classifier_forward(
             stream,
             classifier_config,
             &logits_dev,
@@ -2221,7 +2231,7 @@ fn check_cross_entropy_case<const N: usize, const C: usize>(
             C as u32,
             &mut fused_losses_dev,
         )?;
-        module.fused_classifier_backward_in_place(
+        reference.fused_classifier_backward_in_place(
             stream,
             classifier_config,
             &targets_dev,
