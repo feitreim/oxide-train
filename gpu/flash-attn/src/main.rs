@@ -827,6 +827,93 @@ fn check_fused_staging(
     }
 }
 
+/// `stage_attention_dy_dot_bf16` against the two kernels it replaces.
+///
+/// The staged panel is the same arithmetic on the same bytes and the dot's
+/// butterfly walks the same pairings as the twin's shared-memory tree, so this
+/// substitution owes exact parity in both outputs — every staged word and
+/// every dot bit — and that is what is asserted here.
+fn check_fused_dy_dot(
+    stream: &CudaStream,
+    flash_module: &flash::kernels::LoadedModule,
+    b: usize,
+    t: usize,
+    h: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: every launch below is sized from the same (b, t, h) shape as the
+    // buffers it reads and writes.
+    unsafe {
+        let (n, d) = (b * t, h * HD);
+        let words = n * d / 2;
+        let host_dy = uniform_vec(n * d, 907);
+        let host_y = uniform_vec(n * d, 613);
+        let packed_y: Vec<u32> = host_y
+            .chunks_exact(2)
+            .map(|pair| f32_to_bf16_rne(pair[0]) as u32 | ((f32_to_bf16_rne(pair[1]) as u32) << 16))
+            .collect();
+        let dy = DeviceBuffer::from_host(stream, &host_dy)?;
+        let y = DeviceBuffer::from_host(stream, &packed_y)?;
+
+        let mut want_staged = DeviceBuffer::<u32>::zeroed(stream, words)?;
+        flash_module.stage_attention_heads_bf16(
+            stream,
+            flash::stage_heads_config(n, h, HD),
+            &dy,
+            t as u32,
+            h as u32,
+            1.0,
+            &mut want_staged,
+        )?;
+        let mut want_dot = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        flash_module.flash_attention_backward_dot_bf16(
+            stream,
+            flash::dot_config(n, h, HD),
+            &dy,
+            &y,
+            HD as u32,
+            &mut want_dot,
+        )?;
+
+        let mut got_staged = DeviceBuffer::<u32>::zeroed(stream, words)?;
+        let mut got_dot = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
+        flash_module.stage_attention_dy_dot_bf16(
+            stream,
+            flash::stage_dy_dot_config(n, h, HD),
+            &dy,
+            &y,
+            t as u32,
+            h as u32,
+            &mut got_staged,
+            &mut got_dot,
+        )?;
+
+        for (i, (&g, &w)) in got_staged
+            .to_host_vec(stream)?
+            .iter()
+            .zip(&want_staged.to_host_vec(stream)?)
+            .enumerate()
+        {
+            assert_eq!(
+                g, w,
+                "fused dy staging word {i} at [{b},{t},{h}]: {g:#010x} vs stage {w:#010x}"
+            );
+        }
+        for (i, (&g, &w)) in got_dot
+            .to_host_vec(stream)?
+            .iter()
+            .zip(&want_dot.to_host_vec(stream)?)
+            .enumerate()
+        {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "fused dy dot {i} at [{b},{t},{h}]: {g} vs backward_dot {w}"
+            );
+        }
+        Ok(())
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(HD.is_power_of_two() && HD <= flash::MAX_HEAD_DIM);
     assert_eq!(HD, flash::TILE_HD);
@@ -877,6 +964,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         check_fused_staging(&stream, &flash_module, &naive_module, b, t, h)?;
     }
     println!("✓ fused qkv rotate-and-stage matches split + rope + stage exactly");
+    for (b, t, h) in [(1, 128, 2), (2, 256, 3), (1, 1024, 4)] {
+        check_fused_dy_dot(&stream, &flash_module, b, t, h)?;
+    }
+    println!("✓ fused dy stage-and-dot matches stage + backward_dot exactly");
     check_tcgen05_backward_shape(
         &stream,
         &flash_module,

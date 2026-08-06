@@ -6387,9 +6387,10 @@ fn flash_attention_forward_into<
 /// Attention backward dispatch (issue #35 phase 4): tile-aligned shapes stage
 /// dY into the shared scratch, read the forward's per-block Q/K/V panels, and
 /// run the tcgen05 query-parallel dQ and key-parallel dK/dV kernels; other
-/// shapes stay on the fp32 tiled kernels. Both paths first run the fp32
-/// `backward_dot` over the forward `y` — the tcgen05 kernels consume the same
-/// `Σ dy·y` and the saved natural-log LSE as read-only device slices.
+/// shapes stay on the fp32 tiled kernels. Every path consumes the same
+/// `Σ dy·y` over the forward `y` and the saved natural-log LSE as read-only
+/// device slices; the staged path folds that reduction into its dY staging
+/// pass, the others run `backward_dot` on its own.
 #[allow(clippy::too_many_arguments)]
 fn flash_attention_backward_into<
     const N: usize,
@@ -6415,17 +6416,21 @@ fn flash_attention_backward_into<
     flash_bf16: &Tcgen05Flash,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
-    // SAFETY: dot config and buffers agree on N, H, and HD.
-    profiler.measure(stream, "backward.attention.flash_dot", || unsafe {
-        kernels.flash_attention_backward_dot_bf16(
-            stream,
-            flash_dot_config::<N, H, HD>(),
-            dy.as_device_buffer(),
-            output.as_device_buffer(),
-            HD as u32,
-            softmax_dot.as_device_buffer_mut(),
-        )
-    })?;
+    // The staged arm reads dY once, in the fused pass below; the arms that
+    // have no dY panel to stage take the standalone dot.
+    if !matches!(operands, AttentionOperands::Staged { .. }) {
+        // SAFETY: dot config and buffers agree on N, H, and HD.
+        profiler.measure(stream, "backward.attention.flash_dot", || unsafe {
+            kernels.flash_attention_backward_dot_bf16(
+                stream,
+                flash_dot_config::<N, H, HD>(),
+                dy.as_device_buffer(),
+                output.as_device_buffer(),
+                HD as u32,
+                softmax_dot.as_device_buffer_mut(),
+            )
+        })?;
+    }
     // The per-row oracle is the one generation that reads `y` again, and it
     // reads fp32; every other arm consumes the staged dot above and never
     // touches it. Widen once for that arm alone.
@@ -6450,17 +6455,20 @@ fn flash_attention_backward_into<
             let scratch = scratch.expect("staged operands allocate the flash scratch beside them");
             // Q, K and V were staged once by the forward and are this block's
             // saved activations; only dY, a backward temporary sharing one
-            // buffer across blocks, is staged here.
-            // SAFETY: staged buffers match the N/T/H/HD attention layout.
-            profiler.measure(stream, "backward.attention.stage_bf16", || unsafe {
-                kernels.stage_attention_heads_bf16(
+            // buffer across blocks, is staged here — and the row dots the two
+            // flash kernels consume come off the same read of it.
+            // SAFETY: staged buffers match the N/T/H/HD attention layout, and
+            // the dot buffer is `[N, H]` as the config's `rows * heads`.
+            profiler.measure(stream, "backward.attention.stage_dot_bf16", || unsafe {
+                kernels.stage_attention_dy_dot_bf16(
                     stream,
-                    flash_device::stage_heads_config(N, H, HD),
+                    flash_device::stage_dy_dot_config(N, H, HD),
                     dy.as_device_buffer(),
+                    output.as_device_buffer(),
                     T as u32,
                     H as u32,
-                    1.0,
                     &mut scratch.dy.words,
+                    softmax_dot.as_device_buffer_mut(),
                 )
             })?;
             profiler.measure(stream, "backward.attention.flash_q", || unsafe {

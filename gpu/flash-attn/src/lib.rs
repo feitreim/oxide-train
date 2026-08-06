@@ -24,7 +24,7 @@
 //! - tiled backward launches `rows * heads` blocks for each of dQ and dK/dV.
 
 use cuda_core::LaunchConfig;
-use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread};
+use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread, warp};
 
 // tcgen05 and libdevice-backed oracle kernels intentionally share one embedded
 // pure-PTX artifact at the pinned cuda-oxide revision.
@@ -40,6 +40,11 @@ pub const MAX_HEAD_DIM: usize = 256;
 /// Head width the tiled kernels specialize on; shared tiles are sized by it
 /// at compile time. Launches assert the model's `HD` matches.
 pub const TILE_HD: usize = 128;
+
+/// Lanes in a warp. The fused dY pass gives one warp each `(row, head)`, which
+/// turns its dot reduction into a shuffle butterfly instead of a
+/// shared-memory tree.
+pub const WARP_LANES: usize = 32;
 
 /// Tiled-forward query rows per block. Rewritten by the repository's `SWEEP`
 /// harness. Halved from the HD=64 era so the doubled head width keeps the
@@ -147,6 +152,18 @@ pub mod kernels {
     #[inline(always)]
     fn pack_bf16_pair(low: f32, high: f32) -> u32 {
         f32_to_bf16_rne(low) as u32 | ((f32_to_bf16_rne(high) as u32) << 16)
+    }
+
+    /// The even element of a packed pair, widened.
+    #[inline(always)]
+    fn bf16_low(word: u32) -> f32 {
+        f32::from_bits(word << 16)
+    }
+
+    /// The odd element of a packed pair, widened.
+    #[inline(always)]
+    fn bf16_high(word: u32) -> f32 {
+        f32::from_bits(word & 0xffff_0000)
     }
 
     /// De-interleave the fp32 `[B*T, 3 * H * TILE_HD]` qkv projection output
@@ -1010,6 +1027,70 @@ pub mod kernels {
         }
     }
 
+    /// [`stage_attention_heads_bf16`] and [`flash_attention_backward_dot_bf16`]
+    /// in one pass over `dy`.
+    ///
+    /// The backward's two openers read the same fp32 `[B*T, H*TILE_HD]`
+    /// gradient back to back: one de-interleaves it into the packed-bf16
+    /// head panels the tcgen05 kernels stream with TMA, the other reduces the
+    /// per-`(row, head)` softmax dot `sum_d dy * y`. Here the dot comes off the
+    /// registers the staging pass already loaded, so `dy` is read once.
+    ///
+    /// One warp owns each `(row, head)` and each lane owns pairs `lane` and
+    /// `lane + WARP_LANES`. Those are the twin's elements `i` and `i + 64`, so
+    /// the twin's first tree step is this lane's `even`/`odd` add and the rest
+    /// is a butterfly over the same pairings: the dot is the twin's bit for
+    /// bit. Launch with [`stage_dy_dot_config`].
+    #[kernel]
+    pub fn stage_attention_dy_dot_bf16(
+        dy: &[f32],
+        y: &[u32],
+        sequence_length: u32,
+        heads: u32,
+        mut staged: DisjointSlice<u32>,
+        mut dot: DisjointSlice<f32>,
+    ) {
+        const PAIRS_PER_ROW: usize = TILE_HD / 2;
+
+        let row_head = thread::index_1d().get() / WARP_LANES;
+        if row_head >= dot.len() {
+            return;
+        }
+        let (t, h) = (sequence_length as usize, heads as usize);
+        let (row, head) = (row_head / h, row_head % h);
+        let (batch, token) = (row / t, row % t);
+        let source = row_head * PAIRS_PER_ROW;
+        let destination = ((batch * h + head) * t + token) * PAIRS_PER_ROW;
+
+        let lane = warp::lane_id() as usize;
+        let (near_low, near_high) = (dy[2 * (source + lane)], dy[2 * (source + lane) + 1]);
+        let near_y = y[source + lane];
+        let far = lane + WARP_LANES;
+        let (far_low, far_high) = (dy[2 * (source + far)], dy[2 * (source + far) + 1]);
+        let far_y = y[source + far];
+        // SAFETY: `(row, head, pair) -> destination` is a bijection, so each
+        // lane's two staged words are its own.
+        unsafe {
+            *staged.get_unchecked_mut(destination + lane) = pack_bf16_pair(near_low, near_high);
+            *staged.get_unchecked_mut(destination + far) = pack_bf16_pair(far_low, far_high);
+        }
+
+        let mut even = near_low * bf16_low(near_y) + far_low * bf16_low(far_y);
+        let mut odd = near_high * bf16_high(near_y) + far_high * bf16_high(far_y);
+        let mut partner = WARP_LANES as u32 / 2;
+        while partner > 0 {
+            even += warp::shuffle_xor_f32_sync(u32::MAX, even, partner);
+            odd += warp::shuffle_xor_f32_sync(u32::MAX, odd, partner);
+            partner /= 2;
+        }
+        if lane == 0 {
+            // SAFETY: one warp owns each `row_head` dot.
+            unsafe {
+                *dot.get_unchecked_mut(row_head) = even + odd;
+            }
+        }
+    }
+
     /// FlashAttention-2 style tiled dQ.
     ///
     /// One block owns `(sequence, head, query block)`; probabilities are
@@ -1439,6 +1520,23 @@ pub fn stage_heads_config(rows: usize, heads: usize, head_dim: usize) -> LaunchC
     let words = rows * heads * head_dim / 2;
     assert!(words <= u32::MAX as usize);
     LaunchConfig::for_num_elems(words as u32)
+}
+
+/// Launch shape for [`kernels::stage_attention_dy_dot_bf16`]: one warp per
+/// `(row, head)`, whole warps to a block so no row's butterfly straddles one.
+pub fn stage_dy_dot_config(rows: usize, heads: usize, head_dim: usize) -> LaunchConfig {
+    const BLOCK: usize = 256;
+    assert_eq!(
+        head_dim, TILE_HD,
+        "the fused dY pass specializes on TILE_HD"
+    );
+    let lanes = rows * heads * WARP_LANES;
+    assert!(lanes <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (lanes.div_ceil(BLOCK) as u32, 1, 1),
+        block_dim: (BLOCK as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
 }
 
 /// Launch shape for [`kernels::flash_attention_backward_kv_tiled`].
