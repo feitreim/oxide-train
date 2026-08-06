@@ -15,6 +15,7 @@ Local usage (see also ./run.sh):
     modal run modal_app.py::doctor                        # env / GPU sanity check
 """
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -752,6 +753,249 @@ def dump_ptx(kernel: str) -> str:
     if not dumps:
         raise SystemExit(f"no .ptx produced under {proj}")
     return "\n".join(f"===== {p.relative_to(proj)} =====\n{p.read_text()}" for p in dumps)
+
+
+# ptxas' per-entry report. `-v` writes one block per entry point to stderr; the
+# stack frame line is omitted entirely when the frame is zero.
+_PTXAS_ENTRY = re.compile(r"Function properties for '?([A-Za-z0-9_$]+)'?")
+_PTXAS_FRAME = re.compile(r"(\d+) bytes stack frame")
+_PTXAS_REGS = re.compile(r"Used (\d+) registers")
+
+
+def _ptxas_report(ptx: Path, arch: str) -> dict[str, tuple[int, int]]:
+    """`{entry: (registers, stack frame bytes)}` for one PTX file.
+
+    This is the same allocator the driver's JIT runs when `cuModuleLoadData`
+    takes the PTX text a `#[cuda_module]` embeds, so it answers the register
+    question without a GPU.
+    """
+    result = subprocess.run(
+        ["ptxas", f"--gpu-name={arch}", "-O3", "-v", str(ptx), "-o", "/dev/null"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"ptxas failed on {ptx}:\n{result.stderr}")
+    entries: dict[str, tuple[int, int]] = {}
+    current = None
+    frame = 0
+    for line in result.stderr.splitlines():
+        if name := _PTXAS_ENTRY.search(line):
+            current, frame = name.group(1), 0
+        if current and (bytes_ := _PTXAS_FRAME.search(line)):
+            frame = int(bytes_.group(1))
+        if current and (regs := _PTXAS_REGS.search(line)):
+            entries[current] = (int(regs.group(1)), frame)
+            current = None
+    return entries
+
+
+def _ptx_functions(text: str) -> dict[str, str]:
+    """`{name: body}` for every function in one PTX file.
+
+    LLVM brackets each one with `// -- Begin function <name>` / `// -- End
+    function`, which is the only structure a permutation preserves — comparing
+    these instead of the whole file is what tells a reordering apart from a
+    codegen difference.
+    """
+    functions: dict[str, str] = {}
+    name, body = None, []
+    for line in text.splitlines():
+        if begin := re.search(r"// -- Begin function ([A-Za-z0-9_$.]+)", line):
+            name, body = begin.group(1), []
+        elif "// -- End function" in line and name:
+            functions[name] = "\n".join(body)
+            name = None
+        elif name:
+            body.append(line)
+    return functions
+
+
+@app.function(cpu=16, memory=32 * 1024, timeout=4 * 3600)
+def rebuild_stability(kernel: str = "gemm", rounds: int = 6, arch: str = "sm_100a") -> None:
+    """Build ONE commit `rounds` times and ask whether the toolchain agrees
+    with itself (oxide-train#122).
+
+    Register allocation was observed to move between builds of an identical
+    tree — 140 registers and no frame twice, 182 and a 2176 B frame once — and
+    at a wide enough block that is `max_active_blocks_per_multiprocessor = 0`
+    and a refused launch, not a slow one. Two layers can be responsible and
+    this separates them, because the PTX is the boundary between them:
+
+    - **codegen** (rustc + the cuda-oxide backend + `llc`) turns the crate into
+      PTX text. If the PTX *bytes* move across rounds, it is this layer.
+    - **ptxas** turns PTX into SASS and assigns registers. If the bytes are
+      identical and the register counts still move, it is this one.
+
+    Each round builds in its own copy of the tree so nothing is incremental and
+    every rustc process is fresh. No GPU: `cargo oxide` links the driver stub,
+    and `ptxas` is the allocator the driver's JIT runs anyway.
+    """
+    import hashlib
+    import os
+    import shutil
+
+    # No GPU here, so no driver: `cargo oxide` links libcuda and the toolkit's
+    # stub is what satisfies it, exactly as the image's own warmup build does.
+    os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64/stubs"
+
+    source = f"{PROJECT_DIR}"
+    hashes: dict[str, list[str]] = {}
+    reports: list[dict[str, tuple[int, int]]] = []
+    keep = Path("/tmp/rounds")
+    keep.mkdir(exist_ok=True)
+
+    # Every round builds at the SAME path. Cargo's `-C metadata` disambiguator
+    # is derived from it and rides inside every mangled generic symbol, so a
+    # per-round directory would make the PTX differ for a reason that has
+    # nothing to do with the question.
+    root = "/tmp/build"
+    orders: list[list[str]] = []
+    for round_index in range(rounds):
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.copytree(source, root, ignore=shutil.ignore_patterns("target"))
+        proj = f"{root}/gpu/{kernel}"
+        _run(
+            ["cargo", "oxide", "build", kernel, "--arch", arch],
+            cwd=proj,
+        )
+        dumps = sorted(
+            Path(dirpath, name)
+            for dirpath, _, names in os.walk(proj)
+            for name in names
+            if name.endswith(".ptx")
+        )
+        if not dumps:
+            raise SystemExit(f"round {round_index}: no .ptx under gpu/{kernel}")
+        report: dict[str, tuple[int, int]] = {}
+        order: list[str] = []
+        for ptx in dumps:
+            name = str(ptx.relative_to(proj))
+            text = ptx.read_text()
+            hashes.setdefault(name, []).append(
+                hashlib.sha256(text.encode()).hexdigest()[:12]
+            )
+            order += re.findall(r"^\.visible \.entry ([A-Za-z0-9_$]+)", text, re.M)
+            shutil.copy(ptx, keep / f"{name.replace('/', '_')}.{round_index}")
+            report.update(_ptxas_report(ptx, arch))
+        reports.append(report)
+        orders.append(order)
+
+    print(f"\n===== {rounds} builds of gpu/{kernel} at {arch} =====", flush=True)
+    print("\nPTX identity (sha256, first 12) — codegen's output")
+    codegen_stable = True
+    for name, digests in hashes.items():
+        distinct = sorted(set(digests))
+        codegen_stable &= len(distinct) == 1
+        print(f"  {name:<24} {' '.join(digests)}   {len(distinct)} distinct")
+
+    print("\nEntry emission order — what a byte diff is mostly made of")
+    distinct_orders = {tuple(order) for order in orders}
+    print(f"  {len(distinct_orders)} distinct orders over {rounds} builds")
+    if len(distinct_orders) > 1:
+        for round_index, order in enumerate(orders):
+            print(f"  round {round_index}: {' '.join(order)}")
+
+    print("\nptxas allocation (registers / stack frame bytes) — the allocator's output")
+    names = sorted({entry for report in reports for entry in report})
+    ptxas_stable = True
+    for entry in names:
+        cells = [report.get(entry) for report in reports]
+        rendered = " ".join("-" if c is None else f"{c[0]}/{c[1]}" for c in cells)
+        distinct = sorted({c for c in cells if c is not None})
+        ptxas_stable &= len(distinct) == 1
+        flap = "" if len(distinct) == 1 else "   ✗ flaps"
+        print(f"  {entry:<40} {rendered}{flap}")
+
+    print("\nPer-function body digest — is the difference a permutation, or the code?")
+    bodies: dict[str, list[str]] = {}
+    for round_index in range(rounds):
+        for dump in sorted(keep.glob(f"*.{round_index}")):
+            for function, body in _ptx_functions(dump.read_text()).items():
+                bodies.setdefault(function, []).append(
+                    hashlib.sha256(body.encode()).hexdigest()[:12]
+                )
+    permutation = True
+    for function, digests in sorted(bodies.items()):
+        distinct = len(set(digests))
+        permutation &= distinct == 1 and len(digests) == rounds
+        mark = "" if distinct == 1 else f"   ✗ {distinct} distinct bodies"
+        print(f"  {function:<40} {digests[0]}{mark}")
+
+    print()
+    if codegen_stable and ptxas_stable:
+        print("stable: identical PTX and identical allocation across every build")
+    elif not codegen_stable and permutation and ptxas_stable:
+        print(
+            "CODEGEN emits the same functions in a nondeterministic ORDER: the PTX "
+            "bytes move every build, every function body is byte-identical, and "
+            "ptxas allocates the same registers regardless. Reproducibility bug, "
+            "not (here) a register bug."
+        )
+    elif not codegen_stable:
+        print(
+            "CODEGEN is nondeterministic in the function BODIES, not only their "
+            "order. Any register movement is downstream of that."
+        )
+    else:
+        print(
+            "PTXAS is nondeterministic: byte-identical PTX allocated differently. "
+            "Report it upstream against this image's ptxas."
+        )
+    subprocess.run("ptxas --version", shell=True)
+
+
+@app.function(gpu=DEFAULT_GPU, timeout=3600)
+def jit_probe(kernel: str = "gemm") -> None:
+    """The other half of [`rebuild_stability`]: what the *driver* does with the
+    PTX a build produced.
+
+    `cargo oxide` emits `<kernel>.ptx` and `load_kernel_module` hands the text
+    to `cuModuleLoad`, so register allocation happens in the driver's JIT at
+    load time — not at build time. That makes the driver a build input nobody
+    pins: Modal hands out whatever host it has, and the register counts a
+    kernel gets are a function of (PTX bytes, driver version).
+
+    So this prints all three together — the PTX digest, the driver, and what
+    `cuFuncGetAttribute` says the loaded kernels got. Run it a few times; a
+    constant digest beside a moving register count is the driver, and both
+    moving together is the build.
+    """
+    import hashlib
+
+    _run(
+        ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"],
+        cwd="/",
+    )
+    proj = _proj(kernel)
+    _run(["cargo", "oxide", "build", kernel, "--arch", "sm_100a"], cwd=proj)
+    print("=== the image's ptxas ===", flush=True)
+    subprocess.run("ptxas --version | tail -2", shell=True)
+    for ptx in sorted(Path(proj).glob("*.ptx")):
+        digest = hashlib.sha256(ptx.read_bytes()).hexdigest()[:12]
+        print(f"{ptx.name}: sha256 {digest}, {ptx.stat().st_size} bytes", flush=True)
+        for entry, (registers, frame) in sorted(
+            _ptxas_report(ptx, "sm_100a").items()
+        ):
+            print(f"  {entry:<40} {registers:>3} regs, {frame:>4} frame bytes")
+    # And now the driver's own copy of it, which is the one that counts: these
+    # numbers come back from `cuFuncGetAttribute` after `cuModuleLoad` JITs the
+    # same text above. A disagreement here is the whole bug.
+    print("=== the driver's JIT, via cuFuncGetAttribute ===", flush=True)
+    subprocess.run(["cargo", "oxide", "run", kernel], cwd=proj)
+
+
+@app.local_entrypoint()
+def rebuilds(kernel: str = "gemm", rounds: int = 6, arch: str = "sm_100a") -> None:
+    """modal run modal_app.py::rebuilds --kernel gemm --rounds 6"""
+    rebuild_stability.remote(kernel, rounds, arch)
+
+
+@app.local_entrypoint()
+def jit(kernel: str = "gemm", gpu: str = "") -> None:
+    """modal run modal_app.py::jit --kernel gemm"""
+    fn = jit_probe.with_options(gpu=gpu) if gpu else jit_probe
+    fn.remote(kernel)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
