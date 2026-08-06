@@ -190,5 +190,5 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let shard = TokenFile::open(&shard_path)?;
     let cuda = CudaContext::new(0)?;
-    dispatch!(batch, shard.tokens(), steps, &cuda; 12, 14, 16, 18, 20, 24)
+    dispatch!(batch, shard.tokens(), steps, &cuda; 12, 14, 16, 18, 20, 21, 22, 24)
 }
