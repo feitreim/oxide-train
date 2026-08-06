@@ -13,10 +13,14 @@ use optim::{AdamWConfig, AuxLossSchedule};
 mod model;
 use model::{GpuDense, GpuDenseAdamW, GpuMoeWorkspace};
 
-const B: usize = 12;
+/// Batch size. A B200 holds 21 of these, but throughput stops paying at 16:
+/// 12 -> 16 is worth 2.9%, and 16 -> 20 another 0.2% for 21 GiB
+/// (`modal run modal_app.py::sweep_batch`).
+const B: usize = 16;
 const T: usize = 2_048;
-const N: usize = 24_576;
-const NP: usize = 24_576;
+const N: usize = B * T;
+/// `N` padded to the tcgen05 row tile, which every `B * T` already meets.
+const NP: usize = N;
 const VOCAB: usize = 50_257;
 const VP: usize = 50_432;
 const D: usize = 3_072;
@@ -25,7 +29,9 @@ const HD: usize = 128;
 const FF: usize = 4_096;
 const E: usize = 8;
 const K: usize = 2;
-const C: usize = 6_144;
+/// Per-expert capacity at a capacity factor of one: every routed token has a
+/// slot, so no batch size drops one.
+const C: usize = N * K / E;
 const L: usize = 12;
 const B200_BF16_PEAK_FLOPS: f64 = 2.25e15;
 
@@ -52,7 +58,6 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    assert_eq!(N, B * T);
     let shard_path =
         env::var("TRAIN_SHARD").unwrap_or_else(|_| "/data/wiki-val-00000.tok".to_owned());
     let max_steps: usize = env_parse("TRAIN_STEPS", 100);
