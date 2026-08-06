@@ -153,6 +153,23 @@ def _proj(kernel: str) -> str:
     return proj
 
 
+def _resolve_ref(clone: str, ref: str) -> str:
+    """Name `ref` as the fresh `clone` can see it.
+
+    A clone's only local branch is the one it checked out; every other pushed
+    branch is a remote-tracking ref. `git worktree add --detach` skips the DWIM
+    that would otherwise infer `origin/<ref>`, so spell it out here.
+    """
+    for candidate in (ref, f"origin/{ref}"):
+        probe = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
+            cwd=clone, capture_output=True,
+        )
+        if probe.returncode == 0:
+            return candidate
+    raise SystemExit(f"ref {ref} is neither a ref nor a branch on origin")
+
+
 def _prepare_gemm_ptx(root: str, oxide: list[str] | None = None) -> None:
     """Prebuild gpu/gemm and stage its pure-PTX artifact for model.
 
@@ -412,7 +429,8 @@ def compare_train(
     arms = []
     for name, arm_ref in (("baseline", baseline_ref), ("candidate", ref)):
         root = f"/tmp/train-{name}"
-        _run(["git", "worktree", "add", "--quiet", "--detach", root, arm_ref], cwd=clone)
+        resolved = _resolve_ref(clone, arm_ref)
+        _run(["git", "worktree", "add", "--quiet", "--detach", root, resolved], cwd=clone)
         proj = f"{root}/gpu/model"
         if CUDA_OXIDE_REF not in Path(proj, "Cargo.toml").read_text():
             raise SystemExit(f"{name} ref {arm_ref} pins a cuda-oxide the image lacks")
