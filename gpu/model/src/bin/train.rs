@@ -13,10 +13,10 @@ use optim::{AdamWConfig, AuxLossSchedule};
 mod model;
 use model::{GpuDense, GpuDenseAdamW, GpuMoeWorkspace};
 
-/// Batch size. A B200 holds 21, with 1.1 GiB to spare; 20 is the last one that
-/// leaves any margin, and the last that buys anything -- 21 is worth 0.2% over
-/// it (`modal run modal_app.py::sweep_batch`).
-const B: usize = 20;
+/// Batch size. A B200 holds 21 of these, but throughput stops paying at 16:
+/// 12 -> 16 is worth 2.9%, and 16 -> 20 another 0.2% for 21 GiB
+/// (`modal run modal_app.py::sweep_batch`).
+const B: usize = 16;
 const T: usize = 2_048;
 const N: usize = B * T;
 /// `N` padded to the tcgen05 row tile, which every `B * T` already meets.

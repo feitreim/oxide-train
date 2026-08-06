@@ -1011,10 +1011,10 @@ impl pipeline::Job for BackwardKvProbe {
                         let ds_from = stamp::<KV_PASS_SPLIT>();
                         store_tile(ds, band, column, lane, probability);
                         let ds_stored = stamp::<KV_PASS_SPLIT>();
-                        self.sums.tread +=
-                            scored_read.wrapping_sub(read_from) + grad_read.wrapping_sub(p_stored);
-                        self.sums.sstore +=
-                            p_stored.wrapping_sub(p_from) + ds_stored.wrapping_sub(ds_from);
+                        self.sums.tread += scored_read.wrapping_sub(read_from)
+                            + grad_read.wrapping_sub(p_stored);
+                        self.sums.sstore += p_stored.wrapping_sub(p_from)
+                            + ds_stored.wrapping_sub(ds_from);
                         column += SCORE_CHUNK as u32;
                     }
                     let passed = clock64();

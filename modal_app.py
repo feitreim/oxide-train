@@ -267,24 +267,19 @@ def _set_train_batch(proj: str, batch: int) -> None:
     timeout=4 * 3600,
     volumes={"/data": wiki_volume},
 )
-def batch_sweep(
-    batches: str,
-    steps: int = 12,
-    shard: str | None = None,
-    bsweep_at: str = "",
-) -> None:
+def batch_sweep(batches: str, steps: int = 12, shard: str | None = None) -> None:
     """Measure the trainer's throughput at several batch sizes, in one container.
 
     `B` is a compile-time constant, so each batch is its own build of
     `bin/train.rs`. `N`, `NP` and `C` derive from `B`, which makes the whole
-    reconfiguration one line to rewrite. Measuring the trainer itself is the
-    point: cuda-oxide collects kernels from the selected binary target, so a
-    separate harness is not guaranteed to compile the same device code.
+    reconfiguration one line to rewrite, and a build is only ~25s beside the
+    minutes each batch spends initializing parameters.
 
-    `bsweep_at` additionally runs `bin/bsweep.rs` at the listed batch sizes.
-    That binary carries every candidate at once and picks one from `SWEEP_B`;
-    running it beside the trainer at a shared batch size is what says whether
-    its cheaper sweep is measuring the same kernels.
+    Sweeping the trainer rather than a harness that carries every batch size at
+    once is not fastidiousness. cuda-oxide collects kernels from the selected
+    binary target, so such a harness compiles different device code: one read
+    12 -> 20 as +5.5% where the trainer measures +3.2%, agreeing at the small
+    batch it was checked against and diverging at the large one.
     """
     _run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], cwd="/")
     proj = _proj("model")
@@ -300,17 +295,9 @@ def batch_sweep(
         try:
             _run(["env", *env, "cargo", "oxide", "run", "model", "--bin", "train"], cwd=proj)
         except subprocess.CalledProcessError as e:
+            # A batch too large for HBM fails here, which is how the sweep finds
+            # the ceiling; the batches after it still run.
             print(f"train B={batch} failed: {e}", flush=True)
-
-    for batch in filter(None, (value.strip() for value in bsweep_at.split(","))):
-        print(f"=== bsweep B={batch} ===", flush=True)
-        try:
-            _run(
-                ["env", f"SWEEP_B={batch}", *env, "cargo", "oxide", "run", "model", "--bin", "bsweep"],
-                cwd=proj,
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"bsweep B={batch} failed: {e}", flush=True)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
@@ -634,14 +621,9 @@ def prepare(limit_files: int = 0, limit_articles: int = 0) -> None:
 
 
 @app.local_entrypoint()
-def sweep_batch(
-    batches: str = "12,16,18",
-    steps: int = 12,
-    shard: str = "",
-    bsweep_at: str = "",
-) -> None:
-    """modal run modal_app.py::sweep_batch --batches 12,16,18 --bsweep-at 12"""
-    batch_sweep.remote(batches, steps, shard or None, bsweep_at)
+def sweep_batch(batches: str = "12,16,20", steps: int = 12, shard: str = "") -> None:
+    """modal run modal_app.py::sweep_batch --batches 12,16,20"""
+    batch_sweep.remote(batches, steps, shard or None)
 
 
 @app.local_entrypoint()
