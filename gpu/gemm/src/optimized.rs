@@ -694,6 +694,9 @@ struct Tile<D: Drain> {
     rank: u32,
     full: SemaphoreRing<ITEMS>,
     empty: SemaphoreRing<ITEMS>,
+    /// Equal-shaped GEMMs this launch covers, stacked in memory: `1` is a
+    /// plain launch and the whole batching apparatus is `expert = 0`.
+    experts: u32,
 }
 
 /// The items one cluster owns, in order: the static strided schedule
@@ -751,7 +754,14 @@ impl<D: Drain> Tile<D> {
         unsafe {
             let mut stage_index = 0u32;
             while let Some(item) = walk.next() {
-                let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP);
+                let (expert, tile_m, tile_n) = self.place(item);
+                // Expert `e`'s operands are expert `e`'s descriptors, which
+                // already carry its base address and its row stride — so a
+                // batched item's coordinates are a single GEMM's, unshifted.
+                let (a_map, b_map) = (
+                    self.a_map.add(expert as usize),
+                    self.b_map.add(expert as usize),
+                );
                 // All four of the pair's tiles complete on the leader's copy of
                 // the stage barrier, and only the leader charges it:
                 // `expect_tx` is `.shared::cta`, so a peer could not charge that
@@ -774,12 +784,12 @@ impl<D: Drain> Tile<D> {
                     // branch.
                     let bytes = if self.transposed {
                         MnStage::from_raw(a.base())
-                            .tma_load_2d_arriving_at(self.a_map, a_line, depth, stage)
+                            .tma_load_2d_arriving_at(a_map, a_line, depth, stage)
                             + MnStage::from_raw(b.base())
-                                .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage)
+                                .tma_load_2d_arriving_at(b_map, b_line, depth, stage)
                     } else {
-                        a.tma_load_2d_arriving_at(self.a_map, depth, a_line, stage)
-                            + b.tma_load_2d_arriving_at(self.b_map, depth, b_line, stage)
+                        a.tma_load_2d_arriving_at(a_map, depth, a_line, stage)
+                            + b.tma_load_2d_arriving_at(b_map, depth, b_line, stage)
                     };
                     if self.rank == LEADER {
                         self.load
@@ -945,13 +955,34 @@ impl<D: Drain> Tile<D> {
             .columns_right(BLOCK_N as u32 * (sequence % SLOTS))
     }
 
+    /// The GEMM `item` belongs to and its tile within that GEMM.
+    ///
+    /// The expert is the item space's *outermost* axis, so a cluster walks a
+    /// run of one expert's tiles before it reaches the next and
+    /// [`pipeline::grouped`]'s operand locality is untouched — it is asked the
+    /// same question about the same tile grid it was asked before.
+    #[inline(always)]
+    fn place(&self, item: u32) -> (u32, u32, u32) {
+        let tiles = self.tiles_m * self.tiles_n;
+        let expert = item / tiles;
+        let (tile_m, tile_n) = pipeline::grouped(item % tiles, self.tiles_m, self.tiles_n, GROUP);
+        (expert, tile_m, tile_n)
+    }
+
     /// This warp's origin in `C` for `item`: the pair tile, this rank's half of
     /// it, and the 32 rows the warp owns.
+    ///
+    /// `C` is one allocation holding every expert's matrix, so the expert is
+    /// `tiles_m` tile-rows of it — the only place a batched launch's geometry
+    /// differs from a single one's, and the reason no expert stride is a
+    /// parameter.
     #[inline(always)]
     fn origin(&self, item: u32) -> (u32, u32) {
-        let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP);
+        let (expert, tile_m, tile_n) = self.place(item);
         (
-            2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * warp_id(),
+            2 * BLOCK_M as u32 * (expert * self.tiles_m + tile_m)
+                + BLOCK_M as u32 * self.rank
+                + 32 * warp_id(),
             BLOCK_N as u32 * tile_n,
         )
     }
@@ -974,6 +1005,7 @@ pub mod kernels {
         tiles_n: u32,
         k_blocks: u32,
         transposed: bool,
+        experts: u32,
         out: D,
     ) -> Tile<D> {
         unsafe {
@@ -996,6 +1028,7 @@ pub mod kernels {
                 rank: cluster::block_rank(),
                 full: shared.full,
                 empty: shared.empty,
+                experts,
             }
         }
     }
@@ -1065,6 +1098,7 @@ pub mod kernels {
                 tiles_n,
                 k as u32 / BLOCK_K as u32,
                 transposed != 0,
+                1,
                 out,
             );
             sweep(&tile, tiles_m * tiles_n);
@@ -1093,6 +1127,7 @@ pub mod kernels {
         tiles_m: u32,
         tiles_n: u32,
         transposed: u32,
+        experts: u32,
     ) {
         unsafe {
             let out = Wide {
@@ -1105,9 +1140,10 @@ pub mod kernels {
                 tiles_n,
                 k as u32 / BLOCK_K as u32,
                 transposed != 0,
+                experts,
                 out,
             );
-            sweep(&tile, tiles_m * tiles_n);
+            sweep(&tile, experts * tiles_m * tiles_n);
         }
     }
 
@@ -1137,6 +1173,7 @@ pub mod kernels {
         tiles_m: u32,
         tiles_n: u32,
         transposed: u32,
+        experts: u32,
     ) {
         unsafe {
             let tile = attach(
@@ -1146,9 +1183,10 @@ pub mod kernels {
                 tiles_n,
                 k as u32 / BLOCK_K as u32,
                 transposed != 0,
+                experts,
                 Reduce { c_map },
             );
-            sweep(&tile, tiles_m * tiles_n);
+            sweep(&tile, experts * tiles_m * tiles_n);
         }
     }
 
