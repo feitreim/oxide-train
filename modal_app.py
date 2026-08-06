@@ -380,6 +380,80 @@ def compare_profile(kernel: str, baseline_ref: str) -> None:
     _run(["target/release/profile"], cwd=candidate)
 
 
+@app.function(
+    gpu=DEFAULT_GPU,
+    timeout=4 * 3600,
+    volumes={"/data": wiki_volume},
+)
+def compare_train(
+    ref: str,
+    baseline_ref: str = "main",
+    steps: int = 12,
+    rounds: int = 2,
+    shard: str | None = None,
+) -> None:
+    """Alternate `bin/train` between two pushed refs in ONE container.
+
+    `compare_profile` gives a fusion claim its same-container pair, but a
+    throughput claim is quoted from `bin/train.rs`, whose numbers move with the
+    GPU it landed on and the clocks it found there. Both arms are worktrees of
+    the same clone -- neither is the mounted tree, so what is measured is
+    exactly two committed refs, and the candidate must be pushed. `B` is a
+    compile-time constant of train.rs and is whatever each ref says it is.
+
+    Each arm is built once (that build's run is the discarded warmup), then the
+    arms alternate round by round so a drift in clocks lands on both.
+    """
+    import re
+    import statistics
+
+    clone = "/tmp/rust-trainer-refs"
+    _run(["git", "clone", "--quiet", TRAINER_REPO, clone], cwd="/tmp")
+    arms = []
+    for name, arm_ref in (("baseline", baseline_ref), ("candidate", ref)):
+        root = f"/tmp/train-{name}"
+        _run(["git", "worktree", "add", "--quiet", "--detach", root, arm_ref], cwd=clone)
+        proj = f"{root}/gpu/model"
+        if CUDA_OXIDE_REF not in Path(proj, "Cargo.toml").read_text():
+            raise SystemExit(f"{name} ref {arm_ref} pins a cuda-oxide the image lacks")
+        arms.append((f"{name} {arm_ref}", proj))
+
+    env = ["env", f"TRAIN_STEPS={steps}", "TRAIN_LOG_EVERY=100"]
+    if shard:
+        env.append(f"TRAIN_SHARD={shard}")
+    for _, proj in arms:
+        _run([*env, "cargo", "oxide", "run", "model", "--bin", "train"], cwd=proj)
+
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    measured: dict[str, list[tuple[float, float]]] = {label: [] for label, _ in arms}
+    for round_index in range(rounds):
+        for label, proj in arms:
+            print(f"=== round {round_index} {label} ===", flush=True)
+            output = subprocess.run(
+                [*env, "target/release/train"],
+                cwd=proj, check=True, text=True, capture_output=True,
+            ).stdout
+            print(output, flush=True)
+            throughput = re.search(r"throughput=([\d.]+) tokens/s mfu=([\d.]+)%", output)
+            if throughput is None:
+                raise SystemExit(f"{label} round {round_index} reported no throughput")
+            measured[label].append((float(throughput[1]), float(throughput[2])))
+
+    print("=== summary ===", flush=True)
+    means = []
+    for label, _ in arms:
+        tokens, mfu = zip(*measured[label])
+        means.append(statistics.fmean(tokens))
+        runs = " ".join(f"{value:.1f}" for value in tokens)
+        print(
+            f"{label}: mean={means[-1]:.1f} tokens/s "
+            f"spread={(max(tokens) - min(tokens)) / means[-1]:.2%} "
+            f"mfu={statistics.fmean(mfu):.2f}% runs=[{runs}]",
+            flush=True,
+        )
+    print(f"candidate/baseline={means[1] / means[0]:.4f}", flush=True)
+
+
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
 def run_sweep(kernel: str, configs: str) -> None:
     """Bench several tuning configs in ONE container so they share a GPU and
@@ -624,6 +698,14 @@ def prepare(limit_files: int = 0, limit_articles: int = 0) -> None:
 def sweep_batch(batches: str = "12,16,20", steps: int = 12, shard: str = "") -> None:
     """modal run modal_app.py::sweep_batch --batches 12,16,20"""
     batch_sweep.remote(batches, steps, shard or None)
+
+
+@app.local_entrypoint()
+def train_ab(
+    ref: str, baseline_ref: str = "main", steps: int = 12, rounds: int = 2, shard: str = ""
+) -> None:
+    """modal run modal_app.py::train_ab --ref <pushed-branch>"""
+    compare_train.remote(ref, baseline_ref, steps, rounds, shard or None)
 
 
 @app.local_entrypoint()
