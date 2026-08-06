@@ -11,7 +11,7 @@
 //! the device staging kernel bit-exactly against a CPU mirror. The fp32 and
 //! tcgen05 kernels load from one embedded pure-PTX artifact.
 
-use bench_util::uniform_vec;
+use bench_util::{function_profile, uniform_vec};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 
 #[path = "lib.rs"]
@@ -827,6 +827,32 @@ fn check_fused_staging(
     }
 }
 
+/// What ptxas gave the fused dY pass and the two kernels it replaces.
+///
+/// Fusion raises liveness, and a kernel that crosses an occupancy step can
+/// lose on the clock while winning on traffic. The driver is asked directly,
+/// at each kernel's own block width, rather than inferred from the diff.
+fn report_dy_dot_residency(
+    flash_module: &flash::kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let module = flash_module.as_cuda_module();
+    println!("dY pass residency (registers/thread, spill bytes, blocks/SM)");
+    for (name, block_threads) in [
+        ("stage_attention_heads_bf16", 256),
+        ("flash_attention_backward_dot_bf16", HD as u32),
+        ("stage_attention_dy_dot_bf16", 256),
+    ] {
+        let function = module.load_function(name)?;
+        let profile = function_profile(&function)?;
+        let blocks = function.max_active_blocks_per_multiprocessor(block_threads, 0)?;
+        println!(
+            "  {name:<34} {:>4} {:>6} {blocks:>4} at {block_threads} threads",
+            profile.registers, profile.spill_bytes,
+        );
+    }
+    Ok(())
+}
+
 /// `stage_attention_dy_dot_bf16` against the two kernels it replaces.
 ///
 /// The staged panel is the same arithmetic on the same bytes and the dot's
@@ -968,6 +994,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         check_fused_dy_dot(&stream, &flash_module, b, t, h)?;
     }
     println!("✓ fused dy stage-and-dot matches stage + backward_dot exactly");
+    report_dy_dot_residency(&flash_module)?;
     check_tcgen05_backward_shape(
         &stream,
         &flash_module,
