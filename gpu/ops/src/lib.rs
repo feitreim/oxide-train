@@ -16,7 +16,7 @@ use cuda_device::{
 };
 
 use kittens::global::{GlobalRows, load_cols, load_rows, store_rows};
-use kittens::reg::{Add, BaseLdtm, ColVec, RegTile, RegVec};
+use kittens::reg::{BaseLdtm, ColVec, RegTile, RegVec};
 use kittens::shared::{Bf16, F32};
 use kittens::{lane, warp_id};
 
@@ -791,9 +791,10 @@ pub mod kernels {
     /// The weight gradient is the axis that does not fit that picture. It is a
     /// sum down a column, so it cannot live in a row statistic — but it also
     /// does not have to leave the warp: `col_sum` gives the chunk's 32 columns
-    /// summed over the warp's 16 rows, `column_group_reduce` makes the eight
-    /// replicas of that vector agree, and the four lanes holding distinct
-    /// columns pay one atomic each. That is `dim` atomics per 16 rows, which is
+    /// summed over the warp's 16 rows — folding across the column group itself,
+    /// so the eight lanes that hold a column already agree on the whole of it —
+    /// and the four lanes holding distinct columns pay one atomic each. That is
+    /// `dim` atomics per 16 rows, which is
     /// exactly what the shared-memory kernel already paid — the shared
     /// accumulator was never buying fewer of them, only spreading them over a
     /// block that owned the same 16 rows.
@@ -866,10 +867,12 @@ pub mod kernels {
                     r.add(g.mul_col(w).mul_row(inv)).sub(v.mul_row(correction)),
                 );
 
-                // The column statistic, completed across the group so all
-                // eight replicas of the vector agree, then paid for once by
-                // the four lanes that hold distinct columns.
-                let partials = g.mul(v).mul_row(inv).col_sum().column_group_reduce::<Add>();
+                // The column statistic, paid for by the four lanes that hold
+                // distinct columns. `col_sum` has already folded across the
+                // column group, so the eight lanes holding a column agree on
+                // the whole of it; folding again here would sum those eight
+                // agreeing copies and multiply `dweight` by 8.
+                let partials = g.mul(v).mul_row(inv).col_sum();
                 if lane < 4 {
                     let mut value = 0usize;
                     while value < NormBackColumns::VALUES {
