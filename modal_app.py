@@ -300,6 +300,55 @@ def batch_sweep(batches: str, steps: int = 12, shard: str | None = None) -> None
             print(f"train B={batch} failed: {e}", flush=True)
 
 
+@app.function(
+    gpu=DEFAULT_GPU,
+    timeout=4 * 3600,
+    volumes={"/data": wiki_volume},
+)
+def compare_train(
+    baseline_ref: str,
+    batch: int = 16,
+    steps: int = 12,
+    shard: str | None = None,
+) -> None:
+    """Run a retained git baseline of the trainer and the mounted candidate
+    back to back in ONE container, so a throughput claim sees one GPU and one
+    set of clocks.
+
+    `bin/train.rs` is the harness whose numbers count: cuda-oxide collects
+    kernels from the selected binary target, so a standalone benchmark
+    compiles different device code and diverges batch-dependently (#105).
+    Both sides are rebuilt at the same `B` and run the same number of steps;
+    train.rs discards its first steps itself and reports tokens/s, MFU and
+    the device memory its steady state holds.
+    """
+    import os
+    import re
+
+    baseline_root = "/tmp/rust-trainer-baseline"
+    _run(["git", "clone", "--quiet", TRAINER_REPO, baseline_root], cwd="/tmp")
+    _run(["git", "checkout", "--quiet", baseline_ref], cwd=baseline_root)
+
+    baseline = f"{baseline_root}/gpu/model"
+    candidate = _proj("model")
+    baseline_manifest = Path(baseline, "Cargo.toml").read_text()
+    if CUDA_OXIDE_REF not in baseline_manifest:
+        raise SystemExit(
+            f"baseline {baseline_ref} pins a different cuda-oxide than the "
+            "candidate; a paired run would compare two codegen backends"
+        )
+    for project in (baseline, candidate):
+        _set_train_batch(project, batch)
+
+    env = ["env", f"TRAIN_STEPS={steps}", "TRAIN_LOG_EVERY=100"]
+    if shard:
+        env.append(f"TRAIN_SHARD={shard}")
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    for label, project in ((f"baseline {baseline_ref}", baseline), ("candidate", candidate)):
+        print(f"=== train B={batch} {label} ===", flush=True)
+        _run([*env, "cargo", "oxide", "run", "model", "--bin", "train"], cwd=project)
+
+
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
 def compare_profile(kernel: str, baseline_ref: str) -> None:
     """Build a retained git baseline and the mounted candidate, then profile
@@ -624,6 +673,12 @@ def prepare(limit_files: int = 0, limit_articles: int = 0) -> None:
 def sweep_batch(batches: str = "12,16,20", steps: int = 12, shard: str = "") -> None:
     """modal run modal_app.py::sweep_batch --batches 12,16,20"""
     batch_sweep.remote(batches, steps, shard or None)
+
+
+@app.local_entrypoint()
+def compare_batch(baseline_ref: str, batch: int = 16, steps: int = 12, shard: str = "") -> None:
+    """modal run modal_app.py::compare_batch --baseline-ref origin/main"""
+    compare_train.remote(baseline_ref, batch, steps, shard or None)
 
 
 @app.local_entrypoint()
