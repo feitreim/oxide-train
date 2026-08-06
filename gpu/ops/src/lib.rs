@@ -38,6 +38,26 @@ pub const NORM_THREADS: usize = 256;
 /// owned column, rather than one atomic per input element.
 pub const NORM_WEIGHT_ROWS_PER_BLOCK: usize = 256;
 
+/// Rows one fused RMSNorm-backward block owns.
+///
+/// The block carries a shared column-partial accumulator for the weight
+/// gradient across all of them and pays one atomic per column at the end, so
+/// this is the whole trade: fewer rows is more blocks to fill the device and
+/// proportionally more atomics on the same `dim` addresses. Occupancy is
+/// register-bound at 4 blocks/SM either way, so this only buys waves against
+/// atomics — and it is not monotone. Paired trainer runs at B=16 measure
+/// +2.76% at 8, **+3.59% at 16** and +2.24% at 32, on baselines 0.27% apart.
+/// 16 leaves 2048 blocks at the training shape, where the split kernel it
+/// replaces launched 32768 one-row blocks.
+pub const NORM_BACKWARD_ROWS_PER_BLOCK: usize = 16;
+
+/// Widest row the fused RMSNorm kernels carry in shared memory.
+///
+/// The backward's column partials and the forward pair's staged row are both
+/// sized by it, and it is the one shape condition on the fused arms — the
+/// split kernels stay as what anything wider takes.
+pub const NORM_MAX_COLUMNS: usize = 4096;
+
 /// Threads in one expert's deterministic MoE capacity-assignment block.
 ///
 /// Each lane owns one contiguous range of token/rank pairs. A block-wide
@@ -827,6 +847,363 @@ pub mod kernels {
         // zero/accumulation state and subsequent optimizer read.
         let slot = unsafe { DeviceAtomicF32::from_ptr(dweight.as_mut_ptr().add(col)) };
         slot.fetch_add(grad, AtomicOrdering::Relaxed);
+    }
+
+    /// The whole RMSNorm backward in one launch: the input gradient, the
+    /// residual branch's add, the weight gradient, and — when the caller
+    /// supplies a destination — the forward's normalized output recomputed
+    /// for a consumer that would otherwise have kept it saved all step.
+    ///
+    /// The split form reads `x` and `dy` three times (twice for the input
+    /// gradient, once more for the weight gradient), writes a row-factor
+    /// buffer only to read it back, and then a separate `add` reads and
+    /// rewrites the whole gradient. Here a block owns
+    /// [`NORM_BACKWARD_ROWS_PER_BLOCK`] rows and takes each of them apart in
+    /// one go: reduce the row, then immediately spend the same values on all
+    /// four outputs while they are still in cache.
+    ///
+    /// The weight gradient is what forces the shape. A column's partial sum
+    /// spans rows, so it cannot live in the register of a lane that owns one
+    /// row's column — it lives in [`WEIGHT_PARTIALS`], one shared slot per
+    /// column, disjointly owned by the lane that strides onto it. Rows per
+    /// block is then purely how many atomics the pass costs: one per column
+    /// per block, paid once at the end.
+    ///
+    /// # Safety
+    ///
+    /// `dim` must be even so a row starts on a word boundary, and at most
+    /// [`NORM_MAX_COLUMNS`] so the column partials fit; `dweight` must hold
+    /// `dim` accumulators this launch may atomically update.
+    #[kernel]
+    pub unsafe fn rms_norm_backward_fused_bf16(
+        x: &[u32],
+        weight: &[f32],
+        dy: &[f32],
+        residual: &[f32],
+        eps: f32,
+        rows: u32,
+        dim: u32,
+        mut dx: DisjointSlice<f32>,
+        mut dweight: DisjointSlice<f32>,
+        mut normalized: DisjointSlice<u32>,
+    ) {
+        static mut SUM_SQ: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+        static mut DOT: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+        static mut WEIGHT_PARTIALS: SharedArray<f32, NORM_MAX_COLUMNS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != NORM_THREADS {
+            return;
+        }
+        let d = dim as usize;
+        if d == 0 || !d.is_multiple_of(2) || d > NORM_MAX_COLUMNS {
+            return;
+        }
+        let words = d / 2;
+        let row_start = thread::blockIdx_x() as usize * NORM_BACKWARD_ROWS_PER_BLOCK;
+        let row_end = (row_start + NORM_BACKWARD_ROWS_PER_BLOCK).min(rows as usize);
+        if row_start >= row_end {
+            return;
+        }
+        let elements = row_end * d;
+        if elements > 2 * x.len()
+            || elements > dy.len()
+            || elements > residual.len()
+            || elements > dx.len()
+            || d > weight.len()
+            || d > dweight.len()
+        {
+            return;
+        }
+        // An absent destination is how the caller says it kept the forward's
+        // output instead; every site that recomputes hands over a whole one.
+        let recompute = 2 * normalized.len() >= elements;
+
+        let mut column = tid;
+        while column < d {
+            unsafe {
+                WEIGHT_PARTIALS[column] = 0.0;
+            }
+            column += NORM_THREADS;
+        }
+        thread::sync_threads();
+
+        for row in row_start..row_end {
+            let base = row * d;
+            let word_base = row * words;
+
+            let mut sum_sq = 0.0f32;
+            let mut dot = 0.0f32;
+            let mut word = tid;
+            while word < words {
+                let [low, high] = bf16_halves(x[word_base + word]);
+                sum_sq += low * low + high * high;
+                dot += dy[base + 2 * word] * weight[2 * word] * low
+                    + dy[base + 2 * word + 1] * weight[2 * word + 1] * high;
+                word += NORM_THREADS;
+            }
+            unsafe {
+                SUM_SQ[tid] = sum_sq;
+                DOT[tid] = dot;
+            }
+            thread::sync_threads();
+
+            let mut stride = NORM_THREADS / 2;
+            while stride > 0 {
+                if tid < stride {
+                    unsafe {
+                        SUM_SQ[tid] += SUM_SQ[tid + stride];
+                        DOT[tid] += DOT[tid + stride];
+                    }
+                }
+                thread::sync_threads();
+                stride /= 2;
+            }
+            if tid == 0 {
+                unsafe {
+                    let row_inv = 1.0 / (SUM_SQ[0] / dim as f32 + eps).sqrt();
+                    SUM_SQ[0] = row_inv;
+                    DOT[0] = row_inv * row_inv * row_inv * DOT[0] / dim as f32;
+                }
+            }
+            thread::sync_threads();
+
+            let row_inv = unsafe { SUM_SQ[0] };
+            let correction = unsafe { DOT[0] };
+            word = tid;
+            while word < words {
+                let low_column = 2 * word;
+                let high_column = low_column + 1;
+                let low_weight = weight[low_column];
+                let high_weight = weight[high_column];
+                let [low, high] = bf16_halves(x[word_base + word]);
+                let low_dy = dy[base + low_column];
+                let high_dy = dy[base + high_column];
+                // SAFETY: each lane owns distinct words of this row and the
+                // column partials the same striding gave it.
+                unsafe {
+                    *dx.get_unchecked_mut(base + low_column) = residual[base + low_column]
+                        + low_dy * low_weight * row_inv
+                        - low * correction;
+                    *dx.get_unchecked_mut(base + high_column) = residual[base + high_column]
+                        + high_dy * high_weight * row_inv
+                        - high * correction;
+                    if recompute {
+                        *normalized.get_unchecked_mut(word_base + word) =
+                            bf16_pair(low * row_inv * low_weight, high * row_inv * high_weight);
+                    }
+                    WEIGHT_PARTIALS[low_column] += low_dy * low * row_inv;
+                    WEIGHT_PARTIALS[high_column] += high_dy * high * row_inv;
+                }
+                word += NORM_THREADS;
+            }
+            // The next row's reduction overwrites this one's partials.
+            thread::sync_threads();
+        }
+
+        column = tid;
+        while column < d {
+            // SAFETY: `column` was bounds-checked and every access to this
+            // location in this kernel is atomic. Stream ordering covers the
+            // preceding zero/accumulation state and subsequent optimizer read.
+            let slot = unsafe { DeviceAtomicF32::from_ptr(dweight.as_mut_ptr().add(column)) };
+            slot.fetch_add(unsafe { WEIGHT_PARTIALS[column] }, AtomicOrdering::Relaxed);
+            column += NORM_THREADS;
+        }
+    }
+
+    /// The residual add and the RMSNorm that reads its result, in one launch.
+    ///
+    /// `stream_input` and `projection` are the two branches meeting at a layer
+    /// boundary; `sum` is the rounded residual stream the backward will read
+    /// and `y` its normalization. The row is staged in [`ROW`] on the way
+    /// through, so the second walk costs no traffic at all and the statistic
+    /// is taken over exactly the rounded values `sum` holds — the same
+    /// quantity the separate norm would have read back.
+    ///
+    /// # Safety
+    ///
+    /// `dim` must be even and at most [`NORM_MAX_COLUMNS`].
+    #[kernel]
+    pub unsafe fn rms_norm_forward_residual_bf16(
+        stream_input: &[u32],
+        projection: &[f32],
+        weight: &[f32],
+        eps: f32,
+        dim: u32,
+        mut sum: DisjointSlice<u32>,
+        mut y: DisjointSlice<u32>,
+    ) {
+        static mut PARTIALS: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+        static mut ROW: SharedArray<u32, { NORM_MAX_COLUMNS / 2 }> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != NORM_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        if d == 0 || !d.is_multiple_of(2) || d > NORM_MAX_COLUMNS {
+            return;
+        }
+        let words = d / 2;
+        let base = row * words;
+        if base + words > stream_input.len()
+            || base + words > sum.len()
+            || base + words > y.len()
+            || 2 * (base + words) > projection.len()
+            || d > weight.len()
+        {
+            return;
+        }
+
+        let mut sum_sq = 0.0f32;
+        let mut word = tid;
+        while word < words {
+            let [low, high] = bf16_halves(stream_input[base + word]);
+            let packed = bf16_pair(
+                low + projection[2 * (base + word)],
+                high + projection[2 * (base + word) + 1],
+            );
+            // SAFETY: each lane owns distinct words of this block's row.
+            unsafe {
+                *sum.get_unchecked_mut(base + word) = packed;
+                ROW[word] = packed;
+            }
+            let [low, high] = bf16_halves(packed);
+            sum_sq += low * low + high * high;
+            word += NORM_THREADS;
+        }
+        unsafe {
+            PARTIALS[tid] = sum_sq;
+        }
+        thread::sync_threads();
+
+        let mut stride = NORM_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    PARTIALS[tid] += PARTIALS[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            unsafe {
+                PARTIALS[0] = 1.0 / (PARTIALS[0] / dim as f32 + eps).sqrt();
+            }
+        }
+        thread::sync_threads();
+
+        let inv = unsafe { PARTIALS[0] };
+        word = tid;
+        while word < words {
+            let [low, high] = bf16_halves(unsafe { ROW[word] });
+            // SAFETY: each lane owns distinct words of this block's row.
+            unsafe {
+                *y.get_unchecked_mut(base + word) = bf16_pair(
+                    low * inv * weight[2 * word],
+                    high * inv * weight[2 * word + 1],
+                );
+            }
+            word += NORM_THREADS;
+        }
+    }
+
+    /// The token lookup and the RMSNorm that reads it, in one launch.
+    ///
+    /// Same shape as [`rms_norm_forward_residual_bf16`] with the gather in
+    /// place of the add: `y` is the embedded row the backward scatters into
+    /// and `normalized` the first block's attention input.
+    ///
+    /// # Safety
+    ///
+    /// `dim` must be even and at most [`NORM_MAX_COLUMNS`].
+    #[kernel]
+    pub unsafe fn embedding_forward_norm_bf16(
+        table: &[u32],
+        tokens: &[u32],
+        weight: &[f32],
+        eps: f32,
+        dim: u32,
+        mut y: DisjointSlice<u32>,
+        mut normalized: DisjointSlice<u32>,
+    ) {
+        static mut PARTIALS: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+        static mut ROW: SharedArray<u32, { NORM_MAX_COLUMNS / 2 }> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != NORM_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        if d == 0 || !d.is_multiple_of(2) || d > NORM_MAX_COLUMNS {
+            return;
+        }
+        let words = d / 2;
+        let base = row * words;
+        if row >= tokens.len()
+            || base + words > y.len()
+            || base + words > normalized.len()
+            || d > weight.len()
+        {
+            return;
+        }
+        let token_base = tokens[row] as usize * words;
+        if token_base + words > table.len() {
+            return;
+        }
+
+        let mut sum_sq = 0.0f32;
+        let mut word = tid;
+        while word < words {
+            let packed = table[token_base + word];
+            // SAFETY: each lane owns distinct words of this block's row.
+            unsafe {
+                *y.get_unchecked_mut(base + word) = packed;
+                ROW[word] = packed;
+            }
+            let [low, high] = bf16_halves(packed);
+            sum_sq += low * low + high * high;
+            word += NORM_THREADS;
+        }
+        unsafe {
+            PARTIALS[tid] = sum_sq;
+        }
+        thread::sync_threads();
+
+        let mut stride = NORM_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    PARTIALS[tid] += PARTIALS[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            unsafe {
+                PARTIALS[0] = 1.0 / (PARTIALS[0] / dim as f32 + eps).sqrt();
+            }
+        }
+        thread::sync_threads();
+
+        let inv = unsafe { PARTIALS[0] };
+        word = tid;
+        while word < words {
+            let [low, high] = bf16_halves(unsafe { ROW[word] });
+            // SAFETY: each lane owns distinct words of this block's row.
+            unsafe {
+                *normalized.get_unchecked_mut(base + word) = bf16_pair(
+                    low * inv * weight[2 * word],
+                    high * inv * weight[2 * word + 1],
+                );
+            }
+            word += NORM_THREADS;
+        }
     }
 
     /// Warp-per-band RMSNorm forward on kittens register tiles.

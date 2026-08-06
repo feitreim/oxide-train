@@ -5,13 +5,13 @@
 //! profile`, which builds and runs a retained baseline binary and this one
 //! back-to-back on the same GPU (SPEC §10.1).
 
-use bench_util::StepProfiler;
+use bench_util::{StepProfiler, function_profile};
 use cuda_core::CudaContext;
 use optim::{AdamWConfig, AuxLossSchedule};
 
 #[path = "../lib.rs"]
 mod model;
-use model::{GpuDense, GpuDenseAdamW, GpuMoeWorkspace};
+use model::{GpuDense, GpuDenseAdamW, GpuMoeWorkspace, NORM_THREADS};
 
 const B: usize = 12;
 const T: usize = 2_048;
@@ -50,6 +50,35 @@ fn print_vram(label: &str) {
     }
 }
 
+/// What ptxas gave the block-per-row RMSNorm kernels and how many blocks of
+/// one fit on an SM. Fusing raises liveness, and a fused kernel that crosses
+/// an occupancy step can lose despite the traffic it saves, so the numbers
+/// belong beside the timings rather than in a one-off run.
+fn report_norm_kernels(
+    dense: &model::dense_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "rmsnorm kernels (registers/thread, spill bytes, blocks/SM at {NORM_THREADS} threads)"
+    );
+    for name in [
+        "rms_norm_forward_fast_bf16",
+        "rms_norm_forward_residual_bf16",
+        "embedding_forward_norm_bf16",
+        "rms_norm_backward_fused_bf16",
+        "rms_norm_backward_x_fast_bf16",
+        "rms_norm_backward_weight_fast_bf16",
+    ] {
+        let function = dense.as_cuda_module().load_function(name)?;
+        let profile = function_profile(&function)?;
+        let blocks = function.max_active_blocks_per_multiprocessor(NORM_THREADS as u32, 0)?;
+        println!(
+            "  {name:<38} {:>3} regs, {:>4} spill bytes, {blocks} blocks/SM",
+            profile.registers, profile.spill_bytes
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(N, B * T);
     assert_eq!(D, H * HD);
@@ -80,6 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flash_bf16 = model::Tcgen05Flash::load(&ctx)?;
     let flash = model::flash_kernels::load(&ctx)?;
     let dense = model::dense_kernels::load(&ctx)?;
+    report_norm_kernels(&dense)?;
 
     let aux_schedule = AuxLossSchedule::default();
     eprintln!("profile setup: initializing parameters block by block");
