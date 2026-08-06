@@ -262,14 +262,17 @@ def batch_sweep(batches: str, steps: int = 12, shard: str | None = None) -> None
     """
     _run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], cwd="/")
     proj = _proj("model")
+    run = ["cargo", "oxide", "run", "model", "--bin", "bsweep"]
+    # With no SWEEP_B the binary only lists its candidates, so this pays for the
+    # build and lets a compile error abort before any batch is attributed one.
+    _run(run, cwd=proj)
     for batch in batches.split(","):
         env = [f"SWEEP_B={batch.strip()}", f"TRAIN_STEPS={steps}"]
         if shard:
             env.append(f"TRAIN_SHARD={shard}")
         print(f"=== B={batch.strip()} ===", flush=True)
-        # Only the first candidate pays for the build; the rest hit the cache.
         try:
-            _run(["env", *env, "cargo", "oxide", "run", "model", "--bin", "bsweep"], cwd=proj)
+            _run(["env", *env, *run], cwd=proj)
         except subprocess.CalledProcessError as e:
             print(f"B={batch.strip()} failed: {e}", flush=True)
 

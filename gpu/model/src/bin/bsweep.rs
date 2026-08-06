@@ -10,7 +10,7 @@
 //! -- and reports free VRAM after each allocation phase alongside the
 //! trainer's own throughput and MFU line.
 
-use std::{env, error::Error, time::Instant};
+use std::{env, error::Error, sync::Arc, time::Instant};
 
 use cuda_core::CudaContext;
 use data::{Batches, TokenFile};
@@ -60,7 +60,7 @@ fn print_vram(label: &str) {
 fn measure<const B: usize, const N: usize, const C: usize>(
     tokens: &[u16],
     steps: usize,
-    cuda: &CudaContext,
+    cuda: &Arc<CudaContext>,
 ) -> Result<(), Box<dyn Error>> {
     assert_eq!(N, B * T);
     assert_eq!(C, N * K / E);
@@ -157,12 +157,17 @@ fn measure<const B: usize, const N: usize, const C: usize>(
 
 /// Instantiates one [`measure`] per compiled-in candidate and selects among
 /// them at run time. `N` and `C` must be const arguments, so the macro derives
-/// each candidate's from its `B`.
+/// each candidate's from its `B`. No selection lists the candidates and
+/// allocates nothing, which is how a caller gates a sweep on the build.
 macro_rules! dispatch {
     ($selected:expr, $tokens:expr, $steps:expr, $cuda:expr; $($b:literal),* $(,)?) => {
         match $selected {
-            $($b => measure::<$b, { $b * T }, { $b * T * K / E }>($tokens, $steps, $cuda),)*
-            other => Err(format!(
+            None => {
+                println!("bsweep candidates: {:?}", [$($b),*]);
+                Ok(())
+            }
+            $(Some($b) => measure::<$b, { $b * T }, { $b * T * K / E }>($tokens, $steps, $cuda),)*
+            Some(other) => Err(format!(
                 "SWEEP_B={other} is not compiled in; the candidates are {:?}",
                 [$($b),*]
             )
@@ -174,10 +179,9 @@ macro_rules! dispatch {
 fn main() -> Result<(), Box<dyn Error>> {
     let shard_path =
         env::var("TRAIN_SHARD").unwrap_or_else(|_| "/data/wiki-val-00000.tok".to_owned());
-    let batch: usize = env::var("SWEEP_B")
-        .expect("SWEEP_B selects the batch size to measure")
-        .parse()
-        .expect("SWEEP_B must be a batch size");
+    let batch: Option<usize> = env::var("SWEEP_B")
+        .ok()
+        .map(|value| value.parse().expect("SWEEP_B must be a batch size"));
     let steps: usize = env::var("TRAIN_STEPS")
         .map(|value| value.parse().expect("TRAIN_STEPS must be a step count"))
         .unwrap_or(12);
