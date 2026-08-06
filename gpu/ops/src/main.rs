@@ -17,11 +17,11 @@ use device::reference::kernels as reference_kernels;
 use device::{
     CLASSIFIER_THREADS, LOSS_TAIL_THREADS, MOE_ASSIGN_THREADS, MOE_AUX_TERMS_THREADS,
     MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS, MOE_ZERO_BINS_BLOCKS, MOE_ZERO_BINS_THREADS,
-    NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK, NORM_TILE_THREADS,
-    NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN, ROUTER_GEMM_THREADS,
-    ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM,
-    ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK,
-    SWIGLU_TILE_THREADS, kernels, rope_table,
+    NORM_BACKWARD_ROWS_PER_BLOCK, NORM_BACKWARD_TILE_CHUNK, NORM_THREADS, NORM_TILE_BLOCK_ROWS,
+    NORM_TILE_CHUNK, NORM_TILE_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN,
+    ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS,
+    ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, SWIGLU_TILE_BLOCK_ROWS,
+    SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS, kernels, rope_table,
 };
 use tensor_core::bf16;
 
@@ -62,6 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_rms_norm(&stream, &reference)?;
     eprintln!("[ops] checking rms_norm tiles");
     check_rms_norm_tile(&stream, &reference)?;
+    eprintln!("[ops] checking rms_norm bf16 tiles");
+    check_rms_norm_tile_bf16(&stream, &module)?;
     eprintln!("[ops] checking swiglu");
     check_swiglu(&stream, &reference)?;
     eprintln!("[ops] checking swiglu tiles");
@@ -1525,6 +1527,158 @@ fn check_rms_norm_tile(
             &y_dev.to_host_vec(stream)?,
             cpu_y.as_slice(),
             2e-5,
+            2e-5,
+        );
+        Ok(())
+    }
+}
+
+/// The bf16 tile RMSNorm kernels against the block-per-row ones they replace.
+///
+/// Neither arm had a gate in this file before: they are the packed production
+/// kernels, and their only coverage was the whole-model parity check. What is
+/// left to prove between the two is that the tile walk covers the same
+/// rectangle and that its statistic — a `row_sum` where the other is a
+/// shared-memory tree over 256 lanes — lands on the same row. Both round in
+/// exactly the same place, so the tolerances are the fp32 RMSNorm gate's own
+/// rather than widened ones.
+///
+/// The backward is compared with an empty `normalized`, which is the arm every
+/// training call site takes and the only one the tile kernel implements.
+fn check_rms_norm_tile_bf16(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: every buffer is N x D, N is a multiple of NORM_TILE_BLOCK_ROWS
+    // and D of both tile chunk widths, so every launch below covers exactly
+    // the rectangle its kernel walks.
+    unsafe {
+        const N: usize = 256;
+        const D: usize = 192;
+        const EPS: f32 = 1e-5;
+        assert_eq!(N % NORM_TILE_BLOCK_ROWS, 0);
+        assert_eq!(D % NORM_TILE_CHUNK, 0);
+        assert_eq!(D % NORM_BACKWARD_TILE_CHUNK, 0);
+
+        let x = CpuTensor::<f32, Rank2<N, D>>::uniform(31);
+        let weight = CpuTensor::<f32, Rank1<D>>::uniform(32).map(|v| v + 1.25);
+        let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(33);
+        let residual = CpuTensor::<f32, Rank2<N, D>>::uniform(34);
+
+        let pack = |values: &[f32]| -> Vec<u32> {
+            values
+                .chunks(2)
+                .map(|pair| {
+                    bf16::from_f32(pair[0]).to_bits() as u32
+                        | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
+                })
+                .collect()
+        };
+        let unpack = |words: &[u32]| -> Vec<f32> {
+            words
+                .iter()
+                .flat_map(|&word| {
+                    [
+                        f32::from_bits((word & 0xffff) << 16),
+                        f32::from_bits(word & 0xffff_0000),
+                    ]
+                })
+                .collect()
+        };
+
+        let x_dev = DeviceBuffer::from_host(stream, &pack(x.as_slice()))?;
+        let weight_dev = DeviceBuffer::from_host(stream, weight.as_slice())?;
+        let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+        let residual_dev = DeviceBuffer::from_host(stream, residual.as_slice())?;
+
+        let flat = LaunchConfig {
+            grid_dim: (N as u32, 1, 1),
+            block_dim: (NORM_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let tiles = LaunchConfig {
+            grid_dim: ((N / NORM_TILE_BLOCK_ROWS) as u32, 1, 1),
+            block_dim: (NORM_TILE_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut shipped = DeviceBuffer::<u32>::zeroed(stream, N * D / 2)?;
+        let mut tiled = DeviceBuffer::<u32>::zeroed(stream, N * D / 2)?;
+        module.rms_norm_forward_fast_bf16(
+            stream,
+            flat,
+            &x_dev,
+            &weight_dev,
+            EPS,
+            D as u32,
+            &mut shipped,
+        )?;
+        module.rms_norm_forward_tile_bf16(
+            stream,
+            tiles,
+            &x_dev,
+            &weight_dev,
+            EPS,
+            D as u32,
+            &mut tiled,
+        )?;
+        assert_close(
+            "rmsnorm bf16 tile y vs flat",
+            &unpack(&tiled.to_host_vec(stream)?),
+            &unpack(&shipped.to_host_vec(stream)?),
+            2e-5,
+            2e-5,
+        );
+
+        let backward_flat = LaunchConfig {
+            grid_dim: (N.div_ceil(NORM_BACKWARD_ROWS_PER_BLOCK) as u32, 1, 1),
+            block_dim: (NORM_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut absent = DeviceBuffer::<u32>::zeroed(stream, 0)?;
+        let mut dx_flat = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+        let mut dweight_flat = DeviceBuffer::<f32>::zeroed(stream, D)?;
+        module.rms_norm_backward_fused_bf16(
+            stream,
+            backward_flat,
+            &x_dev,
+            &weight_dev,
+            &dy_dev,
+            &residual_dev,
+            EPS,
+            N as u32,
+            D as u32,
+            &mut dx_flat,
+            &mut dweight_flat,
+            &mut absent,
+        )?;
+
+        let mut dx_tile = DeviceBuffer::<f32>::zeroed(stream, N * D)?;
+        let mut dweight_tile = DeviceBuffer::<f32>::zeroed(stream, D)?;
+        module.rms_norm_backward_fused_tile_bf16(
+            stream,
+            tiles,
+            &x_dev,
+            &weight_dev,
+            &dy_dev,
+            &residual_dev,
+            EPS,
+            D as u32,
+            &mut dx_tile,
+            &mut dweight_tile,
+        )?;
+        assert_close(
+            "rmsnorm bf16 tile dx vs flat",
+            &dx_tile.to_host_vec(stream)?,
+            &dx_flat.to_host_vec(stream)?,
+            3e-5,
+            3e-5,
+        );
+        assert_close(
+            "rmsnorm bf16 tile dweight vs flat",
+            &dweight_tile.to_host_vec(stream)?,
+            &dweight_flat.to_host_vec(stream)?,
+            5e-6,
             2e-5,
         );
         Ok(())

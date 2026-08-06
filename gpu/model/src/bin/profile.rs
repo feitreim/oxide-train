@@ -13,6 +13,7 @@ use optim::{AdamWConfig, AuxLossSchedule};
 mod model;
 use model::{
     GEMM_SHARED_BYTES, GEMM_THREADS, GpuDense, GpuDenseAdamW, GpuMoeWorkspace, NORM_THREADS,
+    NORM_TILE_THREADS,
 };
 
 const B: usize = 12;
@@ -73,6 +74,26 @@ fn report_norm_kernels(
         let function = dense.as_cuda_module().load_function(name)?;
         let profile = function_profile(&function)?;
         let blocks = function.max_active_blocks_per_multiprocessor(NORM_THREADS as u32, 0)?;
+        println!(
+            "  {name:<38} {:>3} regs, {:>4} spill bytes, {blocks} blocks/SM",
+            profile.registers, profile.spill_bytes
+        );
+    }
+
+    // The tile arms launch a narrower block, so their occupancy is a different
+    // question from the block-per-row kernels' above and gets its own header
+    // rather than a misleading column.
+    println!(
+        "rmsnorm tile kernels (registers/thread, spill bytes, blocks/SM at \
+         {NORM_TILE_THREADS} threads)"
+    );
+    for name in [
+        "rms_norm_forward_tile_bf16",
+        "rms_norm_backward_fused_tile_bf16",
+    ] {
+        let function = dense.as_cuda_module().load_function(name)?;
+        let profile = function_profile(&function)?;
+        let blocks = function.max_active_blocks_per_multiprocessor(NORM_TILE_THREADS as u32, 0)?;
         println!(
             "  {name:<38} {:>3} regs, {:>4} spill bytes, {blocks} blocks/SM",
             profile.registers, profile.spill_bytes

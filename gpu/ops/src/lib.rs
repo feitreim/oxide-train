@@ -16,8 +16,8 @@ use cuda_device::{
 };
 
 use kittens::global::{GlobalRows, load_cols, load_rows, store_rows};
-use kittens::reg::{BaseLdtm, ColVec, RegTile, RegVec};
-use kittens::shared::F32;
+use kittens::reg::{Add, BaseLdtm, ColVec, RegTile, RegVec};
+use kittens::shared::{Bf16, F32};
 use kittens::{lane, warp_id};
 
 /// Threads in the row-parallel fused classifier kernels.
@@ -250,6 +250,23 @@ type NormRows = RegVec<NORM_TILE_ROWS, BaseLdtm>;
 /// owns rather than one per (row, column) pair.
 type NormColumns = ColVec<NORM_TILE_CHUNK, BaseLdtm>;
 
+/// Columns a tile-RMSNorm *backward* warp holds in registers at once.
+///
+/// Half [`NORM_TILE_CHUNK`], and for the reason that constant's own note gives
+/// for stopping at 64: the forward carries one band, and this kernel carries
+/// three at once — the saved input, the upstream gradient and the residual it
+/// adds — so the same register file buys a third of the columns. 64 here is
+/// the `[16, 96]` cliff again, one band earlier.
+pub const NORM_BACKWARD_TILE_CHUNK: usize = 32;
+
+/// One warp's slice of a backward row band, [`NORM_BACKWARD_TILE_CHUNK`] wide.
+type NormBackChunk = RegTile<NORM_TILE_ROWS, NORM_BACKWARD_TILE_CHUNK, BaseLdtm>;
+
+/// The backward chunk's slice of the `[dim]` weight — and, on the way out, of
+/// its gradient: the one statistic in this kernel that runs down a column
+/// rather than across a row.
+type NormBackColumns = ColVec<NORM_BACKWARD_TILE_CHUNK, BaseLdtm>;
+
 /// One warp's slice of a SwiGLU row band.
 type SwigluChunk = RegTile<SWIGLU_TILE_ROWS, SWIGLU_TILE_CHUNK, BaseLdtm>;
 
@@ -413,6 +430,65 @@ pub mod kernels {
                 );
             }
             word += NORM_THREADS;
+        }
+    }
+
+    /// [`rms_norm_forward_fast_bf16`] on kittens register tiles.
+    ///
+    /// The bf16 twin of `reference::kernels::rms_norm_forward_tile`, which
+    /// measured 1.246x of the block-per-row kernel over the same buffers in
+    /// fp32. [`rms_norm_forward_fast_bf16`]'s own note argued this dtype had
+    /// nothing to gain — that packing the stream already doubles the elements a
+    /// lane carries — and the arithmetic does not support it: at `dim` 3072 the
+    /// block-per-row lane holds 6 words, twelve elements, and a
+    /// `[16, NORM_TILE_CHUNK]` band gives it 32. Loads in flight was the whole
+    /// of what that kernel was short of, and packing recovers a sixth of the
+    /// gap rather than closing it.
+    ///
+    /// # Safety
+    ///
+    /// As `reference::kernels::rms_norm_forward_tile`: [`NORM_TILE_THREADS`]
+    /// threads over exactly `rows / NORM_TILE_BLOCK_ROWS` blocks, `rows` a
+    /// multiple of [`NORM_TILE_BLOCK_ROWS`] and `dim` of [`NORM_TILE_CHUNK`],
+    /// both checked by the launcher because this kernel never bounds-checks.
+    #[kernel]
+    pub unsafe fn rms_norm_forward_tile_bf16(
+        x: &[u32],
+        weight: &[f32],
+        eps: f32,
+        dim: u32,
+        mut y: DisjointSlice<u32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let row = NORM_TILE_BLOCK_ROWS as u32 * thread::blockIdx_x()
+                + NORM_TILE_ROWS as u32 * warp_id();
+            let d = dim as usize;
+            // Both streams are packed pairs; the cursor names the bf16 element
+            // and the pair is the access the mover already makes of it.
+            let source = GlobalRows::<Bf16>::from_raw(x.as_ptr() as *mut u8, d);
+            let destination = GlobalRows::<Bf16>::from_raw(y.as_mut_ptr() as *mut u8, d);
+            let parameters = GlobalRows::<F32>::from_raw(weight.as_ptr() as *mut u8, 0);
+
+            let mut total = NormRows::splat(0.0);
+            let mut column = 0u32;
+            while column < dim {
+                let v: NormChunk = load_rows(source, row, column, lane);
+                total.add_assign(v.mul(v).row_sum());
+                column += NORM_TILE_CHUNK as u32;
+            }
+            let inv = total.scale(1.0 / dim as f32).shift(eps).rsqrt();
+
+            column = 0;
+            while column < dim {
+                let v: NormChunk = load_rows(source, row, column, lane);
+                let w: NormColumns = load_cols(parameters, 0, column, lane);
+                // The scale and the weight product stay fp32 and the store is
+                // the only rounding, exactly as the block-per-row kernel's
+                // `bf16_pair` was.
+                store_rows(destination, row, column, lane, v.mul_row(inv).mul_col(w));
+                column += NORM_TILE_CHUNK as u32;
+            }
         }
     }
 
@@ -699,6 +775,115 @@ pub mod kernels {
             let slot = unsafe { DeviceAtomicF32::from_ptr(dweight.as_mut_ptr().add(column)) };
             slot.fetch_add(unsafe { WEIGHT_PARTIALS[column] }, AtomicOrdering::Relaxed);
             column += NORM_THREADS;
+        }
+    }
+
+    /// [`rms_norm_backward_fused_bf16`] on kittens register tiles.
+    ///
+    /// The block-per-row kernel pays for its two row statistics in shared
+    /// memory: a 256-lane tree is eight barriers, and it runs that tree once
+    /// per row for all [`NORM_BACKWARD_ROWS_PER_BLOCK`] of them — 160 barriers
+    /// a block, to produce two numbers a row. Here a warp owns
+    /// [`NORM_TILE_ROWS`] rows at once and both statistics are
+    /// `RegTile::row_sum`: two shuffles, no shared memory, no barrier anywhere
+    /// in the kernel.
+    ///
+    /// The weight gradient is the axis that does not fit that picture. It is a
+    /// sum down a column, so it cannot live in a row statistic — but it also
+    /// does not have to leave the warp: `col_sum` gives the chunk's 32 columns
+    /// summed over the warp's 16 rows, `column_group_reduce` makes the eight
+    /// replicas of that vector agree, and the four lanes holding distinct
+    /// columns pay one atomic each. That is `dim` atomics per 16 rows, which is
+    /// exactly what the shared-memory kernel already paid — the shared
+    /// accumulator was never buying fewer of them, only spreading them over a
+    /// block that owned the same 16 rows.
+    ///
+    /// No `normalized` output: every training call site hands this kernel an
+    /// empty one (`no_normalized`), so the arm that recomputed the forward's
+    /// result is dead weight here and the shape stays three bands.
+    ///
+    /// # Safety
+    ///
+    /// Launch with [`NORM_TILE_THREADS`] threads over exactly
+    /// `rows / NORM_TILE_BLOCK_ROWS` blocks: `rows` must be a multiple of
+    /// [`NORM_TILE_BLOCK_ROWS`] and `dim` of [`NORM_BACKWARD_TILE_CHUNK`], both
+    /// the launcher's to check, since this kernel never bounds-checks. As
+    /// [`rms_norm_backward_fused_bf16`], `dweight` is accumulated into and the
+    /// caller owes it a zeroed buffer.
+    #[kernel]
+    pub unsafe fn rms_norm_backward_fused_tile_bf16(
+        x: &[u32],
+        weight: &[f32],
+        dy: &[f32],
+        residual: &[f32],
+        eps: f32,
+        dim: u32,
+        mut dx: DisjointSlice<f32>,
+        mut dweight: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let row = NORM_TILE_BLOCK_ROWS as u32 * thread::blockIdx_x()
+                + NORM_TILE_ROWS as u32 * warp_id();
+            let d = dim as usize;
+            // The saved input is packed two bf16 to a `u32`; the cursor names
+            // the element, so the stride is the row's `dim` values and the
+            // widening happens in the load instruction.
+            let source = GlobalRows::<Bf16>::from_raw(x.as_ptr() as *mut u8, d);
+            let upstream = GlobalRows::<F32>::from_raw(dy.as_ptr() as *mut u8, d);
+            let carried = GlobalRows::<F32>::from_raw(residual.as_ptr() as *mut u8, d);
+            let destination = GlobalRows::<F32>::from_slice(&mut dx, d);
+            // A one-row cursor: the weight is a per-column operand, read once
+            // per chunk by `load_cols` rather than once per row (#172).
+            let parameters = GlobalRows::<F32>::from_raw(weight.as_ptr() as *mut u8, 0);
+
+            let mut squares = NormRows::splat(0.0);
+            let mut dots = NormRows::splat(0.0);
+            let mut column = 0u32;
+            while column < dim {
+                let v: NormBackChunk = load_rows(source, row, column, lane);
+                let g: NormBackChunk = load_rows(upstream, row, column, lane);
+                let w: NormBackColumns = load_cols(parameters, 0, column, lane);
+                squares.add_assign(v.mul(v).row_sum());
+                dots.add_assign(g.mul_col(w).mul(v).row_sum());
+                column += NORM_BACKWARD_TILE_CHUNK as u32;
+            }
+            let inv = squares.scale(1.0 / dim as f32).shift(eps).rsqrt();
+            // `inv³ · dot / dim`, the block-per-row kernel's `correction`.
+            let correction = dots.mul(inv).mul(inv).mul(inv).scale(1.0 / dim as f32);
+
+            column = 0;
+            while column < dim {
+                let v: NormBackChunk = load_rows(source, row, column, lane);
+                let g: NormBackChunk = load_rows(upstream, row, column, lane);
+                let r: NormBackChunk = load_rows(carried, row, column, lane);
+                let w: NormBackColumns = load_cols(parameters, 0, column, lane);
+                store_rows(
+                    destination,
+                    row,
+                    column,
+                    lane,
+                    r.add(g.mul_col(w).mul_row(inv)).sub(v.mul_row(correction)),
+                );
+
+                // The column statistic, completed across the group so all
+                // eight replicas of the vector agree, then paid for once by
+                // the four lanes that hold distinct columns.
+                let partials = g.mul(v).mul_row(inv).col_sum().column_group_reduce::<Add>();
+                if lane < 4 {
+                    let mut value = 0usize;
+                    while value < NormBackColumns::VALUES {
+                        let at = column as usize + NormBackColumns::column(lane, value) as usize;
+                        // SAFETY: `at` is inside the `dim` accumulators the
+                        // launcher promised, and every access to that location
+                        // in this kernel is atomic.
+                        let slot = DeviceAtomicF32::from_ptr(dweight.as_mut_ptr().add(at));
+                        slot.fetch_add(partials.get(value), AtomicOrdering::Relaxed);
+                        value += 1;
+                    }
+                }
+                column += NORM_BACKWARD_TILE_CHUNK as u32;
+            }
         }
     }
 
