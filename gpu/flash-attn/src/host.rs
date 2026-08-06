@@ -219,6 +219,48 @@ pub unsafe fn create_flash_head_tma_map(
     }
 }
 
+/// Build a head-panel tensor map over a **row-major** packed-pair
+/// `[batches * sequence_length, heads * 128]` panel — the layout a projection
+/// GEMM writes, addressed as if it were the `[batches * heads, T, 128]`
+/// staging buffer [`create_flash_head_tma_map`] describes.
+///
+/// The relayout is the descriptor's, not a kernel's: a head is a column band
+/// `FLASH_HD` wide, so it is dimension 2 at stride `FLASH_HD`, while a token
+/// is dimension 1 at the panel's full row stride. `(batch, token)` collapses
+/// into that one row coordinate because `batch * T + token` is exactly the
+/// panel's row index, which is why an operand nobody relaid out still arrives
+/// as `[TILE, HD]` head tiles. Consumers pass `row = batch * T + token` and
+/// `plane = head` where a staged panel takes `row = token` and
+/// `plane = batch * heads + head`.
+///
+/// # Safety
+///
+/// `buffer` must stay allocated at the same device address for every kernel
+/// launch that consumes the returned map.
+pub unsafe fn create_flash_row_major_tma_map(
+    stream: &CudaStream,
+    buffer: &DeviceBuffer<u32>,
+    rows: usize,
+    heads: usize,
+) -> Result<FlashHeadTmaMap, Box<dyn Error>> {
+    assert_eq!(buffer.len() * 2, rows * heads * FLASH_HD);
+    assert!(rows.is_multiple_of(FLASH_TILE));
+    let width = heads * FLASH_HD;
+    let layout = unsafe {
+        kittens::global::GlobalLayout::<kittens::shared::Bf16, 3>::strided(
+            buffer.cu_deviceptr(),
+            [FLASH_HD, rows, heads],
+            [1, width, FLASH_HD],
+        )
+    };
+    layout.tensor_map::<kittens::shared::SharedTile<
+        kittens::shared::Bf16,
+        FLASH_TILE,
+        FLASH_HD,
+        kittens::shared::Swizzle128B,
+    >>(stream)
+}
+
 /// Raise a kernel's dynamic-shared-memory ceiling above the 48 KiB default.
 fn opt_in_dynamic_smem(function: &CudaFunction, bytes: u32) -> Result<(), Box<dyn Error>> {
     use cuda_core::sys::{

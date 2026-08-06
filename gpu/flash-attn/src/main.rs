@@ -20,8 +20,8 @@ mod flash;
 mod naive;
 
 use flash::host::{
-    Tcgen05Flash, correction_count_len, create_flash_head_tma_map, device_sm_count,
-    flash_backward_kv_config, flash_backward_q_config, flash_forward_config,
+    Tcgen05Flash, correction_count_len, create_flash_head_tma_map, create_flash_row_major_tma_map,
+    device_sm_count, flash_backward_kv_config, flash_backward_q_config, flash_forward_config,
 };
 
 const HD: usize = 128;
@@ -49,6 +49,16 @@ fn stage_heads(input: &[f32], b: usize, t: usize, h: usize, scale: f32) -> Vec<u
         }
     }
     staged
+}
+
+/// Round a `[B*T, H*HD]` operand to bf16 pairs where it lies — the layout a
+/// projection GEMM's packed epilogue writes, and the one V is read in through
+/// `create_flash_row_major_tma_map` instead of being relaid out.
+fn pack_rows(input: &[f32]) -> Vec<u32> {
+    input
+        .chunks_exact(2)
+        .map(|pair| f32_to_bf16_rne(pair[0]) as u32 | ((f32_to_bf16_rne(pair[1]) as u32) << 16))
+        .collect()
 }
 
 /// Stage one operand on device and require bit-parity with the CPU mirror.
@@ -118,7 +128,7 @@ fn check_tcgen05_shape(
         let q_scale = LOG2_E / (HD as f32).sqrt();
         let q_staged = stage_on_device(stream, flash_module, &q_device, &q, b, t, h, q_scale, "q")?;
         let k_staged = stage_on_device(stream, flash_module, &k_device, &k, b, t, h, 1.0, "k")?;
-        let v_staged = stage_on_device(stream, flash_module, &v_device, &v, b, t, h, 1.0, "v")?;
+        let v_rows = DeviceBuffer::from_host(stream, &pack_rows(&v))?;
 
         // Tier 1 oracle: materialized probabilities from ops.
         let mut probabilities = DeviceBuffer::<f32>::zeroed(stream, n * h * t)?;
@@ -161,7 +171,7 @@ fn check_tcgen05_shape(
 
         let q_tma = unsafe { create_flash_head_tma_map(stream, &q_staged, t, b * h)? };
         let k_tma = unsafe { create_flash_head_tma_map(stream, &k_staged, t, b * h)? };
-        let v_tma = unsafe { create_flash_head_tma_map(stream, &v_staged, t, b * h)? };
+        let v_tma = unsafe { create_flash_row_major_tma_map(stream, &v_rows, n, h)? };
         let naive_y_host = naive_y.to_host_vec(stream)?;
         let tiled_y_host = tiled_y.to_host_vec(stream)?;
         let tiled_lse_host = tiled_lse.to_host_vec(stream)?;
@@ -236,7 +246,7 @@ fn check_tcgen05_backward_shape(
         let q_scale = LOG2_E / (HD as f32).sqrt();
         let q_staged = stage_on_device(stream, flash_module, &q_device, &q, b, t, h, q_scale, "q")?;
         let k_staged = stage_on_device(stream, flash_module, &k_device, &k, b, t, h, 1.0, "k")?;
-        let v_staged = stage_on_device(stream, flash_module, &v_device, &v, b, t, h, 1.0, "v")?;
+        let v_rows = DeviceBuffer::from_host(stream, &pack_rows(&v))?;
         let dy_staged = stage_on_device(stream, flash_module, &dy_device, &dy, b, t, h, 1.0, "dy")?;
 
         // Tier-1 oracle: materialized-probability backward from ops.
@@ -296,7 +306,7 @@ fn check_tcgen05_backward_shape(
         // Model data flow: tcgen05 forward y/LSE, then fp32 backward_dot over y.
         let q_tma = unsafe { create_flash_head_tma_map(stream, &q_staged, t, b * h)? };
         let k_tma = unsafe { create_flash_head_tma_map(stream, &k_staged, t, b * h)? };
-        let v_tma = unsafe { create_flash_head_tma_map(stream, &v_staged, t, b * h)? };
+        let v_tma = unsafe { create_flash_row_major_tma_map(stream, &v_rows, n, h)? };
         let dy_tma = unsafe { create_flash_head_tma_map(stream, &dy_staged, t, b * h)? };
         let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
         let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
@@ -722,8 +732,8 @@ fn check_shape(
 
 /// The fused rotate-and-stage pass against the composition it substitutes for.
 ///
-/// `stage_qkv_heads_bf16` replaces `split_group3` + two `rope_forward` passes +
-/// three `stage_attention_heads_bf16` launches. Everything it drops was fp32
+/// `stage_qk_heads_bf16` replaces `split_group3` + two `rope_forward` passes +
+/// two `stage_attention_heads_bf16` launches. Everything it drops was fp32
 /// storage between two kernels, so the substitution owes exact parity — every
 /// staged word, not a tolerance — and that is what is asserted here. The
 /// unfused kernels keep their own bit-exact CPU mirror above; this gate is the
@@ -741,7 +751,7 @@ fn check_fused_staging(
     unsafe {
         let (n, d) = (b * t, h * HD);
         let words = n * d / 2;
-        let qkv = DeviceBuffer::from_host(stream, &uniform_vec(n * 3 * d, 181))?;
+        let qk = DeviceBuffer::from_host(stream, &uniform_vec(n * 2 * d, 181))?;
         let table = DeviceBuffer::from_host(stream, &naive::rope_table(t, HD))?;
         let q_scale = LOG2_E / (HD as f32).sqrt();
         let elements = LaunchConfig::for_num_elems((n * d) as u32);
@@ -750,16 +760,7 @@ fn check_fused_staging(
 
         let mut split_q = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
         let mut split_k = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-        let mut split_v = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
-        naive_module.split_group3(
-            stream,
-            elements,
-            &qkv,
-            d as u32,
-            &mut split_q,
-            &mut split_k,
-            &mut split_v,
-        )?;
+        naive_module.split_group2(stream, elements, &qk, d as u32, &mut split_q, &mut split_k)?;
         let mut rotated_q = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
         let mut rotated_k = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
         naive_module.rope_forward(
@@ -785,24 +786,21 @@ fn check_fused_staging(
 
         let mut fused_q = DeviceBuffer::<u32>::zeroed(stream, words)?;
         let mut fused_k = DeviceBuffer::<u32>::zeroed(stream, words)?;
-        let mut fused_v = DeviceBuffer::<u32>::zeroed(stream, words)?;
-        flash_module.stage_qkv_heads_bf16(
+        flash_module.stage_qk_heads_bf16(
             stream,
             staging,
-            &qkv,
+            &qk,
             &table,
             t as u32,
             h as u32,
             q_scale,
             &mut fused_q,
             &mut fused_k,
-            &mut fused_v,
         )?;
 
         for (name, operand, scale, fused) in [
             ("q", &rotated_q, q_scale, &fused_q),
             ("k", &rotated_k, 1.0, &fused_k),
-            ("v", &split_v, 1.0, &fused_v),
         ] {
             let mut expected = DeviceBuffer::<u32>::zeroed(stream, words)?;
             flash_module.stage_attention_heads_bf16(

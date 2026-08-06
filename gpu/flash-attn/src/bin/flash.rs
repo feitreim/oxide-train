@@ -17,8 +17,8 @@ use tcgen05_device as tcgen05;
 
 use host::{
     FLASH_HD, FLASH_QUERIES, FLASH_SUBTILE_HD, FLASH_TILE, Tcgen05Flash, correction_count_len,
-    create_flash_head_tma_map, device_sm_count, flash_backward_kv_config, flash_backward_q_config,
-    flash_forward_config,
+    create_flash_head_tma_map, create_flash_row_major_tma_map, device_sm_count,
+    flash_backward_kv_config, flash_backward_q_config, flash_forward_config,
 };
 
 /// Pinned ptxas ceilings (issue #61 phase 0): the B200-measured budgets from
@@ -268,6 +268,16 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f32], atol: f32, rtol: f
         );
     }
     println!("  {name:<9} max abs error: {max_error:.3e}");
+}
+
+/// Round a `[B*T, H*HD]` operand to bf16 pairs where it lies — the layout a
+/// projection GEMM's packed epilogue writes, and the one V is read in through
+/// `create_flash_row_major_tma_map` instead of being relaid out.
+fn pack_rows(input: &[f32]) -> Vec<u32> {
+    input
+        .chunks_exact(2)
+        .map(|pair| f32_to_bf16_rne(pair[0]) as u32 | ((f32_to_bf16_rne(pair[1]) as u32) << 16))
+        .collect()
 }
 
 /// Software exp2/log2 accuracy against the host libm oracles. Gates the
@@ -541,10 +551,10 @@ fn check_forward(
 
     let q_device = DeviceBuffer::from_host(stream, &q_staged)?;
     let k_device = DeviceBuffer::from_host(stream, &k_staged)?;
-    let v_device = DeviceBuffer::from_host(stream, &v_staged)?;
+    let v_device = DeviceBuffer::from_host(stream, &pack_rows(&v))?;
     let q_tma = unsafe { create_flash_head_tma_map(stream, &q_device, t, b * h)? };
     let k_tma = unsafe { create_flash_head_tma_map(stream, &k_device, t, b * h)? };
-    let v_tma = unsafe { create_flash_head_tma_map(stream, &v_device, t, b * h)? };
+    let v_tma = unsafe { create_flash_row_major_tma_map(stream, &v_device, n, h)? };
     let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
     let mut corrections = DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;
@@ -707,11 +717,11 @@ fn check_backward(
 
     let q_device = DeviceBuffer::from_host(stream, &q_staged)?;
     let k_device = DeviceBuffer::from_host(stream, &k_staged)?;
-    let v_device = DeviceBuffer::from_host(stream, &v_staged)?;
+    let v_device = DeviceBuffer::from_host(stream, &pack_rows(&v))?;
     let dy_device = DeviceBuffer::from_host(stream, &dy_staged)?;
     let q_tma = unsafe { create_flash_head_tma_map(stream, &q_device, t, b * h)? };
     let k_tma = unsafe { create_flash_head_tma_map(stream, &k_device, t, b * h)? };
-    let v_tma = unsafe { create_flash_head_tma_map(stream, &v_device, t, b * h)? };
+    let v_tma = unsafe { create_flash_row_major_tma_map(stream, &v_device, n, h)? };
     let dy_tma = unsafe { create_flash_head_tma_map(stream, &dy_device, t, b * h)? };
     let lse_device = DeviceBuffer::from_host(stream, &lse)?;
     let dot_device = DeviceBuffer::from_host(stream, &dot)?;
@@ -800,13 +810,12 @@ fn bench(
     let q_scale = LOG2_E / (FLASH_HD as f32).sqrt();
     let q_staged = stage_heads(&uniform_vec(n * d, 81), b, t, h, q_scale);
     let k_staged = stage_heads(&uniform_vec(n * d, 82), b, t, h, 1.0);
-    let v_staged = stage_heads(&uniform_vec(n * d, 83), b, t, h, 1.0);
+    let v_device = DeviceBuffer::from_host(stream, &pack_rows(&uniform_vec(n * d, 83)))?;
     let q_device = DeviceBuffer::from_host(stream, &q_staged)?;
     let k_device = DeviceBuffer::from_host(stream, &k_staged)?;
-    let v_device = DeviceBuffer::from_host(stream, &v_staged)?;
     let q_tma = unsafe { create_flash_head_tma_map(stream, &q_device, t, b * h)? };
     let k_tma = unsafe { create_flash_head_tma_map(stream, &k_device, t, b * h)? };
-    let v_tma = unsafe { create_flash_head_tma_map(stream, &v_device, t, b * h)? };
+    let v_tma = unsafe { create_flash_row_major_tma_map(stream, &v_device, n, h)? };
     let mut y = DeviceBuffer::<f32>::zeroed(stream, n * d)?;
     let mut lse = DeviceBuffer::<f32>::zeroed(stream, n * h)?;
     let mut corrections = DeviceBuffer::<u32>::zeroed(stream, correction_count_len(b, t, h))?;

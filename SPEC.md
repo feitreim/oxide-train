@@ -226,14 +226,29 @@ every other shape, whose fp32 oracle kernels still read `[N,D]` triples and
 still take the split and the two rotation passes.
 
 On the staged path the whole chain from the projection to the flash operand is
-one pass: `stage_qkv_heads_bf16` reads the fp32 `[N,3D]` panel and writes the
-three head-major bf16 panels, rotating Q and K from a precomputed cos/sin table
+one pass: `stage_qk_heads_bf16` reads the fp32 `[N,2D]` panel and writes the
+two head-major bf16 panels, rotating Q and K from a precomputed cos/sin table
 and folding Q's `softmax_scale · log2(e)` in. It substitutes for
-`split_group3` + two `rope_forward` passes + three `stage_attention_heads_bf16`
+`split_group2` + two `rope_forward` passes + two `stage_attention_heads_bf16`
 launches, and every intermediate it drops was fp32 storage between two kernels,
 so it is that composition's output bit for bit — `--kernel flash-attn` asserts
 exactly that at three tile-aligned shapes. The unfused kernels stay as the
 oracles they are checked against (§11).
+
+V is not in that pass and never was rotated, scaled or accumulated: the only
+work the staging did on it was round to bf16 and transpose token against head.
+The GEMM's packed epilogue already rounds and a TMA descriptor already
+transposes, so the projection runs as **two** GEMMs — the Q/K groups into the
+fp32 panel above, and V's group's packed bf16 straight into the saved panel
+flash reads. Both read the one transposed weight operand through descriptors
+over its two row bands (`TransposedBands`), and flash addresses head `h` of the
+row-major V panel as a column band through `create_flash_row_major_tma_map`
+(`row = batch · T + token`, `plane = head`, where a staged panel takes
+`row = token`, `plane = batch · H + head`). Splitting the output's `N` leaves
+each tile's K walk alone, so V's fp32 accumulator is the unsplit GEMM's to the
+bit and the epilogue's rounding lands where the staging pass's did. What
+disappears is V's whole fp32 round trip: the wide store, the staging read and
+the staging write — `3 · N · D · 4` bytes a block (#107 A8).
 
 The backward re-staging goes with them: Q/K/V are per-block panels the forward
 already wrote, so only dY — a backward temporary — is staged, and
