@@ -125,3 +125,97 @@ Model and batch shapes remain compile-time constants in
 step count, logging/checkpoint intervals, and AdamW scalars. Checkpoints include
 all parameters, AdamW moments/configuration, the global step, static shape
 metadata, and the next batch position; saves use atomic replacement.
+
+## PyTorch throughput baseline
+
+`gpu/model/baselines/pytorch_baseline.py` is the trainer's external reference:
+the same 4.39B-parameter model, the same tokens off the same shard, the same
+twelve-steps-minus-one measurement window, and the same
+`training_flops_per_token()` over the same 2.25 PFLOP/s denominator. It runs in
+its own Modal image (torch, no rustc) beside the kernel image:
+
+```bash
+modal run modal_app.py::pytorch_baseline                             # eager, B=16
+modal run modal_app.py::pytorch_baseline --tiers "default" --batches 16
+modal run modal_app.py::pytorch_baseline --tiers "reduce-overhead" --batches 16
+modal run modal_app.py::pytorch_baseline --masters fp32              # stock autocast
+```
+
+The script asserts its own parameter count against the Rust model's term by
+term, and its optimizer's moment dtypes against the policy, before it reports a
+number — so neither a drifted shape nor a quietly narrowed moment can become a
+throughput win.
+
+### Matched precision policy (`--masters bf16`, the default)
+
+`optim`'s policy, reproduced: **bf16 masters** for every matrix-shaped
+parameter, **fp32 for norms and the router**, **fp32 AdamW moments**, and the
+update arithmetic done in fp32 on a widened master that rounds back to bf16 on
+the way out. One B200, B=16, twelve steps with the first discarded,
+`wiki-val-00000.tok`:
+
+| Tier | tokens/s | MFU | vs trainer | peak VRAM | CUDA graphs | compile |
+| --- | --- | --- | --- | --- | --- | --- |
+| trainer (`bin/train.rs`) | 81,532 | 36.20% | — | — | no | — |
+| PyTorch eager | 49,282 | 21.88% | −39.6% | 132.6 GiB | no | 30.9 s |
+| `torch.compile()` | **91,669** | **40.71%** | **+12.4%** | **95.5 GiB** | no | 38.0 s |
+| `torch.compile(mode="reduce-overhead")` | 91,289 | 40.54% | +12.0% | 95.5 GiB | **yes** | 23.1 s |
+
+The measured split is 87 parameters: 50 bf16 masters, 37 fp32 norms and
+routers, and 174 of 174 moments fp32.
+
+`mode="reduce-overhead"` *is* CUDA graphs, which the trainer does not have, so
+it is not the honest comparison — and here it is 0.4% *behind* plain
+`torch.compile()`, i.e. inside the noise of an 11-step window on a 357ms step.
+The script checks whether inductor actually recorded graphs rather than
+trusting the mode name. The line to answer is the **+12.4%** one.
+
+`mode="max-autotune"` was not run: the escalation only continues while the
+trainer is still ahead, and it stopped being ahead at `torch.compile()`.
+
+### Stock autocast policy (`--masters fp32`), kept for the record
+
+fp32 masters under bf16 autocast with `AdamW(fused=True)` — the default a
+PyTorch practitioner reaches for, and what the first pass at this baseline
+measured. It carries a real handicap the trainer does not: a weight cast per
+matmul and twice the parameter and gradient bytes.
+
+| Tier | B | tokens/s | MFU | vs trainer @ B=16 | peak VRAM | CUDA graphs |
+| --- | --- | --- | --- | --- | --- | --- |
+| PyTorch eager | 16 | 44,635 | 19.82% | −45.3% | 148.7 GiB | no |
+| PyTorch eager | 12 | 46,668 | 20.72% | −42.8% | 125.8 GiB | no |
+| `torch.compile()` | 16 | 88,840 | 39.45% | +9.0% | 111.6 GiB | no |
+| `torch.compile(mode="reduce-overhead")` | 16 | 89,541 | 39.76% | +9.8% | 111.5 GiB | yes |
+
+Matching the policy is worth +3.2% and 16.1 GiB against that, which is the
+whole of the handicap and not much more.
+
+### Where the policies still cannot meet
+
+- **Gradients.** The trainer keeps fp32 gradients for every parameter — its
+  weight-gradient GEMMs write fp32 directly beside a bf16 master. PyTorch's
+  autograd produces gradients in the parameter's dtype, so the 50 bf16 masters
+  get bf16 gradients; the 37 fp32 norms and routers do match. This is not
+  fixable without a custom autograd function behind every matmul, and it
+  **favors PyTorch**: half the gradient bytes to write, read, and reduce. It
+  costs accuracy rather than speed — most visibly in the embedding's
+  scatter-add, which accumulates in bf16 where the trainer accumulates in fp32.
+- **Optimizer fusion.** PyTorch ships no fused kernel for a mixed
+  parameter/moment dtype, so the bf16-master step is `torch.compile`d instead.
+  Every row above has a fused optimizer one way or the other — `fused=True`
+  where the dtypes allow it. It is not a detail: the same update left
+  uncompiled is eleven passes over 4.39B parameters, costs 77ms a step, and
+  drags `torch.compile()` from 91,669 down to 75,490, which would have measured
+  the baseline's optimizer rather than the trainer's kernels.
+- **The classifier.** The trainer's fused classifier never materializes fp32
+  logits over the padded vocabulary; `F.cross_entropy` does. **Favors the
+  trainer**, in both memory and bandwidth.
+- **Everything else matches.** Norms, router, moments, and the update math are
+  fp32 on both sides; the update expression and its round-to-nearest commit are
+  transcribed from `optim::adamw_step` and `MasterStorage::Bf16`. Under bf16
+  masters the embedding lookup is already bf16, so the residual-stream cast that
+  the fp32 policy needed is a no-op and the one concession PyTorch used to get
+  is gone.
+- **Routing is identical**, and with a capacity factor of one both sides compute
+  `E * C` expert rows whatever the routing looks like — so load balance cannot
+  move either number.

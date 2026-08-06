@@ -135,6 +135,27 @@ image = (
     )
 )
 
+# The PyTorch throughput baseline shares nothing with the kernel toolchain
+# above -- no rustc, no LLVM, no codegen backend -- so it gets its own image
+# rather than adding a multi-gigabyte torch install to every kernel run.
+TORCH_VERSION = "2.13.0"
+
+torch_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install(
+        f"torch=={TORCH_VERSION}",
+        index_url="https://download.pytorch.org/whl/cu130",
+    )
+    .pip_install("numpy")
+    # Peak memory is close enough to the B200's that fragmentation decides
+    # whether B=16 fits.
+    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+    .add_local_file(
+        str(Path(__file__).parent / "gpu/model/baselines/pytorch_baseline.py"),
+        "/root/pytorch_baseline.py",
+    )
+)
+
 app = modal.App("rust-trainer", image=image)
 wiki_volume = modal.Volume.from_name("rust-trainer-wiki", create_if_missing=True)
 
@@ -298,6 +319,45 @@ def batch_sweep(batches: str, steps: int = 12, shard: str | None = None) -> None
             # A batch too large for HBM fails here, which is how the sweep finds
             # the ceiling; the batches after it still run.
             print(f"train B={batch} failed: {e}", flush=True)
+
+
+@app.function(
+    gpu=DEFAULT_GPU,
+    image=torch_image,
+    timeout=4 * 3600,
+    volumes={"/data": wiki_volume},
+)
+def torch_baseline(
+    tiers: str, batches: str, steps: int, shard: str | None, masters: str = "bf16"
+) -> None:
+    """Measure the same model, tokens, and MFU formula under PyTorch.
+
+    One container runs every (tier, batch) pair so the comparison is against a
+    single GPU and a single set of container conditions. A tier is a value for
+    `--compile`, with the empty string meaning eager; compiled tiers get extra
+    warmup steps so no compilation lands inside the timed window.
+    """
+    _run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], cwd="/")
+    for tier in (value.strip() for value in tiers.split(",")):
+        for batch in (int(value) for value in batches.split(",") if value.strip()):
+            cmd = ["python", "/root/pytorch_baseline.py", "--batch", str(batch), "--steps", str(steps)]
+            cmd += ["--masters", masters]
+            # Eager is measured cold, like the Rust trainer, whose first step is
+            # the one `train.rs` also discards -- except that bf16 masters
+            # compile their optimizer step, which wants a warmup of its own.
+            warmup = 3 if tier else (1 if masters == "bf16" else 0)
+            cmd += ["--warmup", str(warmup)]
+            if tier:
+                cmd += ["--compile", tier]
+            if shard:
+                cmd += ["--shard", shard]
+            print(f"=== pytorch tier={tier or 'eager'} masters={masters} B={batch} ===", flush=True)
+            try:
+                _run(cmd, cwd="/root")
+            except subprocess.CalledProcessError as e:
+                # An out-of-memory tier is a result, not a reason to lose the
+                # tiers behind it.
+                print(f"pytorch tier={tier or 'eager'} B={batch} failed: {e}", flush=True)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
@@ -624,6 +684,23 @@ def prepare(limit_files: int = 0, limit_articles: int = 0) -> None:
 def sweep_batch(batches: str = "12,16,20", steps: int = 12, shard: str = "") -> None:
     """modal run modal_app.py::sweep_batch --batches 12,16,20"""
     batch_sweep.remote(batches, steps, shard or None)
+
+
+@app.local_entrypoint()
+def pytorch_baseline(
+    tiers: str = "", batches: str = "16", steps: int = 12, shard: str = "", masters: str = "bf16"
+) -> None:
+    """modal run modal_app.py::pytorch_baseline --tiers ",reduce-overhead"
+
+    Tiers are `--compile` values, comma separated, with an empty entry meaning
+    eager -- so `""` is tier 1 alone and `",,max-autotune"` would be silly but
+    legal. The escalation rule lives in the reader, not here: run the next tier
+    only when the trainer is still ahead of the last one.
+
+    `--masters bf16` is the trainer's precision policy; `--masters fp32` is the
+    stock autocast one, kept because the first table was measured under it.
+    """
+    torch_baseline.remote(tiers, batches, steps, shard or None, masters)
 
 
 @app.local_entrypoint()
