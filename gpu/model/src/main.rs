@@ -398,6 +398,7 @@ fn expert_compute_parity<const E: usize, const C: usize, const D: usize, const F
     gemm: &model::gemm_kernels::LoadedModule,
     gemm_bf16: &model::Tcgen05Gemm,
     dense: &model::dense_kernels::LoadedModule,
+    reference: &model::dense_reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut cpu: [ExpertFfn<C, D, FF>; E] = std::array::from_fn(|expert| {
         let mut expert = ExpertFfn::initialized(700 + 3 * expert as u64);
@@ -703,6 +704,7 @@ fn muon_overfit_tiny_batch(
     flash: &model::flash_kernels::LoadedModule,
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
+    reference: &model::dense_reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     type TinyDense = Dense<4, 4, 4, 512, 4, 128, 12>;
     let tokens = [0, 1, 2, 3];
@@ -737,6 +739,7 @@ fn muon_overfit_tiny_batch(
             flash,
             flash_bf16,
             dense,
+            reference,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
@@ -750,6 +753,7 @@ fn muon_overfit_tiny_batch(
             flash,
             flash_bf16,
             dense,
+            reference,
         )?;
         optimizer.update(&mut gpu, stream, tensor, gemm)?;
     }
@@ -765,6 +769,7 @@ fn muon_overfit_tiny_batch(
         flash,
         flash_bf16,
         dense,
+        reference,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -788,6 +793,7 @@ fn overfit_tiny_batch(
     flash: &model::flash_kernels::LoadedModule,
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
+    reference: &model::dense_reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     type TinyDense = Dense<4, 4, 4, 512, 4, 128, 12>;
     let tokens = [0, 1, 2, 3];
@@ -824,6 +830,7 @@ fn overfit_tiny_batch(
             flash,
             flash_bf16,
             dense,
+            reference,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
@@ -837,6 +844,7 @@ fn overfit_tiny_batch(
             flash,
             flash_bf16,
             dense,
+            reference,
         )?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
@@ -852,6 +860,7 @@ fn overfit_tiny_batch(
         flash,
         flash_bf16,
         dense,
+        reference,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -884,6 +893,7 @@ fn aligned_tcgen05_linears(
     flash: &model::flash_kernels::LoadedModule,
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
+    reference: &model::dense_reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const NA: usize = 256;
     const TA: usize = 4;
@@ -919,6 +929,7 @@ fn aligned_tcgen05_linears(
         flash,
         flash_bf16,
         dense,
+        reference,
     )?;
     assert_close(
         "aligned loss",
@@ -939,6 +950,7 @@ fn aligned_tcgen05_linears(
         flash,
         flash_bf16,
         dense,
+        reference,
     )?;
 
     macro_rules! grad {
@@ -997,6 +1009,7 @@ fn aligned_tcgen05_linears(
             flash,
             flash_bf16,
             dense,
+            reference,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
@@ -1010,6 +1023,7 @@ fn aligned_tcgen05_linears(
             flash,
             flash_bf16,
             dense,
+            reference,
         )?;
         optimizer.update(&mut gpu, stream, tensor)?;
     }
@@ -1024,6 +1038,7 @@ fn aligned_tcgen05_linears(
         flash,
         flash_bf16,
         dense,
+        reference,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -1051,6 +1066,7 @@ fn aligned_muon_overfit(
     flash: &model::flash_kernels::LoadedModule,
     flash_bf16: &model::Tcgen05Flash,
     dense: &model::dense_kernels::LoadedModule,
+    reference: &model::dense_reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const NA: usize = 256;
     const TA: usize = 4;
@@ -1093,6 +1109,7 @@ fn aligned_muon_overfit(
             flash,
             flash_bf16,
             dense,
+            reference,
         )?;
         if initial_loss.is_none() {
             initial_loss = Some(workspace.loss().to_host(stream)?[0]);
@@ -1106,6 +1123,7 @@ fn aligned_muon_overfit(
             flash,
             flash_bf16,
             dense,
+            reference,
         )?;
         optimizer.update(&mut gpu, stream, tensor, gemm)?;
     }
@@ -1120,6 +1138,7 @@ fn aligned_muon_overfit(
         flash,
         flash_bf16,
         dense,
+        reference,
     )?;
     let final_loss = workspace.loss().to_host(stream)?[0];
     let initial_loss = initial_loss.expect("training loop runs at least once");
@@ -1616,6 +1635,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flash_bf16 = model::Tcgen05Flash::load(&ctx)?;
     let flash = model::flash_kernels::load(&ctx)?;
     let dense = model::dense_kernels::load(&ctx)?;
+    let reference = model::dense_reference_kernels::load(&ctx)?;
 
     let mut cpu = Dense::<N, T, VOCAB, D, H, HD, FF>::new(42);
     // Both sides keep bf16 masters (#57); the GPU rounds on upload, so the
@@ -1638,6 +1658,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash,
         &flash_bf16,
         &dense,
+        &reference,
     )?;
     assert_close(
         "loss",
@@ -1658,6 +1679,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash,
         &flash_bf16,
         &dense,
+        &reference,
     )?;
 
     macro_rules! grad {
@@ -1717,6 +1739,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash,
         &flash_bf16,
         &dense,
+        &reference,
     )?;
     assert_close(
         "loss (pass 2)",
@@ -1735,6 +1758,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash,
         &flash_bf16,
         &dense,
+        &reference,
     )?;
     grads!(" (pass 2)");
 
@@ -1936,6 +1960,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &dense,
+        &reference,
     )?;
     expert_compute_parity::<2, 256, 256, 256>(
         "aligned tcgen05",
@@ -1945,6 +1970,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gemm,
         &gemm_bf16,
         &dense,
+        &reference,
     )?;
     moe_model_parity::<8, 256, 4, 19, 3, 2, 3, 2>(
         "fp32-oracle",
@@ -1998,6 +2024,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash,
         &flash_bf16,
         &dense,
+        &reference,
     )?;
     muon_overfit_tiny_batch(
         &stream,
@@ -2007,6 +2034,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash,
         &flash_bf16,
         &dense,
+        &reference,
     )?;
     aligned_tcgen05_linears(
         &stream,
@@ -2016,6 +2044,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash,
         &flash_bf16,
         &dense,
+        &reference,
     )?;
     aligned_muon_overfit(
         &stream,
@@ -2025,6 +2054,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash,
         &flash_bf16,
         &dense,
+        &reference,
     )?;
     Ok(())
 }

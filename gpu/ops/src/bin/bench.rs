@@ -21,6 +21,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 #[path = "../lib.rs"]
 #[allow(dead_code)]
 mod device;
+use device::reference::kernels as reference_kernels;
 use device::{
     CLASSIFIER_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_THREADS,
     SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_THREADS, kernels, rope_table,
@@ -97,9 +98,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
-    bench_rms_norm(&stream, &module)?;
+    let reference = reference_kernels::load(&ctx)?;
+    bench_rms_norm(&stream, &reference)?;
     bench_classifier(&stream, &module)?;
-    bench_swiglu(&stream, &module)?;
+    bench_swiglu(&stream, &reference)?;
     bench_rope(&stream, &module)?;
     Ok(())
 }
@@ -156,7 +158,7 @@ fn bench_classifier(
 /// operands respectively. All four are the same walk over the same rectangle.
 fn bench_swiglu(
     stream: &std::sync::Arc<CudaStream>,
-    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let len = N * FF;
     let element = 4.0;
@@ -171,13 +173,13 @@ fn bench_swiglu(
     let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: all three buffers are `len` long and the launch covers
         // exactly that many elements.
-        unsafe { module.swiglu_forward(stream, flat, &gate, &up, &mut y)? };
+        unsafe { reference.swiglu_forward(stream, flat, &gate, &up, &mut y)? };
         Ok(())
     })?;
     let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: N divides SWIGLU_TILE_BLOCK_ROWS and FF the tile chunk.
         unsafe {
-            module.swiglu_forward_tile(
+            reference.swiglu_forward_tile(
                 stream,
                 swiglu_tile_grid(N),
                 &gate,
@@ -195,7 +197,7 @@ fn bench_swiglu(
     let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: the packed output is one word per input pair.
         unsafe {
-            module.swiglu_forward_bf16(
+            reference.swiglu_forward_bf16(
                 stream,
                 LaunchConfig::for_num_elems((len / 2) as u32),
                 &gate,
@@ -209,13 +211,13 @@ fn bench_swiglu(
 
     let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: all four buffers are `len` long.
-        unsafe { module.swiglu_backward_gate(stream, flat, &gate, &up, &dy, &mut y)? };
+        unsafe { reference.swiglu_backward_gate(stream, flat, &gate, &up, &dy, &mut y)? };
         Ok(())
     })?;
     let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: as the fp32 forward, with `dy` the third operand.
         unsafe {
-            module.swiglu_backward_gate_tile(
+            reference.swiglu_backward_gate_tile(
                 stream,
                 swiglu_tile_grid(N),
                 &gate,
@@ -231,13 +233,13 @@ fn bench_swiglu(
 
     let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: all three buffers are `len` long.
-        unsafe { module.swiglu_backward_up(stream, flat, &gate, &dy, &mut y)? };
+        unsafe { reference.swiglu_backward_up(stream, flat, &gate, &dy, &mut y)? };
         Ok(())
     })?;
     let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: as the fp32 forward, over two operands.
         unsafe {
-            module.swiglu_backward_up_tile(
+            reference.swiglu_backward_up_tile(
                 stream,
                 swiglu_tile_grid(N),
                 &gate,
@@ -294,7 +296,7 @@ fn bench_rope(
 
 fn bench_rms_norm(
     stream: &std::sync::Arc<CudaStream>,
-    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const EPS: f32 = 1e-5;
 
@@ -311,7 +313,7 @@ fn bench_rms_norm(
         // SAFETY: the launch shape is the one `rms_norm_forward_fast` documents
         // and every buffer is N x D.
         unsafe {
-            module.rms_norm_forward_fast(
+            reference.rms_norm_forward_fast(
                 stream,
                 row_grid(N, NORM_THREADS),
                 &x,
@@ -326,7 +328,7 @@ fn bench_rms_norm(
     let tile = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: N is a multiple of NORM_TILE_BLOCK_ROWS and D of the chunk.
         unsafe {
-            module.rms_norm_forward_tile(
+            reference.rms_norm_forward_tile(
                 stream,
                 norm_tile_grid(N),
                 &x,
@@ -349,7 +351,7 @@ fn bench_rms_norm(
     let shipped = time_gpu_iters(stream, WARMUP, ITERS, || {
         // SAFETY: as the forward launch, plus `inv` being N long.
         unsafe {
-            module.rms_norm_backward_x_fast(
+            reference.rms_norm_backward_x_fast(
                 stream,
                 row_grid(N, NORM_THREADS),
                 &x,
