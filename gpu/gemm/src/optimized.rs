@@ -166,9 +166,18 @@
 //!   **182 with a 2176 B frame** once — `max_active_blocks_per_multiprocessor`
 //!   of **0**, and `DriverError(701, "too many resources requested for launch")`
 //!   at the first weight-gradient launch. The same 182 launches fine at 192
-//!   threads. ptxas' allocation for these three kernels is not reproducible
-//!   across builds, and the split is what turns that variance into a kernel
-//!   that will not run.
+//!   threads.
+//!
+//!   oxide-train#122 went after that variance and found the *build* innocent:
+//!   eight rebuilds of the split commit at a fixed path give byte-identical PTX
+//!   and 140 registers every time. What is not pinned is the compiler that
+//!   allocates them — `cargo oxide` emits PTX and `cuModuleLoad` hands it to the
+//!   **driver's** JIT, so the register count is a function of whatever libcuda
+//!   the host happens to have. What made the split fragile is that its entry
+//!   points declared no `.maxntid`: the driver then *derives* the launchable
+//!   block width from the allocation it chose (measured 384 at 140 registers,
+//!   and 256 at 182 — below the split's own 320), which is the whole distance
+//!   between a launch and a `701`. [`THREADS`] carries the pin that closes it.
 //!
 //! `bin/profile`'s GEMM report exists because of the second one: `gpu/gemm`'s
 //! budget gate reads a different compilation from the one the training step
@@ -198,7 +207,7 @@
 
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{DisjointSlice, cluster, cluster_launch, kernel, thread, warp};
+use cuda_device::{DisjointSlice, cluster, cluster_launch, kernel, launch_bounds, thread, warp};
 use cuda_host::cuda_module;
 
 use kittens::epilogue::{StoreRing, Warp};
@@ -245,6 +254,19 @@ const CHUNKS: usize = BLOCK_K / 16;
 pub const STAGES: usize = 6;
 /// One warp per 32 accumulator rows — the band warps, every one of which
 /// drains — plus the producer warp and the MMA warp, which never do.
+///
+/// Every shipped entry point declares this and [`CTAS_PER_SM`] to ptxas as
+/// `#[launch_bounds(192, 1)]`, spelled out because the attribute takes integer
+/// literals only. **An entry with no `.maxntid` tells ptxas nothing about the
+/// block it will be launched in**: the allocator optimizes against the
+/// architecture's 255 registers and whether the result fits the real geometry
+/// is arithmetic nobody performs. That is oxide-train#122 — a build gave this
+/// kernel family 182 registers and a 2176 B frame for a 320-thread block,
+/// `max_active_blocks_per_multiprocessor` came back **0**, and the first launch
+/// was refused with `701`, the same 182 being fine at 192. Declared, one
+/// resident CTA is a constraint ptxas must meet rather than an outcome to hope
+/// for: an allocation that cannot reach it spills instead, which the budget
+/// gate reads and fails on.
 pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32 + 64;
 /// Warps that own a 32-row band of the accumulator.
 const DRAIN_WARPS: usize = BLOCK_M / 32;
@@ -405,7 +427,10 @@ pub const SHARED_BYTES: usize = staged(shared(SharedPlan::sizing()).plan).1.byte
 const SHARED_OPTIN: usize = 232_448;
 
 const _: () = {
-    assert!(THREADS == 192 && MAX_CLUSTERS == 74);
+    // The two halves of every entry point's `#[launch_bounds(192, 1)]`, which
+    // cannot spell either of them.
+    assert!(THREADS == 192 && CTAS_PER_SM == 1);
+    assert!(MAX_CLUSTERS == 74);
     // The item rings cost the plan nothing: their sixty-four bytes land in the
     // 128-byte alignment padding in front of the staging tiles. cuBLASLt's own
     // launch declares 213 280 B, so this is the same rung with 16 KiB more of
@@ -1117,6 +1142,7 @@ pub mod kernels {
     /// reaches, and the grid must be a whole number of clusters — see
     /// [`super::host::tcgen05_launch_config`].
     #[kernel]
+    #[launch_bounds(192, 1)]
     #[cluster_launch(2, 1, 1)]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_tcgen05_bf16_optimized(
@@ -1167,6 +1193,7 @@ pub mod kernels {
     /// As [`gemm_tcgen05_bf16_optimized`], with `c_offset..c_offset +
     /// experts * m * n` inside `c` and `experts` live descriptors at each map.
     #[kernel]
+    #[launch_bounds(192, 1)]
     #[cluster_launch(2, 1, 1)]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_tcgen05_f32_optimized(
@@ -1220,6 +1247,7 @@ pub mod kernels {
     /// reads what a store would ignore) covering every tile the item walk
     /// reaches, and nothing else may write it during the launch.
     #[kernel]
+    #[launch_bounds(192, 1)]
     #[cluster_launch(2, 1, 1)]
     pub unsafe fn gemm_tcgen05_f32_accumulate(
         a_map: *const TmaDescriptor,
