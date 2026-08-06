@@ -100,13 +100,29 @@ tokens/s and MFU per run plus each arm's mean and spread.
 The external pair is `modal run modal_app.py::versus --ref main --batch 32`,
 which alternates `bin/train` against the PyTorch baseline of
 `gpu/model/baselines/pytorch_baseline.py` the same way. It runs on `ab_image`
-— the kernel toolchain plus torch, the only image that can hold both — and
+-- the kernel toolchain plus torch, the only image that can hold both -- and
 takes the trainer from `--ref` and the script from `--torch-ref`, so the
 baseline branch stays the source of truth for what PyTorch is asked to do. The
 batch is imposed on both arms, torch's compile time lands in its own warmup
 steps, an arm whose inductor recorded CUDA graphs is rejected (the trainer has
 none), and the summary carries a 95% interval on the difference rather than
 two point estimates.
+
+At `B=32`, 30 steps, `main` (`c5a3b1a`) against `torch.compile()` with default
+mode, three containers of alternating rounds:
+
+| Container | rounds | trainer tokens/s | `torch.compile()` tokens/s | trainer/torch |
+| --- | --- | --- | --- | --- |
+| 1 | 3 | 92,517 (±0.13%) | 92,554 (±0.22%) | 0.9996 |
+| 2 | 6 | 90,048 (±0.13%) | 91,637 (±0.43%) | 0.9827 |
+| 3 | 6 | 90,716 (±0.38%) | 91,625 (±0.25%) | 0.9901 |
+
+Over all fifteen pairs the trainer is at **0.9890 of `torch.compile()`, ±0.0042
+at 95%** -- 1.1% behind, and the interval excludes parity. It is not ahead in
+any container, so `mode="max-autotune"` stays unrun by the standing escalation
+rule. The reason this needed one container is in the columns: each arm holds a
+0.13-0.43% spread *within* a container while the trainer's mean moves 2.7%
+*between* them. Pairing is what makes a 1% claim measurable at all.
 
 To add a kernel: copy `gpu/vecadd` to `gpu/<name>`, set `name` in its
 `Cargo.toml`, write the `#[kernel]` in `src/lib.rs`, and give it a real
