@@ -247,6 +247,33 @@ def run_kernel(
     _run(cmd, cwd=proj)
 
 
+@app.function(
+    gpu=DEFAULT_GPU,
+    timeout=4 * 3600,
+    volumes={"/data": wiki_volume},
+)
+def batch_sweep(batches: str, steps: int = 12, shard: str | None = None) -> None:
+    """Measure model's training throughput at several batch sizes.
+
+    `B` is a compile-time constant, so `gpu/model/src/bin/bsweep.rs` compiles a
+    fixed set of candidates and `SWEEP_B` picks one per process. One build
+    serves the whole sweep, and a batch that exhausts HBM fails in its own
+    process, leaving the rest of the sweep to run.
+    """
+    _run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], cwd="/")
+    proj = _proj("model")
+    for batch in batches.split(","):
+        env = [f"SWEEP_B={batch.strip()}", f"TRAIN_STEPS={steps}"]
+        if shard:
+            env.append(f"TRAIN_SHARD={shard}")
+        print(f"=== B={batch.strip()} ===", flush=True)
+        # Only the first candidate pays for the build; the rest hit the cache.
+        try:
+            _run(["env", *env, "cargo", "oxide", "run", "model", "--bin", "bsweep"], cwd=proj)
+        except subprocess.CalledProcessError as e:
+            print(f"B={batch.strip()} failed: {e}", flush=True)
+
+
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
 def compare_profile(kernel: str, baseline_ref: str) -> None:
     """Build a retained git baseline and the mounted candidate, then profile
@@ -565,6 +592,12 @@ def prepare_data(limit_files: int = 0, limit_articles: int = 0) -> None:
 @app.local_entrypoint()
 def prepare(limit_files: int = 0, limit_articles: int = 0) -> None:
     prepare_data.remote(limit_files, limit_articles)
+
+
+@app.local_entrypoint()
+def sweep_batch(batches: str = "12,14,16,18,20,24", steps: int = 12, shard: str = "") -> None:
+    """modal run modal_app.py::sweep_batch --batches 12,16,20"""
+    batch_sweep.remote(batches, steps, shard or None)
 
 
 @app.local_entrypoint()
