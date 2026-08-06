@@ -509,18 +509,19 @@ fn check_moe_routing(
             E as u32,
             &mut serial_router_dweight_dev,
         )?;
+        let router_wgrad_config = LaunchConfig {
+            grid_dim: (
+                D.div_ceil(ROUTER_WGRAD_BM) as u32,
+                ROUTER_WGRAD_SPLITS as u32,
+                1,
+            ),
+            block_dim: (ROUTER_WGRAD_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             module.router_backward_weight_split(
                 stream,
-                LaunchConfig {
-                    grid_dim: (
-                        D.div_ceil(ROUTER_WGRAD_BM) as u32,
-                        ROUTER_WGRAD_SPLITS as u32,
-                        1,
-                    ),
-                    block_dim: (ROUTER_WGRAD_THREADS as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                router_wgrad_config,
                 &x_dev,
                 &dlogits_dev,
                 N as u32,
@@ -528,8 +529,6 @@ fn check_moe_routing(
                 D as u32,
                 &mut router_dweight_partials_dev,
             )?;
-        }
-        unsafe {
             module.router_backward_weight_merge(
                 stream,
                 LaunchConfig::for_num_elems((D * E) as u32),
@@ -551,15 +550,7 @@ fn check_moe_routing(
         unsafe {
             module.router_backward_weight_split(
                 stream,
-                LaunchConfig {
-                    grid_dim: (
-                        D.div_ceil(ROUTER_WGRAD_BM) as u32,
-                        ROUTER_WGRAD_SPLITS as u32,
-                        1,
-                    ),
-                    block_dim: (ROUTER_WGRAD_THREADS as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
+                router_wgrad_config,
                 &x_dev,
                 &dlogits_dev,
                 N as u32,
