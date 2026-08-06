@@ -11,7 +11,9 @@ use optim::{AdamWConfig, AuxLossSchedule};
 
 #[path = "../lib.rs"]
 mod model;
-use model::{GpuDense, GpuDenseAdamW, GpuMoeWorkspace, NORM_THREADS};
+use model::{
+    GEMM_SHARED_BYTES, GEMM_THREADS, GpuDense, GpuDenseAdamW, GpuMoeWorkspace, NORM_THREADS,
+};
 
 const B: usize = 12;
 const T: usize = 2_048;
@@ -79,6 +81,32 @@ fn report_norm_kernels(
     Ok(())
 }
 
+/// The same for the three tcgen05 GEMMs, which `gpu/gemm`'s own gate also
+/// prints — and prints *different numbers* for.
+///
+/// Same source, other crate: what ptxas allocates depends on what else it is
+/// compiling, so the counts the GEMM budget pins are the counts in `gpu/gemm`
+/// and not necessarily the ones the training step launches. That matters more
+/// than it reads: a launch whose block a thread's registers do not divide into
+/// the file is refused outright (`701`), not merely made slow, so the number to
+/// read here is `blocks/SM` — a **zero** is a launch the driver will not take.
+fn report_gemm_kernels(gemm: &model::Tcgen05Gemm) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "tcgen05 GEMMs (registers/thread, spill bytes, CTAs/SM at {GEMM_THREADS} threads \
+         and {GEMM_SHARED_BYTES} B)"
+    );
+    for (name, function) in gemm.kernels() {
+        let profile = function_profile(function)?;
+        let blocks = function
+            .max_active_blocks_per_multiprocessor(GEMM_THREADS, GEMM_SHARED_BYTES as u32)?;
+        println!(
+            "  {name:<38} {:>3} regs, {:>4} spill bytes, {blocks} CTAs/SM",
+            profile.registers, profile.spill_bytes
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(N, B * T);
     assert_eq!(D, H * HD);
@@ -110,6 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flash = model::flash_kernels::load(&ctx)?;
     let dense = model::dense_kernels::load(&ctx)?;
     report_norm_kernels(&dense)?;
+    report_gemm_kernels(&gemm_bf16)?;
 
     let aux_schedule = AuxLossSchedule::default();
     eprintln!("profile setup: initializing parameters block by block");
