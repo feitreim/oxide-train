@@ -294,8 +294,7 @@ def batch_sweep(
     if shard:
         env.append(f"TRAIN_SHARD={shard}")
 
-    for batch in batches.split(","):
-        batch = batch.strip()
+    for batch in filter(None, (value.strip() for value in batches.split(","))):
         _set_train_batch(proj, int(batch))
         print(f"=== train B={batch} ===", flush=True)
         try:
