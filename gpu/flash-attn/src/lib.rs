@@ -959,6 +959,57 @@ pub mod kernels {
         }
     }
 
+    /// [`flash_attention_backward_dot`] reading a packed-bf16 attention
+    /// output.
+    ///
+    /// `y` is a saved activation and is stored packed; `dy` is a backward
+    /// temporary and stays fp32. The product and the tree reduction are the
+    /// twin's fp32 ones.
+    #[kernel]
+    pub fn flash_attention_backward_dot_bf16(
+        dy: &[f32],
+        output: &[u32],
+        head_dim: u32,
+        mut dot: DisjointSlice<f32>,
+    ) {
+        static mut PARTIALS: SharedArray<f32, MAX_HEAD_DIM> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let hd = head_dim as usize;
+        if hd == 0
+            || hd > MAX_HEAD_DIM
+            || !hd.is_power_of_two()
+            || thread::blockDim_x() as usize != hd
+        {
+            return;
+        }
+        let row_head = thread::blockIdx_x() as usize;
+        let base = row_head * hd;
+        let element = base + tid;
+        let word = output[element / 2];
+        let bits = (if element % 2 == 0 { word } else { word >> 16 }) as u16;
+        unsafe {
+            PARTIALS[tid] = dy[element] * f32::from_bits((bits as u32) << 16);
+        }
+        thread::sync_threads();
+        let mut stride = hd / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    PARTIALS[tid] += PARTIALS[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            // SAFETY: one block owns each `row_head` dot.
+            unsafe {
+                *dot.get_unchecked_mut(row_head) = PARTIALS[0];
+            }
+        }
+    }
+
     /// FlashAttention-2 style tiled dQ.
     ///
     /// One block owns `(sequence, head, query block)`; probabilities are

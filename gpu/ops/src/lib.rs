@@ -255,6 +255,22 @@ pub mod kernels {
         f32_to_bf16_bits(low) as u32 | ((f32_to_bf16_bits(high) as u32) << 16)
     }
 
+    /// The logical element `index` of a packed-bf16 buffer: low half is even.
+    #[inline(always)]
+    fn bf16_at(words: &[u32], index: usize) -> f32 {
+        let word = words[index / 2];
+        bf16_bits_to_f32((if index % 2 == 0 { word } else { word >> 16 }) as u16)
+    }
+
+    /// Both halves of one packed word, low first.
+    #[inline(always)]
+    fn bf16_halves(word: u32) -> [f32; 2] {
+        [
+            bf16_bits_to_f32(word as u16),
+            bf16_bits_to_f32((word >> 16) as u16),
+        ]
+    }
+
     #[kernel]
     pub fn rms_norm_forward(
         x: &[f32],
@@ -387,6 +403,83 @@ pub mod kernels {
         }
     }
 
+    /// [`rms_norm_forward_fast`] over a packed-bf16 activation stream.
+    ///
+    /// A lane owns whole words, so it carries two values per step; the sum of
+    /// squares, the scale and the weight product all stay in fp32 registers
+    /// and only the store rounds. There is no tile arm for this dtype: the
+    /// tile kernel's advantage over the block-per-row one was loads in flight
+    /// (see [`rms_norm_forward_tile`]), and packing the stream doubles the
+    /// elements each of these lanes already carries.
+    #[kernel]
+    pub fn rms_norm_forward_fast_bf16(
+        x: &[u32],
+        weight: &[f32],
+        eps: f32,
+        dim: u32,
+        mut y: DisjointSlice<u32>,
+    ) {
+        static mut PARTIALS: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != NORM_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        if d == 0 || !d.is_multiple_of(2) {
+            return;
+        }
+        let words = d / 2;
+        let base = row * words;
+        if base + words > x.len() || base + words > y.len() || d > weight.len() {
+            return;
+        }
+
+        let mut sum_sq = 0.0f32;
+        let mut word = tid;
+        while word < words {
+            let [low, high] = bf16_halves(x[base + word]);
+            sum_sq += low * low + high * high;
+            word += NORM_THREADS;
+        }
+        unsafe {
+            PARTIALS[tid] = sum_sq;
+        }
+        thread::sync_threads();
+
+        let mut stride = NORM_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    PARTIALS[tid] += PARTIALS[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            unsafe {
+                PARTIALS[0] = 1.0 / (PARTIALS[0] / dim as f32 + eps).sqrt();
+            }
+        }
+        thread::sync_threads();
+
+        let inv = unsafe { PARTIALS[0] };
+        word = tid;
+        while word < words {
+            let [low, high] = bf16_halves(x[base + word]);
+            // SAFETY: each lane owns distinct words of this block's row.
+            unsafe {
+                *y.get_unchecked_mut(base + word) = bf16_pair(
+                    low * inv * weight[2 * word],
+                    high * inv * weight[2 * word + 1],
+                );
+            }
+            word += NORM_THREADS;
+        }
+    }
+
     /// Block-per-row RMSNorm input backward, also producing the row inverse
     /// factors consumed by the weight-gradient kernel.
     ///
@@ -467,6 +560,91 @@ pub mod kernels {
             unsafe {
                 *dx.get_unchecked_mut(base + col) =
                     dy[base + col] * weight[col] * row_inv - x[base + col] * correction;
+            }
+            col += NORM_THREADS;
+        }
+    }
+
+    /// [`rms_norm_backward_x_fast`] reading its saved input packed.
+    ///
+    /// Only `x` changes dtype: the incoming and outgoing gradients are
+    /// backward temporaries and stay fp32, and both reductions still
+    /// accumulate in fp32 registers.
+    #[kernel]
+    pub fn rms_norm_backward_x_fast_bf16(
+        x: &[u32],
+        weight: &[f32],
+        dy: &[f32],
+        eps: f32,
+        dim: u32,
+        mut dx: DisjointSlice<f32>,
+        mut inv: DisjointSlice<f32>,
+    ) {
+        static mut SUM_SQ: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+        static mut DOT: SharedArray<f32, NORM_THREADS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != NORM_THREADS {
+            return;
+        }
+        let row = thread::blockIdx_x() as usize;
+        let d = dim as usize;
+        let base = row * d;
+        if d == 0
+            || !d.is_multiple_of(2)
+            || base + d > x.len() * 2
+            || base + d > dy.len()
+            || base + d > dx.len()
+            || d > weight.len()
+            || row >= inv.len()
+        {
+            return;
+        }
+
+        let mut sum_sq = 0.0f32;
+        let mut dot = 0.0f32;
+        let mut col = tid;
+        while col < d {
+            let value = bf16_at(x, base + col);
+            sum_sq += value * value;
+            dot += dy[base + col] * weight[col] * value;
+            col += NORM_THREADS;
+        }
+        unsafe {
+            SUM_SQ[tid] = sum_sq;
+            DOT[tid] = dot;
+        }
+        thread::sync_threads();
+
+        let mut stride = NORM_THREADS / 2;
+        while stride > 0 {
+            if tid < stride {
+                unsafe {
+                    SUM_SQ[tid] += SUM_SQ[tid + stride];
+                    DOT[tid] += DOT[tid + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if tid == 0 {
+            unsafe {
+                let row_inv = 1.0 / (SUM_SQ[0] / dim as f32 + eps).sqrt();
+                SUM_SQ[0] = row_inv;
+                DOT[0] = row_inv * row_inv * row_inv * DOT[0] / dim as f32;
+                *inv.get_unchecked_mut(row) = row_inv;
+            }
+        }
+        thread::sync_threads();
+
+        let row_inv = unsafe { SUM_SQ[0] };
+        let correction = unsafe { DOT[0] };
+        col = tid;
+        while col < d {
+            // SAFETY: each lane owns distinct columns of this block's row.
+            unsafe {
+                *dx.get_unchecked_mut(base + col) =
+                    dy[base + col] * weight[col] * row_inv - bf16_at(x, base + col) * correction;
             }
             col += NORM_THREADS;
         }
@@ -582,6 +760,44 @@ pub mod kernels {
         let mut grad = 0.0f32;
         for row in row_start..row_end {
             grad += dy[row * d + col] * x[row * d + col] * inv[row];
+        }
+
+        // SAFETY: `col` was bounds-checked and every access to this location
+        // in this kernel is atomic. Stream ordering covers the preceding
+        // zero/accumulation state and subsequent optimizer read.
+        let slot = unsafe { DeviceAtomicF32::from_ptr(dweight.as_mut_ptr().add(col)) };
+        slot.fetch_add(grad, AtomicOrdering::Relaxed);
+    }
+
+    /// [`rms_norm_backward_weight_fast`] reading its saved input packed.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`rms_norm_backward_weight_fast`], and `dim` must be
+    /// even so a row starts on a word boundary.
+    #[kernel]
+    pub unsafe fn rms_norm_backward_weight_fast_bf16(
+        x: &[u32],
+        dy: &[f32],
+        inv: &[f32],
+        rows: u32,
+        dim: u32,
+        mut dweight: DisjointSlice<f32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != NORM_THREADS {
+            return;
+        }
+        let d = dim as usize;
+        let col = thread::blockIdx_x() as usize * NORM_THREADS + tid;
+        if col >= d || col >= dweight.len() {
+            return;
+        }
+        let row_start = thread::blockIdx_y() as usize * NORM_WEIGHT_ROWS_PER_BLOCK;
+        let row_end = (row_start + NORM_WEIGHT_ROWS_PER_BLOCK).min(rows as usize);
+        let mut grad = 0.0f32;
+        for row in row_start..row_end {
+            grad += dy[row * d + col] * bf16_at(x, row * d + col) * inv[row];
         }
 
         // SAFETY: `col` was bounds-checked and every access to this location
@@ -1107,6 +1323,30 @@ pub mod kernels {
             let word = weight[element / 2];
             let bits = (if element % 2 == 0 { word } else { word >> 16 }) as u16;
             *slot = f32::from_bits((bits as u32) << 16);
+        }
+    }
+
+    /// [`embedding_forward`] writing the packed activation stream.
+    ///
+    /// The master is already bf16 (#57) and so is the stream, so a row of the
+    /// table reaches the first block's input as whole words: this lookup
+    /// neither widens nor rounds, and moves half the bytes of the fp32 one.
+    #[kernel]
+    pub fn embedding_forward_bf16(
+        weight: &[u32],
+        tokens: &[u32],
+        dim: u32,
+        mut y: DisjointSlice<u32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let d = dim as usize;
+        if d == 0 || !d.is_multiple_of(2) {
+            return;
+        }
+        let words = d / 2;
+        if let Some(slot) = y.get_mut(index) {
+            *slot = weight[tokens[i / words] as usize * words + i % words];
         }
     }
 
@@ -2132,6 +2372,112 @@ pub mod kernels {
         unsafe { router_gemm_impl(n, e, d, x, weight, logits) }
     }
 
+    /// [`router_gemm_impl`] with a packed-bf16 `A`.
+    ///
+    /// Only the token tile's staging load differs: it widens on the way into
+    /// shared memory, so the inner product and the accumulator are the fp32
+    /// ones the twin uses and the router's own arithmetic is unchanged.
+    #[inline(always)]
+    unsafe fn router_gemm_bf16_impl(
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[u32],
+        b: &[f32],
+        mut c: DisjointSlice<f32>,
+    ) {
+        static mut TILE_A: SharedArray<f32, { ROUTER_GEMM_BM * ROUTER_GEMM_BK }> =
+            SharedArray::UNINIT;
+        static mut TILE_B: SharedArray<f32, { ROUTER_GEMM_BK * ROUTER_GEMM_BN }> =
+            SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != ROUTER_GEMM_THREADS {
+            return;
+        }
+        let thread_row = tid / ROUTER_GEMM_BN;
+        let thread_col = tid % ROUTER_GEMM_BN;
+        let block_row = thread::blockIdx_y() as usize * ROUTER_GEMM_BM;
+        let block_col = thread::blockIdx_x() as usize * ROUTER_GEMM_BN;
+        let mut accumulator = 0.0f32;
+
+        let mut k_base = 0usize;
+        while k_base < k {
+            let mut local = tid;
+            while local < ROUTER_GEMM_BM * ROUTER_GEMM_BK {
+                let tile_row = local / ROUTER_GEMM_BK;
+                let tile_col = local % ROUTER_GEMM_BK;
+                let global_row = block_row + tile_row;
+                let global_col = k_base + tile_col;
+                unsafe {
+                    TILE_A[tile_row * ROUTER_GEMM_BK + tile_col] =
+                        if global_row < m && global_col < k {
+                            bf16_at(a, global_row * k + global_col)
+                        } else {
+                            0.0
+                        };
+                }
+                local += ROUTER_GEMM_THREADS;
+            }
+
+            local = tid;
+            while local < ROUTER_GEMM_BK * ROUTER_GEMM_BN {
+                let tile_row = local / ROUTER_GEMM_BN;
+                let tile_col = local % ROUTER_GEMM_BN;
+                let global_row = k_base + tile_row;
+                let global_col = block_col + tile_col;
+                unsafe {
+                    TILE_B[tile_row * ROUTER_GEMM_BN + tile_col] =
+                        if global_row < k && global_col < n {
+                            b[global_row * n + global_col]
+                        } else {
+                            0.0
+                        };
+                }
+                local += ROUTER_GEMM_THREADS;
+            }
+            thread::sync_threads();
+
+            let mut inner = 0usize;
+            while inner < ROUTER_GEMM_BK {
+                unsafe {
+                    accumulator += TILE_A[thread_row * ROUTER_GEMM_BK + inner]
+                        * TILE_B[inner * ROUTER_GEMM_BN + thread_col];
+                }
+                inner += 1;
+            }
+            thread::sync_threads();
+            k_base += ROUTER_GEMM_BK;
+        }
+
+        let global_row = block_row + thread_row;
+        let global_col = block_col + thread_col;
+        if global_row < m && global_col < n {
+            unsafe {
+                *c.get_unchecked_mut(global_row * n + global_col) = accumulator;
+            }
+        }
+    }
+
+    /// [`router_logits`] over a packed-bf16 token stream. The router weight
+    /// and the logits stay fp32: the router is an fp32 parameter by design.
+    #[kernel]
+    pub unsafe fn router_logits_bf16(
+        x: &[u32],
+        weight: &[f32],
+        dim: u32,
+        experts: u32,
+        logits: DisjointSlice<f32>,
+    ) {
+        let d = dim as usize;
+        let e = experts as usize;
+        if d == 0 || e == 0 || !(x.len() * 2).is_multiple_of(d) {
+            return;
+        }
+        let n = x.len() * 2 / d;
+        unsafe { router_gemm_bf16_impl(n, e, d, x, weight, logits) }
+    }
+
     /// Per-token softmax, deterministic top-k, and selected-probability
     /// renormalization. Ties select the lower expert index.
     #[kernel]
@@ -2579,6 +2925,97 @@ pub mod kernels {
         }
     }
 
+    /// [`moe_scatter_bf16_quad`] with a packed source.
+    ///
+    /// The token stream is already the dtype the bins hold, so the scatter is
+    /// one 8-byte copy per thread: it reads half the bytes of the fp32 twin
+    /// and rounds nothing at all. `dim` must be a multiple of [`QUAD_LANES`].
+    #[kernel]
+    pub unsafe fn moe_scatter_packed_quad(
+        x: &[u32],
+        selected_experts: &[u32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut expert_input: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if d == 0 || k == 0 || !d.is_multiple_of(QUAD_LANES) {
+            return;
+        }
+        let row_quads = d / QUAD_LANES;
+        let pair = i / row_quads;
+        let quad = i % row_quads;
+        if pair >= selected_experts.len() || pair >= slots.len() {
+            return;
+        }
+        let slot = slots[pair];
+        if slot == MOE_DROPPED_SLOT {
+            return;
+        }
+        let expert = selected_experts[pair] as usize;
+        let token = pair / k;
+        let source = token * (d / 2) + 2 * quad;
+        let word = (expert * c + slot as usize) * (d / 2) + 2 * quad;
+        if source + 1 >= x.len() || word + 1 >= expert_input.len() {
+            return;
+        }
+        // SAFETY: `source` and `word` are both even, so the 8-byte load and
+        // store are aligned; bounds were checked above and deterministic bin
+        // assignment guarantees one writer per accepted slot.
+        let packed = unsafe { *(x.as_ptr().add(source) as *const u64) };
+        unsafe {
+            *(expert_input.as_mut_ptr().add(word) as *mut u64) = packed;
+        }
+    }
+
+    /// [`moe_scatter`] with a packed source and an fp32 destination, for the
+    /// shapes whose expert panels miss the tcgen05 contract and stay wide.
+    /// The destination must be pre-zeroed.
+    #[kernel]
+    pub unsafe fn moe_scatter_packed_wide(
+        x: &[u32],
+        selected_experts: &[u32],
+        slots: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut expert_input: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if d == 0 || k == 0 {
+            return;
+        }
+        let pair = i / d;
+        let column = i % d;
+        if pair >= selected_experts.len() || pair >= slots.len() {
+            return;
+        }
+        let slot = slots[pair];
+        if slot == MOE_DROPPED_SLOT {
+            return;
+        }
+        let expert = selected_experts[pair] as usize;
+        let token = pair / k;
+        let output = (expert * c + slot as usize) * d + column;
+        let source = token * d + column;
+        if source >= x.len() * 2 || output >= expert_input.len() {
+            return;
+        }
+        // Deterministic bin assignment guarantees one writer per accepted slot.
+        unsafe {
+            *expert_input.get_unchecked_mut(output) = bf16_at(x, source);
+        }
+    }
+
     /// Gather expert outputs to token order using the renormalized gate weights.
     #[kernel]
     pub fn moe_gather_combine(
@@ -2724,6 +3161,133 @@ pub mod kernels {
         }
         unsafe {
             *(output.as_mut_ptr().add(base) as *mut u128) = quad_bits(value);
+        }
+    }
+
+    /// [`moe_gather_combine_add`] on a packed residual stream, one word per
+    /// thread. The arm for a `dim` the quad twin's 16-byte accesses cannot
+    /// cover; `dim` must still be even.
+    #[kernel]
+    pub fn moe_gather_combine_add_bf16(
+        expert_output: &[f32],
+        selected_experts: &[u32],
+        gate_weights: &[f32],
+        slots: &[u32],
+        residual: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut output: DisjointSlice<u32>,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if d == 0 || k == 0 || !d.is_multiple_of(2) {
+            return;
+        }
+        let words = d / 2;
+        let token = i / words;
+        let column = 2 * (i % words);
+        if (token + 1) * k > slots.len()
+            || (token + 1) * k > selected_experts.len()
+            || (token + 1) * k > gate_weights.len()
+            || i >= residual.len()
+        {
+            return;
+        }
+        let mut value = bf16_halves(residual[i]);
+        for rank in 0..k {
+            let pair = token * k + rank;
+            let slot = slots[pair];
+            if slot != MOE_DROPPED_SLOT {
+                let expert = selected_experts[pair] as usize;
+                let input = (expert * c + slot as usize) * d + column;
+                if input + 1 >= expert_output.len() {
+                    return;
+                }
+                let gate = gate_weights[pair];
+                value[0] += gate * expert_output[input];
+                value[1] += gate * expert_output[input + 1];
+            }
+        }
+        if let Some(slot) = output.get_mut(index) {
+            *slot = bf16_pair(value[0], value[1]);
+        }
+    }
+
+    /// [`moe_gather_combine_add_quad`] on a packed residual stream.
+    ///
+    /// The expert outputs stay fp32 — they are the down projection's epilogue
+    /// target — and the combine still sums in fp32 registers. Only the
+    /// residual read and the block-output store are packed, so the block
+    /// boundary rounds exactly once.
+    #[kernel]
+    pub unsafe fn moe_gather_combine_add_quad_bf16(
+        expert_output: &[f32],
+        selected_experts: &[u32],
+        gate_weights: &[f32],
+        slots: &[u32],
+        residual: &[u32],
+        dim: u32,
+        top_k: u32,
+        capacity: u32,
+        mut output: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        let d = dim as usize;
+        let k = top_k as usize;
+        let c = capacity as usize;
+        if d == 0 || k == 0 || !d.is_multiple_of(QUAD_LANES) {
+            return;
+        }
+        let row_quads = d / QUAD_LANES;
+        let token = i / row_quads;
+        let quad = i % row_quads;
+        let base = token * (d / 2) + 2 * quad;
+        if base + 1 >= residual.len()
+            || base + 1 >= output.len()
+            || (token + 1) * k > slots.len()
+            || (token + 1) * k > selected_experts.len()
+            || (token + 1) * k > gate_weights.len()
+        {
+            return;
+        }
+        // SAFETY: `base` is even so the 8-byte residual load and output store
+        // are aligned, and every bin row offset is a multiple of `QUAD_LANES`
+        // so the 16-byte expert reads are; bounds were checked above and this
+        // thread exclusively owns its output quad.
+        let packed = unsafe { *(residual.as_ptr().add(base) as *const u64) };
+        let mut value = [
+            bf16_bits_to_f32(packed as u16),
+            bf16_bits_to_f32((packed >> 16) as u16),
+            bf16_bits_to_f32((packed >> 32) as u16),
+            bf16_bits_to_f32((packed >> 48) as u16),
+        ];
+        for rank in 0..k {
+            let pair = token * k + rank;
+            let slot = slots[pair];
+            if slot != MOE_DROPPED_SLOT {
+                let expert = selected_experts[pair] as usize;
+                let input = (expert * c + slot as usize) * d + QUAD_LANES * quad;
+                if input + QUAD_LANES > expert_output.len() {
+                    return;
+                }
+                let gate = gate_weights[pair];
+                let outputs =
+                    quad_lanes(unsafe { *(expert_output.as_ptr().add(input) as *const u128) });
+                for lane in 0..QUAD_LANES {
+                    value[lane] += gate * outputs[lane];
+                }
+            }
+        }
+        let mut store = 0u64;
+        for lane in 0..QUAD_LANES {
+            store |= (f32_to_bf16_bits(value[lane]) as u64) << (16 * lane);
+        }
+        unsafe {
+            *(output.as_mut_ptr().add(base) as *mut u64) = store;
         }
     }
 
@@ -3494,6 +4058,94 @@ pub mod kernels {
             while slot < ROUTER_WGRAD_ROWS {
                 let row = row_base + slot * ROUTER_WGRAD_THREADS;
                 let value = if row < d { x[row_offset + row] } else { 0.0 };
+                let mut expert = 0usize;
+                while expert < ROUTER_MAX_EXPERTS {
+                    accumulators[slot][expert] += value * gates[expert];
+                    expert += 1;
+                }
+                slot += 1;
+            }
+            token += 1;
+        }
+
+        let mut slot = 0usize;
+        while slot < ROUTER_WGRAD_ROWS {
+            let row = row_base + slot * ROUTER_WGRAD_THREADS;
+            if row < d {
+                let mut expert = 0usize;
+                while expert < e {
+                    unsafe {
+                        *partials.get_unchecked_mut((split * e + expert) * d + row) =
+                            accumulators[slot][expert];
+                    }
+                    expert += 1;
+                }
+            }
+            slot += 1;
+        }
+    }
+
+    /// [`router_backward_weight_split`] reading its saved input packed.
+    ///
+    /// The partition boundaries, the per-lane register tile and the ascending
+    /// reduction order are the twin's, so this stays as deterministic as it
+    /// was; only the `x` load widens.
+    #[kernel]
+    pub unsafe fn router_backward_weight_split_bf16(
+        x: &[u32],
+        dlogits: &[f32],
+        tokens: u32,
+        experts: u32,
+        dim: u32,
+        mut partials: DisjointSlice<f32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS {
+            return;
+        }
+        let n = tokens as usize;
+        let e = experts as usize;
+        let d = dim as usize;
+        if e == 0
+            || e > ROUTER_MAX_EXPERTS
+            || d == 0
+            || n * d > x.len() * 2
+            || n * e > dlogits.len()
+        {
+            return;
+        }
+        let split = thread::blockIdx_y() as usize;
+        let row_base = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM + tid;
+        if (split + 1) * e * d > partials.len() {
+            return;
+        }
+
+        let partition = n.div_ceil(ROUTER_WGRAD_SPLITS);
+        let token_end = ((split + 1) * partition).min(n);
+        let mut token = (split * partition).min(n);
+
+        let mut accumulators = [[0.0f32; ROUTER_MAX_EXPERTS]; ROUTER_WGRAD_ROWS];
+        while token < token_end {
+            let mut gates = [0.0f32; ROUTER_MAX_EXPERTS];
+            let mut expert = 0usize;
+            while expert < ROUTER_MAX_EXPERTS {
+                gates[expert] = if expert < e {
+                    dlogits[token * e + expert]
+                } else {
+                    0.0
+                };
+                expert += 1;
+            }
+
+            let row_offset = token * d;
+            let mut slot = 0usize;
+            while slot < ROUTER_WGRAD_ROWS {
+                let row = row_base + slot * ROUTER_WGRAD_THREADS;
+                let value = if row < d {
+                    bf16_at(x, row_offset + row)
+                } else {
+                    0.0
+                };
                 let mut expert = 0usize;
                 while expert < ROUTER_MAX_EXPERTS {
                     accumulators[slot][expert] += value * gates[expert];

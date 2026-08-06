@@ -116,7 +116,7 @@ use gemm_device::host::{
 use tensor_device::{
     GpuAdamWMoments, GpuBf16Tensor, GpuMuonMomentum, GpuTensor, MASTER_ROUNDING_NEAREST,
     MASTER_ROUNDING_STOCHASTIC, MasterAdamW, master_transpose_config, pack_bf16_pairs,
-    transpose_pairs_config,
+    transpose_pairs_config, unpack_bf16_pairs,
 };
 
 pub mod checkpoint;
@@ -380,6 +380,34 @@ fn add_into<S: Shape, P: KernelProfiler>(
     })
 }
 
+/// The residual add on a packed stream: `output = stream + projection`.
+///
+/// `stream` and `output` are packed activations and `projection` is the fp32
+/// epilogue target of the projection that feeds the branch. The sum itself is
+/// computed in fp32 registers, so a layer boundary costs one rounding rather
+/// than one per operand.
+fn add_bf16_into<const N: usize, const D: usize, P: KernelProfiler>(
+    stream_input: &Bf16Acts<N, D>,
+    projection: &GpuTensor<f32, Rank2<N, D>>,
+    output: &mut Bf16Acts<N, D>,
+    stream: &CudaStream,
+    kernels: &tensor_kernels::LoadedModule,
+    profiler: &mut P,
+    name: &'static str,
+) -> Result<(), DriverError> {
+    // SAFETY: one thread per word of an `[N, D]` stream, and the fp32 operand
+    // holds the `N * D` elements those words cover.
+    profiler.measure(stream, name, || unsafe {
+        kernels.add_bf16(
+            stream,
+            Bf16Acts::<N, D>::words_config(),
+            stream_input.as_device_buffer(),
+            projection.as_device_buffer(),
+            output.as_device_buffer_mut(),
+        )
+    })
+}
+
 fn fill_zero<S: Shape, P: KernelProfiler>(
     output: &mut GpuTensor<f32, S>,
     stream: &CudaStream,
@@ -444,8 +472,11 @@ fn scale_into<S: Shape, P: KernelProfiler>(
 /// The weight operand is an unshaped buffer because it is the widened view of
 /// a bf16 master, not a tensor in its own right; its extent is checked by the
 /// caller's const generics.
+/// The activation operand is an unshaped buffer for the same reason the weight
+/// is: the stream it comes from is packed bf16, and this GEMM family reads the
+/// fp32 copy [`LinearScratch::oracle_input`] widened for it.
 fn gemm_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
-    lhs: &GpuTensor<f32, Rank2<M, K>>,
+    lhs: &DeviceBuffer<f32>,
     rhs: &DeviceBuffer<f32>,
     output: &mut GpuTensor<f32, Rank2<M, N>>,
     stream: &CudaStream,
@@ -460,7 +491,7 @@ fn gemm_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
             M,
             N,
             K,
-            lhs.as_device_buffer(),
+            lhs,
             rhs,
             output.as_device_buffer_mut(),
         )
@@ -468,7 +499,7 @@ fn gemm_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
 }
 
 fn gemm_tn_accumulate_into<const M: usize, const K: usize, const N: usize, P: KernelProfiler>(
-    lhs: &GpuTensor<f32, Rank2<M, K>>,
+    lhs: &DeviceBuffer<f32>,
     rhs: &GpuTensor<f32, Rank2<M, N>>,
     output: &mut GpuTensor<f32, Rank2<K, N>>,
     stream: &CudaStream,
@@ -483,7 +514,7 @@ fn gemm_tn_accumulate_into<const M: usize, const K: usize, const N: usize, P: Ke
             K,
             N,
             M,
-            lhs.as_device_buffer(),
+            lhs,
             rhs.as_device_buffer(),
             output.as_device_buffer_mut(),
         )
@@ -710,6 +741,11 @@ impl<const N: usize, const D: usize, const FF: usize> Bf16LinearScratch<N, D, FF
 struct LinearScratch<const N: usize, const D: usize, const FF: usize> {
     bf16: Option<Bf16LinearScratch<N, D, FF>>,
     oracle_weights: Option<DeviceBuffer<f32>>,
+    /// The fp32 copy of a packed activation the fallback GEMM reads. The
+    /// activation stream is packed for every shape, but this GEMM family is
+    /// not, so a shape that misses the tcgen05 contract widens its input here
+    /// first. No training shape reaches it.
+    oracle_input: Option<DeviceBuffer<f32>>,
 }
 
 impl<const N: usize, const D: usize, const FF: usize> LinearScratch<N, D, FF> {
@@ -728,19 +764,28 @@ impl<const N: usize, const D: usize, const FF: usize> LinearScratch<N, D, FF> {
             && widths
                 .iter()
                 .all(|&(input, output)| tcgen05_linear_eligible(N, input, output));
-        let oracle_weights = if all_tcgen05 {
-            None
+        let (oracle_weights, oracle_input) = if all_tcgen05 {
+            (None, None)
         } else {
             let elements = widths
                 .iter()
                 .map(|&(input, output)| input * output)
                 .max()
                 .expect("a block has at least one linear");
-            Some(DeviceBuffer::zeroed(stream, elements)?)
+            let inputs = widths
+                .iter()
+                .map(|&(input, _)| N * input)
+                .max()
+                .expect("a block has at least one linear");
+            (
+                Some(DeviceBuffer::zeroed(stream, elements)?),
+                Some(DeviceBuffer::zeroed(stream, inputs)?),
+            )
         };
         Ok(Self {
             bf16,
             oracle_weights,
+            oracle_input,
         })
     }
 
@@ -748,6 +793,42 @@ impl<const N: usize, const D: usize, const FF: usize> LinearScratch<N, D, FF> {
         self.oracle_weights
             .as_mut()
             .expect("the fp32 oracle path needs its widened weight staging")
+    }
+
+    /// Widen a packed activation into the staging the fallback GEMM reads.
+    fn widen_input<const W: usize>(
+        &mut self,
+        x: &Bf16Acts<N, W>,
+        stream: &CudaStream,
+        kernels: &tensor_kernels::LoadedModule,
+    ) -> Result<(), DriverError> {
+        let wide = self
+            .oracle_input
+            .as_mut()
+            .expect("the fp32 oracle path needs its widened input staging");
+        // SAFETY: the staging holds `N * W` elements for the widest linear
+        // this scratch serves, and the launch covers exactly that many.
+        unsafe {
+            kernels.convert_bf16_pairs_to_f32(
+                stream,
+                LaunchConfig::for_num_elems((N * W) as u32),
+                x.as_device_buffer(),
+                wide,
+            )
+        }
+    }
+
+    /// The widened `(activation, weight)` pair the fallback GEMM reads, after
+    /// [`LinearScratch::widen_input`] and `widen_into` have filled them.
+    fn oracle_operands(&self) -> (&DeviceBuffer<f32>, &DeviceBuffer<f32>) {
+        (
+            self.oracle_input
+                .as_ref()
+                .expect("the fp32 oracle path needs its widened input staging"),
+            self.oracle_weights
+                .as_ref()
+                .expect("the fp32 oracle path needs its widened weight staging"),
+        )
     }
 }
 
@@ -852,6 +933,70 @@ impl<const N: usize, const T: usize, const D: usize, const H: usize>
     }
 }
 
+/// One `[N, W]` saved activation, stored packed-bf16 in the dtype its readers
+/// want, with the two descriptors they address it through.
+///
+/// Every consumer of a saved activation on the training path is either a
+/// tcgen05 GEMM operand or a pointwise kernel that widens per element. The
+/// GEMMs want K-major for a row operand and MN-major for a weight-gradient
+/// one, so a stream stored this way is read *in place* by both: the
+/// `convert_f32_to_bf16_pairs` that used to stage each projection's operand
+/// is gone, and so is the fp32 copy it read. What remains fp32 is what a
+/// reduction or a statistic needs — the log-sum-exp, the router's
+/// probabilities, the losses and every gradient (SPEC §7.1).
+struct Bf16Acts<const N: usize, const W: usize> {
+    words: DeviceBuffer<u32>,
+    k_map: Bf16PairsTmaMap,
+    mn_map: Bf16PairsTmaMap,
+}
+
+impl<const N: usize, const W: usize> Bf16Acts<N, W> {
+    fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+        assert!(
+            W.is_multiple_of(2),
+            "a packed activation needs an even width"
+        );
+        let words = DeviceBuffer::zeroed(stream, N * W / 2)?;
+        // SAFETY: both maps live beside the buffer they describe inside this
+        // struct, which never reallocates it.
+        let k_map = unsafe { create_bf16_pairs_tma_map(stream, &words, W, N, TmaLayout::KMajor)? };
+        let mn_map =
+            unsafe { create_bf16_pairs_tma_map(stream, &words, W, N, TmaLayout::MnMajor)? };
+        Ok(Self {
+            words,
+            k_map,
+            mn_map,
+        })
+    }
+
+    fn as_device_buffer(&self) -> &DeviceBuffer<u32> {
+        &self.words
+    }
+
+    fn as_device_buffer_mut(&mut self) -> &mut DeviceBuffer<u32> {
+        &mut self.words
+    }
+
+    /// The launch covering one thread per word of this activation.
+    fn words_config() -> LaunchConfig {
+        pairs_config(N * W / 2)
+    }
+
+    /// Host copy in element order, widened. Parity gates and checkpoint tests
+    /// are the only callers; it synchronizes the stream.
+    #[allow(dead_code)]
+    fn to_host(&self, stream: &CudaStream) -> Result<Vec<f32>, DriverError> {
+        Ok(unpack_bf16_pairs(&self.words.to_host_vec(stream)?))
+    }
+
+    /// Overwrite from host values in element order, rounding to bf16.
+    #[allow(dead_code)]
+    fn upload(&mut self, values: &[f32], stream: &CudaStream) -> Result<(), DriverError> {
+        assert_eq!(values.len(), N * W);
+        upload_device(self.words.cu_deviceptr(), &pack_bf16_pairs(values), stream)
+    }
+}
+
 pub struct GpuLinear<const IN: usize, const OUT: usize> {
     pub w: GpuBf16Tensor<Rank2<IN, OUT>>,
     pub dw: GpuTensor<f32, Rank2<IN, OUT>>,
@@ -886,7 +1031,7 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
     #[allow(clippy::too_many_arguments, unused_unsafe)]
     fn forward_into<const N: usize, const D: usize, const FF: usize, P: KernelProfiler>(
         &self,
-        x: &GpuTensor<f32, Rank2<N, IN>>,
+        x: &Bf16Acts<N, IN>,
         output: &mut GpuTensor<f32, Rank2<N, OUT>>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
@@ -896,40 +1041,37 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
-        if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
+        if let Some(compute) = &self.compute
             && tcgen05_linear_eligible(N, IN, OUT)
         {
+            // The activation is already the operand's dtype and layout, so it
+            // is addressed in place through its own K-major descriptor: the
+            // quantize that used to stage it is gone.
             // SAFETY: buffers and launch tiles are validated by the eligibility check.
             profiler.measure(stream, name, || unsafe {
-                tensor.convert_f32_to_bf16_pairs(
+                tcgen05.f32_store(
                     stream,
-                    pairs_config(N * IN / 2),
-                    x.as_device_buffer(),
-                    &mut staging.rows,
-                )?;
-                unsafe {
-                    tcgen05.f32_store(
-                        stream,
-                        tcgen05_launch_config(N, OUT, IN),
-                        staging.row_maps.get::<D, FF>(IN).as_ptr(),
-                        compute.transposed_tma.as_ptr(),
-                        output.as_device_buffer_mut(),
-                        OUT as u32,
-                        IN as u32,
-                    )
-                }
+                    tcgen05_launch_config(N, OUT, IN),
+                    x.k_map.as_ptr(),
+                    compute.transposed_tma.as_ptr(),
+                    output.as_device_buffer_mut(),
+                    OUT as u32,
+                    IN as u32,
+                )
             })
         } else {
-            let weights = scratch.oracle_weights();
-            self.w.widen_into(weights, stream, tensor)?;
-            gemm_into(x, weights, output, stream, fp32, profiler, name)
+            scratch.widen_input(x, stream, tensor)?;
+            self.w
+                .widen_into(scratch.oracle_weights(), stream, tensor)?;
+            let (input, weights) = scratch.oracle_operands();
+            gemm_into::<N, IN, OUT, P>(input, weights, output, stream, fp32, profiler, name)
         }
     }
 
     #[allow(clippy::too_many_arguments, unused_unsafe)]
     fn backward_into<const N: usize, const D: usize, const FF: usize, P: KernelProfiler>(
         &mut self,
-        x: &GpuTensor<f32, Rank2<N, IN>>,
+        x: &Bf16Acts<N, IN>,
         dy: &GpuTensor<f32, Rank2<N, OUT>>,
         dx: &mut GpuTensor<f32, Rank2<N, IN>>,
         stream: &CudaStream,
@@ -943,19 +1085,15 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
         if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
             && tcgen05_linear_eligible(N, IN, OUT)
         {
-            // SAFETY: both quantize launches cover exactly the panels they
-            // write, and the accumulate's tiles come from the eligibility check.
+            // SAFETY: the quantize launch covers exactly the panel it writes,
+            // and the accumulate's tiles come from the eligibility check.
             profiler.measure(stream, names[0], || unsafe {
                 // `dW += xᵀ·dy` reads both operands MN-major straight out of
-                // their native `[N, width]` panels, so staging is a plain
-                // quantize each and no transpose runs at all. `rows` doubles as
-                // the input GEMM's row operand below.
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * IN / 2),
-                    x.as_device_buffer(),
-                    &mut staging.lhs,
-                )?;
+                // their native `[N, width]` panels, so no transpose runs at
+                // all. The activation is a saved one and is already packed —
+                // it is addressed through its own MN-major descriptor — so
+                // only the gradient is staged, and `rows` doubles as the input
+                // GEMM's row operand below.
                 tensor.convert_f32_to_bf16_pairs(
                     stream,
                     pairs_config(N * OUT / 2),
@@ -966,7 +1104,7 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                     tcgen05.f32_accumulate_transposed(
                         stream,
                         tcgen05_launch_config(IN, OUT, N),
-                        staging.lhs_mn_maps.get::<D, FF>(IN).as_ptr(),
+                        x.mn_map.as_ptr(),
                         staging.row_mn_maps.get::<D, FF>(OUT).as_ptr(),
                         self.dw.as_device_buffer_mut(),
                         OUT as u32,
@@ -989,7 +1127,17 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                 )
             })
         } else {
-            gemm_tn_accumulate_into(x, dy, &mut self.dw, stream, fp32, profiler, names[0])?;
+            scratch.widen_input(x, stream, tensor)?;
+            let (input, _) = scratch.oracle_operands();
+            gemm_tn_accumulate_into::<N, IN, OUT, P>(
+                input,
+                dy,
+                &mut self.dw,
+                stream,
+                fp32,
+                profiler,
+                names[0],
+            )?;
             let weights = scratch.oracle_weights();
             self.w.widen_into(weights, stream, tensor)?;
             gemm_nt_into(dy, weights, dx, stream, fp32, profiler, names[1])
@@ -1112,7 +1260,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
     #[allow(clippy::too_many_arguments, unused_unsafe)]
     fn forward_into<const N: usize, const D: usize, const FF: usize, P: KernelProfiler>(
         &self,
-        x: &GpuTensor<f32, Rank2<N, IN>>,
+        x: &Bf16Acts<N, IN>,
         output: &mut GpuTensor<f32, Rank3<N, GROUPS, OUT>>,
         stream: &CudaStream,
         tensor: &tensor_kernels::LoadedModule,
@@ -1123,32 +1271,28 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         name: &'static str,
     ) -> Result<(), DriverError> {
         let width = GROUPS * OUT;
-        if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
+        if let Some(compute) = &self.compute
             && tcgen05_linear_eligible(N, IN, width)
         {
+            // The activation is read in place through its own K-major
+            // descriptor; see [`GpuLinear::forward_into`].
             // SAFETY: buffers and launch tiles are validated by the eligibility check.
             profiler.measure(stream, name, || unsafe {
-                tensor.convert_f32_to_bf16_pairs(
+                tcgen05.f32_store(
                     stream,
-                    pairs_config(N * IN / 2),
-                    x.as_device_buffer(),
-                    &mut staging.rows,
-                )?;
-                unsafe {
-                    tcgen05.f32_store(
-                        stream,
-                        tcgen05_launch_config(N, width, IN),
-                        staging.row_maps.get::<D, FF>(IN).as_ptr(),
-                        compute.transposed_tma.as_ptr(),
-                        output.as_device_buffer_mut(),
-                        width as u32,
-                        IN as u32,
-                    )
-                }
+                    tcgen05_launch_config(N, width, IN),
+                    x.k_map.as_ptr(),
+                    compute.transposed_tma.as_ptr(),
+                    output.as_device_buffer_mut(),
+                    width as u32,
+                    IN as u32,
+                )
             })
         } else {
-            let weights = scratch.oracle_weights();
-            self.w.widen_into(weights, stream, tensor)?;
+            scratch.widen_input(x, stream, tensor)?;
+            self.w
+                .widen_into(scratch.oracle_weights(), stream, tensor)?;
+            let (input, weights) = scratch.oracle_operands();
             profiler.measure(stream, name, || unsafe {
                 fp32.register_gemm_store(
                     stream,
@@ -1156,7 +1300,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     N,
                     width,
                     IN,
-                    x.as_device_buffer(),
+                    input,
                     weights,
                     output.as_device_buffer_mut(),
                 )
@@ -1167,7 +1311,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
     #[allow(clippy::too_many_arguments, unused_unsafe)]
     fn backward_into<const N: usize, const D: usize, const FF: usize, P: KernelProfiler>(
         &mut self,
-        x: &GpuTensor<f32, Rank2<N, IN>>,
+        x: &Bf16Acts<N, IN>,
         dy: RowGradient<'_, N, GROUPS, OUT>,
         dx: &mut GpuTensor<f32, Rank2<N, IN>>,
         stream: &CudaStream,
@@ -1182,18 +1326,12 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         if let (Some(compute), Some(staging)) = (&self.compute, scratch.bf16.as_mut())
             && tcgen05_linear_eligible(N, IN, width)
         {
-            // SAFETY: both quantize launches cover exactly the panels they
-            // write, and the accumulate's tiles come from the eligibility check.
+            // SAFETY: the quantize launch covers exactly the panel it writes,
+            // and the accumulate's tiles come from the eligibility check.
             profiler.measure(stream, names[0], || unsafe {
                 // See `GpuLinear::backward_into`: both weight-gradient operands
-                // are consumed MN-major from their native panels, so each is a
-                // plain quantize and nothing is transposed.
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * IN / 2),
-                    x.as_device_buffer(),
-                    &mut staging.lhs,
-                )?;
+                // are consumed MN-major from their native panels, so nothing is
+                // transposed, and the saved activation is already packed.
                 if let RowGradient::Wide(dy) = dy {
                     tensor.convert_f32_to_bf16_pairs(
                         stream,
@@ -1206,7 +1344,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     tcgen05.f32_accumulate_transposed(
                         stream,
                         tcgen05_launch_config(IN, width, N),
-                        staging.lhs_mn_maps.get::<D, FF>(IN).as_ptr(),
+                        x.mn_map.as_ptr(),
                         staging.row_mn_maps.get::<D, FF>(width).as_ptr(),
                         self.dw.as_device_buffer_mut(),
                         width as u32,
@@ -1233,6 +1371,8 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
             let RowGradient::Wide(dy) = dy else {
                 panic!("the fp32 fallback reads a wide row gradient, as `packed_row_gradient` says")
             };
+            scratch.widen_input(x, stream, tensor)?;
+            let (input, _) = scratch.oracle_operands();
             profiler.measure(stream, names[0], || unsafe {
                 fp32.register_gemm_tn_accumulate(
                     stream,
@@ -1240,7 +1380,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     IN,
                     width,
                     N,
-                    x.as_device_buffer(),
+                    input,
                     dy.as_device_buffer(),
                     self.dw.as_device_buffer_mut(),
                 )
@@ -2358,44 +2498,44 @@ impl<const D: usize> GpuRmsNorm<D> {
         })
     }
 
-    fn forward_into<const N: usize, P: KernelProfiler>(
+    /// The norm reads and writes the packed activation stream; its statistic,
+    /// its scale and the weight product all stay fp32 in registers, so the
+    /// only rounding is the one store.
+    ///
+    /// There is no tile arm at this dtype — see `rms_norm_forward_fast_bf16`
+    /// for why the block-per-row kernel is the right one once the stream is
+    /// packed.
+    /// `YROWS` lets the output be taller than the input: the final norm writes
+    /// the lm head's `[NP, D]` operand, whose padded tail rows were zeroed at
+    /// allocation and must stay zero. The launch covers exactly `N` rows.
+    fn forward_into<const N: usize, const YROWS: usize, P: KernelProfiler>(
         &self,
-        x: &GpuTensor<f32, Rank2<N, D>>,
-        y: &mut GpuTensor<f32, Rank2<N, D>>,
+        x: &Bf16Acts<N, D>,
+        y: &mut Bf16Acts<YROWS, D>,
         stream: &CudaStream,
         kernels: &dense_kernels::LoadedModule,
         profiler: &mut P,
         name: &'static str,
     ) -> Result<(), DriverError> {
-        // SAFETY: norm launch dimensions and Rank2 buffers agree on N * D, and
-        // the tile arm is only taken at a shape `norm_tiles` accepted.
+        assert!(YROWS >= N, "a norm cannot write fewer rows than it reads");
+        // SAFETY: the launch covers N rows of D columns, which both packed
+        // buffers hold.
         profiler.measure(stream, name, || unsafe {
-            match norm_tiles(N, D) {
-                Some(tiles) => kernels.rms_norm_forward_tile(
-                    stream,
-                    tiles,
-                    x.as_device_buffer(),
-                    self.w.as_device_buffer(),
-                    self.eps,
-                    D as u32,
-                    y.as_device_buffer_mut(),
-                ),
-                None => kernels.rms_norm_forward_fast(
-                    stream,
-                    norm_config::<N>(),
-                    x.as_device_buffer(),
-                    self.w.as_device_buffer(),
-                    self.eps,
-                    D as u32,
-                    y.as_device_buffer_mut(),
-                ),
-            }
+            kernels.rms_norm_forward_fast_bf16(
+                stream,
+                norm_config::<N>(),
+                x.as_device_buffer(),
+                self.w.as_device_buffer(),
+                self.eps,
+                D as u32,
+                y.as_device_buffer_mut(),
+            )
         })
     }
 
     fn backward_into<const N: usize, P: KernelProfiler>(
         &mut self,
-        x: &GpuTensor<f32, Rank2<N, D>>,
+        x: &Bf16Acts<N, D>,
         dy: &GpuTensor<f32, Rank2<N, D>>,
         dx: &mut GpuTensor<f32, Rank2<N, D>>,
         inv: &mut GpuTensor<f32, Rank1<N>>,
@@ -2406,7 +2546,7 @@ impl<const D: usize> GpuRmsNorm<D> {
     ) -> Result<(), DriverError> {
         // SAFETY: norm launch dimensions and saved/output buffers agree on N * D.
         profiler.measure(stream, names[0], || unsafe {
-            kernels.rms_norm_backward_x_fast(
+            kernels.rms_norm_backward_x_fast_bf16(
                 stream,
                 norm_config::<N>(),
                 x.as_device_buffer(),
@@ -2419,7 +2559,7 @@ impl<const D: usize> GpuRmsNorm<D> {
             )
         })?;
         profiler.measure(stream, names[1], || unsafe {
-            kernels.rms_norm_backward_weight_fast(
+            kernels.rms_norm_backward_weight_fast_bf16(
                 stream,
                 norm_weight_config::<N, D>(),
                 x.as_device_buffer(),
@@ -2452,10 +2592,12 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
         })
     }
 
+    /// Master and stream are both bf16, so the lookup is a copy of whole
+    /// words: it neither widens nor rounds.
     fn forward_into<const N: usize, P: KernelProfiler>(
         &self,
         tokens: &GpuTensor<u32, Rank1<N>>,
-        y: &mut GpuTensor<f32, Rank2<N, D>>,
+        y: &mut Bf16Acts<N, D>,
         stream: &CudaStream,
         kernels: &dense_kernels::LoadedModule,
         profiler: &mut P,
@@ -2463,9 +2605,9 @@ impl<const VOCAB: usize, const D: usize> GpuEmbedding<VOCAB, D> {
     ) -> Result<(), DriverError> {
         // SAFETY: token and output shapes satisfy the embedding launch contract.
         profiler.measure(stream, name, || unsafe {
-            kernels.embedding_forward(
+            kernels.embedding_forward_bf16(
                 stream,
-                LaunchConfig::for_num_elems((N * D) as u32),
+                Bf16Acts::<N, D>::words_config(),
                 self.w.as_words(),
                 tokens.as_device_buffer(),
                 D as u32,
@@ -3811,13 +3953,16 @@ struct GpuBlockActs<
     const K: usize,
     const C: usize,
 > {
-    input: GpuTensor<f32, Rank2<N, D>>,
-    attention_normalized: GpuTensor<f32, Rank2<N, D>>,
+    input: Bf16Acts<N, D>,
+    attention_normalized: Bf16Acts<N, D>,
     attention: AttentionOperands<N, D>,
-    attended: GpuTensor<f32, Rank2<N, D>>,
+    attended: Bf16Acts<N, D>,
+    /// Natural-log row statistic. It stays fp32: the backward recreates the
+    /// probabilities from it, and bf16's 8 mantissa bits are not enough to
+    /// carry an exponent argument.
     attention_logsumexp: GpuTensor<f32, Rank2<N, H>>,
-    ffn_input: GpuTensor<f32, Rank2<N, D>>,
-    ffn_normalized: GpuTensor<f32, Rank2<N, D>>,
+    ffn_input: Bf16Acts<N, D>,
+    ffn_normalized: Bf16Acts<N, D>,
     routing: GpuRoutingActs<N, E, K>,
     experts: GpuExpertActs<E, C, D, FF>,
 }
@@ -3834,13 +3979,13 @@ impl<
 {
     fn new(stream: &CudaStream, sequence_length: usize) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
-            input: GpuTensor::zeros(stream)?,
-            attention_normalized: GpuTensor::zeros(stream)?,
+            input: Bf16Acts::new(stream)?,
+            attention_normalized: Bf16Acts::new(stream)?,
             attention: AttentionOperands::new(stream, sequence_length, H)?,
-            attended: GpuTensor::zeros(stream)?,
+            attended: Bf16Acts::new(stream)?,
             attention_logsumexp: GpuTensor::zeros(stream)?,
-            ffn_input: GpuTensor::zeros(stream)?,
-            ffn_normalized: GpuTensor::zeros(stream)?,
+            ffn_input: Bf16Acts::new(stream)?,
+            ffn_normalized: Bf16Acts::new(stream)?,
             routing: GpuRoutingActs::new(stream)?,
             experts: GpuExpertActs::new(stream)?,
         })
@@ -3879,6 +4024,17 @@ struct GpuBlockScratch<
     d_model_3: GpuTensor<f32, Rank2<N, D>>,
     d_model_4: GpuTensor<f32, Rank2<N, D>>,
     norm_backward_inv: GpuTensor<f32, Rank1<N>>,
+    /// The attention output widened for the per-row oracle backward, which is
+    /// the one flash generation that reads `y` again and reads it fp32.
+    /// `None` — and so not allocated at all — for every shape either the
+    /// tcgen05 or the tiled kernels cover, which is every training shape.
+    attended_wide: Option<GpuTensor<f32, Rank2<N, D>>>,
+}
+
+/// Does this shape fall through to the per-row oracle backward, the only
+/// flash generation that reads the attention output again?
+fn flash_oracle_reads_output(sequence_length: usize, head_dim: usize) -> bool {
+    !tcgen05_attention_eligible(sequence_length, head_dim) && head_dim != flash_device::TILE_HD
 }
 
 impl<
@@ -3913,6 +4069,9 @@ impl<
             d_model_3: GpuTensor::zeros(stream)?,
             d_model_4: GpuTensor::zeros(stream)?,
             norm_backward_inv: GpuTensor::zeros(stream)?,
+            attended_wide: flash_oracle_reads_output(sequence_length, D / H)
+                .then(|| GpuTensor::zeros(stream))
+                .transpose()?,
         })
     }
 }
@@ -3951,13 +4110,15 @@ pub struct GpuMoeWorkspace<
     next_staging: usize,
     block_acts: Vec<GpuBlockActs<N, D, H, FF, E, K, C>>,
     block_scratch: GpuBlockScratch<N, D, H, FF, E, K, C>,
-    final_input: GpuTensor<f32, Rank2<N, D>>,
-    final_normalized: GpuTensor<f32, Rank2<N, D>>,
-    head_input: DeviceBuffer<u32>,
+    final_input: Bf16Acts<N, D>,
+    /// The final norm's output *is* the lm head's operand: it is packed, and
+    /// the head's two descriptors are its own, so the quantize that used to
+    /// stand between them is gone along with the `[NP, D]` copy it wrote.
+    /// It is `NP` rows tall; rows `N..NP` are zeroed at allocation and never
+    /// written, so the padded rows of `logits` stay zero (see the type doc).
+    final_normalized: Bf16Acts<NP, D>,
     logits: DeviceBuffer<u32>,
     d_head_input: DeviceBuffer<u32>,
-    head_input_tma: Bf16PairsTmaMap,
-    head_input_mn_tma: Bf16PairsTmaMap,
     logits_tma: Bf16PairsTmaMap,
     logits_mn_tma: Bf16PairsTmaMap,
     linear_scratch: LinearScratch<N, D, FF>,
@@ -3987,14 +4148,9 @@ impl<
         // MoE blocks keep only the attention projections as plain linears; the
         // expert FFN owns its own staging.
         let linear_scratch = LinearScratch::new(stream, &[(D, 3 * D), (D, D)])?;
-        let head_input = DeviceBuffer::zeroed(stream, NP * D / 2)?;
         let logits = DeviceBuffer::zeroed(stream, NP * VP / 2)?;
-        // SAFETY: the mapped buffers live in this workspace beside their maps
-        // and are never reallocated.
-        let head_input_tma =
-            unsafe { create_bf16_pairs_tma_map(stream, &head_input, D, NP, TmaLayout::KMajor)? };
-        let head_input_mn_tma =
-            unsafe { create_bf16_pairs_tma_map(stream, &head_input, D, NP, TmaLayout::MnMajor)? };
+        // SAFETY: the mapped buffer lives in this workspace beside its maps
+        // and is never reallocated.
         let logits_tma =
             unsafe { create_bf16_pairs_tma_map(stream, &logits, VP, NP, TmaLayout::KMajor)? };
         let logits_mn_tma =
@@ -4008,13 +4164,10 @@ impl<
                 .map(|_| GpuBlockActs::new(stream, T))
                 .collect::<Result<_, _>>()?,
             block_scratch: GpuBlockScratch::new(stream, T)?,
-            final_input: GpuTensor::zeros(stream)?,
-            final_normalized: GpuTensor::zeros(stream)?,
-            head_input,
+            final_input: Bf16Acts::new(stream)?,
+            final_normalized: Bf16Acts::new(stream)?,
             logits,
             d_head_input: DeviceBuffer::zeroed(stream, NP * D / 2)?,
-            head_input_tma,
-            head_input_mn_tma,
             logits_tma,
             logits_mn_tma,
             linear_scratch,
@@ -4128,27 +4281,28 @@ pub struct GpuDenseWorkspace<
     targets: GpuTensor<u32, Rank1<N>>,
     staging: [InputStaging<N>; 2],
     next_staging: usize,
-    attention_input: GpuTensor<f32, Rank2<N, D>>,
-    attention_normalized: GpuTensor<f32, Rank2<N, D>>,
+    attention_input: Bf16Acts<N, D>,
+    attention_normalized: Bf16Acts<N, D>,
     qkv: GpuTensor<f32, Rank3<N, 3, D>>,
     attention: AttentionOperands<N, D>,
-    attended: GpuTensor<f32, Rank2<N, D>>,
+    attended: Bf16Acts<N, D>,
     attention_logsumexp: GpuTensor<f32, Rank2<N, H>>,
     attention_dot: GpuTensor<f32, Rank2<N, H>>,
-    ffn_input: GpuTensor<f32, Rank2<N, D>>,
-    ffn_normalized: GpuTensor<f32, Rank2<N, D>>,
+    /// The attention output widened for the per-row oracle backward; see
+    /// `GpuBlockScratch::attended_wide`.
+    attended_wide: Option<GpuTensor<f32, Rank2<N, D>>>,
+    ffn_input: Bf16Acts<N, D>,
+    ffn_normalized: Bf16Acts<N, D>,
     gate_up: GpuTensor<f32, Rank3<N, 2, FF>>,
     gate: GpuTensor<f32, Rank2<N, FF>>,
     up: GpuTensor<f32, Rank2<N, FF>>,
-    activated: GpuTensor<f32, Rank2<N, FF>>,
-    final_input: GpuTensor<f32, Rank2<N, D>>,
-    final_normalized: GpuTensor<f32, Rank2<N, D>>,
+    activated: Bf16Acts<N, FF>,
+    final_input: Bf16Acts<N, D>,
+    /// See the MoE workspace's field of the same name.
+    final_normalized: Bf16Acts<NP, D>,
     projection_output: GpuTensor<f32, Rank2<N, D>>,
-    head_input: DeviceBuffer<u32>,
     logits: DeviceBuffer<u32>,
     d_head_input: DeviceBuffer<u32>,
-    head_input_tma: Bf16PairsTmaMap,
-    head_input_mn_tma: Bf16PairsTmaMap,
     logits_tma: Bf16PairsTmaMap,
     logits_mn_tma: Bf16PairsTmaMap,
     linear_scratch: LinearScratch<N, D, FF>,
@@ -4183,14 +4337,9 @@ impl<
     pub fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
         let linear_scratch =
             LinearScratch::new(stream, &[(D, 3 * D), (D, D), (D, 2 * FF), (FF, D)])?;
-        let head_input = DeviceBuffer::zeroed(stream, NP * D / 2)?;
         let logits = DeviceBuffer::zeroed(stream, NP * VP / 2)?;
-        // SAFETY: the mapped buffers live in this workspace beside their maps
-        // and are never reallocated.
-        let head_input_tma =
-            unsafe { create_bf16_pairs_tma_map(stream, &head_input, D, NP, TmaLayout::KMajor)? };
-        let head_input_mn_tma =
-            unsafe { create_bf16_pairs_tma_map(stream, &head_input, D, NP, TmaLayout::MnMajor)? };
+        // SAFETY: the mapped buffer lives in this workspace beside its maps
+        // and is never reallocated.
         let logits_tma =
             unsafe { create_bf16_pairs_tma_map(stream, &logits, VP, NP, TmaLayout::KMajor)? };
         let logits_mn_tma =
@@ -4200,27 +4349,27 @@ impl<
             targets: GpuTensor::zeros(stream)?,
             staging: [InputStaging::new(stream)?, InputStaging::new(stream)?],
             next_staging: 0,
-            attention_input: GpuTensor::zeros(stream)?,
-            attention_normalized: GpuTensor::zeros(stream)?,
+            attention_input: Bf16Acts::new(stream)?,
+            attention_normalized: Bf16Acts::new(stream)?,
             qkv: GpuTensor::zeros(stream)?,
             attention: AttentionOperands::new(stream, T, H)?,
-            attended: GpuTensor::zeros(stream)?,
+            attended: Bf16Acts::new(stream)?,
             attention_logsumexp: GpuTensor::zeros(stream)?,
             attention_dot: GpuTensor::zeros(stream)?,
-            ffn_input: GpuTensor::zeros(stream)?,
-            ffn_normalized: GpuTensor::zeros(stream)?,
+            attended_wide: flash_oracle_reads_output(T, D / H)
+                .then(|| GpuTensor::zeros(stream))
+                .transpose()?,
+            ffn_input: Bf16Acts::new(stream)?,
+            ffn_normalized: Bf16Acts::new(stream)?,
             gate_up: GpuTensor::zeros(stream)?,
             gate: GpuTensor::zeros(stream)?,
             up: GpuTensor::zeros(stream)?,
-            activated: GpuTensor::zeros(stream)?,
-            final_input: GpuTensor::zeros(stream)?,
-            final_normalized: GpuTensor::zeros(stream)?,
+            activated: Bf16Acts::new(stream)?,
+            final_input: Bf16Acts::new(stream)?,
+            final_normalized: Bf16Acts::new(stream)?,
             projection_output: GpuTensor::zeros(stream)?,
-            head_input,
             logits,
             d_head_input: DeviceBuffer::zeroed(stream, NP * D / 2)?,
-            head_input_tma,
-            head_input_mn_tma,
             logits_tma,
             logits_mn_tma,
             linear_scratch,
@@ -4372,7 +4521,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
     >(
         &self,
         acts: &mut GpuBlockActs<N, D, H, FF, E, K, C>,
-        output: &mut GpuTensor<f32, Rank2<N, D>>,
+        output: &mut Bf16Acts<N, D>,
         scratch: &mut GpuBlockScratch<N, D, H, FF, E, K, C>,
         linear_scratch: &mut LinearScratch<N, D, FF>,
         mut flash_scratch: Option<&mut FlashAttentionScratch<N, T, D, H>>,
@@ -4416,7 +4565,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         )?;
         flash_attention_forward_into::<N, T, D, H, HD, P>(
             &acts.attention,
-            &mut acts.attended,
+            &mut scratch.d_model_0,
             &mut acts.attention_logsumexp,
             flash_scratch.as_deref_mut(),
             stream,
@@ -4424,6 +4573,20 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             flash_bf16,
             profiler,
         )?;
+        // The flash epilogue writes fp32. Rounding it once here is what the
+        // two `convert_f32_to_bf16_pairs` the o_proj GEMMs used to stage cost
+        // between them, and the fp32 panel is a scratch every block shares
+        // rather than a saved activation each block owns.
+        // SAFETY: one thread per word of the `[N, D]` stream, over an fp32
+        // scratch of exactly the elements those words cover.
+        profiler.measure(stream, "forward.attention.pack", || unsafe {
+            tensor.convert_f32_to_bf16_pairs(
+                stream,
+                Bf16Acts::<N, D>::words_config(),
+                scratch.d_model_0.as_device_buffer(),
+                acts.attended.as_device_buffer_mut(),
+            )
+        })?;
         self.o_proj.forward_into(
             &acts.attended,
             &mut scratch.projection_output,
@@ -4435,7 +4598,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             profiler,
             "forward.o_proj.gemm",
         )?;
-        add_into(
+        add_bf16_into(
             &acts.input,
             &scratch.projection_output,
             &mut acts.ffn_input,
@@ -4454,7 +4617,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         )?;
 
         profiler.measure(stream, "forward.router.logits", || unsafe {
-            dense.router_logits(
+            dense.router_logits_bf16(
                 stream,
                 router_gemm_config(N, E),
                 acts.ffn_normalized.as_device_buffer(),
@@ -4522,10 +4685,13 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             },
         })?;
         profiler.measure(stream, "forward.router.scatter", || match bin_input {
-            // The packed panel's tcgen05 alignment makes D a multiple of
-            // QUAD_LANES, so the quad walk always applies.
+            // Stream and bins are now the same dtype, so the packed arm is a
+            // plain copy: the round that used to happen here happened once at
+            // the norm that produced the stream. The packed panel's tcgen05
+            // alignment makes D a multiple of QUAD_LANES, so the quad walk
+            // always applies.
             ExpertPanel::Packed(panel) => unsafe {
-                dense.moe_scatter_bf16_quad(
+                dense.moe_scatter_packed_quad(
                     stream,
                     LaunchConfig::for_num_elems((N * K * D / QUAD_LANES) as u32),
                     ffn_normalized.as_device_buffer(),
@@ -4538,7 +4704,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                 )
             },
             ExpertPanel::Wide(values) => unsafe {
-                dense.moe_scatter(
+                dense.moe_scatter_packed_wide(
                     stream,
                     LaunchConfig::for_num_elems((N * K * D) as u32),
                     ffn_normalized.as_device_buffer(),
@@ -4566,7 +4732,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         // SAFETY: routing indices and slots were produced for the same N/K/C shape.
         profiler.measure(stream, "forward.router.gather", || unsafe {
             if D.is_multiple_of(QUAD_LANES) {
-                dense.moe_gather_combine_add_quad(
+                dense.moe_gather_combine_add_quad_bf16(
                     stream,
                     LaunchConfig::for_num_elems((N * D / QUAD_LANES) as u32),
                     acts.experts.bin_output.as_device_buffer(),
@@ -4580,9 +4746,9 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                     output.as_device_buffer_mut(),
                 )
             } else {
-                dense.moe_gather_combine_add(
+                dense.moe_gather_combine_add_bf16(
                     stream,
-                    LaunchConfig::for_num_elems((N * D) as u32),
+                    Bf16Acts::<N, D>::words_config(),
                     acts.experts.bin_output.as_device_buffer(),
                     acts.routing.selected_experts.as_device_buffer(),
                     acts.routing.gate_weights.as_device_buffer(),
@@ -4743,7 +4909,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             )
         })?;
         profiler.measure(stream, "backward.router.weight", || unsafe {
-            dense.router_backward_weight_split(
+            dense.router_backward_weight_split_bf16(
                 stream,
                 router_wgrad_split_config::<D>(),
                 acts.ffn_normalized.as_device_buffer(),
@@ -4831,6 +4997,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
         flash_attention_backward_into::<N, T, D, H, HD, P>(
             &acts.attention,
             &acts.attended,
+            scratch.attended_wide.as_mut(),
             &acts.attention_logsumexp,
             &mut scratch.attention_dot,
             &scratch.d_model_0,
@@ -4839,6 +5006,7 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
             &mut scratch.d_model_4,
             flash_scratch.as_deref_mut(),
             stream,
+            tensor,
             flash,
             flash_bf16,
             profiler,
@@ -5116,18 +5284,12 @@ impl<
                 profiler,
                 "forward.final_norm",
             )?;
-            // Rows N..NP of head_input were zeroed at allocation and the convert
-            // stops at the fp32 input's length, so they stay zero.
-            profiler.measure(stream, "forward.lm_head.quantize", || {
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * D / 2),
-                    workspace.final_normalized.as_device_buffer(),
-                    &mut workspace.head_input,
-                )
-            })?;
+            // Rows N..NP of `final_normalized` were zeroed at allocation and
+            // the norm launch covers only the first N, so they stay zero. The
+            // head reads the norm's output in place: the quantize that used to
+            // stand here is gone with the fp32 copy it read.
             self.lm_head.forward_into::<NP, P>(
-                &workspace.head_input_tma,
+                &workspace.final_normalized.k_map,
                 &mut workspace.logits,
                 stream,
                 gemm_bf16,
@@ -5237,12 +5399,12 @@ impl<
                 dense,
                 profiler,
             )?;
-            // Rows N..NP of head_input and logits hold zeros (forward computed
-            // them from the zero-padded head input and the classifier backward
-            // skips them), so the MN-major operands feed exact zeros into the
-            // weight GEMM's padded reduction slice.
+            // Rows N..NP of `final_normalized` and `logits` hold zeros (the
+            // forward computed them from the zero-padded head input and the
+            // classifier backward skips them), so the MN-major operands feed
+            // exact zeros into the weight GEMM's padded reduction slice.
             self.lm_head.backward_weight::<NP, P>(
-                &workspace.head_input_mn_tma,
+                &workspace.final_normalized.mn_map,
                 &workspace.logits_mn_tma,
                 stream,
                 gemm_bf16,
@@ -5486,7 +5648,7 @@ impl<
             )?;
             flash_attention_forward_into::<N, T, D, H, HD, P>(
                 &workspace.attention,
-                &mut workspace.attended,
+                &mut workspace.d_model_0,
                 &mut workspace.attention_logsumexp,
                 workspace.flash_scratch.as_mut(),
                 stream,
@@ -5494,6 +5656,17 @@ impl<
                 flash_bf16,
                 profiler,
             )?;
+            // See the MoE block forward: the flash epilogue is fp32 and the
+            // saved copy the o_proj GEMMs read is packed.
+            // SAFETY: one thread per word of the `[N, D]` stream.
+            profiler.measure(stream, "forward.attention.pack", || {
+                tensor.convert_f32_to_bf16_pairs(
+                    stream,
+                    Bf16Acts::<N, D>::words_config(),
+                    workspace.d_model_0.as_device_buffer(),
+                    workspace.attended.as_device_buffer_mut(),
+                )
+            })?;
             self.o_proj.forward_into(
                 &workspace.attended,
                 &mut workspace.projection_output,
@@ -5505,7 +5678,7 @@ impl<
                 profiler,
                 "forward.o_proj.gemm",
             )?;
-            add_into(
+            add_bf16_into(
                 &workspace.attention_input,
                 &workspace.projection_output,
                 &mut workspace.ffn_input,
@@ -5544,15 +5717,18 @@ impl<
                     workspace.up.as_device_buffer_mut(),
                 )
             })?;
-            swiglu_into(
-                &workspace.gate,
-                &workspace.up,
-                &mut workspace.activated,
-                stream,
-                dense,
-                profiler,
-                "forward.swiglu",
-            )?;
+            // The down projection reads its operand packed, so the SwiGLU
+            // stores packed and the quantize between them never existed.
+            // SAFETY: one thread per word of the `[N, FF]` activation.
+            profiler.measure(stream, "forward.swiglu", || unsafe {
+                dense.swiglu_forward_bf16(
+                    stream,
+                    Bf16Acts::<N, FF>::words_config(),
+                    workspace.gate.as_device_buffer(),
+                    workspace.up.as_device_buffer(),
+                    workspace.activated.as_device_buffer_mut(),
+                )
+            })?;
             self.down_proj.forward_into(
                 &workspace.activated,
                 &mut workspace.projection_output,
@@ -5564,7 +5740,7 @@ impl<
                 profiler,
                 "forward.down_proj.gemm",
             )?;
-            add_into(
+            add_bf16_into(
                 &workspace.ffn_input,
                 &workspace.projection_output,
                 &mut workspace.final_input,
@@ -5582,18 +5758,12 @@ impl<
                 profiler,
                 "forward.final_norm",
             )?;
-            // Rows N..NP of head_input were zeroed at allocation and the convert
-            // stops at the fp32 input's length, so they stay zero.
-            profiler.measure(stream, "forward.lm_head.quantize", || {
-                tensor.convert_f32_to_bf16_pairs(
-                    stream,
-                    pairs_config(N * D / 2),
-                    workspace.final_normalized.as_device_buffer(),
-                    &mut workspace.head_input,
-                )
-            })?;
+            // Rows N..NP of `final_normalized` were zeroed at allocation and
+            // the norm launch covers only the first N, so they stay zero. The
+            // head reads the norm's output in place: the quantize that used to
+            // stand here is gone with the fp32 copy it read.
             self.lm_head.forward_into::<NP, P>(
-                &workspace.head_input_tma,
+                &workspace.final_normalized.k_map,
                 &mut workspace.logits,
                 stream,
                 gemm_bf16,
@@ -5662,12 +5832,12 @@ impl<
                 dense,
                 profiler,
             )?;
-            // Rows N..NP of head_input and logits hold zeros (forward computed
-            // them from the zero-padded head input and the classifier backward
-            // skips them), so the MN-major operands feed exact zeros into the
-            // weight GEMM's padded reduction slice.
+            // Rows N..NP of `final_normalized` and `logits` hold zeros (the
+            // forward computed them from the zero-padded head input and the
+            // classifier backward skips them), so the MN-major operands feed
+            // exact zeros into the weight GEMM's padded reduction slice.
             self.lm_head.backward_weight::<NP, P>(
-                &workspace.head_input_mn_tma,
+                &workspace.final_normalized.mn_map,
                 &workspace.logits_mn_tma,
                 stream,
                 gemm_bf16,
@@ -5786,6 +5956,7 @@ impl<
             flash_attention_backward_into::<N, T, D, H, HD, P>(
                 &workspace.attention,
                 &workspace.attended,
+                workspace.attended_wide.as_mut(),
                 &workspace.attention_logsumexp,
                 &mut workspace.attention_dot,
                 &workspace.d_model_0,
@@ -5794,6 +5965,7 @@ impl<
                 &mut workspace.d_model_4,
                 workspace.flash_scratch.as_mut(),
                 stream,
+                tensor,
                 flash,
                 flash_bf16,
                 profiler,
@@ -6185,7 +6357,8 @@ fn flash_attention_backward_into<
     P: KernelProfiler,
 >(
     operands: &AttentionOperands<N, D>,
-    output: &GpuTensor<f32, Rank2<N, D>>,
+    output: &Bf16Acts<N, D>,
+    oracle_output: Option<&mut GpuTensor<f32, Rank2<N, D>>>,
     logsumexp: &GpuTensor<f32, Rank2<N, H>>,
     softmax_dot: &mut GpuTensor<f32, Rank2<N, H>>,
     dy: &GpuTensor<f32, Rank2<N, D>>,
@@ -6194,13 +6367,14 @@ fn flash_attention_backward_into<
     dv: &mut GpuTensor<f32, Rank2<N, D>>,
     scratch: Option<&mut FlashAttentionScratch<N, T, D, H>>,
     stream: &CudaStream,
+    tensor: &tensor_kernels::LoadedModule,
     kernels: &flash_kernels::LoadedModule,
     flash_bf16: &Tcgen05Flash,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
     // SAFETY: dot config and buffers agree on N, H, and HD.
     profiler.measure(stream, "backward.attention.flash_dot", || unsafe {
-        kernels.flash_attention_backward_dot(
+        kernels.flash_attention_backward_dot_bf16(
             stream,
             flash_dot_config::<N, H, HD>(),
             dy.as_device_buffer(),
@@ -6209,6 +6383,25 @@ fn flash_attention_backward_into<
             softmax_dot.as_device_buffer_mut(),
         )
     })?;
+    // The per-row oracle is the one generation that reads `y` again, and it
+    // reads fp32; every other arm consumes the staged dot above and never
+    // touches it. Widen once for that arm alone.
+    let oracle_output = match oracle_output {
+        Some(wide) => {
+            // SAFETY: the launch covers exactly the `N * D` elements the
+            // packed output holds.
+            unsafe {
+                tensor.convert_bf16_pairs_to_f32(
+                    stream,
+                    elementwise_config::<Rank2<N, D>>(),
+                    output.as_device_buffer(),
+                    wide.as_device_buffer_mut(),
+                )?;
+            }
+            Some(&*wide)
+        }
+        None => None,
+    };
     match operands {
         AttentionOperands::Staged { q, k, v } => {
             let scratch = scratch.expect("staged operands allocate the flash scratch beside them");
@@ -6298,6 +6491,8 @@ fn flash_attention_backward_into<
         }
         // Per-row oracle fallback; see the forward dispatch for the contract.
         AttentionOperands::Wide { q, k, v } => {
+            let output = oracle_output
+                .expect("the per-row oracle backward needs the widened attention output");
             // SAFETY: per-row config covers N * H rows with HD lanes.
             profiler.measure(stream, "backward.attention.flash_q", || unsafe {
                 kernels.flash_attention_backward_q(

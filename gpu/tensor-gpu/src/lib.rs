@@ -47,6 +47,25 @@ pub mod kernels {
         }
     }
 
+    /// A residual add whose stream is packed bf16: `a` and `out` hold two
+    /// values per word, `b` is the projection's fp32 epilogue target.
+    ///
+    /// One thread owns one word. Both halves widen into fp32 registers and the
+    /// sum is computed there, so the stream carries exactly one rounding per
+    /// layer boundary rather than one per operand.
+    #[kernel]
+    pub fn add_bf16(a: &[u32], b: &[f32], mut out: DisjointSlice<u32>) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = out.get_mut(index) {
+            let word = a[i];
+            *slot = pack_bf16_pair(
+                bf16_bits_to_f32(word as u16) + b[2 * i],
+                bf16_bits_to_f32((word >> 16) as u16) + b[2 * i + 1],
+            );
+        }
+    }
+
     #[kernel]
     pub fn mul(a: &[f32], b: &[f32], mut out: DisjointSlice<f32>) {
         let index = thread::index_1d();
@@ -323,6 +342,13 @@ pub mod kernels {
         let bits = value.to_bits();
         let round = 0x7fffu32 + ((bits >> 16) & 1);
         (bits.wrapping_add(round) >> 16) as u16
+    }
+
+    /// Two adjacent f32s as the one packed word [`convert_f32_to_bf16_pairs`]
+    /// would have written for them: low half first.
+    #[inline(always)]
+    fn pack_bf16_pair(low: f32, high: f32) -> u32 {
+        f32_to_bf16_bits(low) as u32 | ((f32_to_bf16_bits(high) as u32) << 16)
     }
 
     /// splitmix64's mixing round, ported verbatim from
