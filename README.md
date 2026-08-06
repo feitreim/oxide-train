@@ -125,3 +125,60 @@ Model and batch shapes remain compile-time constants in
 step count, logging/checkpoint intervals, and AdamW scalars. Checkpoints include
 all parameters, AdamW moments/configuration, the global step, static shape
 metadata, and the next batch position; saves use atomic replacement.
+
+## PyTorch throughput baseline
+
+`gpu/model/baselines/pytorch_baseline.py` is the trainer's external reference:
+the same 4.39B-parameter model, the same tokens off the same shard, the same
+twelve-steps-minus-one measurement window, and the same
+`training_flops_per_token()` over the same 2.25 PFLOP/s denominator. It runs in
+its own Modal image (torch, no rustc) beside the kernel image:
+
+```bash
+modal run modal_app.py::pytorch_baseline                             # eager, B=16
+modal run modal_app.py::pytorch_baseline --tiers "default" --batches 16
+modal run modal_app.py::pytorch_baseline --tiers "reduce-overhead" --batches 16
+```
+
+The script asserts its own parameter count against the Rust model's term by
+term before it reports a number, so a shape that drifted cannot quietly become
+a throughput win.
+
+One B200, twelve steps with the first discarded, `wiki-val-00000.tok`:
+
+| Tier | B | tokens/s | MFU | vs trainer @ B=16 | CUDA graphs |
+| --- | --- | --- | --- | --- | --- |
+| trainer (`bin/train.rs`) | 16 | 81,532 | 36.20% | — | no |
+| trainer (`bin/train.rs`) | 12 | 79,200 | 35.17% | −2.9% | no |
+| PyTorch eager | 16 | 44,635 | 19.82% | −45.3% | no |
+| PyTorch eager | 12 | 46,668 | 20.72% | −42.8% | no |
+| `torch.compile()` | 16 | 88,840 | 39.45% | **+9.0%** | no |
+| `torch.compile(mode="reduce-overhead")` | 16 | 89,541 | 39.76% | **+9.8%** | **yes** |
+
+`mode="reduce-overhead"` *is* CUDA graphs, which the trainer does not have, so
+it is not the honest comparison — but it is also not where the gap comes from:
+it beats plain `torch.compile()` by 0.8% at a 370ms step, and the script now
+checks whether inductor actually recorded graphs rather than trusting the mode
+name. The line to answer is the +9.0% one.
+
+Eager is not the baseline to chase. It runs the same GEMMs but pays for every
+elementwise pass between them, and its own run-to-run spread is wide (40.7k to
+46.7k at B=12 across two runs) because it is launch-bound; the compiled tiers
+repeat to within 0.6%. `mode="max-autotune"` was not run: the escalation only
+continues while the trainer is still ahead, and it stopped being ahead at
+`torch.compile()`.
+
+Where the two policies cannot be made identical, and each one's direction:
+
+- The trainer keeps **bf16 master weights** with fp32 gradients and fp32 AdamW
+  moments; PyTorch keeps fp32 masters under bf16 autocast, which costs it a
+  weight cast per matmul and 148.7 GiB of peak memory eager against the
+  trainer's far smaller footprint. This favors the trainer.
+- The trainer's fused classifier never materializes fp32 logits over the padded
+  vocabulary; `F.cross_entropy` under autocast does. This favors the trainer.
+- PyTorch gets one concession autocast would not give it: the embedding output
+  is cast to bf16 so the residual stream is bf16 on both sides, rather than
+  running every residual add and norm in fp32. This favors PyTorch.
+- Routing is identical, and with a capacity factor of one both sides compute
+  `E * C` expert rows whatever the routing looks like — so load balance cannot
+  move either number.
