@@ -683,34 +683,30 @@ impl Bf16LinearMaps {
 
 /// Reusable packed-bf16 operand storage for all block-linear GEMMs.
 ///
-/// Both operands are staged in their natural `[N, width]` row-major layout:
-/// `rows` takes the output gradient (also the input GEMM's row operand) and
-/// `lhs` the activation. The weight gradient reads them MN-major through the
-/// tcgen05 descriptor transpose (#53), so each buffer carries a K-major map
-/// set and an MN-major one and nothing is ever transposed in global memory.
+/// One buffer, not two. `rows` stages the output gradient in its natural
+/// `[N, width]` row-major layout and doubles as the input GEMM's row operand;
+/// the weight gradient reads it MN-major through the tcgen05 descriptor
+/// transpose (#53), so it carries a K-major map set and an MN-major one and
+/// nothing is ever transposed in global memory. The activation operand used to
+/// be staged here beside it — now it is the saved activation itself, read
+/// through its own descriptors, so that buffer and its map set are gone.
 struct Bf16LinearScratch<const N: usize, const D: usize, const FF: usize> {
     rows: DeviceBuffer<u32>,
-    lhs: DeviceBuffer<u32>,
     row_maps: Bf16LinearMaps,
     row_mn_maps: Bf16LinearMaps,
-    lhs_mn_maps: Bf16LinearMaps,
 }
 
 impl<const N: usize, const D: usize, const FF: usize> Bf16LinearScratch<N, D, FF> {
     fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
         let max_width = D.max(FF).max(3 * D).max(2 * FF);
         let rows = DeviceBuffer::zeroed(stream, N * max_width / 2)?;
-        let lhs = DeviceBuffer::zeroed(stream, N * max_width / 2)?;
 
         let row_maps = Self::maps(stream, &rows, TmaLayout::KMajor)?;
         let row_mn_maps = Self::maps(stream, &rows, TmaLayout::MnMajor)?;
-        let lhs_mn_maps = Self::maps(stream, &lhs, TmaLayout::MnMajor)?;
         Ok(Self {
             rows,
-            lhs,
             row_maps,
             row_mn_maps,
-            lhs_mn_maps,
         })
     }
 
@@ -806,13 +802,20 @@ impl<const N: usize, const D: usize, const FF: usize> LinearScratch<N, D, FF> {
             .oracle_input
             .as_mut()
             .expect("the fp32 oracle path needs its widened input staging");
-        // SAFETY: the staging holds `N * W` elements for the widest linear
-        // this scratch serves, and the launch covers exactly that many.
+        // The staging is sized for the *widest* linear this scratch serves, so
+        // it is longer than this activation whenever a narrower one is running.
+        // `convert_bf16_pairs_to_f32` bounds itself on the output, which would
+        // let the launch's rounded-up tail read past the packed input; the
+        // region form carries the element count and stops there.
+        // SAFETY: the staging holds at least `N * W` elements and the launch
+        // covers exactly that many.
         unsafe {
-            kernels.convert_bf16_pairs_to_f32(
+            kernels.widen_bf16_region(
                 stream,
                 LaunchConfig::for_num_elems((N * W) as u32),
                 x.as_device_buffer(),
+                0,
+                (N * W) as u32,
                 wide,
             )
         }
