@@ -890,13 +890,20 @@ pub mod kernels {
     pub fn swiglu_forward_bf16(gate: &[f32], up: &[f32], mut y: DisjointSlice<u32>) {
         let index = thread::index_1d();
         let pair = index.get();
-        if 2 * pair + 1 >= gate.len() || 2 * pair + 1 >= up.len() {
+        let elements = gate.len().min(up.len());
+        if 2 * pair >= elements {
             return;
         }
         if let Some(slot) = y.get_mut(index) {
             let mut packed = 0u32;
+            // An odd element count leaves the last word half real; its high
+            // half stays zero and no reader looks past `elements`. Bailing on
+            // the whole word instead, as this once did, dropped that element.
             for half in 0..2 {
                 let i = 2 * pair + half;
+                if i >= elements {
+                    break;
+                }
                 let sigmoid = 1.0 / (1.0 + (-gate[i]).exp());
                 packed |= (f32_to_bf16_bits(gate[i] * sigmoid * up[i]) as u32) << (16 * half);
             }

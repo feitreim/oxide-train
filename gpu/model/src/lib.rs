@@ -959,11 +959,7 @@ struct Bf16ActsMaps {
 
 impl<const N: usize, const W: usize> Bf16Acts<N, W> {
     fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
-        assert!(
-            W.is_multiple_of(2),
-            "a packed activation needs an even width"
-        );
-        let words = DeviceBuffer::zeroed(stream, N * W / 2)?;
+        let words = DeviceBuffer::zeroed(stream, Self::words())?;
         // A tiled tensor map needs the width on `TC_BK` and the height on the
         // layout's tile, so the descriptors exist only where the tcgen05 path
         // does. `tcgen05_linear_eligible` is the stricter test the call sites
@@ -1010,9 +1006,20 @@ impl<const N: usize, const W: usize> Bf16Acts<N, W> {
         &mut self.words
     }
 
+    /// The packed words this activation occupies.
+    ///
+    /// The stream is packed flat, two values to the word, so an odd `W` puts
+    /// one row's tail and the next row's head in the same word. That costs
+    /// nothing: every width the row-addressed kernels read is even by
+    /// construction (`D = H * HD`, and a tensor map needs `W` on `TC_BK`
+    /// anyway), and an odd one is only ever consumed flat, element by element.
+    fn words() -> usize {
+        (N * W).div_ceil(2)
+    }
+
     /// The launch covering one thread per word of this activation.
     fn words_config() -> LaunchConfig {
-        pairs_config(N * W / 2)
+        pairs_config(Self::words())
     }
 
     /// Host copy in element order, widened. Parity gates and checkpoint tests
