@@ -136,20 +136,34 @@ fn pack_bf16(values: &[f32]) -> Vec<u32> {
 // granted the architecture's 255 rather than the ~170 twelve warps left it, and
 // the ceiling that closed #83's two-band hoist is gone. These three counts are
 // what the kernel *asks for*, not what it may have.
+//
+// The epilogue's warpgroup split (ferro #197) ratchets all three down, because
+// a band is the register cost of a drain and the split halves the band: bf16
+// 132 → 86, the fp32 store 168 → 96 (its `HalfRow` went from 128 fp32 a lane to
+// 64), and the reduce 146 → 140, which moves least because its `[16, 64]`
+// half-bands did not change shape — it lifts four of them instead of eight.
+//
+// What the ceiling *is* moved with them, and by more than the counts did. At
+// 320 threads ptxas is compiling against a `.maxntid` of 640 rather than 384,
+// so the file it may divide gives a thread 96 registers rather than 168 — and
+// the bf16 and fp32-store drains land at 86 and 96 with **zero** spill and zero
+// frame, which is the split paying for its own block. The reduce keeps 384 and
+// its 168, and 140 sits under that. Every rung being under its cap with nothing
+// in local memory is the thing to check when one of these moves.
 const KERNEL_BUDGETS: [KernelBudget; 3] = [
     KernelBudget {
         name: "gemm_tcgen05_bf16_optimized",
-        max_registers: 132,
+        max_registers: 86,
         max_spill_bytes: 0,
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_optimized",
-        max_registers: 168,
+        max_registers: 96,
         max_spill_bytes: 0,
     },
     KernelBudget {
         name: "gemm_tcgen05_f32_accumulate",
-        max_registers: 146,
+        max_registers: 140,
         max_spill_bytes: 0,
     },
 ];
