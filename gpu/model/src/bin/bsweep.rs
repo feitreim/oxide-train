@@ -103,7 +103,8 @@ fn measure<const B: usize, const N: usize, const C: usize>(
         let inputs: &[usize; N] = inputs.as_slice().try_into().expect("length N");
         let targets: &[usize; N] = targets.as_slice().try_into().expect("length N");
 
-        gpu.zero_grad(&stream, &tensor)?;
+        // No gradient fill, matching the trainer: allocation zeroes the
+        // gradients and every AdamW write-back clears the one it consumed.
         let aux_coefficient = optimizer.aux_coefficient();
         gpu.forward(
             inputs,

@@ -247,34 +247,71 @@ def run_kernel(
     _run(cmd, cwd=proj)
 
 
+def _set_train_batch(proj: str, batch: int) -> None:
+    """Rewrite `bin/train.rs`'s compile-time batch size in the mounted copy."""
+    import re
+
+    source = Path(proj, "src/bin/train.rs")
+    patched, count = re.subn(
+        r"(?m)^const B: usize = \d+;$",
+        f"const B: usize = {batch};",
+        source.read_text(),
+    )
+    if count != 1:
+        raise SystemExit(f"expected one `const B: usize` in train.rs, found {count}")
+    source.write_text(patched)
+
+
 @app.function(
     gpu=DEFAULT_GPU,
     timeout=4 * 3600,
     volumes={"/data": wiki_volume},
 )
-def batch_sweep(batches: str, steps: int = 12, shard: str | None = None) -> None:
-    """Measure model's training throughput at several batch sizes.
+def batch_sweep(
+    batches: str,
+    steps: int = 12,
+    shard: str | None = None,
+    bsweep_at: str = "",
+) -> None:
+    """Measure the trainer's throughput at several batch sizes, in one container.
 
-    `B` is a compile-time constant, so `gpu/model/src/bin/bsweep.rs` compiles a
-    fixed set of candidates and `SWEEP_B` picks one per process. One build
-    serves the whole sweep, and a batch that exhausts HBM fails in its own
-    process, leaving the rest of the sweep to run.
+    `B` is a compile-time constant, so each batch is its own build of
+    `bin/train.rs`. `N`, `NP` and `C` derive from `B`, which makes the whole
+    reconfiguration one line to rewrite. Measuring the trainer itself is the
+    point: cuda-oxide collects kernels from the selected binary target, so a
+    separate harness is not guaranteed to compile the same device code.
+
+    `bsweep_at` additionally runs `bin/bsweep.rs` at the listed batch sizes.
+    That binary carries every candidate at once and picks one from `SWEEP_B`;
+    running it beside the trainer at a shared batch size is what says whether
+    its cheaper sweep is measuring the same kernels.
     """
     _run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], cwd="/")
     proj = _proj("model")
-    run = ["cargo", "oxide", "run", "model", "--bin", "bsweep"]
-    # With no SWEEP_B the binary only lists its candidates, so this pays for the
-    # build and lets a compile error abort before any batch is attributed one.
-    _run(run, cwd=proj)
+    # A log every hundredth step keeps the loss readback out of the timed
+    # window, which is the only place the trainer would otherwise synchronize.
+    env = [f"TRAIN_STEPS={steps}", "TRAIN_LOG_EVERY=100"]
+    if shard:
+        env.append(f"TRAIN_SHARD={shard}")
+
     for batch in batches.split(","):
-        env = [f"SWEEP_B={batch.strip()}", f"TRAIN_STEPS={steps}"]
-        if shard:
-            env.append(f"TRAIN_SHARD={shard}")
-        print(f"=== B={batch.strip()} ===", flush=True)
+        batch = batch.strip()
+        _set_train_batch(proj, int(batch))
+        print(f"=== train B={batch} ===", flush=True)
         try:
-            _run(["env", *env, *run], cwd=proj)
+            _run(["env", *env, "cargo", "oxide", "run", "model", "--bin", "train"], cwd=proj)
         except subprocess.CalledProcessError as e:
-            print(f"B={batch.strip()} failed: {e}", flush=True)
+            print(f"train B={batch} failed: {e}", flush=True)
+
+    for batch in filter(None, (value.strip() for value in bsweep_at.split(","))):
+        print(f"=== bsweep B={batch} ===", flush=True)
+        try:
+            _run(
+                ["env", f"SWEEP_B={batch}", *env, "cargo", "oxide", "run", "model", "--bin", "bsweep"],
+                cwd=proj,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"bsweep B={batch} failed: {e}", flush=True)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
@@ -598,9 +635,14 @@ def prepare(limit_files: int = 0, limit_articles: int = 0) -> None:
 
 
 @app.local_entrypoint()
-def sweep_batch(batches: str = "12,14,16,18,20,24", steps: int = 12, shard: str = "") -> None:
-    """modal run modal_app.py::sweep_batch --batches 12,16,20"""
-    batch_sweep.remote(batches, steps, shard or None)
+def sweep_batch(
+    batches: str = "12,16,18",
+    steps: int = 12,
+    shard: str = "",
+    bsweep_at: str = "",
+) -> None:
+    """modal run modal_app.py::sweep_batch --batches 12,16,18 --bsweep-at 12"""
+    batch_sweep.remote(batches, steps, shard or None, bsweep_at)
 
 
 @app.local_entrypoint()
