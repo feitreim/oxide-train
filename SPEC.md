@@ -248,7 +248,15 @@ row-major V panel as a column band through `create_flash_row_major_tma_map`
 each tile's K walk alone, so V's fp32 accumulator is the unsplit GEMM's to the
 bit and the epilogue's rounding lands where the staging pass's did. What
 disappears is V's whole fp32 round trip: the wide store, the staging read and
-the staging write — `3 · N · D · 4` bytes a block (#107 A8).
+the staging write, against a bf16 store added back — `8 · N · D` bytes a block,
+18 GiB a step at B=32 (#107 A8).
+
+Only the staging third of that converts to time. The qkv GEMM is not store-bound
+at this shape: halving a third of its output cost it nothing measurable and the
+split's extra wave gave 0.37 ms back, while the staging pass itself dropped
+5.03 → 3.97 ms. Net −0.70 ms of a 720 ms step directly, and `train_ab` reads
+**+0.39%** over six paired rounds in two containers. The bytes were real; the
+step is not paced by them.
 
 The backward re-staging goes with them: Q/K/V are per-block panels the forward
 already wrote, so only dY — a backward temporary — is staged, and
