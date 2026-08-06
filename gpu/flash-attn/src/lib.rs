@@ -24,7 +24,7 @@
 //! - tiled backward launches `rows * heads` blocks for each of dQ and dK/dV.
 
 use cuda_core::LaunchConfig;
-use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread, warp};
+use cuda_device::{DisjointSlice, SharedArray, cuda_module, float, kernel, thread, warp};
 
 // tcgen05 and libdevice-backed oracle kernels intentionally share one embedded
 // pure-PTX artifact at the pinned cuda-oxide revision.
@@ -1075,8 +1075,18 @@ pub mod kernels {
             *staged.get_unchecked_mut(destination + far) = pack_bf16_pair(far_low, far_high);
         }
 
-        let mut even = near_low * bf16_low(near_y) + far_low * bf16_low(far_y);
-        let mut odd = near_high * bf16_high(near_y) + far_high * bf16_high(far_y);
+        // The twin's products reach its tree through shared memory, which is
+        // what keeps them out of an FMA. Nothing separates them here, so say
+        // it: a contracted `a * b + c * d` is a different number by an ulp or
+        // two, and this kernel owes the twin the same one.
+        let mut even = float::add_rn_f32(
+            float::mul_rn_f32(near_low, bf16_low(near_y)),
+            float::mul_rn_f32(far_low, bf16_low(far_y)),
+        );
+        let mut odd = float::add_rn_f32(
+            float::mul_rn_f32(near_high, bf16_high(near_y)),
+            float::mul_rn_f32(far_high, bf16_high(far_y)),
+        );
         let mut partner = WARP_LANES as u32 / 2;
         while partner > 0 {
             even += warp::shuffle_xor_f32_sync(u32::MAX, even, partner);
