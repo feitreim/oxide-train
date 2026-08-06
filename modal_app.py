@@ -380,6 +380,48 @@ def compare_profile(kernel: str, baseline_ref: str) -> None:
     _run(["target/release/profile"], cwd=candidate)
 
 
+@app.function(
+    gpu=DEFAULT_GPU,
+    timeout=4 * 3600,
+    volumes={"/data": wiki_volume},
+)
+def compare_train(
+    baseline_ref: str,
+    steps: int = 100,
+    batch: int = 16,
+    shard: str | None = None,
+) -> None:
+    """Train a retained git baseline and the mounted candidate back to back in
+    one container.
+
+    `compare_profile` does this for `bin/profile`, but a throughput claim is
+    made with `bin/train.rs`, and SPEC §11 wants the before/after pair from one
+    container. `B` is a compile-time constant, so both trees are rewritten to
+    the same batch the way `batch_sweep` does.
+
+    The baseline must pin the image's cuda-oxide revision; a ref that does not
+    is `compare_profile`'s problem, which installs a matching toolchain.
+    """
+    baseline_root = "/tmp/rust-trainer-baseline"
+    _run(["git", "clone", "--quiet", TRAINER_REPO, baseline_root], cwd="/tmp")
+    _run(["git", "checkout", "--quiet", baseline_ref], cwd=baseline_root)
+    baseline = f"{baseline_root}/gpu/model"
+    if CUDA_OXIDE_REF not in Path(baseline, "Cargo.toml").read_text():
+        raise SystemExit(f"baseline {baseline_ref} pins another cuda-oxide revision")
+
+    env = ["env", f"TRAIN_STEPS={steps}", "TRAIN_LOG_EVERY=100"]
+    if shard:
+        env.append(f"TRAIN_SHARD={shard}")
+    arms = [(f"baseline {baseline_ref}", baseline), ("candidate", _proj("model"))]
+    for _, proj in arms:
+        _set_train_batch(proj, batch)
+
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    for name, proj in arms:
+        print(f"=== {name} B={batch} steps={steps} ===", flush=True)
+        _run([*env, "cargo", "oxide", "run", "model", "--bin", "train"], cwd=proj)
+
+
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
 def run_sweep(kernel: str, configs: str) -> None:
     """Bench several tuning configs in ONE container so they share a GPU and
