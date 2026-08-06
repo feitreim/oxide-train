@@ -13,10 +13,12 @@ use optim::{AdamWConfig, AuxLossSchedule};
 mod model;
 use model::{GpuDense, GpuDenseAdamW, GpuMoeWorkspace};
 
-/// Batch size. A B200 holds 21 of these, but throughput stops paying at 16:
-/// 12 -> 16 is worth 2.9%, and 16 -> 20 another 0.2% for 21 GiB
+/// Batch size. The fusions took the per-batch footprint from 5.33 GiB to 3.39,
+/// so a B200 holds 33 of these rather than 21, and throughput now pays all the
+/// way up: 16 -> 32 is worth 2.7%. 33 is the last that fits and measures no
+/// faster than 32, which keeps 4.3 GiB spare
 /// (`modal run modal_app.py::sweep_batch`).
-const B: usize = 16;
+const B: usize = 32;
 const T: usize = 2_048;
 const N: usize = B * T;
 /// `N` padded to the tcgen05 row tile, which every `B * T` already meets.
