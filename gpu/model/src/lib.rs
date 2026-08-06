@@ -946,8 +946,15 @@ impl<const N: usize, const T: usize, const D: usize, const H: usize>
 /// probabilities, the losses and every gradient (SPEC §7.1).
 struct Bf16Acts<const N: usize, const W: usize> {
     words: DeviceBuffer<u32>,
-    k_map: Bf16PairsTmaMap,
-    mn_map: Bf16PairsTmaMap,
+    /// `None` at a shape no tensor map can describe, which is exactly the
+    /// shape whose GEMMs take the fp32 fallback and never ask for one.
+    maps: Option<Bf16ActsMaps>,
+}
+
+/// The K-major and MN-major descriptors over one packed activation.
+struct Bf16ActsMaps {
+    k: Bf16PairsTmaMap,
+    mn: Bf16PairsTmaMap,
 }
 
 impl<const N: usize, const W: usize> Bf16Acts<N, W> {
@@ -957,16 +964,42 @@ impl<const N: usize, const W: usize> Bf16Acts<N, W> {
             "a packed activation needs an even width"
         );
         let words = DeviceBuffer::zeroed(stream, N * W / 2)?;
+        // A tiled tensor map needs the width on `TC_BK` and the height on the
+        // layout's tile, so the descriptors exist only where the tcgen05 path
+        // does. `tcgen05_linear_eligible` is the stricter test the call sites
+        // make, so a `None` here is never reached by a launch that would read
+        // it; a shape that fails only this one still takes the fallback,
+        // because the fallback is chosen per launch, not per allocation.
+        let mappable = N.is_multiple_of(TC_TILE) && W.is_multiple_of(TC_TILE);
         // SAFETY: both maps live beside the buffer they describe inside this
         // struct, which never reallocates it.
-        let k_map = unsafe { create_bf16_pairs_tma_map(stream, &words, W, N, TmaLayout::KMajor)? };
-        let mn_map =
-            unsafe { create_bf16_pairs_tma_map(stream, &words, W, N, TmaLayout::MnMajor)? };
-        Ok(Self {
-            words,
-            k_map,
-            mn_map,
-        })
+        let maps = mappable
+            .then(|| unsafe {
+                Ok::<_, Box<dyn Error>>(Bf16ActsMaps {
+                    k: create_bf16_pairs_tma_map(stream, &words, W, N, TmaLayout::KMajor)?,
+                    mn: create_bf16_pairs_tma_map(stream, &words, W, N, TmaLayout::MnMajor)?,
+                })
+            })
+            .transpose()?;
+        Ok(Self { words, maps })
+    }
+
+    /// The descriptor a forward GEMM reads this activation's rows through.
+    fn k_map(&self) -> &Bf16PairsTmaMap {
+        &self
+            .maps
+            .as_ref()
+            .expect("a tcgen05 launch asked for a map this shape cannot describe")
+            .k
+    }
+
+    /// The descriptor a weight-gradient GEMM reads this activation through.
+    fn mn_map(&self) -> &Bf16PairsTmaMap {
+        &self
+            .maps
+            .as_ref()
+            .expect("a tcgen05 launch asked for a map this shape cannot describe")
+            .mn
     }
 
     fn as_device_buffer(&self) -> &DeviceBuffer<u32> {
@@ -1052,7 +1085,7 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                 tcgen05.f32_store(
                     stream,
                     tcgen05_launch_config(N, OUT, IN),
-                    x.k_map.as_ptr(),
+                    x.k_map().as_ptr(),
                     compute.transposed_tma.as_ptr(),
                     output.as_device_buffer_mut(),
                     OUT as u32,
@@ -1104,7 +1137,7 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                     tcgen05.f32_accumulate_transposed(
                         stream,
                         tcgen05_launch_config(IN, OUT, N),
-                        x.mn_map.as_ptr(),
+                        x.mn_map().as_ptr(),
                         staging.row_mn_maps.get::<D, FF>(OUT).as_ptr(),
                         self.dw.as_device_buffer_mut(),
                         OUT as u32,
@@ -1281,7 +1314,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                 tcgen05.f32_store(
                     stream,
                     tcgen05_launch_config(N, width, IN),
-                    x.k_map.as_ptr(),
+                    x.k_map().as_ptr(),
                     compute.transposed_tma.as_ptr(),
                     output.as_device_buffer_mut(),
                     width as u32,
@@ -1344,7 +1377,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                     tcgen05.f32_accumulate_transposed(
                         stream,
                         tcgen05_launch_config(IN, width, N),
-                        x.mn_map.as_ptr(),
+                        x.mn_map().as_ptr(),
                         staging.row_mn_maps.get::<D, FF>(width).as_ptr(),
                         self.dw.as_device_buffer_mut(),
                         width as u32,
@@ -5289,7 +5322,7 @@ impl<
             // head reads the norm's output in place: the quantize that used to
             // stand here is gone with the fp32 copy it read.
             self.lm_head.forward_into::<NP, P>(
-                &workspace.final_normalized.k_map,
+                workspace.final_normalized.k_map(),
                 &mut workspace.logits,
                 stream,
                 gemm_bf16,
@@ -5404,7 +5437,7 @@ impl<
             // classifier backward skips them), so the MN-major operands feed
             // exact zeros into the weight GEMM's padded reduction slice.
             self.lm_head.backward_weight::<NP, P>(
-                &workspace.final_normalized.mn_map,
+                workspace.final_normalized.mn_map(),
                 &workspace.logits_mn_tma,
                 stream,
                 gemm_bf16,
@@ -5763,7 +5796,7 @@ impl<
             // head reads the norm's output in place: the quantize that used to
             // stand here is gone with the fp32 copy it read.
             self.lm_head.forward_into::<NP, P>(
-                &workspace.final_normalized.k_map,
+                workspace.final_normalized.k_map(),
                 &mut workspace.logits,
                 stream,
                 gemm_bf16,
@@ -5837,7 +5870,7 @@ impl<
             // classifier backward skips them), so the MN-major operands feed
             // exact zeros into the weight GEMM's padded reduction slice.
             self.lm_head.backward_weight::<NP, P>(
-                &workspace.final_normalized.mn_map,
+                workspace.final_normalized.mn_map(),
                 &workspace.logits_mn_tma,
                 stream,
                 gemm_bf16,
