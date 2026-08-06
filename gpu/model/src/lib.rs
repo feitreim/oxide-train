@@ -109,9 +109,9 @@ use flash_device::host::{
 };
 use gemm_device::fp32_launch_config;
 use gemm_device::host::{
-    Bf16PairsTmaMap, TC_K_PIPELINE, TC_M_TILE, TC_N_TILE, TC_TILE, TmaLayout,
-    create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_pairs_tma_map_region,
-    tcgen05_launch_config,
+    Bf16PairsTmaMap, Bf16PairsTmaMaps, TC_K_PIPELINE, TC_M_TILE, TC_N_TILE, TC_TILE, TmaLayout,
+    create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_pairs_tma_maps,
+    tcgen05_batched_launch_config, tcgen05_launch_config,
 };
 use tensor_device::{
     GpuAdamWMoments, GpuBf16Tensor, GpuMuonMomentum, GpuTensor, MASTER_ROUNDING_NEAREST,
@@ -1469,10 +1469,14 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
 /// per expert (#58). `transposed` is the transpose of the global
 /// `[experts * rows, columns]` matrix, likewise one strided descriptor per
 /// expert, which avoids an allocation or a transpose launch each.
+///
+/// The descriptors live in one allocation for all experts rather than one
+/// each, which is what lets a batched launch reach expert `e`'s operand by
+/// striding the base pointer (#107 A9).
 struct StackedBf16Weights {
     transposed: DeviceBuffer<u32>,
-    normal_maps: Vec<Bf16PairsTmaMap>,
-    transposed_maps: Vec<Bf16PairsTmaMap>,
+    normal_maps: Bf16PairsTmaMaps,
+    transposed_maps: Bf16PairsTmaMaps,
     experts: usize,
     rows: usize,
     columns: usize,
@@ -1502,32 +1506,30 @@ impl StackedBf16Weights {
         // SAFETY: `transposed` lives beside its maps here and the master beside
         // both in the owning expert FFN; neither is ever reallocated, including
         // on checkpoint resume, which refills masters in place.
-        let normal_maps = (0..experts)
-            .map(|expert| unsafe {
-                create_bf16_pairs_tma_map_region(
-                    stream,
-                    master,
-                    expert * rows * columns / 2,
-                    columns,
-                    rows,
-                    columns,
-                    TmaLayout::KMajor,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let transposed_maps = (0..experts)
-            .map(|expert| unsafe {
-                create_bf16_pairs_tma_map_region(
-                    stream,
-                    &transposed,
-                    expert * rows / 2,
-                    rows,
-                    columns,
-                    total_rows,
-                    TmaLayout::KMajor,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let normal_maps = unsafe {
+            create_bf16_pairs_tma_maps(
+                stream,
+                master,
+                experts,
+                rows * columns / 2,
+                columns,
+                rows,
+                columns,
+                TmaLayout::KMajor,
+            )?
+        };
+        let transposed_maps = unsafe {
+            create_bf16_pairs_tma_maps(
+                stream,
+                &transposed,
+                experts,
+                rows / 2,
+                rows,
+                columns,
+                total_rows,
+                TmaLayout::KMajor,
+            )?
+        };
         Ok(Self {
             transposed,
             normal_maps,
@@ -1590,8 +1592,8 @@ pub enum ExpertPanel {
 /// a GEMM row operand (`k_maps`) and as a weight-gradient operand (`mn_maps`).
 pub struct PackedExpertPanel {
     words: DeviceBuffer<u32>,
-    k_maps: Vec<Bf16PairsTmaMap>,
-    mn_maps: Vec<Bf16PairsTmaMap>,
+    k_maps: Bf16PairsTmaMaps,
+    mn_maps: Bf16PairsTmaMaps,
 }
 
 impl ExpertPanel {
@@ -1675,20 +1677,19 @@ fn expert_panel_maps(
     capacity: usize,
     width: usize,
     layout: TmaLayout,
-) -> Result<Vec<Bf16PairsTmaMap>, Box<dyn Error>> {
-    (0..experts)
-        .map(|expert| unsafe {
-            create_bf16_pairs_tma_map_region(
-                stream,
-                words,
-                expert * capacity * width / 2,
-                width,
-                capacity,
-                width,
-                layout,
-            )
-        })
-        .collect()
+) -> Result<Bf16PairsTmaMaps, Box<dyn Error>> {
+    unsafe {
+        create_bf16_pairs_tma_maps(
+            stream,
+            words,
+            experts,
+            capacity * width / 2,
+            width,
+            capacity,
+            width,
+            layout,
+        )
+    }
 }
 
 /// Staging used only by the non-aligned fp32 oracle. One expert is copied into
@@ -1736,23 +1737,20 @@ fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
     if let (Some(compute), ExpertPanel::Packed(input)) = (compute, input)
         && tcgen05_linear_eligible(C, input_width, output_width)
     {
-        profiler.measure(stream, name, || {
-            for expert in 0..E {
-                unsafe {
-                    tcgen05.f32_store_at(
-                        stream,
-                        tcgen05_launch_config(C, output_width, input_width),
-                        input.k_maps[expert].as_ptr(),
-                        compute.transposed_maps[expert].as_ptr(),
-                        output,
-                        expert * C * output_width,
-                        C * output_width,
-                        output_width as u32,
-                        input_width as u32,
-                    )?;
-                }
-            }
-            Ok(())
+        // One launch for all E experts: the panels are stacked `[E, C, width]`
+        // and the descriptors are indexed by expert, so the host loop that
+        // dispatched E identically shaped GEMMs is the kernel's outermost item
+        // axis instead (#107 A9).
+        profiler.measure(stream, name, || unsafe {
+            tcgen05.f32_store_batched(
+                stream,
+                tcgen05_batched_launch_config(C, output_width, input_width, E),
+                &input.k_maps,
+                &compute.transposed_maps,
+                output,
+                output_width as u32,
+                input_width as u32,
+            )
         })
     } else {
         let fp32_scratch = staging
@@ -1829,41 +1827,27 @@ fn expert_linear_backward<const E: usize, const C: usize, P: KernelProfiler>(
         // Both weight-gradient operands are read MN-major out of their native
         // `[E*C, width]` panels (#53), and since #59 both panels are stored
         // packed, so no operand is staged or transposed at all.
-        profiler.measure(stream, names[0], || {
-            for expert in 0..E {
-                unsafe {
-                    tcgen05.f32_accumulate_transposed_at(
-                        stream,
-                        tcgen05_launch_config(input_width, output_width, C),
-                        input.mn_maps[expert].as_ptr(),
-                        dy.mn_maps[expert].as_ptr(),
-                        weight_gradient,
-                        expert * input_width * output_width,
-                        input_width * output_width,
-                        output_width as u32,
-                        C as u32,
-                    )?;
-                }
-            }
-            Ok(())
+        profiler.measure(stream, names[0], || unsafe {
+            tcgen05.f32_accumulate_transposed_batched(
+                stream,
+                tcgen05_batched_launch_config(input_width, output_width, C, E),
+                &input.mn_maps,
+                &dy.mn_maps,
+                weight_gradient,
+                output_width as u32,
+                C as u32,
+            )
         })?;
-        profiler.measure(stream, names[1], || {
-            for expert in 0..E {
-                unsafe {
-                    tcgen05.f32_store_at(
-                        stream,
-                        tcgen05_launch_config(C, input_width, output_width),
-                        dy.k_maps[expert].as_ptr(),
-                        compute.normal_maps[expert].as_ptr(),
-                        input_gradient,
-                        expert * C * input_width,
-                        C * input_width,
-                        input_width as u32,
-                        output_width as u32,
-                    )?;
-                }
-            }
-            Ok(())
+        profiler.measure(stream, names[1], || unsafe {
+            tcgen05.f32_store_batched(
+                stream,
+                tcgen05_batched_launch_config(C, input_width, output_width, E),
+                &dy.k_maps,
+                &compute.normal_maps,
+                input_gradient,
+                input_width as u32,
+                output_width as u32,
+            )
         })
     } else {
         let fp32_scratch = staging
