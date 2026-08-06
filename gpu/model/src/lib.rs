@@ -98,6 +98,13 @@ pub use flash_device::host::Tcgen05Flash;
 pub use flash_device::kernels as flash_kernels;
 pub use gemm_device::fp32::kernels as gemm_kernels;
 pub use gemm_device::host::Tcgen05Gemm;
+/// The tcgen05 GEMM's launch geometry, for a binary that has to ask what the
+/// device made of the kernels **this** crate compiled. `gpu/gemm` pins their
+/// ptxas budgets against its own build of the same source, and what ptxas
+/// allocates depends on what else is in the compilation — so a block a thread's
+/// registers no longer divide into the file is a `701` here and a green gate
+/// there. `bin/profile` reads it.
+pub use gemm_device::optimized::{SHARED_BYTES as GEMM_SHARED_BYTES, THREADS as GEMM_THREADS};
 pub use tensor_device::kernels as tensor_kernels;
 
 use flash_device::host as flash_host;

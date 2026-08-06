@@ -131,6 +131,49 @@
 //! store: #123 measured that route *losing* by 1.0–1.7% at warp scope on this
 //! tile.
 //!
+//! ### The warpgroup split, which ferro-kittens took and this kernel does not
+//!
+//! The band count is fixed at [`DRAIN_WARPS`] by hardware — warp `w` reaches
+//! tensor-memory lanes `32 * w` and no others, so four warps tile [`BLOCK_M`]
+//! exactly. The axis that *is* open is columns: a second warpgroup can take
+//! [`BLOCK_N`]'s upper half, at eight `[32, 64]` staging tiles for the 32 768 B
+//! four `[32, 128]` ones already cost, so the shared plan does not move and the
+//! block goes 192 → 320.
+//!
+//! ferro-kittens shipped exactly that in its #197, after finding that the
+//! measurement which had rejected it was taken through a `.local` depot #166
+//! has since removed: re-run clean, the sign reversed to **+0.8% at 4096³ and
+//! +2.1% at 8192³, with the drain alone 35% cheaper**. This tree pins kittens
+//! past #166, so the depot was never here either and the transfer looked free.
+//!
+//! **It was measured here and it is not taken.** Two reasons, in order of how
+//! much they settle:
+//!
+//! - **It buys nothing.** `train_ab` against `main`, 30 steps, two rounds
+//!   alternating in one container: `candidate/baseline = 0.9979`, lower in both
+//!   rounds, against a within-arm spread of 0.20–0.29%. The drain being cheaper
+//!   is not worth anything to a step whose drain is already off the critical
+//!   path — the deferred epilogue above releases the accumulator at the last
+//!   `tcgen05.ld` and the ping-pong hands it to an item two ahead, so what the
+//!   split makes faster is work that was already running beside an MMA.
+//!   ferro's `gemm_sol` has no accumulator ping-pong, which is where its
+//!   2% lives.
+//! - **It spends the register margin the 1-CTA/SM design bought, and the
+//!   overspend is a refused launch rather than a slow one.** At 192 threads a
+//!   thread may have the architecture's 255; at 320 an SM will not place one
+//!   CTA past **168**. Three builds of the identical split commit gave
+//!   `gemm_tcgen05_f32_accumulate` at 140 registers with no frame twice and
+//!   **182 with a 2176 B frame** once — `max_active_blocks_per_multiprocessor`
+//!   of **0**, and `DriverError(701, "too many resources requested for launch")`
+//!   at the first weight-gradient launch. The same 182 launches fine at 192
+//!   threads. ptxas' allocation for these three kernels is not reproducible
+//!   across builds, and the split is what turns that variance into a kernel
+//!   that will not run.
+//!
+//! `bin/profile`'s GEMM report exists because of the second one: `gpu/gemm`'s
+//! budget gate reads a different compilation from the one the training step
+//! launches, and its green is not evidence about this.
+//!
 //! An **accumulating bf16** `C` leaves the same way through
 //! [`accumulate_shared_rows`], which is that store with one `ld.global.v4` in
 //! front of it. The kernel this replaced read-modify-wrote `C` a 32-bit word at
