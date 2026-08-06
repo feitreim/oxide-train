@@ -751,7 +751,14 @@ impl<D: Drain> Tile<D> {
         unsafe {
             let mut stage_index = 0u32;
             while let Some(item) = walk.next() {
-                let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP);
+                let (expert, tile_m, tile_n) = self.place(item);
+                // Expert `e`'s operands are expert `e`'s descriptors, which
+                // already carry its base address and its row stride — so a
+                // batched item's coordinates are a single GEMM's, unshifted.
+                let (a_map, b_map) = (
+                    self.a_map.add(expert as usize),
+                    self.b_map.add(expert as usize),
+                );
                 // All four of the pair's tiles complete on the leader's copy of
                 // the stage barrier, and only the leader charges it:
                 // `expect_tx` is `.shared::cta`, so a peer could not charge that
@@ -774,12 +781,12 @@ impl<D: Drain> Tile<D> {
                     // branch.
                     let bytes = if self.transposed {
                         MnStage::from_raw(a.base())
-                            .tma_load_2d_arriving_at(self.a_map, a_line, depth, stage)
+                            .tma_load_2d_arriving_at(a_map, a_line, depth, stage)
                             + MnStage::from_raw(b.base())
-                                .tma_load_2d_arriving_at(self.b_map, b_line, depth, stage)
+                                .tma_load_2d_arriving_at(b_map, b_line, depth, stage)
                     } else {
-                        a.tma_load_2d_arriving_at(self.a_map, depth, a_line, stage)
-                            + b.tma_load_2d_arriving_at(self.b_map, depth, b_line, stage)
+                        a.tma_load_2d_arriving_at(a_map, depth, a_line, stage)
+                            + b.tma_load_2d_arriving_at(b_map, depth, b_line, stage)
                     };
                     if self.rank == LEADER {
                         self.load
@@ -945,13 +952,34 @@ impl<D: Drain> Tile<D> {
             .columns_right(BLOCK_N as u32 * (sequence % SLOTS))
     }
 
+    /// The GEMM `item` belongs to and its tile within that GEMM.
+    ///
+    /// The expert is the item space's *outermost* axis, so a cluster walks a
+    /// run of one expert's tiles before it reaches the next and
+    /// [`pipeline::grouped`]'s operand locality is untouched — it is asked the
+    /// same question about the same tile grid it was asked before.
+    #[inline(always)]
+    fn place(&self, item: u32) -> (u32, u32, u32) {
+        let tiles = self.tiles_m * self.tiles_n;
+        let expert = item / tiles;
+        let (tile_m, tile_n) = pipeline::grouped(item % tiles, self.tiles_m, self.tiles_n, GROUP);
+        (expert, tile_m, tile_n)
+    }
+
     /// This warp's origin in `C` for `item`: the pair tile, this rank's half of
     /// it, and the 32 rows the warp owns.
+    ///
+    /// `C` is one allocation holding every expert's matrix, so the expert is
+    /// `tiles_m` tile-rows of it — the only place a batched launch's geometry
+    /// differs from a single one's, and the reason no expert stride is a
+    /// parameter.
     #[inline(always)]
     fn origin(&self, item: u32) -> (u32, u32) {
-        let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, GROUP);
+        let (expert, tile_m, tile_n) = self.place(item);
         (
-            2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * warp_id(),
+            2 * BLOCK_M as u32 * (expert * self.tiles_m + tile_m)
+                + BLOCK_M as u32 * self.rank
+                + 32 * warp_id(),
             BLOCK_N as u32 * tile_n,
         )
     }
@@ -1077,9 +1105,15 @@ pub mod kernels {
     /// [`gemm_tcgen05_f32_accumulate`], which folds at the copy engine instead
     /// of here.
     ///
+    /// `experts` is the batching axis: `a_map` and `b_map` point at that many
+    /// consecutive descriptors and `c` holds that many consecutive `[m, n]`
+    /// matrices, so one launch covers what was a host loop over equal-shaped
+    /// GEMMs (the MoE expert linears, oxide-train#107 A9). `1` is a plain
+    /// launch and costs it a divide an item.
+    ///
     /// # Safety
-    /// As [`gemm_tcgen05_bf16_optimized`], with `c_offset..c_offset + m * n`
-    /// inside `c`.
+    /// As [`gemm_tcgen05_bf16_optimized`], with `c_offset..c_offset +
+    /// experts * m * n` inside `c` and `experts` live descriptors at each map.
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     #[allow(clippy::too_many_arguments)]
@@ -1093,6 +1127,7 @@ pub mod kernels {
         tiles_m: u32,
         tiles_n: u32,
         transposed: u32,
+        experts: u32,
     ) {
         unsafe {
             let out = Wide {
@@ -1107,7 +1142,7 @@ pub mod kernels {
                 transposed != 0,
                 out,
             );
-            sweep(&tile, tiles_m * tiles_n);
+            sweep(&tile, experts * tiles_m * tiles_n);
         }
     }
 
@@ -1121,6 +1156,11 @@ pub mod kernels {
     /// gradient allocation — all live in `c_map`, so the kernel takes no `C`
     /// slice at all; the box is `[16, 32]` fp32 under SWIZZLE_128B, the shape
     /// [`Reduce`]'s staging tile stores through.
+    ///
+    /// `experts` batches as it does in [`gemm_tcgen05_f32_optimized`], and
+    /// `c_map` describes every expert's gradient at once: the stacked
+    /// `[experts * m, n]` matrix, which is what the expert's `m` tile-rows of
+    /// `C` are an offset into.
     ///
     /// # Safety
     /// As [`gemm_tcgen05_bf16_optimized`] for the operand maps; `c_map` must
@@ -1137,6 +1177,7 @@ pub mod kernels {
         tiles_m: u32,
         tiles_n: u32,
         transposed: u32,
+        experts: u32,
     ) {
         unsafe {
             let tile = attach(
@@ -1148,7 +1189,7 @@ pub mod kernels {
                 transposed != 0,
                 Reduce { c_map },
             );
-            sweep(&tile, tiles_m * tiles_n);
+            sweep(&tile, experts * tiles_m * tiles_n);
         }
     }
 

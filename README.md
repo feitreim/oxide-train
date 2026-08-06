@@ -91,6 +91,12 @@ full-step times and the changed kernel rows. Two separate `./run.sh`
 invocations may land on different GPUs or clock states and do **not** satisfy
 the same-container measurement gate in `SPEC.md`.
 
+A throughput claim is quoted from `bin/train`, not from the profile, and gets
+its pair from `modal run modal_app.py::train_ab --ref <pushed-branch>`: two
+worktrees of two pushed refs (`--baseline-ref`, default `main`), each built
+once and then alternated for `--rounds` rounds in one container, reporting
+tokens/s and MFU per run plus each arm's mean and spread.
+
 To add a kernel: copy `gpu/vecadd` to `gpu/<name>`, set `name` in its
 `Cargo.toml`, write the `#[kernel]` in `src/lib.rs`, and give it a real
 `bench.rs` figure of merit (GB/s if bandwidth-bound, TFLOP/s if compute-bound).

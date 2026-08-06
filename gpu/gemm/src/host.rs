@@ -48,6 +48,26 @@ pub fn tcgen05_launch_config(m: usize, n: usize, k: usize) -> LaunchConfig {
     tcgen05_launch_config_over(m, n, k, super::MAX_CLUSTERS)
 }
 
+/// [`tcgen05_launch_config`] for one launch covering `experts` GEMMs of that
+/// shape: the same grid rule over `experts` times the tiles.
+///
+/// The grid only grows where a single expert had fewer tiles than clusters, so
+/// what batching moves is the *tail*: 384 tiles over 74 clusters is six rounds
+/// for 5.19 rounds of work, and eight experts' worth is 42 for 41.5.
+pub fn tcgen05_batched_launch_config(m: usize, n: usize, k: usize, experts: usize) -> LaunchConfig {
+    assert!(experts > 0);
+    let single = tcgen05_launch_config_over(m, n, k, super::MAX_CLUSTERS);
+    let tiles = experts * (m / TC_M_TILE) * (n / TC_N_TILE);
+    LaunchConfig {
+        grid_dim: (
+            TC_RANKS * tiles.min(super::MAX_CLUSTERS as usize) as u32,
+            1,
+            1,
+        ),
+        ..single
+    }
+}
+
 /// [`tcgen05_launch_config`] over a stated number of clusters rather than the
 /// device's.
 ///
@@ -125,6 +145,20 @@ fn encode_bf16_tma_map_strided(
     row_stride: usize,
     layout: TmaLayout,
 ) -> Result<DeviceBuffer<u64>, Box<dyn Error>> {
+    let words = bf16_tma_map_words(base, width, height, row_stride, layout)?;
+    Ok(DeviceBuffer::from_host(stream, &words)?)
+}
+
+/// The descriptor [`encode_bf16_tma_map_strided`] uploads, before it is
+/// uploaded: what lets a batched launch's `experts` descriptors land in one
+/// allocation, 128 bytes apart, instead of one allocation each.
+fn bf16_tma_map_words(
+    base: u64,
+    width: usize,
+    height: usize,
+    row_stride: usize,
+    layout: TmaLayout,
+) -> Result<[u64; 16], Box<dyn Error>> {
     use cuda_core::sys::{
         CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
@@ -165,7 +199,7 @@ fn encode_bf16_tma_map_strided(
         return Err(format!("cuTensorMapEncodeTiled(bf16) failed: {status:?}").into());
     }
     let tensor_map = unsafe { tensor_map.assume_init() };
-    Ok(DeviceBuffer::from_host(stream, &tensor_map.opaque)?)
+    Ok(tensor_map.opaque)
 }
 
 /// Encode a `SWIZZLE_128B` fp32 tensor map delivering `[16, 32]` boxes of a
@@ -332,6 +366,21 @@ pub unsafe fn create_bf16_pairs_tma_map_region(
     row_stride: usize,
     layout: TmaLayout,
 ) -> Result<Bf16PairsTmaMap, Box<dyn Error>> {
+    let base = pairs_region_base(matrix, word_offset, width, height, row_stride);
+    Ok(Bf16PairsTmaMap {
+        descriptor: encode_bf16_tma_map_strided(stream, base, width, height, row_stride, layout)?,
+    })
+}
+
+/// The device address of the `[height, width]` region at `word_offset`, having
+/// checked that the region it names lies inside `matrix`.
+fn pairs_region_base(
+    matrix: &DeviceBuffer<u32>,
+    word_offset: usize,
+    width: usize,
+    height: usize,
+    row_stride: usize,
+) -> u64 {
     assert!(width.is_multiple_of(2));
     assert!(row_stride.is_multiple_of(2));
     assert!(row_stride >= width);
@@ -352,12 +401,66 @@ pub unsafe fn create_bf16_pairs_tma_map_region(
     let byte_offset = word_offset
         .checked_mul(std::mem::size_of::<u32>())
         .expect("bf16 TMA region byte offset overflow");
-    let base = matrix
+    matrix
         .cu_deviceptr()
         .checked_add(byte_offset as u64)
-        .expect("bf16 TMA region device pointer overflow");
-    Ok(Bf16PairsTmaMap {
-        descriptor: encode_bf16_tma_map_strided(stream, base, width, height, row_stride, layout)?,
+        .expect("bf16 TMA region device pointer overflow")
+}
+
+/// One descriptor per expert over equal-shaped regions of one packed-pair
+/// allocation, in a single allocation of their own.
+///
+/// A batched launch reaches expert `e`'s operand by striding the base pointer
+/// by `e` descriptors, which is what lets `E` GEMM launches become one without
+/// the kernel learning anything about how the panel is laid out: the offsets
+/// stay where they already were, in the descriptors.
+pub struct Bf16PairsTmaMaps {
+    descriptors: DeviceBuffer<u64>,
+    experts: usize,
+}
+
+impl Bf16PairsTmaMaps {
+    /// Expert 0's descriptor, and the base the kernel strides from.
+    pub fn as_ptr(&self) -> *const TmaDescriptor {
+        self.descriptors.cu_deviceptr() as *const TmaDescriptor
+    }
+
+    pub fn experts(&self) -> usize {
+        self.experts
+    }
+}
+
+/// Build [`Bf16PairsTmaMaps`] over `experts` regions `expert_words` apart.
+///
+/// Every other argument is [`create_bf16_pairs_tma_map_region`]'s and describes
+/// one expert; `expert_words` is the packed-word distance from one expert's
+/// region to the next, which is a whole panel for a stacked buffer and one
+/// expert's row block for a globally transposed one.
+///
+/// # Safety
+///
+/// As [`create_bf16_pairs_tma_map_region`], for every expert.
+pub unsafe fn create_bf16_pairs_tma_maps(
+    stream: &CudaStream,
+    matrix: &DeviceBuffer<u32>,
+    experts: usize,
+    expert_words: usize,
+    width: usize,
+    height: usize,
+    row_stride: usize,
+    layout: TmaLayout,
+) -> Result<Bf16PairsTmaMaps, Box<dyn Error>> {
+    assert!(experts > 0);
+    let mut words = Vec::with_capacity(experts * 16);
+    for expert in 0..experts {
+        let base = pairs_region_base(matrix, expert * expert_words, width, height, row_stride);
+        words.extend_from_slice(&bf16_tma_map_words(
+            base, width, height, row_stride, layout,
+        )?);
+    }
+    Ok(Bf16PairsTmaMaps {
+        descriptors: DeviceBuffer::from_host(stream, &words)?,
+        experts,
     })
 }
 
@@ -475,13 +578,17 @@ impl Tcgen05Gemm {
         n: u32,
         k: u32,
         layout: TmaLayout,
+        experts: usize,
     ) -> Result<(), DriverError> {
         let output_end = output_offset
             .checked_add(output_elements)
             .expect("tcgen05 fp32 output region overflow");
         assert!(output_end <= output.len());
+        // `C` is described whole — every expert's block of rows — while the
+        // tile counts are one expert's, because they are what the item walk
+        // divides by.
         let c_map = self.reduce_c_map(stream, output, output_offset, output_elements, n)?;
-        let m = output_elements / n as usize;
+        let m = output_elements / experts / n as usize;
         unsafe {
             self.generated.gemm_tcgen05_f32_accumulate(
                 stream,
@@ -493,6 +600,7 @@ impl Tcgen05Gemm {
                 (m / TC_M_TILE) as u32,
                 (n as usize / TC_N_TILE) as u32,
                 u32::from(layout == TmaLayout::MnMajor),
+                experts as u32,
             )
         }
     }
@@ -594,6 +702,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::KMajor,
+                1,
             )
         }
     }
@@ -631,6 +740,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::KMajor,
+                1,
             )
         }
     }
@@ -664,6 +774,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::KMajor,
+                1,
             )
         }
     }
@@ -699,6 +810,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::KMajor,
+                1,
             )
         }
     }
@@ -774,6 +886,92 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::MnMajor,
+                1,
+            )
+        }
+    }
+
+    /// One launch covering every expert of [`Tcgen05Gemm::f32_store_at`]:
+    /// `experts` equal-shaped `C = A·Bᵀ` whose operands are the descriptor
+    /// arrays' entries and whose outputs are `m` rows apart in one allocation.
+    ///
+    /// The kernel's item space gains the expert as its outermost axis and
+    /// nothing else changes: an item's tile coordinates, its operand walk and
+    /// its `C` band are what they were, addressed through expert `e`'s
+    /// descriptors and `e * m` rows down.
+    ///
+    /// # Safety
+    ///
+    /// As [`Tcgen05Gemm::f32_store_at`] for every expert, with `output`
+    /// holding exactly `experts` `m * n` matrices and both arrays that long.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_store_batched(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: &Bf16PairsTmaMaps,
+        b_tma: &Bf16PairsTmaMaps,
+        output: &mut DeviceBuffer<f32>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        let experts = a_tma.experts();
+        assert_eq!(experts, b_tma.experts());
+        let output_elements = output.len();
+        assert_batched_output(output_elements, experts, n);
+        unsafe {
+            launch_tcgen05_f32(
+                &self.generated,
+                stream,
+                config,
+                a_tma.as_ptr(),
+                b_tma.as_ptr(),
+                output,
+                0,
+                output_elements,
+                n,
+                k,
+                TmaLayout::KMajor,
+                experts,
+            )
+        }
+    }
+
+    /// [`Tcgen05Gemm::f32_store_batched`] for the weight gradient:
+    /// `experts` equal-shaped `dW += Aᵀ·B` folded at the copy engine.
+    ///
+    /// # Safety
+    ///
+    /// As [`Tcgen05Gemm::f32_accumulate_transposed_at`] for every expert, with
+    /// `output` holding exactly `experts` `m * n` matrices.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f32_accumulate_transposed_batched(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        a_tma: &Bf16PairsTmaMaps,
+        b_tma: &Bf16PairsTmaMaps,
+        output: &mut DeviceBuffer<f32>,
+        n: u32,
+        k: u32,
+    ) -> Result<(), DriverError> {
+        let experts = a_tma.experts();
+        assert_eq!(experts, b_tma.experts());
+        let output_elements = output.len();
+        assert_batched_output(output_elements, experts, n);
+        unsafe {
+            self.launch_f32_accumulate(
+                stream,
+                config,
+                a_tma.as_ptr(),
+                b_tma.as_ptr(),
+                output,
+                0,
+                output_elements,
+                n,
+                k,
+                TmaLayout::MnMajor,
+                experts,
             )
         }
     }
@@ -813,6 +1011,7 @@ impl Tcgen05Gemm {
                 n,
                 k,
                 TmaLayout::MnMajor,
+                1,
             )
         }
     }
@@ -848,6 +1047,16 @@ impl Tcgen05Gemm {
             )
         }
     }
+}
+
+/// `output` must be exactly the `experts` stacked `[m, n]` matrices a batched
+/// launch walks: `m` is what the kernel's tile-row count and its per-expert
+/// `C` stride are both derived from, so a wrong length is a wrong walk rather
+/// than a caught argument.
+fn assert_batched_output(elements: usize, experts: usize, n: u32) {
+    let rows = elements / experts / n as usize;
+    assert_eq!(elements, experts * rows * n as usize);
+    assert!(rows.is_multiple_of(TC_M_TILE));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -898,12 +1107,13 @@ unsafe fn launch_tcgen05_f32(
     n: u32,
     k: u32,
     layout: TmaLayout,
+    experts: usize,
 ) -> Result<(), DriverError> {
     let output_end = output_offset
         .checked_add(output_elements)
         .expect("tcgen05 fp32 output region overflow");
     assert!(output_end <= output.len());
-    let m = output_elements / n as usize;
+    let m = output_elements / experts / n as usize;
     unsafe {
         module.gemm_tcgen05_f32_optimized(
             stream,
@@ -917,6 +1127,7 @@ unsafe fn launch_tcgen05_f32(
             (m / TC_M_TILE) as u32,
             (n as usize / TC_N_TILE) as u32,
             u32::from(layout == TmaLayout::MnMajor),
+            experts as u32,
         )
     }
 }
