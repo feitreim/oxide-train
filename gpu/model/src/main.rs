@@ -1,8 +1,10 @@
 //! End-to-end forward/backward parity against `nn::Dense`.
 //!
-//! Activations and gradients are fp32 except where the bf16 tcgen05 lm-head
-//! and block linears round them, so quantities downstream of the logits carry
-//! bf16 tolerances. Master weights are bf16 on both sides (#57): the CPU
+//! Saved activations are packed bf16 — the stream the projections read where
+//! it lies — and gradients are fp32, so every quantity a forward pass carries
+//! and everything downstream of it takes bf16 tolerances. The sums and the
+//! statistics inside a kernel are still fp32, so the error is one rounding per
+//! layer boundary, not one per operand. Master weights are bf16 on both sides (#57): the CPU
 //! reference is snapped onto the bf16 grid at construction and after every
 //! update, and the post-update comparison is made *on that grid* — see
 //! [`assert_master_close`].
