@@ -110,9 +110,9 @@ use flash_device::host::{
 };
 use gemm_device::fp32_launch_config;
 use gemm_device::host::{
-    Bf16PairsTmaMap, TC_K_PIPELINE, TC_M_TILE, TC_N_TILE, TC_TILE, TmaLayout,
-    create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_pairs_tma_map_region,
-    tcgen05_launch_config,
+    Bf16PairsTmaMap, Bf16PairsTmaMaps, TC_K_PIPELINE, TC_M_TILE, TC_N_TILE, TC_TILE, TmaLayout,
+    create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_pairs_tma_maps,
+    tcgen05_batched_launch_config, tcgen05_launch_config,
 };
 use tensor_device::{
     GpuAdamWMoments, GpuBf16Tensor, GpuMuonMomentum, GpuTensor, MASTER_ROUNDING_NEAREST,
@@ -292,6 +292,25 @@ fn moe_assign_config<const E: usize>() -> LaunchConfig {
     }
 }
 
+fn moe_aux_terms_config<const E: usize>() -> LaunchConfig {
+    assert!(dense_device::MOE_AUX_TERMS_THREADS.is_power_of_two());
+    assert!(E <= u32::MAX as usize);
+    LaunchConfig {
+        grid_dim: (E as u32, 1, 1),
+        block_dim: (dense_device::MOE_AUX_TERMS_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn loss_tail_config() -> LaunchConfig {
+    assert!(dense_device::LOSS_TAIL_THREADS.is_power_of_two());
+    LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (dense_device::LOSS_TAIL_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 /// Launch for a router GEMM producing an `[m, n]` output: one lane per element
 /// of a `[ROUTER_GEMM_BM, ROUTER_GEMM_BN]` output tile.
 fn router_gemm_config(m: usize, n: usize) -> LaunchConfig {
@@ -388,47 +407,6 @@ fn fill_zero<S: Shape, P: KernelProfiler>(
             stream,
             elementwise_config::<S>(),
             0.0,
-            output.as_device_buffer_mut(),
-        )
-    })
-}
-
-fn sum_into<S: Shape, P: KernelProfiler>(
-    input: &GpuTensor<f32, S>,
-    output: &mut GpuTensor<f32, Rank1<1>>,
-    stream: &CudaStream,
-    kernels: &tensor_kernels::LoadedModule,
-    profiler: &mut P,
-    name: &'static str,
-) -> Result<(), DriverError> {
-    // SAFETY: the reduction config and scalar output satisfy the kernel contract.
-    profiler.measure(stream, name, || unsafe {
-        kernels.sum(
-            stream,
-            reduction_config(),
-            input.as_device_buffer(),
-            S::NUM_ELEMENTS as u32,
-            output.as_device_buffer_mut(),
-        )
-    })
-}
-
-fn scale_into<S: Shape, P: KernelProfiler>(
-    input: &GpuTensor<f32, S>,
-    factor: f32,
-    output: &mut GpuTensor<f32, S>,
-    stream: &CudaStream,
-    kernels: &tensor_kernels::LoadedModule,
-    profiler: &mut P,
-    name: &'static str,
-) -> Result<(), DriverError> {
-    // SAFETY: launch dimensions come from S and both buffers have shape S.
-    profiler.measure(stream, name, || unsafe {
-        kernels.scale(
-            stream,
-            elementwise_config::<S>(),
-            input.as_device_buffer(),
-            factor,
             output.as_device_buffer_mut(),
         )
     })
@@ -1458,10 +1436,14 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
 /// per expert (#58). `transposed` is the transpose of the global
 /// `[experts * rows, columns]` matrix, likewise one strided descriptor per
 /// expert, which avoids an allocation or a transpose launch each.
+///
+/// The descriptors live in one allocation for all experts rather than one
+/// each, which is what lets a batched launch reach expert `e`'s operand by
+/// striding the base pointer (#107 A9).
 struct StackedBf16Weights {
     transposed: DeviceBuffer<u32>,
-    normal_maps: Vec<Bf16PairsTmaMap>,
-    transposed_maps: Vec<Bf16PairsTmaMap>,
+    normal_maps: Bf16PairsTmaMaps,
+    transposed_maps: Bf16PairsTmaMaps,
     experts: usize,
     rows: usize,
     columns: usize,
@@ -1491,32 +1473,30 @@ impl StackedBf16Weights {
         // SAFETY: `transposed` lives beside its maps here and the master beside
         // both in the owning expert FFN; neither is ever reallocated, including
         // on checkpoint resume, which refills masters in place.
-        let normal_maps = (0..experts)
-            .map(|expert| unsafe {
-                create_bf16_pairs_tma_map_region(
-                    stream,
-                    master,
-                    expert * rows * columns / 2,
-                    columns,
-                    rows,
-                    columns,
-                    TmaLayout::KMajor,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let transposed_maps = (0..experts)
-            .map(|expert| unsafe {
-                create_bf16_pairs_tma_map_region(
-                    stream,
-                    &transposed,
-                    expert * rows / 2,
-                    rows,
-                    columns,
-                    total_rows,
-                    TmaLayout::KMajor,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let normal_maps = unsafe {
+            create_bf16_pairs_tma_maps(
+                stream,
+                master,
+                experts,
+                rows * columns / 2,
+                columns,
+                rows,
+                columns,
+                TmaLayout::KMajor,
+            )?
+        };
+        let transposed_maps = unsafe {
+            create_bf16_pairs_tma_maps(
+                stream,
+                &transposed,
+                experts,
+                rows / 2,
+                rows,
+                columns,
+                total_rows,
+                TmaLayout::KMajor,
+            )?
+        };
         Ok(Self {
             transposed,
             normal_maps,
@@ -1579,8 +1559,8 @@ pub enum ExpertPanel {
 /// a GEMM row operand (`k_maps`) and as a weight-gradient operand (`mn_maps`).
 pub struct PackedExpertPanel {
     words: DeviceBuffer<u32>,
-    k_maps: Vec<Bf16PairsTmaMap>,
-    mn_maps: Vec<Bf16PairsTmaMap>,
+    k_maps: Bf16PairsTmaMaps,
+    mn_maps: Bf16PairsTmaMaps,
 }
 
 impl ExpertPanel {
@@ -1664,20 +1644,19 @@ fn expert_panel_maps(
     capacity: usize,
     width: usize,
     layout: TmaLayout,
-) -> Result<Vec<Bf16PairsTmaMap>, Box<dyn Error>> {
-    (0..experts)
-        .map(|expert| unsafe {
-            create_bf16_pairs_tma_map_region(
-                stream,
-                words,
-                expert * capacity * width / 2,
-                width,
-                capacity,
-                width,
-                layout,
-            )
-        })
-        .collect()
+) -> Result<Bf16PairsTmaMaps, Box<dyn Error>> {
+    unsafe {
+        create_bf16_pairs_tma_maps(
+            stream,
+            words,
+            experts,
+            capacity * width / 2,
+            width,
+            capacity,
+            width,
+            layout,
+        )
+    }
 }
 
 /// Staging used only by the non-aligned fp32 oracle. One expert is copied into
@@ -1725,23 +1704,20 @@ fn expert_linear_forward<const E: usize, const C: usize, P: KernelProfiler>(
     if let (Some(compute), ExpertPanel::Packed(input)) = (compute, input)
         && tcgen05_linear_eligible(C, input_width, output_width)
     {
-        profiler.measure(stream, name, || {
-            for expert in 0..E {
-                unsafe {
-                    tcgen05.f32_store_at(
-                        stream,
-                        tcgen05_launch_config(C, output_width, input_width),
-                        input.k_maps[expert].as_ptr(),
-                        compute.transposed_maps[expert].as_ptr(),
-                        output,
-                        expert * C * output_width,
-                        C * output_width,
-                        output_width as u32,
-                        input_width as u32,
-                    )?;
-                }
-            }
-            Ok(())
+        // One launch for all E experts: the panels are stacked `[E, C, width]`
+        // and the descriptors are indexed by expert, so the host loop that
+        // dispatched E identically shaped GEMMs is the kernel's outermost item
+        // axis instead (#107 A9).
+        profiler.measure(stream, name, || unsafe {
+            tcgen05.f32_store_batched(
+                stream,
+                tcgen05_batched_launch_config(C, output_width, input_width, E),
+                &input.k_maps,
+                &compute.transposed_maps,
+                output,
+                output_width as u32,
+                input_width as u32,
+            )
         })
     } else {
         let fp32_scratch = staging
@@ -1818,41 +1794,27 @@ fn expert_linear_backward<const E: usize, const C: usize, P: KernelProfiler>(
         // Both weight-gradient operands are read MN-major out of their native
         // `[E*C, width]` panels (#53), and since #59 both panels are stored
         // packed, so no operand is staged or transposed at all.
-        profiler.measure(stream, names[0], || {
-            for expert in 0..E {
-                unsafe {
-                    tcgen05.f32_accumulate_transposed_at(
-                        stream,
-                        tcgen05_launch_config(input_width, output_width, C),
-                        input.mn_maps[expert].as_ptr(),
-                        dy.mn_maps[expert].as_ptr(),
-                        weight_gradient,
-                        expert * input_width * output_width,
-                        input_width * output_width,
-                        output_width as u32,
-                        C as u32,
-                    )?;
-                }
-            }
-            Ok(())
+        profiler.measure(stream, names[0], || unsafe {
+            tcgen05.f32_accumulate_transposed_batched(
+                stream,
+                tcgen05_batched_launch_config(input_width, output_width, C, E),
+                &input.mn_maps,
+                &dy.mn_maps,
+                weight_gradient,
+                output_width as u32,
+                C as u32,
+            )
         })?;
-        profiler.measure(stream, names[1], || {
-            for expert in 0..E {
-                unsafe {
-                    tcgen05.f32_store_at(
-                        stream,
-                        tcgen05_launch_config(C, input_width, output_width),
-                        dy.k_maps[expert].as_ptr(),
-                        compute.normal_maps[expert].as_ptr(),
-                        input_gradient,
-                        expert * C * input_width,
-                        C * input_width,
-                        input_width as u32,
-                        output_width as u32,
-                    )?;
-                }
-            }
-            Ok(())
+        profiler.measure(stream, names[1], || unsafe {
+            tcgen05.f32_store_batched(
+                stream,
+                tcgen05_batched_launch_config(C, input_width, output_width, E),
+                &dy.k_maps,
+                &compute.normal_maps,
+                input_gradient,
+                input_width as u32,
+                output_width as u32,
+            )
         })
     } else {
         let fp32_scratch = staging
@@ -4116,7 +4078,6 @@ struct GpuBlockScratch<
     no_normalized: DeviceBuffer<u32>,
     attention_dot: GpuTensor<f32, Rank2<N, H>>,
     router_logits: GpuTensor<f32, Rank2<N, E>>,
-    probability_sums: GpuTensor<f32, Rank1<E>>,
     gate_gradients: GpuTensor<f32, Rank2<N, K>>,
     dlogits: GpuTensor<f32, Rank2<N, E>>,
     router_dx: GpuTensor<f32, Rank2<N, D>>,
@@ -4164,7 +4125,6 @@ impl<
             no_normalized: DeviceBuffer::zeroed(stream, 0)?,
             attention_dot: GpuTensor::zeros(stream)?,
             router_logits: GpuTensor::zeros(stream)?,
-            probability_sums: GpuTensor::zeros(stream)?,
             gate_gradients: GpuTensor::zeros(stream)?,
             dlogits: GpuTensor::zeros(stream)?,
             router_dx: GpuTensor::zeros(stream)?,
@@ -4235,7 +4195,11 @@ pub struct GpuMoeWorkspace<
     linear_scratch: LinearScratch<N, D, FF>,
     flash_scratch: Option<FlashAttentionScratch<N, T, D, H>>,
     losses: GpuTensor<f32, Rank1<N>>,
-    loss_sum: GpuTensor<f32, Rank1<1>>,
+    /// Every block's per-expert addend to its load-balancing loss, written
+    /// once per layer and summed into the scalar loss by the tail reduction.
+    /// One buffer for the whole model, so the single-threaded launch that used
+    /// to add each layer's loss on its own is one launch that adds them all.
+    aux_terms: GpuTensor<f32, Rank2<L, E>>,
     loss: GpuTensor<f32, Rank1<1>>,
 }
 
@@ -4288,7 +4252,7 @@ impl<
                 None
             },
             losses: GpuTensor::zeros(stream)?,
-            loss_sum: GpuTensor::zeros(stream)?,
+            aux_terms: GpuTensor::zeros(stream)?,
             loss: GpuTensor::zeros(stream)?,
         })
     }
@@ -4425,7 +4389,10 @@ pub struct GpuDenseWorkspace<
     /// its FFN backward reads first, so neither of its norms recomputes one.
     no_normalized: DeviceBuffer<u32>,
     losses: GpuTensor<f32, Rank1<N>>,
-    loss_sum: GpuTensor<f32, Rank1<1>>,
+    /// A dense model has no experts and so no load-balancing loss, but the
+    /// loss tail is shared with the MoE model and reads a term buffer. This
+    /// one is zeroed at allocation and never written.
+    aux_terms: GpuTensor<f32, Rank1<1>>,
     loss: GpuTensor<f32, Rank1<1>>,
     d_model_0: GpuTensor<f32, Rank2<N, D>>,
     d_model_1: GpuTensor<f32, Rank2<N, D>>,
@@ -4496,7 +4463,7 @@ impl<
             norm_backward_inv: GpuTensor::zeros(stream)?,
             no_normalized: DeviceBuffer::zeroed(stream, 0)?,
             losses: GpuTensor::zeros(stream)?,
-            loss_sum: GpuTensor::zeros(stream)?,
+            aux_terms: GpuTensor::zeros(stream)?,
             loss: GpuTensor::zeros(stream)?,
             d_model_0: GpuTensor::zeros(stream)?,
             d_model_1: GpuTensor::zeros(stream)?,
@@ -5393,6 +5360,24 @@ impl<
                     profiler,
                 )?;
             }
+            // Each block leaves its `E` load-balancing addends in its row of
+            // `aux_terms`. No pre-fill: every row is stored, not accumulated
+            // into, and the loss tail below sums them all in one launch.
+            for (layer, acts) in workspace.block_acts.iter().enumerate() {
+                profiler.measure(stream, "forward.router.aux_terms", || unsafe {
+                    dense.moe_aux_terms(
+                        stream,
+                        moe_aux_terms_config::<E>(),
+                        acts.routing.probabilities.as_device_buffer(),
+                        acts.routing.assignment_counts.as_device_buffer(),
+                        N as u32,
+                        E as u32,
+                        K as u32,
+                        layer as u32,
+                        workspace.aux_terms.as_device_buffer_mut(),
+                    )
+                })?;
+            }
             self.final_norm.forward_into(
                 &workspace.final_input,
                 &mut workspace.final_normalized,
@@ -5417,48 +5402,13 @@ impl<
                 &workspace.logits,
                 &workspace.targets,
                 &mut workspace.losses,
-                &mut workspace.loss_sum,
+                workspace.aux_terms.as_device_buffer(),
+                aux_coefficient,
                 &mut workspace.loss,
                 stream,
-                tensor,
                 dense,
                 profiler,
-            )?;
-            for acts in &workspace.block_acts {
-                // No pre-fill: `moe_probability_sums` stores each expert's sum
-                // rather than accumulating into the slot.
-                profiler.measure(stream, "forward.router.aux_probability_sums", || unsafe {
-                    dense.moe_probability_sums(
-                        stream,
-                        LaunchConfig {
-                            grid_dim: (E as u32, 1, 1),
-                            block_dim: (dense_device::MOE_PROBABILITY_SUMS_THREADS as u32, 1, 1),
-                            shared_mem_bytes: 0,
-                        },
-                        acts.routing.probabilities.as_device_buffer(),
-                        N as u32,
-                        E as u32,
-                        workspace
-                            .block_scratch
-                            .probability_sums
-                            .as_device_buffer_mut(),
-                    )
-                })?;
-                profiler.measure(stream, "forward.router.aux_loss", || unsafe {
-                    dense.moe_aux_loss(
-                        stream,
-                        LaunchConfig::for_num_elems(1),
-                        workspace.block_scratch.probability_sums.as_device_buffer(),
-                        acts.routing.assignment_counts.as_device_buffer(),
-                        N as u32,
-                        E as u32,
-                        K as u32,
-                        aux_coefficient,
-                        workspace.loss.as_device_buffer_mut(),
-                    )
-                })?;
-            }
-            Ok(())
+            )
         }
     }
 
@@ -5869,10 +5819,10 @@ impl<
                 &workspace.logits,
                 &workspace.targets,
                 &mut workspace.losses,
-                &mut workspace.loss_sum,
+                workspace.aux_terms.as_device_buffer(),
+                0.0,
                 &mut workspace.loss,
                 stream,
-                tensor,
                 dense,
                 profiler,
             )
@@ -6715,15 +6665,23 @@ fn swiglu_backward_into<const N: usize, const FF: usize, P: KernelProfiler>(
     Ok(())
 }
 
+/// The loss tail: per-token cross entropy, then the one reduction that turns
+/// it into the scalar training loss.
+///
+/// `aux_terms` holds every layer's per-expert load-balancing addend, already
+/// written by `moe_aux_terms`; a model without experts leaves it zero.
+/// Folding the auxiliary terms into the mean is what
+/// keeps this tail at two launches instead of the classifier plus a `sum`, a
+/// `scale` and one single-threaded launch per layer.
 #[allow(clippy::too_many_arguments)]
 fn cross_entropy_into<const N: usize, const VOCAB: usize, const VP: usize, P: KernelProfiler>(
     logits: &DeviceBuffer<u32>,
     targets: &GpuTensor<u32, Rank1<N>>,
     losses: &mut GpuTensor<f32, Rank1<N>>,
-    loss_sum: &mut GpuTensor<f32, Rank1<1>>,
+    aux_terms: &DeviceBuffer<f32>,
+    aux_coefficient: f32,
     loss: &mut GpuTensor<f32, Rank1<1>>,
     stream: &CudaStream,
-    tensor: &tensor_kernels::LoadedModule,
     dense: &dense_kernels::LoadedModule,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
@@ -6740,23 +6698,18 @@ fn cross_entropy_into<const N: usize, const VOCAB: usize, const VP: usize, P: Ke
             losses.as_device_buffer_mut(),
         )
     })?;
-    sum_into(
-        losses,
-        loss_sum,
-        stream,
-        tensor,
-        profiler,
-        "forward.loss.reduction",
-    )?;
-    scale_into(
-        loss_sum,
-        1.0 / N as f32,
-        loss,
-        stream,
-        tensor,
-        profiler,
-        "forward.loss.mean",
-    )
+    // SAFETY: one block reduces the N losses and reads every auxiliary term.
+    profiler.measure(stream, "forward.loss.mean", || unsafe {
+        dense.loss_mean_with_aux(
+            stream,
+            loss_tail_config(),
+            losses.as_device_buffer(),
+            N as u32,
+            aux_terms,
+            aux_coefficient,
+            loss.as_device_buffer_mut(),
+        )
+    })
 }
 
 fn cross_entropy_backward_into<

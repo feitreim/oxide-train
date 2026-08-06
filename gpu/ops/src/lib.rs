@@ -93,15 +93,33 @@ pub const ROUTER_INPUT_BN: usize = ROUTER_INPUT_THREADS * ROUTER_INPUT_COLUMNS;
 
 /// Threads in one router weight-gradient partition block.
 pub const ROUTER_WGRAD_THREADS: usize = 256;
-/// Model rows each router weight-gradient lane owns. The lane holds their
-/// `[E]` accumulators in registers, so one coalesced `x` load feeds `E` FMAs.
-pub const ROUTER_WGRAD_ROWS: usize = 4;
+/// Model rows each router weight-gradient lane owns: both halves of one packed
+/// `x` word, so a warp's load is a full 128-byte sector and the lane holds
+/// `ROWS * E` accumulators in registers.
+pub const ROUTER_WGRAD_ROWS: usize = 2;
 /// Model rows one router weight-gradient block owns.
 pub const ROUTER_WGRAD_BM: usize = ROUTER_WGRAD_THREADS * ROUTER_WGRAD_ROWS;
+/// Tokens a lane loads before it multiplies any of them.
+///
+/// The token loop's trip count is a runtime value NVVM will not unroll, so this
+/// is the only thing putting more than one `x` load in flight per lane — the
+/// same fact `MOE_PROBABILITY_SUMS_THREADS` records, and the reason this kernel
+/// used to run at a tenth of memory rate.
+///
+/// The staged values land in a `.local` depot because the multiply loop that
+/// reads them stays rolled, and that is the faster arrangement: `#[unroll]`ing
+/// it folds the depot away into 128 straight-line FMAs and measured **4.3205 ms
+/// against 3.1397** over the step's twelve launches. The depot is L1-resident
+/// and the registers it saves are what keep the warps that hide the loads.
+pub const ROUTER_WGRAD_TOKENS: usize = 8;
 /// Contiguous token partitions the router weight gradient is split into. Each
 /// partition is summed by one block and the partitions are merged in ascending
 /// order, which fixes the reduction order independently of block scheduling.
-pub const ROUTER_WGRAD_SPLITS: usize = 256;
+///
+/// It also sizes the `[SPLITS, E, D]` partial buffer the merge reads back, so
+/// it is worth no more than it buys: `D * SPLITS * TOKENS` loads in flight is
+/// already past memory rate at 64, where 256 cost four times the partials.
+pub const ROUTER_WGRAD_SPLITS: usize = 64;
 
 /// Sentinel written by deterministic MoE binning for a capacity-dropped pair.
 pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
@@ -111,7 +129,7 @@ pub const MOE_DROPPED_SLOT: u32 = u32::MAX;
 /// power of two.
 pub const MOE_SCATTER_DY_THREADS: usize = 256;
 
-/// Threads in one block-per-expert routing-probability reduction. Lanes stride
+/// Threads in one block-per-expert auxiliary-loss term reduction. Lanes stride
 /// the tokens before a tree reduction, so this must remain a power of two.
 ///
 /// One block per expert is only `E` blocks, so the token loop's depth is all
@@ -119,7 +137,11 @@ pub const MOE_SCATTER_DY_THREADS: usize = 256;
 /// value NVVM will not unroll, which leaves each lane one load in flight and
 /// the launch `N / threads` load latencies deep. A full block is 24 of them
 /// rather than 96 (#99).
-pub const MOE_PROBABILITY_SUMS_THREADS: usize = 1024;
+pub const MOE_AUX_TERMS_THREADS: usize = 1024;
+
+/// Threads in the single-block loss tail. Lanes stride the per-token losses
+/// before a tree reduction, so this must remain a power of two.
+pub const LOSS_TAIL_THREADS: usize = 1024;
 
 /// Threads in one MoE dead-slot zeroing block.
 pub const MOE_ZERO_BINS_THREADS: usize = 256;
@@ -3087,38 +3109,55 @@ pub mod kernels {
         }
     }
 
-    /// Parallel token reduction for each expert's mean routing probability.
+    /// One expert's addend to one layer's Switch-style load-balancing loss:
+    /// `E · assignment_fraction · mean_probability`, so a layer's whole
+    /// auxiliary loss is the sum of its `E` terms and the model's is the sum
+    /// of the whole `[L, E]` buffer.
     ///
     /// One block owns an expert, and so owns that expert's slot outright: lanes
     /// accumulate strided token slices, a tree reduction combines them, and
-    /// lane 0 stores. Accumulating the lanes with same-address atomics instead
-    /// needed the buffer pre-zeroed by a `fill` launch per layer, serialized
-    /// [`MOE_PROBABILITY_SUMS_THREADS`] adds on one word, and left the summation
-    /// order — and so the reported auxiliary loss — dependent on their arrival
-    /// order (#99). The auxiliary *gradient* never reads this: `router_backward`
-    /// derives it from the assignment counts.
+    /// lane 0 weights the mean and stores. Accumulating the lanes with
+    /// same-address atomics instead needed the buffer pre-zeroed by a `fill`
+    /// launch per layer, serialized [`MOE_AUX_TERMS_THREADS`] adds on one word,
+    /// and left the summation order — and so the reported auxiliary loss —
+    /// dependent on their arrival order (#99). Leaving a term per
+    /// `(layer, expert)` keeps that property while letting one launch at the
+    /// end of the forward fold every layer's loss into the scalar at once. The
+    /// auxiliary *gradient* never reads this: `router_backward` derives it from
+    /// the assignment counts.
     #[kernel]
-    pub unsafe fn moe_probability_sums(
+    pub unsafe fn moe_aux_terms(
         probabilities: &[f32],
+        assignment_counts: &[u32],
         tokens: u32,
         experts: u32,
-        mut probability_sums: DisjointSlice<f32>,
+        top_k: u32,
+        layer: u32,
+        mut aux_terms: DisjointSlice<f32>,
     ) {
-        static mut SUMS: SharedArray<f32, MOE_PROBABILITY_SUMS_THREADS> = SharedArray::UNINIT;
+        static mut SUMS: SharedArray<f32, MOE_AUX_TERMS_THREADS> = SharedArray::UNINIT;
 
         let expert = thread::blockIdx_x() as usize;
         let lane = thread::threadIdx_x() as usize;
         let n = tokens as usize;
         let e = experts as usize;
+        let k = top_k as usize;
+        let term = layer as usize * e + expert;
         // Uniform over the block, so no lane reaches a barrier the rest skip.
-        if expert >= e || expert >= probability_sums.len() || probabilities.len() < n * e {
+        if expert >= e
+            || n == 0
+            || k == 0
+            || term >= aux_terms.len()
+            || expert >= assignment_counts.len()
+            || probabilities.len() < n * e
+        {
             return;
         }
         let mut sum = 0.0f32;
         let mut token = lane;
         while token < n {
             sum += probabilities[token * e + expert];
-            token += MOE_PROBABILITY_SUMS_THREADS;
+            token += MOE_AUX_TERMS_THREADS;
         }
 
         // SAFETY: each lane owns its own slot of the block's scratch.
@@ -3126,7 +3165,7 @@ pub mod kernels {
             SUMS[lane] = sum;
         }
         thread::sync_threads();
-        let mut stride = MOE_PROBABILITY_SUMS_THREADS / 2;
+        let mut stride = MOE_AUX_TERMS_THREADS / 2;
         while stride > 0 {
             if lane < stride {
                 // SAFETY: the surviving half of the lanes own disjoint slots.
@@ -3138,41 +3177,78 @@ pub mod kernels {
             stride /= 2;
         }
         if lane == 0 {
-            // SAFETY: this block exclusively owns `expert`.
+            let assignment_fraction = assignment_counts[expert] as f32 / (n * k) as f32;
+            // SAFETY: this block exclusively owns `(layer, expert)`.
             unsafe {
-                *probability_sums.get_unchecked_mut(expert) = SUMS[0];
+                *aux_terms.get_unchecked_mut(term) =
+                    e as f32 * assignment_fraction * (SUMS[0] / n as f32);
             }
         }
     }
 
-    /// Add the weighted Switch-style load-balancing loss to the scalar training
-    /// loss from the already-reduced expert probability sums.
+    /// The scalar training loss: mean per-token cross entropy plus every
+    /// layer's weighted auxiliary loss.
+    ///
+    /// One block. Lanes reduce the per-token losses grid-stride, a tree
+    /// reduction combines them, and lane 0 folds in the terms
+    /// [`moe_aux_terms`] left behind, summed in layer-major order so the
+    /// reported loss does not depend on which block wrote which term. This is
+    /// the whole loss tail: it replaces a `sum`, a `scale` and one
+    /// single-threaded auxiliary launch per layer — kernels whose cost was
+    /// almost entirely their launch. A model without experts leaves `aux_terms`
+    /// zero and gets the plain mean.
     #[kernel]
-    pub unsafe fn moe_aux_loss(
-        probability_sums: &[f32],
-        assignment_counts: &[u32],
+    pub unsafe fn loss_mean_with_aux(
+        losses: &[f32],
         tokens: u32,
-        experts: u32,
-        top_k: u32,
+        aux_terms: &[f32],
         coefficient: f32,
         mut loss: DisjointSlice<f32>,
     ) {
-        if thread::index_1d().get() != 0 || loss.is_empty() {
-            return;
-        }
+        static mut PARTIALS: SharedArray<f32, LOSS_TAIL_THREADS> = SharedArray::UNINIT;
+
+        let lane = thread::threadIdx_x() as usize;
         let n = tokens as usize;
-        let e = experts as usize;
-        let k = top_k as usize;
-        if n == 0 || e == 0 || k == 0 || probability_sums.len() < e || assignment_counts.len() < e {
+        // Uniform over the block, so no lane reaches a barrier the rest skip.
+        if thread::blockDim_x() as usize != LOSS_TAIL_THREADS
+            || n == 0
+            || losses.len() < n
+            || loss.is_empty()
+        {
             return;
         }
-        let mut auxiliary = 0.0f32;
-        for expert in 0..e {
-            let assignment_fraction = assignment_counts[expert] as f32 / (n * k) as f32;
-            auxiliary += assignment_fraction * probability_sums[expert] / n as f32;
+        let mut partial = 0.0f32;
+        let mut token = lane;
+        while token < n {
+            partial += losses[token];
+            token += LOSS_TAIL_THREADS;
         }
+
+        // SAFETY: each lane owns its own slot of the block's scratch.
         unsafe {
-            *loss.get_unchecked_mut(0) += coefficient * e as f32 * auxiliary;
+            PARTIALS[lane] = partial;
+        }
+        thread::sync_threads();
+        let mut stride = LOSS_TAIL_THREADS / 2;
+        while stride > 0 {
+            if lane < stride {
+                // SAFETY: the surviving half of the lanes own disjoint slots.
+                unsafe {
+                    PARTIALS[lane] += PARTIALS[lane + stride];
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if lane == 0 {
+            let mut auxiliary = 0.0f32;
+            for term in 0..aux_terms.len() {
+                auxiliary += aux_terms[term];
+            }
+            // SAFETY: the single surviving lane of the single block stores.
+            unsafe {
+                *loss.get_unchecked_mut(0) = PARTIALS[0] / n as f32 + coefficient * auxiliary;
+            }
         }
     }
 
@@ -4382,19 +4458,33 @@ pub mod kernels {
     }
 
     /// One contiguous token partition of the router weight gradient
-    /// `dweight[D,E] = x[N,D]^T dlogits[N,E]`, written to
+    /// `dweight[D,E] = x[N,D]ᵀ·dlogits[N,E]`, written to
     /// `partials[SPLITS, E, D]` for `router_backward_weight_merge` to sum.
     ///
     /// `D*E` is far too few outputs to fill the machine on its own, so the
-    /// token dimension is split across blocks. A block owns
-    /// `ROUTER_WGRAD_BM` model rows of one partition, lane-major so each `x`
-    /// read is a full coalesced sector, and each lane keeps `[E]` accumulators
-    /// per owned row in registers: one `x` load feeds `E` FMAs and the gate row
-    /// is a warp-uniform broadcast shared by the whole register tile.
+    /// token dimension is split across blocks: a block owns `ROUTER_WGRAD_BM`
+    /// model rows of one partition, lane-major so each `x` read is a full
+    /// coalesced sector, and each lane keeps the `[E]` accumulators of the two
+    /// rows it owns in registers — one load feeds `2 * E` FMAs against a gate
+    /// row the whole warp shares.
+    ///
+    /// Two things keep the token walk at memory rate, and both are about loads
+    /// sharing a basic block: the shape is validated once up front so the walk
+    /// indexes unchecked, and `ROUTER_WGRAD_TOKENS` of them are issued before
+    /// any is multiplied. Guarding each load instead — a bounds check, an
+    /// `expert < e` test — puts every one in a block of its own, which is one
+    /// load in flight per warp and was a tenth of the achievable bandwidth.
     ///
     /// The reduction order is fixed: a lane owns its outputs alone and sums its
     /// partition in ascending token order, and the merge sums partitions in
-    /// ascending order. No lane, block, or launch ordering can perturb it.
+    /// ascending order. No lane, block, or launch ordering can perturb it,
+    /// which is what the checkpoint-resume gate holds the trajectory to.
+    ///
+    /// # Safety
+    ///
+    /// `x` must hold `tokens * dim` elements, `dlogits` `tokens * experts` and
+    /// `partials` `SPLITS * experts * dim`; `dim` must be even. Each is
+    /// checked, and a launch that fails any of them writes nothing.
     #[kernel]
     pub unsafe fn router_backward_weight_split(
         x: &[f32],
@@ -4404,76 +4494,93 @@ pub mod kernels {
         dim: u32,
         mut partials: DisjointSlice<f32>,
     ) {
-        let tid = thread::threadIdx_x() as usize;
-        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS {
-            return;
-        }
         let n = tokens as usize;
         let e = experts as usize;
         let d = dim as usize;
-        if e == 0 || e > ROUTER_MAX_EXPERTS || d == 0 || n * d > x.len() || n * e > dlogits.len() {
+        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS
+            || e == 0
+            || e > ROUTER_MAX_EXPERTS
+            || !d.is_multiple_of(ROUTER_WGRAD_ROWS)
+            || n * d > x.len()
+            || n * e > dlogits.len()
+            || ROUTER_WGRAD_SPLITS * e * d > partials.len()
+        {
             return;
         }
-        let split = thread::blockIdx_y() as usize;
-        let row_base = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM + tid;
-        if (split + 1) * e * d > partials.len() {
+        let row = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM
+            + thread::threadIdx_x() as usize * ROUTER_WGRAD_ROWS;
+        if row >= d {
             return;
         }
 
         let partition = n.div_ceil(ROUTER_WGRAD_SPLITS);
+        let split = thread::blockIdx_y() as usize;
         let token_end = ((split + 1) * partition).min(n);
         let mut token = (split * partition).min(n);
 
-        let mut accumulators = [[0.0f32; ROUTER_MAX_EXPERTS]; ROUTER_WGRAD_ROWS];
+        let mut low = [0.0f32; ROUTER_MAX_EXPERTS];
+        let mut high = [0.0f32; ROUTER_MAX_EXPERTS];
         while token < token_end {
-            let mut gates = [0.0f32; ROUTER_MAX_EXPERTS];
-            let mut expert = 0usize;
-            while expert < ROUTER_MAX_EXPERTS {
-                gates[expert] = if expert < e {
-                    dlogits[token * e + expert]
-                } else {
-                    0.0
-                };
-                expert += 1;
+            let mut lows = [0.0f32; ROUTER_WGRAD_TOKENS];
+            let mut highs = [0.0f32; ROUTER_WGRAD_TOKENS];
+            let mut step = 0usize;
+            while step < ROUTER_WGRAD_TOKENS {
+                // The tail rereads the partition's last token and multiplies
+                // it by zero. Clamping costs one select; branching would cost
+                // the load its place in this block.
+                let index = (token + step).min(token_end - 1);
+                let keep = if token + step < token_end { 1.0 } else { 0.0 };
+                let base = index * d + row;
+                unsafe {
+                    lows[step] = *x.get_unchecked(base) * keep;
+                    highs[step] = *x.get_unchecked(base + 1) * keep;
+                }
+                step += 1;
             }
 
-            let row_offset = token * d;
-            let mut slot = 0usize;
-            while slot < ROUTER_WGRAD_ROWS {
-                let row = row_base + slot * ROUTER_WGRAD_THREADS;
-                let value = if row < d { x[row_offset + row] } else { 0.0 };
+            let mut step = 0usize;
+            while step < ROUTER_WGRAD_TOKENS {
+                let gate_base = (token + step).min(token_end - 1) * e;
                 let mut expert = 0usize;
                 while expert < ROUTER_MAX_EXPERTS {
-                    accumulators[slot][expert] += value * gates[expert];
+                    let held = expert < e;
+                    let gate = unsafe {
+                        *dlogits.get_unchecked(gate_base + if held { expert } else { 0 })
+                    };
+                    let gate = if held { gate } else { 0.0 };
+                    low[expert] += lows[step] * gate;
+                    high[expert] += highs[step] * gate;
                     expert += 1;
                 }
-                slot += 1;
+                step += 1;
             }
-            token += 1;
+            token += ROUTER_WGRAD_TOKENS;
         }
 
-        let mut slot = 0usize;
-        while slot < ROUTER_WGRAD_ROWS {
-            let row = row_base + slot * ROUTER_WGRAD_THREADS;
-            if row < d {
-                let mut expert = 0usize;
-                while expert < e {
-                    unsafe {
-                        *partials.get_unchecked_mut((split * e + expert) * d + row) =
-                            accumulators[slot][expert];
-                    }
-                    expert += 1;
+        // The lane's two rows are adjacent in `partials`, so each expert's
+        // pair of stores is one contiguous run per warp.
+        let base = split * e * d + row;
+        let mut expert = 0usize;
+        while expert < ROUTER_MAX_EXPERTS {
+            if expert < e {
+                unsafe {
+                    *partials.get_unchecked_mut(base + expert * d) = low[expert];
+                    *partials.get_unchecked_mut(base + expert * d + 1) = high[expert];
                 }
             }
-            slot += 1;
+            expert += 1;
         }
     }
 
     /// [`router_backward_weight_split`] reading its saved input packed.
     ///
-    /// The partition boundaries, the per-lane register tile and the ascending
-    /// reduction order are the twin's, so this stays as deterministic as it
-    /// was; only the `x` load widens.
+    /// The pair of rows a lane owns is the pair a packed word already holds, so
+    /// the widening is free and the load is the same one instruction.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`router_backward_weight_split`], with `x` holding
+    /// `tokens * dim / 2` packed words.
     #[kernel]
     pub unsafe fn router_backward_weight_split_bf16(
         x: &[u32],
@@ -4483,77 +4590,76 @@ pub mod kernels {
         dim: u32,
         mut partials: DisjointSlice<f32>,
     ) {
-        let tid = thread::threadIdx_x() as usize;
-        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS {
-            return;
-        }
         let n = tokens as usize;
         let e = experts as usize;
         let d = dim as usize;
-        if e == 0
+        if thread::blockDim_x() as usize != ROUTER_WGRAD_THREADS
+            || e == 0
             || e > ROUTER_MAX_EXPERTS
-            || d == 0
+            || !d.is_multiple_of(ROUTER_WGRAD_ROWS)
             || n * d > x.len() * 2
             || n * e > dlogits.len()
+            || ROUTER_WGRAD_SPLITS * e * d > partials.len()
         {
             return;
         }
-        let split = thread::blockIdx_y() as usize;
-        let row_base = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM + tid;
-        if (split + 1) * e * d > partials.len() {
+        let row = thread::blockIdx_x() as usize * ROUTER_WGRAD_BM
+            + thread::threadIdx_x() as usize * ROUTER_WGRAD_ROWS;
+        if row >= d {
             return;
         }
 
         let partition = n.div_ceil(ROUTER_WGRAD_SPLITS);
+        let split = thread::blockIdx_y() as usize;
         let token_end = ((split + 1) * partition).min(n);
         let mut token = (split * partition).min(n);
 
-        let mut accumulators = [[0.0f32; ROUTER_MAX_EXPERTS]; ROUTER_WGRAD_ROWS];
+        let mut low = [0.0f32; ROUTER_MAX_EXPERTS];
+        let mut high = [0.0f32; ROUTER_MAX_EXPERTS];
         while token < token_end {
-            let mut gates = [0.0f32; ROUTER_MAX_EXPERTS];
-            let mut expert = 0usize;
-            while expert < ROUTER_MAX_EXPERTS {
-                gates[expert] = if expert < e {
-                    dlogits[token * e + expert]
-                } else {
-                    0.0
-                };
-                expert += 1;
+            let mut lows = [0.0f32; ROUTER_WGRAD_TOKENS];
+            let mut highs = [0.0f32; ROUTER_WGRAD_TOKENS];
+            let mut step = 0usize;
+            while step < ROUTER_WGRAD_TOKENS {
+                let index = (token + step).min(token_end - 1);
+                let keep = if token + step < token_end { 1.0 } else { 0.0 };
+                let halves = bf16_halves(unsafe { *x.get_unchecked((index * d + row) / 2) });
+                lows[step] = halves[0] * keep;
+                highs[step] = halves[1] * keep;
+                step += 1;
             }
 
-            let row_offset = token * d;
-            let mut slot = 0usize;
-            while slot < ROUTER_WGRAD_ROWS {
-                let row = row_base + slot * ROUTER_WGRAD_THREADS;
-                let value = if row < d {
-                    bf16_at(x, row_offset + row)
-                } else {
-                    0.0
-                };
+            let mut step = 0usize;
+            while step < ROUTER_WGRAD_TOKENS {
+                let gate_base = (token + step).min(token_end - 1) * e;
                 let mut expert = 0usize;
                 while expert < ROUTER_MAX_EXPERTS {
-                    accumulators[slot][expert] += value * gates[expert];
+                    let held = expert < e;
+                    let gate = unsafe {
+                        *dlogits.get_unchecked(gate_base + if held { expert } else { 0 })
+                    };
+                    let gate = if held { gate } else { 0.0 };
+                    low[expert] += lows[step] * gate;
+                    high[expert] += highs[step] * gate;
                     expert += 1;
                 }
-                slot += 1;
+                step += 1;
             }
-            token += 1;
+            token += ROUTER_WGRAD_TOKENS;
         }
 
-        let mut slot = 0usize;
-        while slot < ROUTER_WGRAD_ROWS {
-            let row = row_base + slot * ROUTER_WGRAD_THREADS;
-            if row < d {
-                let mut expert = 0usize;
-                while expert < e {
-                    unsafe {
-                        *partials.get_unchecked_mut((split * e + expert) * d + row) =
-                            accumulators[slot][expert];
-                    }
-                    expert += 1;
+        // The lane's two rows are adjacent in `partials`, so each expert's
+        // pair of stores is one contiguous run per warp.
+        let base = split * e * d + row;
+        let mut expert = 0usize;
+        while expert < ROUTER_MAX_EXPERTS {
+            if expert < e {
+                unsafe {
+                    *partials.get_unchecked_mut(base + expert * d) = low[expert];
+                    *partials.get_unchecked_mut(base + expert * d + 1) = high[expert];
                 }
             }
-            slot += 1;
+            expert += 1;
         }
     }
 
