@@ -916,6 +916,67 @@ fn check_moe_scatter_dy_case<const D: usize>(
         1e-6,
         1e-6,
     );
+
+    // The packed twin, where both the saved output it dots against and the bin
+    // gradient it writes are bf16. Only an even `D` reaches it: a packed bin
+    // row of odd width would straddle words, which is why the kernel bails on
+    // one, and why a packed bin panel only exists at tcgen05-aligned shapes.
+    if D.is_multiple_of(2) {
+        let pack = |values: &[f32]| -> Vec<u32> {
+            values
+                .chunks(2)
+                .map(|pair| {
+                    bf16::from_f32(pair[0]).to_bits() as u32
+                        | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
+                })
+                .collect()
+        };
+        let expert_output_words = DeviceBuffer::from_host(stream, &pack(&expert_output))?;
+        let mut gradient_words = DeviceBuffer::from_host(stream, &pack(&poison))?;
+        let mut packed_gate_gradients_dev = DeviceBuffer::<f32>::zeroed(stream, N * K)?;
+        unsafe {
+            module.moe_zero_dead_bins_bf16(
+                stream,
+                zero_dead_bins_config::<E>(1),
+                &counts_dev,
+                D as u32,
+                C as u32,
+                &mut gradient_words,
+            )?;
+            module.moe_scatter_dy_packed(
+                stream,
+                LaunchConfig {
+                    grid_dim: ((N * K) as u32, 1, 1),
+                    block_dim: (MOE_SCATTER_DY_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &expert_output_words,
+                &dy_dev,
+                &selected_dev,
+                &gates_dev,
+                &slots_dev,
+                D as u32,
+                K as u32,
+                C as u32,
+                &mut gradient_words,
+                &mut packed_gate_gradients_dev,
+            )?;
+        }
+        assert_eq!(
+            gradient_words.to_host_vec(stream)?,
+            pack(&expected_gradient),
+            "packed scatter must be the wide bin gradient rounded to bf16"
+        );
+        // Every operand here is exact in bf16, so the dot product reads the
+        // same values the wide kernel did and differs only by summation order.
+        assert_close(
+            "MoE gate gradients off a packed saved output",
+            &packed_gate_gradients_dev.to_host_vec(stream)?,
+            &expected_gate_gradients,
+            1e-6,
+            1e-6,
+        );
+    }
     Ok(())
 }
 
@@ -1773,8 +1834,16 @@ fn check_swiglu_interleaved_case<const ROWS: usize, const FF: usize>(
     // packs the `ROWS x FF` (or interleaved `ROWS x 2FF`) rectangle into, and
     // the bf16 launches only run at an FF divisible by four.
     unsafe {
-        let gate = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(14);
-        let up = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(15);
+        // The packed panel holds gate and up rounded to bf16, so the flat fp32
+        // reference reads the same rounded values the packed kernels unpack
+        // (as `check_embedding` does for the bf16 master) — which keeps every
+        // comparison below exact rather than tolerant.
+        let gate = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(14)
+            .to_bf16()
+            .to_f32();
+        let up = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(15)
+            .to_bf16()
+            .to_f32();
         let dy = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(16);
         let mut interleaved = vec![0.0f32; ROWS * 2 * FF];
         for row in 0..ROWS {
@@ -1846,11 +1915,14 @@ fn check_swiglu_interleaved_case<const ROWS: usize, const FF: usize>(
                     })
                     .collect()
             };
+            // The packed arms read the panel packed too: it is the gate/up
+            // GEMM's own epilogue target now, never an fp32 buffer.
+            let gate_up_words = DeviceBuffer::from_host(stream, &pack(&interleaved))?;
             let mut y_words = DeviceBuffer::<u32>::zeroed(stream, ROWS * FF / 2)?;
-            module.swiglu_forward_interleaved_bf16(
+            module.swiglu_forward_interleaved_packed(
                 stream,
                 LaunchConfig::for_num_elems((ROWS * FF / 4) as u32),
-                &gate_up_dev,
+                &gate_up_words,
                 FF as u32,
                 &mut y_words,
             )?;
@@ -1861,10 +1933,10 @@ fn check_swiglu_interleaved_case<const ROWS: usize, const FF: usize>(
             );
 
             let mut d_words = DeviceBuffer::<u32>::zeroed(stream, ROWS * FF)?;
-            module.swiglu_backward_interleaved_bf16(
+            module.swiglu_backward_interleaved_packed(
                 stream,
                 LaunchConfig::for_num_elems((ROWS * FF / 4) as u32),
-                &gate_up_dev,
+                &gate_up_words,
                 &dy_dev,
                 FF as u32,
                 &mut d_words,
