@@ -327,7 +327,9 @@ def batch_sweep(batches: str, steps: int = 12, shard: str | None = None) -> None
     timeout=4 * 3600,
     volumes={"/data": wiki_volume},
 )
-def torch_baseline(tiers: str, batches: str, steps: int, shard: str | None) -> None:
+def torch_baseline(
+    tiers: str, batches: str, steps: int, shard: str | None, masters: str = "bf16"
+) -> None:
     """Measure the same model, tokens, and MFU formula under PyTorch.
 
     One container runs every (tier, batch) pair so the comparison is against a
@@ -339,14 +341,17 @@ def torch_baseline(tiers: str, batches: str, steps: int, shard: str | None) -> N
     for tier in (value.strip() for value in tiers.split(",")):
         for batch in (int(value) for value in batches.split(",") if value.strip()):
             cmd = ["python", "/root/pytorch_baseline.py", "--batch", str(batch), "--steps", str(steps)]
+            cmd += ["--masters", masters]
             # Eager is measured cold, like the Rust trainer, whose first step is
-            # the one `train.rs` also discards.
-            cmd += ["--warmup", "3" if tier else "0"]
+            # the one `train.rs` also discards -- except that bf16 masters
+            # compile their optimizer step, which wants a warmup of its own.
+            warmup = 3 if tier else (1 if masters == "bf16" else 0)
+            cmd += ["--warmup", str(warmup)]
             if tier:
                 cmd += ["--compile", tier]
             if shard:
                 cmd += ["--shard", shard]
-            print(f"=== pytorch tier={tier or 'eager'} B={batch} ===", flush=True)
+            print(f"=== pytorch tier={tier or 'eager'} masters={masters} B={batch} ===", flush=True)
             try:
                 _run(cmd, cwd="/root")
             except subprocess.CalledProcessError as e:
@@ -683,7 +688,7 @@ def sweep_batch(batches: str = "12,16,20", steps: int = 12, shard: str = "") -> 
 
 @app.local_entrypoint()
 def pytorch_baseline(
-    tiers: str = "", batches: str = "16", steps: int = 12, shard: str = ""
+    tiers: str = "", batches: str = "16", steps: int = 12, shard: str = "", masters: str = "bf16"
 ) -> None:
     """modal run modal_app.py::pytorch_baseline --tiers ",reduce-overhead"
 
@@ -691,8 +696,11 @@ def pytorch_baseline(
     eager -- so `""` is tier 1 alone and `",,max-autotune"` would be silly but
     legal. The escalation rule lives in the reader, not here: run the next tier
     only when the trainer is still ahead of the last one.
+
+    `--masters bf16` is the trainer's precision policy; `--masters fp32` is the
+    stock autocast one, kept because the first table was measured under it.
     """
-    torch_baseline.remote(tiers, batches, steps, shard or None)
+    torch_baseline.remote(tiers, batches, steps, shard or None, masters)
 
 
 @app.local_entrypoint()

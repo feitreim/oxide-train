@@ -75,6 +75,126 @@ def uniform_(tensor: torch.Tensor, fan_in: int) -> torch.Tensor:
         return tensor.uniform_(-1.0, 1.0).mul_(1.0 / math.sqrt(fan_in))
 
 
+def keeps_fp32_master(name: str) -> bool:
+    """`ParameterKind::Norm` and `::Router`, the two the Rust leaves in fp32.
+
+    Everything else -- `Embedding`, `Matrix`, `Head` -- is a bf16 master on the
+    device (`GpuBf16Tensor`, `GpuBf16Head`), so it narrows here too.
+    """
+    return name.endswith("norm.weight") or name.endswith("router")
+
+
+def narrow_masters(model: nn.Module) -> None:
+    """Replace every matrix-shaped parameter with a bf16 master in place."""
+    for name, parameter in model.named_parameters():
+        if not keeps_fp32_master(name):
+            parameter.data = parameter.data.to(torch.bfloat16)
+
+
+def master_adamw_update(
+    parameters: list[torch.Tensor],
+    gradients: list[torch.Tensor],
+    firsts: list[torch.Tensor],
+    seconds: list[torch.Tensor],
+    beta1: float,
+    beta2: float,
+    lr: float,
+    eps: float,
+    decay: float,
+    first_correction: torch.Tensor,
+    second_correction: torch.Tensor,
+) -> None:
+    """`optim::adamw_step`, transcribed, one parameter at a time.
+
+    Written with intermediates rather than against them: this is compiled, so
+    inductor fuses each parameter's whole update into a single pass and the
+    temporaries never reach memory. The bias corrections arrive as device
+    scalars so that a changing step count is not a guard to recompile against.
+    """
+    for parameter, gradient, first, second in zip(parameters, gradients, firsts, seconds):
+        # fp32 accumulators, so a bf16 gradient promotes on the way in and both
+        # moments stay fp32 whatever the master is.
+        first.mul_(beta1).add_(gradient, alpha=1 - beta1)
+        second.mul_(beta2).addcmul_(gradient, gradient, value=1 - beta2)
+        # The master widens for the update; `copy_` into a bf16 destination is
+        # the round-to-nearest that `MasterStorage::commit` performs.
+        widened = parameter.float()
+        first_hat = first / first_correction
+        second_hat = second / second_correction
+        update = first_hat / (second_hat.sqrt() + eps) + decay * widened
+        parameter.copy_(widened - lr * update)
+
+
+class MasterAdamW(torch.optim.Optimizer):
+    """AdamW with fp32 moments and fp32 update arithmetic at any parameter dtype.
+
+    `torch.optim.AdamW` sizes its moments after the parameter it updates, so a
+    bf16 master would get bf16 moments -- not the policy. The Rust keeps every
+    moment fp32 and narrows only the master, widening it for the update and
+    rounding the result back on the way out (`MasterStorage::Bf16` with
+    `MasterRounding::Nearest`). Decoupled decay and epsilon on the corrected
+    second moment, both as the Rust writes them.
+
+    The step is compiled because PyTorch ships no fused kernel for a mixed
+    parameter/moment dtype, and an uncompiled elementwise chain over 4.39B
+    parameters is eleven passes over memory where a fused kernel is one -- 65ms
+    a step, which would measure this file rather than the policy. Every row of
+    the comparison therefore has a fused optimizer: `fused=True` where the
+    dtypes let it, this where they do not.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        betas: tuple[float, float],
+        eps: float,
+        weight_decay: float,
+        compile_step: bool = True,
+    ) -> None:
+        super().__init__(
+            list(params), dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        )
+        self.update = torch.compile(master_adamw_update) if compile_step else master_adamw_update
+        self.step_count = 0
+        self.corrections = torch.zeros(2, dtype=torch.float32, device="cuda")
+
+    @torch.no_grad()
+    def step(self) -> None:  # type: ignore[override]
+        self.step_count += 1
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            parameters = [p for p in group["params"] if p.grad is not None]
+            for parameter in parameters:
+                state = self.state[parameter]
+                if not state:
+                    state["first"] = torch.zeros_like(parameter, dtype=torch.float32)
+                    state["second"] = torch.zeros_like(parameter, dtype=torch.float32)
+            self.corrections[0] = 1 - beta1**self.step_count
+            self.corrections[1] = 1 - beta2**self.step_count
+            self.update(
+                parameters,
+                [p.grad for p in parameters],
+                [self.state[p]["first"] for p in parameters],
+                [self.state[p]["second"] for p in parameters],
+                beta1,
+                beta2,
+                group["lr"],
+                group["eps"],
+                group["weight_decay"],
+                self.corrections[0],
+                self.corrections[1],
+            )
+
+
+def dtype_census(tensors) -> dict[str, int]:
+    census: dict[str, int] = {}
+    for tensor in tensors:
+        key = str(tensor.dtype).removeprefix("torch.")
+        census[key] = census.get(key, 0) + 1
+    return census
+
+
 class RmsNorm(nn.Module):
     """`nn::RmsNorm`: `x * w / sqrt(mean(x^2) + eps)`, weight initialized to one.
 
@@ -246,9 +366,10 @@ class MoeDense(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor, coefficient: torch.Tensor):
-        # Autocast leaves an embedding lookup in the parameter dtype, but the
-        # Rust carries a bf16 residual stream; one cast here buys that back
-        # instead of running every residual add and norm in fp32.
+        # Autocast leaves an embedding lookup in the parameter dtype, so under
+        # fp32 masters this cast is what buys back the bf16 residual stream the
+        # Rust carries. Under bf16 masters the lookup is already bf16 and the
+        # cast is a no-op that returns the same tensor.
         x = self.embedding(inputs).to(torch.bfloat16)
         aux_loss = torch.zeros((), dtype=torch.float32, device=x.device)
         for block in self.blocks:
@@ -359,26 +480,39 @@ def cudagraph_report() -> dict:
 
 def measure(
     model: nn.Module,
-    parameters,
+    parameters: list[torch.Tensor],
     data,
     batch_size: int,
     steps: int,
     warmup: int,
     device: torch.device,
     backends: list[SDPBackend],
+    masters: str,
 ) -> dict:
-    optimizer = torch.optim.AdamW(
-        parameters,
-        lr=LEARNING_RATE,
-        betas=BETAS,
-        eps=ADAM_EPS,
-        weight_decay=WEIGHT_DECAY,
-        fused=True,
+    # fp32 masters can use the stock fused AdamW, whose moments follow the
+    # parameter dtype and so are already fp32. bf16 masters cannot: the same
+    # rule would give them bf16 moments.
+    optimizer: torch.optim.Optimizer = (
+        torch.optim.AdamW(
+            parameters,
+            lr=LEARNING_RATE,
+            betas=BETAS,
+            eps=ADAM_EPS,
+            weight_decay=WEIGHT_DECAY,
+            fused=True,
+        )
+        if masters == "fp32"
+        else MasterAdamW(
+            parameters, lr=LEARNING_RATE, betas=BETAS, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY
+        )
     )
     # A device scalar, so the decaying coefficient never becomes a guard that
     # torch.compile would recompile against.
     coefficient = torch.zeros((), device=device)
     losses: list[torch.Tensor] = []
+    # Whatever the policy claims, this is what the run actually holds. Taken on
+    # the first step, because `set_to_none` retires the gradients afterwards.
+    census: dict[str, dict[str, int]] = {}
 
     def step(index: int) -> None:
         inputs, targets = data.batch(index, batch_size, device)
@@ -386,7 +520,19 @@ def measure(
         with torch.autocast("cuda", dtype=torch.bfloat16), sdpa_kernel(backends):
             loss = model(inputs, targets, coefficient)
         loss.backward()
+        if not census:
+            census["parameters"] = dtype_census(parameters)
+            census["gradients"] = dtype_census(p.grad for p in parameters if p.grad is not None)
         optimizer.step()
+        if "moments" not in census:
+            census["moments"] = dtype_census(
+                moment
+                # The step counter is state too, and fused AdamW keeps it on the
+                # device; the moments are the two this is asking about.
+                for state in optimizer.state.values()
+                for key, moment in state.items()
+                if key != "step" and isinstance(moment, torch.Tensor)
+            )
         # Zeroing after the step mirrors the Rust, where each AdamW write-back
         # clears the gradient it consumed.
         optimizer.zero_grad(set_to_none=True)
@@ -425,6 +571,8 @@ def measure(
         "compile_seconds": compile_seconds,
         "warmup_steps": warmup,
         "peak_memory_gib": torch.cuda.max_memory_allocated() / 2**30,
+        "masters": masters,
+        "dtypes": census,
         "losses": [loss.item() for loss in losses],
     }
 
@@ -437,6 +585,12 @@ def main() -> None:
     parser.add_argument("--shard", default="/data/wiki-val-00000.tok")
     parser.add_argument("--random-tokens", action="store_true")
     parser.add_argument("--compile", default="", help="eager when empty, else a torch.compile mode")
+    parser.add_argument(
+        "--masters",
+        default="bf16",
+        choices=("bf16", "fp32"),
+        help="bf16 matches the Rust master policy; fp32 is the autocast default",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -448,6 +602,10 @@ def main() -> None:
     print(f"parameters {json.dumps(counts)}", flush=True)
     if counts["actual_total"] != counts["expected_total"]:
         raise SystemExit("PyTorch parameter count does not match the Rust model")
+    # Narrow after initialization, so both policies start from the same draw
+    # rounded rather than from different draws.
+    if args.masters == "bf16":
+        narrow_masters(model)
 
     tier = f"compile:{args.compile}" if args.compile else "eager"
     compiled = torch.compile(model, mode=args.compile) if args.compile else model
@@ -455,13 +613,14 @@ def main() -> None:
     data = RandomShard() if args.random_tokens else Shard(args.shard)
     result = measure(
         compiled,
-        model.parameters(),
+        list(model.parameters()),
         data,
         args.batch,
         args.steps,
         args.warmup,
         device,
         attention_backends(),
+        args.masters,
     )
     result["tier"] = tier
     result["torch"] = torch.__version__
@@ -469,9 +628,12 @@ def main() -> None:
     if not all(math.isfinite(loss) for loss in result["losses"]):
         raise SystemExit(f"non-finite loss: {result['losses']}")
     print(f"losses {[round(loss, 4) for loss in result['losses']]}", flush=True)
+    print(f"dtypes {json.dumps(result['dtypes'])}", flush=True)
+    if "float32" not in result["dtypes"]["moments"] or len(result["dtypes"]["moments"]) != 1:
+        raise SystemExit(f"AdamW moments are not all fp32: {result['dtypes']['moments']}")
     print(
         f"throughput={result['tokens_per_second']:.1f} tokens/s "
-        f"mfu={100 * result['mfu']:.2f}% tier={tier} batch={args.batch} "
+        f"mfu={100 * result['mfu']:.2f}% tier={tier} masters={args.masters} batch={args.batch} "
         f"measured_steps={result['measured_steps']} elapsed={result['elapsed']:.3f}s "
         f"compile={result['compile_seconds']:.1f}s peak_memory={result['peak_memory_gib']:.1f}GiB "
         f"cuda_graphs={result['recorded_cuda_graphs']}",
