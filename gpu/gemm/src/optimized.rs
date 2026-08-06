@@ -131,6 +131,13 @@
 //! store: #123 measured that route *losing* by 1.0–1.7% at warp scope on this
 //! tile.
 //!
+//! What is *not* one warp's any more is the band's width. [`GROUPS`] splits the
+//! accumulator's columns across two epilogue warpgroups (ferro #197), so the
+//! block is 320 threads and a warp drains `[32, WARP_N]` rather than
+//! `[32, BLOCK_N]` — same two waits, half the values behind each, twice the
+//! warps waiting. The shared plan does not move a byte, because eight staging
+//! tiles half as wide are the same 32 KiB four were.
+//!
 //! An **accumulating bf16** `C` leaves the same way through
 //! [`accumulate_shared_rows`], which is that store with one `ld.global.v4` in
 //! front of it. The kernel this replaced read-modify-wrote `C` a 32-bit word at
@@ -200,11 +207,44 @@ const CHUNKS: usize = BLOCK_K / 16;
 /// two CTAs an SM leave room for. Six is 196 608 B of operand ring and the last
 /// depth that fits at [`CTAS_PER_SM`].
 pub const STAGES: usize = 6;
-/// One warp per 32 accumulator rows — the band warps, every one of which
-/// drains — plus the producer warp and the MMA warp, which never do.
-pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32 + 64;
-/// Warps that own a 32-row band of the accumulator.
-const DRAIN_WARPS: usize = BLOCK_M / 32;
+/// One warp per 32 accumulator rows per column half — the band warps, every one
+/// of which drains — plus the producer warp and the MMA warp, which never do.
+pub const THREADS: u32 = DRAIN_WARPS as u32 * 32 + 64;
+/// Warps that own a 32-row band of the accumulator. The hardware fixes this
+/// one: warp `w` of a warpgroup can reach tensor-memory lanes `32 * w` and no
+/// others, so four warps tile [`BLOCK_M`] rows exactly and a fifth would have
+/// no rows left to own.
+const BAND_WARPS: usize = BLOCK_M / 32;
+/// Epilogue warpgroups, splitting the accumulator's **columns** (ferro #197).
+///
+/// The axis the row ceiling above leaves open. Warp 4 is warpgroup 1's warp 0
+/// and owns the same rows warp 0 does, so a second warpgroup can only take
+/// columns — and doubling the warps halves each one's staging width, so
+/// [`SHARED_BYTES`] is byte-identical either way and the block goes 192 → 320.
+///
+/// ferro-kittens measured this split *losing* 1.4–1.8% and shipped one
+/// warpgroup, then re-ran it at `f64a27b` and found the sign reversed: every row
+/// of the losing table had been taken through a `.local` depot `store_tile_x4`
+/// homed each drained band in until #166's rolled walks were marked (#180/#181/
+/// #184). A band **is** that frame, so the split paid it twice per accumulator
+/// where one warpgroup paid it once, and the arm doing more of the broken thing
+/// read as the arm that was worse. Re-run: **+0.8/+0.9% at 4096³ and +2.1/+2.1%
+/// at 8192³**, with the drain alone going 4.72 → 3.05 µs — 35% cheaper, where
+/// it had been blamed for the loss. This tree's kittens is past #180, so the
+/// depot was never here either.
+///
+/// The lane argument that made the loss plausible is untouched and still true:
+/// a column split puts two requesters on each of four tensor-memory
+/// sub-partitions rather than spreading over eight. That ceiling sits *above*
+/// this rung, not below it. What the split buys is more warps issuing against
+/// the same sub-partitions, which was worth nothing while each warp was also
+/// driving a band through local memory.
+const GROUPS: u32 = 2;
+/// Warps that drain: [`BAND_WARPS`] rows by [`GROUPS`] column halves.
+const DRAIN_WARPS: usize = BAND_WARPS * GROUPS as usize;
+/// Columns of the pair tile one drain warp owns — the accumulator's width over
+/// [`GROUPS`], and what [`STAGE_N`] is two passes of.
+const WARP_N: usize = BLOCK_N / GROUPS as usize;
 /// The warp whose lane 0 issues the item's TMA loads.
 const PRODUCER: u32 = DRAIN_WARPS as u32;
 /// The warp whose lane 0 (leader rank only) waits the accumulator free and
@@ -217,22 +257,24 @@ const PRODUCER: u32 = DRAIN_WARPS as u32;
 /// `gemm_ws`) both kept these roles on warps of their own; now this one does
 /// too.
 const ISSUER: u32 = PRODUCER + 1;
-/// The staged bf16 drain's band, and the shared tile it passes through.
+/// The staged bf16 drain's band, and the shared tile it passes through: half of
+/// [`WARP_N`], so a warp's own columns are two passes exactly as they were when
+/// a warp owned all [`BLOCK_N`] of them.
 ///
-/// It was 64 — "the narrowest bf16 tile `Swizzle128B` admits *and* the widest
-/// four of fit beside the operand rings" — and that second clause was the whole
-/// of it. At 64 a `[32, STAGE_N]` band is `(32 / 16) · (64 / 64) = 2` `.x8`
-/// issues, so the bf16 drain paid **four** exposed TMEM latencies a band where
-/// oxide-train#84 got the fp32 store down to two. It could not have the wider
-/// tile: four `[32, 128]` staging tiles are 32 768 B against the 16 384 B four
-/// `[32, 64]` take, and at two CTAs an SM the plan had no such 16 KiB.
+/// It is 64 again, and for the third distinct reason. At two CTAs an SM it was
+/// 64 because four `[32, 128]` tiles were 16 KiB the plan did not have; #84's
+/// halving bought that 16 KiB and made it 128, which put a band at exactly
+/// [`kittens::tmem::ISSUE_LIMIT`] issues behind one wait. [`GROUPS`] spends the
+/// same 16 KiB the other way — **eight** `[32, 64]` tiles are the same 32 768 B
+/// four `[32, 128]` ones are — so [`SHARED_BYTES`] does not move and the plan
+/// stays at 229 632 B of the 232 448 an SM will opt a CTA into.
 ///
-/// At one CTA an SM it does. `128` makes a band exactly
-/// [`kittens::tmem::ISSUE_LIMIT`] issues behind **one** wait and exactly the 128
-/// registers a thread holds — the same shape [`Wide`]'s half-row already had —
-/// so the bf16 band leaves tensor memory in two waits instead of four, and the
-/// plan lands at 229 632 B of the 232 448 an SM will opt a CTA into.
-const STAGE_N: usize = 128;
+/// What changes is what a wait covers: a `[32, 64]` band is two `.x8` issues
+/// rather than four, so a warp still leaves tensor memory in **two** waits for
+/// its own columns and each wait now carries half the values. The exposed
+/// latency a warp pays is unchanged and there are twice as many warps paying it
+/// in parallel, which is the whole of the split.
+const STAGE_N: usize = WARP_N / 2;
 /// The reduction drain's band, which is *not* [`STAGE_N`]: its staging buffer is
 /// `[16, REDUCE_N]` fp32 and the reduction store's box is what fixes that width,
 /// so widening the bf16 tile leaves this one where it was and simply borrows
@@ -258,10 +300,12 @@ type Ring = SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
 type StageTile = SharedTile<Bf16, 32, STAGE_N, Swizzle128B>;
 type StageRun = SharedTileRing<Bf16, 32, STAGE_N, Swizzle128B, DRAIN_WARPS>;
 type Band = RegTile<32, STAGE_N, BaseLdtm>;
-/// `.x8` issues one [`Band`] takes: two 16-row blocks of two 64-column groups,
-/// which is exactly the batch limit and so exactly one wait.
+/// `.x8` issues one [`Band`] takes: two 16-row blocks of one 64-column group,
+/// batched behind a single wait. Under the batch limit rather than at it —
+/// [`GROUPS`] spends the width on warps instead of on issues, so a warp waits
+/// as many times for half as many values.
 const BAND_ISSUES: usize = (32 / 16) * (STAGE_N / 64);
-const _: () = assert!(BAND_ISSUES == kittens::tmem::ISSUE_LIMIT);
+const _: () = assert!(BAND_ISSUES <= kittens::tmem::ISSUE_LIMIT);
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 
 const _: () = assert!(HALF_N == BLOCK_M, "one stage type serves both operands");
@@ -362,16 +406,25 @@ pub const SHARED_BYTES: usize = staged(shared(SharedPlan::sizing()).plan).1.byte
 const SHARED_OPTIN: usize = 232_448;
 
 const _: () = {
-    assert!(THREADS == 192 && MAX_CLUSTERS == 74);
+    assert!(THREADS == 320 && MAX_CLUSTERS == 74);
     // The item rings cost the plan nothing: their sixty-four bytes land in the
     // 128-byte alignment padding in front of the staging tiles. cuBLASLt's own
     // launch declares 213 280 B, so this is the same rung with 16 KiB more of
     // staging tile on it.
     assert!(SHARED_BYTES == 229_632 && SHARED_BYTES <= SHARED_OPTIN);
     assert!(
-        BLOCK_N == 2 * STAGE_N,
+        WARP_N == 2 * STAGE_N,
         "the staged drain spells its two passes out to hoist the loads ahead of the stores"
     );
+    assert!(
+        WARP_N == 2 * REDUCE_N,
+        "the reduction drain spells its four sub-bands out for the same reason"
+    );
+    // The split is what keeps the plan still: eight `[32, WARP_N / 2]` staging
+    // tiles are the bytes four `[32, WARP_N]` ones were, so `SHARED_BYTES`
+    // above holds at either `GROUPS` and neither rung has to give the operand
+    // ring anything back.
+    assert!(2 * DRAIN_WARPS * STAGE_N == BAND_WARPS * BLOCK_N);
 };
 
 /// The moment a drain has read everything it will read from tensor memory.
@@ -405,6 +458,27 @@ impl Release {
     }
 }
 
+/// This warp's corner of the accumulator: `(row, column)`, both relative to the
+/// rank's `[BLOCK_M, BLOCK_N]` tile.
+///
+/// The two axes are not the same kind of fact. The **row** is hardware — warp
+/// `w` of a warpgroup reaches tensor-memory lanes `32 * w` and no others, so
+/// `warp_id % BAND_WARPS` is the only band a warp could own. The **column** is
+/// [`GROUPS`]' choice: warps `0..BAND_WARPS` take the accumulator's first
+/// [`WARP_N`] columns and warps `BAND_WARPS..` the second, which is why warp 4
+/// shares warp 0's lanes and not its values.
+///
+/// [`Tile::origin`] adds the same pair to the destination, so one band index
+/// never means two different things.
+#[inline(always)]
+fn band_origin() -> (u32, u32) {
+    let warp = warp_id();
+    (
+        32 * (warp % BAND_WARPS as u32),
+        WARP_N as u32 * (warp / BAND_WARPS as u32),
+    )
+}
+
 /// Where a band of the accumulator goes, and how.
 ///
 /// The one thing that differs between the two entry points. Everything above it
@@ -424,8 +498,9 @@ impl Release {
 /// nothing and still bounds the worst case; it is no longer what the overlap
 /// rests on.
 trait Drain: Copy {
-    /// Push this warp's whole `[32, BLOCK_N]` band out to `C` at
-    /// `(row, column)`, releasing the accumulator on the way.
+    /// Push this warp's whole `[32, WARP_N]` band out to `C` at
+    /// `(row, column)` — [`Tile::origin`]'s pair, which already carries
+    /// [`band_origin`] — releasing the accumulator on the way.
     ///
     /// # Safety
     ///
@@ -490,14 +565,16 @@ impl Drain for Packed {
         release: Release,
     ) {
         unsafe {
-            let band_row = 32 * warp_id();
+            let (band_row, band_column) = band_origin();
             let n = STAGE_N as u32;
-            // A whole `[32, STAGE_N]` band behind **one** wait — [`STAGE_N`] is
-            // 128 now, so a band is `ISSUE_LIMIT` issues and 128 registers, the
-            // shape [`Wide`] has had since oxide-train#84. Two passes a band
-            // instead of four, and two exposed TMEM latencies instead of four.
-            let lift =
-                |column| accumulator.tile_x8_batched::<32, STAGE_N, BAND_ISSUES>(band_row, column);
+            // A whole `[32, STAGE_N]` band behind **one** wait, and this warp's
+            // [`WARP_N`] columns are two of them — two passes and two exposed
+            // TMEM latencies, the shape oxide-train#84 got the drain to and the
+            // one [`GROUPS`] keeps while halving what each pass carries.
+            let lift = |column| {
+                accumulator
+                    .tile_x8_batched::<32, STAGE_N, BAND_ISSUES>(band_row, band_column + column)
+            };
             let first: Band = lift(0);
             self.pass(stage, first, row, column);
             let second: Band = lift(n);
@@ -542,13 +619,17 @@ struct Wide {
     c: GlobalRows<F32>,
 }
 
-/// Half of a warp's band, whole across the tile's columns: the widest
-/// `tcgen05.ld.16x256b.x8` batch there is (`ISSUE_LIMIT` issues, one wait) and
-/// exactly half the accumulator row, so two of them are the band and one of
-/// them is what a thread can hold.
-type HalfRow = RegTile<16, BLOCK_N, BaseLdtm>;
-const HALF_ROW_ISSUES: usize = (16 / 16) * (BLOCK_N / 64);
-const _: () = assert!(HALF_ROW_ISSUES == kittens::tmem::ISSUE_LIMIT);
+/// Half of a warp's band, whole across the columns that warp owns: one batched
+/// `tcgen05.ld.16x256b.x8` behind one wait, so two of them are the band.
+///
+/// It was `[16, BLOCK_N]` — `ISSUE_LIMIT` issues and exactly the 128 registers
+/// a thread can hold, which was the ceiling that shape was chosen against.
+/// Under [`GROUPS`] a warp owns [`WARP_N`] columns, so it is `[16, WARP_N]`:
+/// half the issues, half the registers, the same two waits, and twice as many
+/// warps taking them.
+type HalfRow = RegTile<16, WARP_N, BaseLdtm>;
+const HALF_ROW_ISSUES: usize = (16 / 16) * (WARP_N / 64);
+const _: () = assert!(HALF_ROW_ISSUES <= kittens::tmem::ISSUE_LIMIT);
 
 /// The half-band the reduction drain still lifts one issue at a time: its
 /// staging tile is `[16, REDUCE_N]` and nothing slices a wider batch back into
@@ -566,16 +647,16 @@ impl Drain for Wide {
         release: Release,
     ) {
         unsafe {
-            let (lane, band_row) = (lane(), 32 * warp_id());
+            let (lane, (band_row, band_column)) = (lane(), band_origin());
             // One wait a half-row, and the second one is the release's cue.
             // What stays in front of the release is one store pass and two
             // waits; what runs beside the next item's MMA is the other half of
             // the row and every store's completion.
             let top: HalfRow =
-                accumulator.tile_x8_batched::<16, BLOCK_N, HALF_ROW_ISSUES>(band_row, 0);
+                accumulator.tile_x8_batched::<16, WARP_N, HALF_ROW_ISSUES>(band_row, band_column);
             store_rows(self.c, row, column, lane, top);
-            let bottom: HalfRow =
-                accumulator.tile_x8_batched::<16, BLOCK_N, HALF_ROW_ISSUES>(band_row + 16, 0);
+            let bottom: HalfRow = accumulator
+                .tile_x8_batched::<16, WARP_N, HALF_ROW_ISSUES>(band_row + 16, band_column);
             release.now();
             store_rows(self.c, row + 16, column, lane, bottom);
         }
@@ -640,37 +721,32 @@ impl Drain for Reduce {
         release: Release,
     ) {
         unsafe {
-            let (lane, band_row) = (lane(), 32 * warp_id());
+            let (lane, (band_row, band_column)) = (lane(), band_origin());
             let mut ring = ReduceRing::attach(stage.base());
-            // Eight passes spelled out rather than looped — the same argument
+            // Four passes spelled out rather than looped — the same argument
             // `kittens::tmem`'s batching section makes: a loop-carried band
-            // wants a runtime index and lands in local memory. **Three**
-            // half-bands live, one fewer than [`Wide`]: this drain carries the
-            // ring's cursor and the reduction map beside its bands, and the
-            // fourth measured 177 registers — past the 168 that twelve warps an
-            // SM leave a thread, which is the 2 → 1 CTA cliff by another name.
-            // Three still retires the last `tcgen05.ld` with three scatters and
-            // all three of their engine round-trips owed, where one pass of
-            // lookahead left an eighth.
+            // wants a runtime index and lands in local memory. It was eight
+            // before [`GROUPS`]; a warp owns [`WARP_N`] columns now, which is
+            // two of the reduction store's boxes over two row halves.
+            //
+            // **Three** half-bands live, one fewer than [`Wide`]: this drain
+            // carries the ring's cursor and the reduction map beside its bands,
+            // and at eight passes a fourth measured 177 registers — past the
+            // 168 that twelve warps an SM leave a thread. Three still retires
+            // the last `tcgen05.ld` with three scatters and all three of their
+            // engine round-trips owed, which at four passes is three quarters
+            // of the drain behind the release rather than three eighths.
             let n = REDUCE_N as u32;
             let (top, bottom) = (band_row, band_row + 16);
-            let b0: HalfBand = accumulator.tile_x8(top, 0);
-            let b1: HalfBand = accumulator.tile_x8(top, n);
-            let b2: HalfBand = accumulator.tile_x8(top, 2 * n);
+            let b0: HalfBand = accumulator.tile_x8(top, band_column);
+            let b1: HalfBand = accumulator.tile_x8(top, band_column + n);
+            let b2: HalfBand = accumulator.tile_x8(bottom, band_column);
             self.emit(&mut ring, lane, b0, row, column);
-            let b3: HalfBand = accumulator.tile_x8(top, 3 * n);
-            self.emit(&mut ring, lane, b1, row, column + n);
-            let b4: HalfBand = accumulator.tile_x8(bottom, 0);
-            self.emit(&mut ring, lane, b2, row, column + 2 * n);
-            let b5: HalfBand = accumulator.tile_x8(bottom, n);
-            self.emit(&mut ring, lane, b3, row, column + 3 * n);
-            let b6: HalfBand = accumulator.tile_x8(bottom, 2 * n);
-            self.emit(&mut ring, lane, b4, row + 16, column);
-            let b7: HalfBand = accumulator.tile_x8(bottom, 3 * n);
+            let b3: HalfBand = accumulator.tile_x8(bottom, band_column + n);
             release.now();
-            self.emit(&mut ring, lane, b5, row + 16, column + n);
-            self.emit(&mut ring, lane, b6, row + 16, column + 2 * n);
-            self.emit(&mut ring, lane, b7, row + 16, column + 3 * n);
+            self.emit(&mut ring, lane, b1, row, column + n);
+            self.emit(&mut ring, lane, b2, row + 16, column);
+            self.emit(&mut ring, lane, b3, row + 16, column + n);
             ring.drain();
         }
     }
@@ -967,7 +1043,8 @@ impl<D: Drain> Tile<D> {
     }
 
     /// This warp's origin in `C` for `item`: the pair tile, this rank's half of
-    /// it, and the 32 rows the warp owns.
+    /// it, and the [`band_origin`] corner the warp owns — 32 rows by
+    /// [`WARP_N`] columns.
     ///
     /// `C` is one allocation holding every expert's matrix, so the expert is
     /// `tiles_m` tile-rows of it — the only place a batched launch's geometry
@@ -976,11 +1053,12 @@ impl<D: Drain> Tile<D> {
     #[inline(always)]
     fn origin(&self, item: u32) -> (u32, u32) {
         let (expert, tile_m, tile_n) = self.place(item);
+        let (band_row, band_column) = band_origin();
         (
             2 * BLOCK_M as u32 * (expert * self.tiles_m + tile_m)
                 + BLOCK_M as u32 * self.rank
-                + 32 * warp_id(),
-            BLOCK_N as u32 * tile_n,
+                + band_row,
+            BLOCK_N as u32 * tile_n + band_column,
         )
     }
 }
