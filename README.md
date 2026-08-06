@@ -97,6 +97,17 @@ worktrees of two pushed refs (`--baseline-ref`, default `main`), each built
 once and then alternated for `--rounds` rounds in one container, reporting
 tokens/s and MFU per run plus each arm's mean and spread.
 
+The external pair is `modal run modal_app.py::versus --ref main --batch 32`,
+which alternates `bin/train` against the PyTorch baseline of
+`gpu/model/baselines/pytorch_baseline.py` the same way. It runs on `ab_image`
+— the kernel toolchain plus torch, the only image that can hold both — and
+takes the trainer from `--ref` and the script from `--torch-ref`, so the
+baseline branch stays the source of truth for what PyTorch is asked to do. The
+batch is imposed on both arms, torch's compile time lands in its own warmup
+steps, an arm whose inductor recorded CUDA graphs is rejected (the trainer has
+none), and the summary carries a 95% interval on the difference rather than
+two point estimates.
+
 To add a kernel: copy `gpu/vecadd` to `gpu/<name>`, set `name` in its
 `Cargo.toml`, write the `#[kernel]` in `src/lib.rs`, and give it a real
 `bench.rs` figure of merit (GB/s if bandwidth-bound, TFLOP/s if compute-bound).

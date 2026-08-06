@@ -60,7 +60,7 @@ mod kernels {
 fn main() { let _ = (CudaContext::new(0), LaunchConfig::for_num_elems(1)); }
 """
 
-image = (
+kernel_toolchain = (
     # CUDA 13 devel base -- same as cuda-oxide's own .devcontainer/Dockerfile.
     modal.Image.from_registry(
         "nvidia/cuda:13.0.0-devel-ubuntu24.04", add_python="3.12"
@@ -120,6 +120,10 @@ image = (
         # command tries to rebuild the project itself as a backend library.
         "cd /opt/warmup && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs cargo oxide build warmup",
     )
+)
+
+image = (
+    kernel_toolchain
     # Live mounts (re-read each run; edits need no image rebuild). crates/ is
     # mounted because gpu/bench-util path-depends on crates/tensor-core (shared
     # RNG for CPU/GPU parity).
@@ -133,6 +137,21 @@ image = (
         str(Path(__file__).parent / "rust-toolchain.toml"),
         f"{PROJECT_DIR}/rust-toolchain.toml",
     )
+)
+
+# The kernel toolchain plus PyTorch, for the one question neither image alone
+# can answer: how the trainer and the PyTorch baseline compare on ONE GPU under
+# ONE set of container conditions. Torch's several gigabytes stay off `image`,
+# so kernel runs are unaffected; only `torch_versus_train` pays for them.
+TORCH_VERSION = "2.13.0"
+TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
+
+ab_image = (
+    kernel_toolchain.pip_install(f"torch=={TORCH_VERSION}", index_url=TORCH_INDEX)
+    .pip_install("numpy")
+    # Peak memory is close enough to the B200's that fragmentation decides
+    # whether the batch fits.
+    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
 )
 
 app = modal.App("rust-trainer", image=image)
@@ -472,6 +491,147 @@ def compare_train(
     print(f"candidate/baseline={means[1] / means[0]:.4f}", flush=True)
 
 
+# Two-sided 95% critical values of Student's t, indexed by degrees of freedom.
+# Round counts here are small enough that the normal 1.96 would understate the
+# interval by a factor of two.
+T95 = {1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31, 9: 2.26, 10: 2.23}
+BASELINE_SCRIPT = "gpu/model/baselines/pytorch_baseline.py"
+
+
+@app.function(
+    gpu=DEFAULT_GPU,
+    image=ab_image,
+    timeout=4 * 3600,
+    volumes={"/data": wiki_volume},
+)
+def torch_versus_train(
+    ref: str = "main",
+    torch_ref: str = "pytorch-throughput-baseline",
+    batch: int = 32,
+    steps: int = 30,
+    rounds: int = 3,
+    compile_mode: str = "default",
+    shard: str | None = None,
+) -> None:
+    """Alternate `bin/train` and the PyTorch baseline in ONE container.
+
+    The two have only ever been measured in different containers, where the
+    1.4% container-to-container spread of the trainer alone is wider than the
+    ~1% that separates them -- so the comparison was unresolved by construction,
+    not by measurement. This runs both arms on one GPU, alternating round by
+    round like `compare_train`, so a drift in clocks lands on both.
+
+    Both arms come from pushed refs of this repo: the trainer from `ref`, the
+    baseline script from `torch_ref`, which keeps the baseline branch the source
+    of truth for what PyTorch is asked to do. `batch` is imposed on both -- on
+    the script by argument and on train.rs by rewriting its compile-time `B` --
+    so a matched batch is a property of the run rather than of the two refs.
+
+    Each arm gets a discarded warmup: the trainer's is the run that follows its
+    build, torch's is a whole extra process, which also fills the inductor cache
+    so the timed rounds recompile from disk. Compile time never lands in a timed
+    window either way -- the script's own warmup steps absorb it.
+    """
+    import re
+    import statistics
+
+    clone = "/tmp/rust-trainer-versus"
+    _run(["git", "clone", "--quiet", TRAINER_REPO, clone], cwd="/tmp")
+    roots = {}
+    for name, arm_ref in (("train", ref), ("torch", torch_ref)):
+        roots[name] = f"/tmp/versus-{name}"
+        _run(
+            ["git", "worktree", "add", "--quiet", "--detach", roots[name], _resolve_ref(clone, arm_ref)],
+            cwd=clone,
+        )
+
+    proj = f"{roots['train']}/gpu/model"
+    if CUDA_OXIDE_REF not in Path(proj, "Cargo.toml").read_text():
+        raise SystemExit(f"ref {ref} pins a cuda-oxide the image lacks")
+    _set_train_batch(proj, batch)
+    script = f"{roots['torch']}/{BASELINE_SCRIPT}"
+    if not Path(script).is_file():
+        raise SystemExit(f"ref {torch_ref} carries no {BASELINE_SCRIPT}")
+
+    env = ["env", f"TRAIN_STEPS={steps}", "TRAIN_LOG_EVERY=100"]
+    if shard:
+        env.append(f"TRAIN_SHARD={shard}")
+    train_cmd = [*env, "target/release/train"]
+    # The script discards its first measured step exactly as train.rs does, so
+    # one `steps` gives both arms the same measured window.
+    torch_cmd = ["python", script, "--batch", str(batch), "--steps", str(steps)]
+    torch_cmd += ["--masters", "bf16", "--warmup", "3"]
+    if compile_mode:
+        torch_cmd += ["--compile", compile_mode]
+    if shard:
+        torch_cmd += ["--shard", shard]
+
+    def measure(label: str, cmd: list[str], cwd: str) -> tuple[float, float]:
+        print(f"=== {label} ===", flush=True)
+        output = subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=True).stdout
+        print(output, flush=True)
+        reported = re.search(r"throughput=([\d.]+) tokens/s mfu=([\d.]+)%", output)
+        if reported is None:
+            raise SystemExit(f"{label} reported no throughput")
+        graphs = re.search(r"cuda_graphs=(\S+)", output)
+        if graphs and graphs[1] != "False":
+            # The trainer has no CUDA graphs and cuda-oxide cannot give it any,
+            # so a graphed torch arm is a different comparison than this one.
+            raise SystemExit(f"{label} recorded CUDA graphs ({graphs[1]}); not a matched arm")
+        return float(reported[1]), float(reported[2])
+
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    _run([*env, "cargo", "oxide", "run", "model", "--bin", "train"], cwd=proj)
+    measure("warmup torch", torch_cmd, "/root")
+
+    arms = (("train", train_cmd, proj), ("torch", torch_cmd, "/root"))
+    measured: dict[str, list[tuple[float, float]]] = {name: [] for name, _, _ in arms}
+    for index in range(rounds):
+        for name, cmd, cwd in arms:
+            measured[name].append(measure(f"round {index} {name}", cmd, cwd))
+
+    print("=== rounds ===", flush=True)
+    print("round  " + "  ".join(f"{name:>22}" for name, _, _ in arms), flush=True)
+    for index in range(rounds):
+        cells = (f"{measured[name][index][0]:>13.1f} {measured[name][index][1]:>7.2f}%" for name, _, _ in arms)
+        print(f"{index:<7}" + "  ".join(cells), flush=True)
+
+    print("=== summary ===", flush=True)
+    statistics_by_arm = {}
+    for name, _, _ in arms:
+        tokens, mfu = zip(*measured[name])
+        mean = statistics.fmean(tokens)
+        deviation = statistics.stdev(tokens) if len(tokens) > 1 else 0.0
+        statistics_by_arm[name] = (mean, deviation, len(tokens))
+        print(
+            f"{name}: mean={mean:.1f} tokens/s sd={deviation:.1f} ({deviation / mean:.2%}) "
+            f"spread={(max(tokens) - min(tokens)) / mean:.2%} mfu={statistics.fmean(mfu):.2f}%",
+            flush=True,
+        )
+
+    (train_mean, train_sd, count), (torch_mean, torch_sd, _) = (
+        statistics_by_arm["train"],
+        statistics_by_arm["torch"],
+    )
+    # Welch's interval with the conservative degrees of freedom -- one arm's
+    # worth minus one, rather than the Satterthwaite value it can only exceed.
+    # A single round per arm has no interval at all, and says so.
+    error = (
+        T95.get(count - 1, 2.23) * ((train_sd**2 + torch_sd**2) / count) ** 0.5
+        if count > 1
+        else float("inf")
+    )
+    difference = train_mean - torch_mean
+    print(
+        f"train/torch={train_mean / torch_mean:.4f} "
+        f"difference={difference:+.1f} +/- {error:.1f} tokens/s "
+        f"({difference / torch_mean:+.2%} +/- {error / torch_mean:.2%})",
+        flush=True,
+    )
+    verdict = "ahead" if difference > error else ("behind" if -difference > error else "unresolved")
+    print(f"verdict: trainer is {verdict} at 95%", flush=True)
+
+
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
 def run_sweep(kernel: str, configs: str) -> None:
     """Bench several tuning configs in ONE container so they share a GPU and
@@ -724,6 +884,25 @@ def train_ab(
 ) -> None:
     """modal run modal_app.py::train_ab --ref <pushed-branch>"""
     compare_train.remote(ref, baseline_ref, steps, rounds, shard or None)
+
+
+@app.local_entrypoint()
+def versus(
+    ref: str = "main",
+    torch_ref: str = "pytorch-throughput-baseline",
+    batch: int = 32,
+    steps: int = 30,
+    rounds: int = 3,
+    compile_mode: str = "default",
+    shard: str = "",
+) -> None:
+    """modal run modal_app.py::versus --ref main --batch 32
+
+    The trainer against the PyTorch baseline in one container. `--compile-mode`
+    is a `torch.compile` mode, empty meaning eager; the arm is rejected if
+    inductor recorded CUDA graphs, since the trainer has none.
+    """
+    torch_versus_train.remote(ref, torch_ref, batch, steps, rounds, compile_mode, shard or None)
 
 
 @app.local_entrypoint()
