@@ -42,6 +42,24 @@ fn training_flops_per_token() -> f64 {
     (linear_flops + attention_flops) as f64
 }
 
+/// Device memory in use, in GiB, as `(used, total)`.
+///
+/// A steady-state step allocates nothing, so this read after the first step
+/// *is* the peak: the workspace, the parameters and the optimizer state are
+/// all live by then and nothing is freed until the process exits.
+fn device_memory_gib() -> (f64, f64) {
+    let (mut free, mut total) = (0usize, 0usize);
+    // SAFETY: both out-parameters are live locals and a context is current.
+    let status = unsafe { cuda_core::sys::cuMemGetInfo_v2(&mut free, &mut total) };
+    assert_eq!(
+        status,
+        cuda_core::sys::cudaError_enum_CUDA_SUCCESS,
+        "cuMemGetInfo failed"
+    );
+    const GIB: f64 = (1usize << 30) as f64;
+    ((total - free) as f64 / GIB, total as f64 / GIB)
+}
+
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
     env::var(name)
         .ok()
@@ -211,6 +229,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         optimizer.update(&mut gpu, &stream, &tensor)?;
         if step == starting_step + 1 && step < max_steps {
             stream.synchronize()?;
+            let (used, total) = device_memory_gib();
+            println!("device_memory used={used:.2}GiB total={total:.2}GiB batch={B}");
             timing_start = Some(Instant::now());
         }
 
