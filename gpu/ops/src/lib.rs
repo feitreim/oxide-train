@@ -1565,43 +1565,6 @@ pub mod kernels {
         }
     }
 
-    /// [`join_group2`] storing packed-bf16 pairs, one word per thread per
-    /// group. `width` counts f32 columns per group and must be even; the two
-    /// groups land `width / 2` words apart inside each interleaved row (#59).
-    #[kernel]
-    pub unsafe fn join_group2_bf16(
-        first: &[f32],
-        second: &[f32],
-        width: u32,
-        mut output: DisjointSlice<u32>,
-    ) {
-        let i = thread::index_1d().get();
-        let width = width as usize;
-        if width == 0 || !width.is_multiple_of(2) {
-            return;
-        }
-        let half = width / 2;
-        let row = i / half;
-        let column = i % half;
-        let source = row * width + 2 * column;
-        if source + 1 >= first.len() || source + 1 >= second.len() {
-            return;
-        }
-        let base = row * width + column;
-        if base + half >= output.len() {
-            return;
-        }
-        let low = f32_to_bf16_bits(first[source]) as u32
-            | ((f32_to_bf16_bits(first[source + 1]) as u32) << 16);
-        let high = f32_to_bf16_bits(second[source]) as u32
-            | ((f32_to_bf16_bits(second[source + 1]) as u32) << 16);
-        // SAFETY: both indices were bounds-checked and one thread owns each.
-        unsafe {
-            *output.get_unchecked_mut(base) = low;
-            *output.get_unchecked_mut(base + half) = high;
-        }
-    }
-
     #[kernel]
     pub fn split_group3(
         input: &[f32],
@@ -1765,30 +1728,6 @@ pub mod kernels {
             let word = weight[element / 2];
             let bits = (if element % 2 == 0 { word } else { word >> 16 }) as u16;
             *slot = f32::from_bits((bits as u32) << 16);
-        }
-    }
-
-    /// [`embedding_forward`] writing the packed activation stream.
-    ///
-    /// The master is already bf16 (#57) and so is the stream, so a row of the
-    /// table reaches the first block's input as whole words: this lookup
-    /// neither widens nor rounds, and moves half the bytes of the fp32 one.
-    #[kernel]
-    pub fn embedding_forward_bf16(
-        weight: &[u32],
-        tokens: &[u32],
-        dim: u32,
-        mut y: DisjointSlice<u32>,
-    ) {
-        let index = thread::index_1d();
-        let i = index.get();
-        let d = dim as usize;
-        if d == 0 || !d.is_multiple_of(2) {
-            return;
-        }
-        let words = d / 2;
-        if let Some(slot) = y.get_mut(index) {
-            *slot = weight[tokens[i / words] as usize * words + i % words];
         }
     }
 

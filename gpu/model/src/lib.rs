@@ -55,25 +55,7 @@ pub mod tensor_device;
 
 pub use dense_device::NORM_THREADS;
 pub use dense_device::kernels as dense_kernels;
-use dense_device::{
-    NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK, NORM_TILE_THREADS, QUAD_LANES, SWIGLU_TILE_BLOCK_ROWS,
-    SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS,
-};
-
-/// The tile RMSNorm forward's launch, or `None` at a shape it cannot cover.
-///
-/// The kernel bounds-checks nothing, so this is the single place the
-/// divisibility is decided and `rms_norm_forward_fast` is the arm every other
-/// shape takes.
-fn norm_tiles(rows: usize, columns: usize) -> Option<LaunchConfig> {
-    (rows.is_multiple_of(NORM_TILE_BLOCK_ROWS) && columns.is_multiple_of(NORM_TILE_CHUNK)).then(
-        || LaunchConfig {
-            grid_dim: ((rows / NORM_TILE_BLOCK_ROWS) as u32, 1, 1),
-            block_dim: (NORM_TILE_THREADS as u32, 1, 1),
-            shared_mem_bytes: 0,
-        },
-    )
-}
+use dense_device::{QUAD_LANES, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS};
 
 /// The tile-SwiGLU launch for a `rows x columns` rectangle, or `None` when the
 /// shape does not divide the tile the way the kernels require.
@@ -6685,39 +6667,6 @@ fn flash_attention_backward_into<
             })
         }
     }
-}
-
-fn swiglu_into<const N: usize, const FF: usize, P: KernelProfiler>(
-    gate: &GpuTensor<f32, Rank2<N, FF>>,
-    up: &GpuTensor<f32, Rank2<N, FF>>,
-    output: &mut GpuTensor<f32, Rank2<N, FF>>,
-    stream: &CudaStream,
-    kernels: &dense_kernels::LoadedModule,
-    profiler: &mut P,
-    name: &'static str,
-) -> Result<(), DriverError> {
-    // SAFETY: all elementwise buffers contain N * FF elements, and the tile
-    // arm is only taken at a shape `swiglu_tiles` accepted.
-    profiler.measure(stream, name, || unsafe {
-        match swiglu_tiles(N, FF) {
-            Some(tiles) => kernels.swiglu_forward_tile(
-                stream,
-                tiles,
-                gate.as_device_buffer(),
-                up.as_device_buffer(),
-                FF as u32,
-                output.as_device_buffer_mut(),
-            ),
-            None => kernels.swiglu_forward(
-                stream,
-                LaunchConfig::for_num_elems((N * FF) as u32),
-                gate.as_device_buffer(),
-                up.as_device_buffer(),
-                output.as_device_buffer_mut(),
-            ),
-        }
-    })?;
-    Ok(())
 }
 
 fn swiglu_backward_into<const N: usize, const FF: usize, P: KernelProfiler>(
