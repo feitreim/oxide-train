@@ -43,9 +43,12 @@ pub const NORM_WEIGHT_ROWS_PER_BLOCK: usize = 256;
 /// The block carries a shared column-partial accumulator for the weight
 /// gradient across all of them and pays one atomic per column at the end, so
 /// this is the whole trade: fewer rows is more blocks to fill the device and
-/// proportionally more atomics on the same `dim` addresses. 16 leaves 2048
-/// blocks at the training shape, where the split kernel it replaces launched
-/// 32768 one-row blocks.
+/// proportionally more atomics on the same `dim` addresses. Occupancy is
+/// register-bound at 4 blocks/SM either way, so this only buys waves against
+/// atomics — and it is not monotone. Paired trainer runs at B=16 measure
+/// +2.76% at 8, **+3.59% at 16** and +2.24% at 32, on baselines 0.27% apart.
+/// 16 leaves 2048 blocks at the training shape, where the split kernel it
+/// replaces launched 32768 one-row blocks.
 pub const NORM_BACKWARD_ROWS_PER_BLOCK: usize = 16;
 
 /// Widest row the fused RMSNorm kernels carry in shared memory.

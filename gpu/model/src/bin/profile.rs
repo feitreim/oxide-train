@@ -57,7 +57,9 @@ fn print_vram(label: &str) {
 fn report_norm_kernels(
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("rmsnorm kernels (registers/thread, spill bytes, blocks/SM at {NORM_THREADS} threads)");
+    println!(
+        "rmsnorm kernels (registers/thread, spill bytes, blocks/SM at {NORM_THREADS} threads)"
+    );
     for name in [
         "rms_norm_forward_fast_bf16",
         "rms_norm_forward_residual_bf16",

@@ -53,8 +53,8 @@ mod gemm_device;
 #[allow(dead_code)]
 pub mod tensor_device;
 
-pub use dense_device::kernels as dense_kernels;
 pub use dense_device::NORM_THREADS;
+pub use dense_device::kernels as dense_kernels;
 use dense_device::{
     NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK, NORM_TILE_THREADS, QUAD_LANES, SWIGLU_TILE_BLOCK_ROWS,
     SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS,
