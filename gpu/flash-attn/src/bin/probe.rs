@@ -24,8 +24,8 @@ mod tcgen05_device;
 use tcgen05_device as tcgen05;
 
 use host::{
-    FLASH_HD, Tcgen05Flash, create_flash_head_tma_map, flash_backward_kv_config,
-    flash_backward_q_config,
+    FLASH_HD, Tcgen05Flash, create_flash_head_tma_map, create_flash_row_major_tma_map,
+    flash_backward_kv_config, flash_backward_q_config,
 };
 use tcgen05::phase_probe as probe;
 
@@ -57,6 +57,16 @@ fn stage_heads(input: &[f32], b: usize, t: usize, h: usize, scale: f32) -> Vec<u
         }
     }
     staged
+}
+
+/// Round a `[B*T, H*HD]` operand to bf16 pairs where it lies — the layout a
+/// projection GEMM's packed epilogue writes, and the one V is read in through
+/// `create_flash_row_major_tma_map` instead of being relaid out.
+fn pack_rows(input: &[f32]) -> Vec<u32> {
+    input
+        .chunks_exact(2)
+        .map(|pair| f32_to_bf16_rne(pair[0]) as u32 | ((f32_to_bf16_rne(pair[1]) as u32) << 16))
+        .collect()
 }
 
 /// One CTA's counter block, averaged over the CTAs that ran an item.
@@ -242,13 +252,7 @@ impl Budget {
                 "      per item:   FILL  {:>6.0}          GAP     {:>6.0}         EPI {:>6.0}   \
                  DRAIN {:>6.0}\n      EPI split:   EWAIT {:>6.0}          ETREAD  {:>6.0}       \
                  ESTORE {:>6.0}",
-                self.fill,
-                self.gap,
-                self.epi,
-                self.drain,
-                self.ewait,
-                self.etread,
-                self.estore,
+                self.fill, self.gap, self.epi, self.drain, self.ewait, self.etread, self.estore,
             );
         }
         println!(
@@ -332,13 +336,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let k =
             DeviceBuffer::from_host(stream, &stage_heads(&uniform_vec(n * d, 82), b, t, h, 1.0))?;
-        let v =
-            DeviceBuffer::from_host(stream, &stage_heads(&uniform_vec(n * d, 83), b, t, h, 1.0))?;
+        let v = DeviceBuffer::from_host(stream, &pack_rows(&uniform_vec(n * d, 83)))?;
         let dy =
             DeviceBuffer::from_host(stream, &stage_heads(&uniform_vec(n * d, 84), b, t, h, 1.0))?;
         let q_tma = unsafe { create_flash_head_tma_map(stream, &q, t, b * h)? };
         let k_tma = unsafe { create_flash_head_tma_map(stream, &k, t, b * h)? };
-        let v_tma = unsafe { create_flash_head_tma_map(stream, &v, t, b * h)? };
+        let v_tma = unsafe { create_flash_row_major_tma_map(stream, &v, n, h)? };
         let dy_tma = unsafe { create_flash_head_tma_map(stream, &dy, t, b * h)? };
         let lse = DeviceBuffer::from_host(stream, &vec![0.0f32; n * h])?;
         let dot = DeviceBuffer::from_host(stream, &vec![0.0f32; n * h])?;

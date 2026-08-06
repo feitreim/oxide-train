@@ -97,12 +97,13 @@ use flash_device::host as flash_host;
 // what the backward configs beside it already did.
 use flash_device::host::{
     FLASH_HD, FLASH_QUERIES, FlashHeadTmaMap, correction_count_len, create_flash_head_tma_map,
+    create_flash_row_major_tma_map,
 };
 use gemm_device::fp32_launch_config;
 use gemm_device::host::{
     Bf16PairsTmaMap, Bf16PairsTmaMaps, TC_K_PIPELINE, TC_M_TILE, TC_N_TILE, TC_TILE, TmaLayout,
-    create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_pairs_tma_maps,
-    tcgen05_batched_launch_config, tcgen05_launch_config,
+    create_bf16_pairs_tma_map, create_bf16_pairs_tma_map_prefix, create_bf16_pairs_tma_map_region,
+    create_bf16_pairs_tma_maps, tcgen05_batched_launch_config, tcgen05_launch_config,
 };
 use tensor_device::{
     GpuAdamWMoments, GpuBf16Tensor, GpuMuonMomentum, GpuTensor, MASTER_ROUNDING_NEAREST,
@@ -531,17 +532,32 @@ struct Bf16LinearWeights {
     transposed: DeviceBuffer<u32>,
     normal_tma: Bf16PairsTmaMap,
     transposed_tma: Bf16PairsTmaMap,
+    bands: Option<TransposedBands>,
+}
+
+/// The transposed operand's two row bands: a grouped projection's leading
+/// `groups - 1` groups, and its last group alone.
+///
+/// A projection whose last group has a destination of its own runs one GEMM
+/// per band over these. They map the same bytes `transposed_tma` maps whole,
+/// so the split costs two descriptors and no storage.
+struct TransposedBands {
+    leading: Bf16PairsTmaMap,
+    last: Bf16PairsTmaMap,
 }
 
 impl Bf16LinearWeights {
     /// `master` is the linear's packed `[rows, columns]` master, mapped in
     /// place; `values` are the same weights on the host, for the transpose.
+    /// `groups` splits `columns`, and a grouped operand also gets the band
+    /// maps a per-destination forward reads.
     fn new(
         stream: &CudaStream,
         master: &DeviceBuffer<u32>,
         values: &[f32],
         rows: usize,
         columns: usize,
+        groups: usize,
     ) -> Result<Self, Box<dyn Error>> {
         assert_eq!(values.len(), rows * columns);
         let mut transposed_values = vec![0.0f32; rows * columns];
@@ -560,11 +576,49 @@ impl Bf16LinearWeights {
         let transposed_tma = unsafe {
             create_bf16_pairs_tma_map(stream, &transposed, rows, columns, TmaLayout::KMajor)?
         };
+        let bands = match groups {
+            1 => None,
+            _ => Some(Self::bands(stream, &transposed, rows, columns, groups)?),
+        };
         Ok(Self {
             transposed,
             normal_tma,
             transposed_tma,
+            bands,
         })
+    }
+
+    /// The `[columns, rows]` transposed operand cut above its last group.
+    fn bands(
+        stream: &CudaStream,
+        transposed: &DeviceBuffer<u32>,
+        rows: usize,
+        columns: usize,
+        groups: usize,
+    ) -> Result<TransposedBands, Box<dyn Error>> {
+        let leading_rows = columns - columns / groups;
+        // SAFETY: both regions lie inside `transposed`, which lives beside its
+        // maps and is only ever rewritten in place.
+        unsafe {
+            Ok(TransposedBands {
+                leading: create_bf16_pairs_tma_map_prefix(
+                    stream,
+                    transposed,
+                    rows,
+                    leading_rows,
+                    TmaLayout::KMajor,
+                )?,
+                last: create_bf16_pairs_tma_map_region(
+                    stream,
+                    transposed,
+                    leading_rows * rows / 2,
+                    rows,
+                    columns - leading_rows,
+                    rows,
+                    TmaLayout::KMajor,
+                )?,
+            })
+        }
     }
 
     /// Re-transpose the master the optimizer just wrote. The `[rows, columns]`
@@ -774,6 +828,20 @@ fn tcgen05_linear_eligible(m: usize, k: usize, n: usize) -> bool {
     m.is_multiple_of(TC_M_TILE) && k.is_multiple_of(TC_K_PIPELINE) && n.is_multiple_of(TC_N_TILE)
 }
 
+/// Whether this shape both runs attention on the tcgen05 kernels and gets its
+/// V panel from the projection's packed epilogue.
+///
+/// One predicate, because V has no other writer: nothing stages it, so a shape
+/// whose qkv projection misses the packed GEMM has no packed V to address and
+/// keeps the fp32 triple whole.
+fn staged_attention_eligible<const N: usize, const D: usize>(t: usize, heads: usize) -> bool {
+    tcgen05_attention_eligible(t, D / heads)
+        && D.is_multiple_of(TC_TILE)
+        && (3 * D).is_multiple_of(TC_TILE)
+        && tcgen05_linear_eligible(N, D, 2 * D)
+        && tcgen05_linear_eligible(N, D, D)
+}
+
 fn tcgen05_attention_eligible(t: usize, head_dim: usize) -> bool {
     // Every MMA in the tcgen05 attention kernels fills 128 real rows — the
     // forward's query block (#68) and the backward's Design-B tile pair (#47
@@ -802,6 +870,22 @@ impl StagedHeads {
         let tma = unsafe { create_flash_head_tma_map(stream, &words, sequence_length, planes)? };
         Ok(Self { words, tma })
     }
+
+    /// The same panel bytes in the projection's own row-major `[N, H*HD]`
+    /// order, mapped so flash reads a head as a column band. Nothing stages
+    /// this one: its GEMM writes it (see [`AttentionOperands`]).
+    fn row_major(
+        stream: &CudaStream,
+        words: usize,
+        rows: usize,
+        heads: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        let words = DeviceBuffer::zeroed(stream, words)?;
+        // SAFETY: the mapped buffer lives beside its map and is never
+        // reallocated.
+        let tma = unsafe { create_flash_row_major_tma_map(stream, &words, rows, heads)? };
+        Ok(Self { words, tma })
+    }
 }
 
 /// Where a block keeps Q, K and V between the projection and attention.
@@ -813,6 +897,15 @@ impl StagedHeads {
 /// passes and the backward's re-staging all go away with it (SPEC §7.1).
 /// Shapes the tcgen05 kernels do not cover keep the fp32 triple its oracle
 /// kernels read.
+///
+/// V goes one step further and is never staged at all (#107 A8). Nothing
+/// rotates it and nothing scales it, so the only work the staging pass did on
+/// V's third of the panel was round it to bf16 and transpose token against
+/// head — and the GEMM's packed epilogue already rounds, while a TMA
+/// descriptor already transposes. So the projection writes V's group straight
+/// into this buffer as its own bf16 GEMM and flash addresses a head as a
+/// column band of it. What disappears is V's whole round trip through fp32:
+/// the wide store, the staging read and the staging write.
 enum AttentionOperands<const N: usize, const D: usize> {
     Staged {
         q: StagedHeads,
@@ -832,7 +925,7 @@ impl<const N: usize, const D: usize> AttentionOperands<N, D> {
         sequence_length: usize,
         heads: usize,
     ) -> Result<Self, Box<dyn Error>> {
-        if !tcgen05_attention_eligible(sequence_length, D / heads) {
+        if !staged_attention_eligible::<N, D>(sequence_length, heads) {
             return Ok(Self::Wide {
                 q: GpuTensor::zeros(stream)?,
                 k: GpuTensor::zeros(stream)?,
@@ -844,7 +937,7 @@ impl<const N: usize, const D: usize> AttentionOperands<N, D> {
         Ok(Self::Staged {
             q: panel()?,
             k: panel()?,
-            v: panel()?,
+            v: StagedHeads::row_major(stream, N * D / 2, N, heads)?,
         })
     }
 }
@@ -995,6 +1088,7 @@ impl<const IN: usize, const OUT: usize> GpuLinear<IN, OUT> {
                 values,
                 IN,
                 OUT,
+                1,
             )?)
         } else {
             None
@@ -1208,6 +1302,7 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
                 &weights,
                 IN,
                 GROUPS * OUT,
+                GROUPS,
             )?)
         } else {
             None
@@ -1233,6 +1328,67 @@ impl<const IN: usize, const GROUPS: usize, const OUT: usize> GpuGroupedLinear<IN
         let staging = scratch.bf16.as_mut()?;
         (self.compute.is_some() && tcgen05_linear_eligible(N, IN, GROUPS * OUT))
             .then_some(&mut staging.rows)
+    }
+
+    /// The band descriptors [`Self::forward_last_group_packed`] reads, or
+    /// `None` when this shape's forward must run as one GEMM into one fp32
+    /// panel. The condition is that method's own, so the two never disagree.
+    fn packed_last_group<const N: usize>(&self) -> Option<&TransposedBands> {
+        let bands = self.compute.as_ref()?.bands.as_ref()?;
+        (tcgen05_linear_eligible(N, IN, (GROUPS - 1) * OUT) && tcgen05_linear_eligible(N, IN, OUT))
+            .then_some(bands)
+    }
+
+    /// The forward as one GEMM per destination: the leading `GROUPS - 1`
+    /// groups into the fp32 panel a pointwise consumer reads, and the last
+    /// group's packed bf16 into `last`, a buffer somebody else's descriptor
+    /// addresses in place.
+    ///
+    /// Both read the one transposed operand the whole forward reads, through
+    /// descriptors over its two row bands — nothing is copied and nothing is
+    /// re-transposed. Splitting the output's `N` leaves each tile's K walk
+    /// alone, so the last group's fp32 accumulator is the whole GEMM's to the
+    /// bit and the packed epilogue's rounding lands exactly where a staging
+    /// pass's would have.
+    #[allow(clippy::too_many_arguments, unused_unsafe)]
+    fn forward_last_group_packed<const N: usize, P: KernelProfiler>(
+        &self,
+        bands: &TransposedBands,
+        x: &Bf16Acts<N, IN>,
+        leading: &mut GpuTensor<f32, Rank3<N, GROUPS, OUT>>,
+        last: &mut DeviceBuffer<u32>,
+        stream: &CudaStream,
+        tcgen05: &Tcgen05Gemm,
+        profiler: &mut P,
+        names: (&'static str, &'static str),
+    ) -> Result<(), DriverError> {
+        let leading_width = (GROUPS - 1) * OUT;
+        // SAFETY: both launches are the eligibility check's own shapes, and
+        // each output region holds exactly the matrix its GEMM writes.
+        profiler.measure(stream, names.0, || unsafe {
+            tcgen05.f32_store_at(
+                stream,
+                tcgen05_launch_config(N, leading_width, IN),
+                x.k_map().as_ptr(),
+                bands.leading.as_ptr(),
+                leading.as_device_buffer_mut(),
+                0,
+                N * leading_width,
+                leading_width as u32,
+                IN as u32,
+            )
+        })?;
+        profiler.measure(stream, names.1, || unsafe {
+            tcgen05.store(
+                stream,
+                tcgen05_launch_config(N, OUT, IN),
+                x.k_map().as_ptr(),
+                bands.last.as_ptr(),
+                last,
+                OUT as u32,
+                IN as u32,
+            )
+        })
     }
 
     #[allow(clippy::too_many_arguments, unused_unsafe)]
@@ -4701,24 +4857,19 @@ impl<const D: usize, const FF: usize, const E: usize> GpuBlock<D, FF, E> {
                 "forward.attention_norm",
             )?;
         }
-        self.qkv_proj.forward_into(
+        project_attention_operands::<N, T, D, H, HD, FF, P>(
+            &self.qkv_proj,
             &acts.attention_normalized,
             &mut scratch.qkv,
-            stream,
-            tensor,
-            gemm,
-            gemm_bf16,
-            linear_scratch,
-            profiler,
-            "forward.qkv_proj.gemm",
-        )?;
-        stage_attention_operands::<N, T, D, H, HD, P>(
-            &scratch.qkv,
             &mut acts.attention,
             &mut scratch.d_model_0,
             &scratch.rope_table,
             stream,
+            tensor,
             dense,
+            gemm,
+            gemm_bf16,
+            linear_scratch,
             flash,
             profiler,
         )?;
@@ -5777,24 +5928,19 @@ impl<
                 profiler,
                 "forward.embedding_norm",
             )?;
-            self.qkv_proj.forward_into(
+            project_attention_operands::<N, T, D, H, HD, FF, P>(
+                &self.qkv_proj,
                 &workspace.attention_normalized,
                 &mut workspace.qkv,
-                stream,
-                tensor,
-                gemm,
-                gemm_bf16,
-                &mut workspace.linear_scratch,
-                profiler,
-                "forward.qkv_proj.gemm",
-            )?;
-            stage_attention_operands::<N, T, D, H, HD, P>(
-                &workspace.qkv,
                 &mut workspace.attention,
                 &mut workspace.d_model_0,
                 &workspace.rope_table,
                 stream,
+                tensor,
                 dense,
+                gemm,
+                gemm_bf16,
+                &mut workspace.linear_scratch,
                 flash,
                 profiler,
             )?;
@@ -6239,53 +6385,89 @@ fn rope_into<
     })
 }
 
-/// Q, K and V out of the projection's fp32 `[N, 3D]` panel and into whatever
-/// this shape's attention reads.
+/// The qkv projection, and Q/K/V out of it into whatever this shape's
+/// attention reads.
 ///
-/// The staged path does it in one pass — split, rotate, scale, quantize and
-/// relayout head-major — where the fp32 path still needs the split and two
-/// rotation passes it always did. `rotated` is a scratch `[N, D]` the fp32
-/// path rotates through and the staged path never touches.
+/// Where flash streams packed head panels, V never enters the fp32 panel at
+/// all: the projection runs as two GEMMs and its V group's packed epilogue
+/// writes the saved panel flash addresses in place, so the rotate-and-stage
+/// pass reads a Q/K panel two thirds the width and writes two operands
+/// instead of three (#107 A8). Q and K still go through it because RoPE is
+/// theirs alone — split, rotate, scale, quantize and relayout head-major in
+/// one pass — where the fp32 path still needs the split and two rotation
+/// passes it always did. `rotated` is a scratch `[N, D]` the fp32 path
+/// rotates through and the staged path never touches.
 #[allow(clippy::too_many_arguments)]
-fn stage_attention_operands<
+fn project_attention_operands<
     const N: usize,
     const T: usize,
     const D: usize,
     const H: usize,
     const HD: usize,
+    const FF: usize,
     P: KernelProfiler,
 >(
-    qkv: &GpuTensor<f32, Rank3<N, 3, D>>,
+    qkv_proj: &GpuGroupedLinear<D, 3, D>,
+    x: &Bf16Acts<N, D>,
+    qkv: &mut GpuTensor<f32, Rank3<N, 3, D>>,
     operands: &mut AttentionOperands<N, D>,
     rotated: &mut GpuTensor<f32, Rank2<N, D>>,
     table: &DeviceBuffer<f32>,
     stream: &CudaStream,
+    tensor: &tensor_kernels::LoadedModule,
     dense: &dense_kernels::LoadedModule,
+    gemm: &gemm_kernels::LoadedModule,
+    gemm_bf16: &Tcgen05Gemm,
+    linear_scratch: &mut LinearScratch<N, D, FF>,
     flash: &flash_kernels::LoadedModule,
     profiler: &mut P,
 ) -> Result<(), DriverError> {
+    if let AttentionOperands::Staged { q, k, v } = operands {
+        let bands = qkv_proj
+            .packed_last_group::<N>()
+            .expect("staged operands are only built where the projection's V group runs packed");
+        qkv_proj.forward_last_group_packed::<N, P>(
+            bands,
+            x,
+            qkv,
+            &mut v.words,
+            stream,
+            gemm_bf16,
+            profiler,
+            ("forward.qkv_proj.gemm", "forward.qkv_proj.gemm_v"),
+        )?;
+        // Fold softmax_scale * log2(e) into Q so the kernel's softmax is
+        // base-2 native; K quantizes unscaled.
+        let q_scale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
+        // SAFETY: the panel is [N, 2D] and both staged buffers match the
+        // N/T/H/HD attention layout.
+        return profiler.measure(stream, "forward.attention.stage_qk", || unsafe {
+            flash.stage_qk_heads_bf16(
+                stream,
+                flash_device::stage_heads_config(N, H, HD),
+                qkv.as_device_buffer(),
+                table,
+                T as u32,
+                H as u32,
+                q_scale,
+                &mut q.words,
+                &mut k.words,
+            )
+        });
+    }
+    qkv_proj.forward_into(
+        x,
+        qkv,
+        stream,
+        tensor,
+        gemm,
+        gemm_bf16,
+        linear_scratch,
+        profiler,
+        "forward.qkv_proj.gemm",
+    )?;
     match operands {
-        AttentionOperands::Staged { q, k, v } => {
-            // Fold softmax_scale * log2(e) into Q so the kernel's softmax is
-            // base-2 native; K/V quantize unscaled.
-            let q_scale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
-            // SAFETY: the panel is [N, 3D] and the three staged buffers match
-            // the N/T/H/HD attention layout.
-            profiler.measure(stream, "forward.attention.stage_qkv", || unsafe {
-                flash.stage_qkv_heads_bf16(
-                    stream,
-                    flash_device::stage_heads_config(N, H, HD),
-                    qkv.as_device_buffer(),
-                    table,
-                    T as u32,
-                    H as u32,
-                    q_scale,
-                    &mut q.words,
-                    &mut k.words,
-                    &mut v.words,
-                )
-            })
-        }
+        AttentionOperands::Staged { .. } => unreachable!("the staged arm returned above"),
         AttentionOperands::Wide { q, k, v } => {
             // SAFETY: qkv contains three contiguous N * D groups.
             profiler.measure(stream, "forward.qkv_proj.split", || unsafe {

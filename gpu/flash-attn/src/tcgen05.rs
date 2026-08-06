@@ -567,6 +567,34 @@ pub mod kernels {
     /// the recomputed probabilities live in.
     const LOG2E: f32 = 1.442_695_04;
 
+    /// Where V is, in the coordinates of the panel the projection GEMM left it
+    /// in: row-major `[batches * T, heads * HD]`, so the batch folds into the
+    /// row and the head stands alone as the plane. Q, K and dY are relaid-out
+    /// head panels and keep the `(batch, head)` plane; V is never relaid out,
+    /// which is the whole point — its map does the transposition
+    /// (`create_flash_row_major_tma_map`).
+    #[derive(Clone, Copy)]
+    struct Values {
+        row_base: i32,
+        plane: i32,
+    }
+
+    impl Values {
+        #[inline(always)]
+        fn of(batch: u32, head: u32, sequence_length: u32) -> Self {
+            Self {
+                row_base: (batch * sequence_length) as i32,
+                plane: head as i32,
+            }
+        }
+
+        /// The row coordinate of the key tile `row` rows into the sequence.
+        #[inline(always)]
+        fn row(self, row: i32) -> i32 {
+            self.row_base + row
+        }
+    }
+
     // The gemm-encoded operand descriptors and the chained K=16 MMA walks
     // (score/gradient, plain and 7e15-paired) now live in kittens::shared
     // (`operand_descriptor`) and kittens::mma (`mma_abt`/`mma_ab`) — same
@@ -804,7 +832,7 @@ pub mod kernels {
 
         /// Stage `key_tile`'s K and V panels, charging one barrier for both.
         #[inline(always)]
-        unsafe fn load_kv(&self, key_tile: u32, plane: i32) {
+        unsafe fn load_kv(&self, key_tile: u32, plane: i32, values: Values) {
             unsafe {
                 let row = (key_tile * TILE as u32) as i32;
                 let full = self.shared.kv_loaded.sem(key_tile);
@@ -813,11 +841,12 @@ pub mod kernels {
                     .k
                     .tile(key_tile)
                     .tma_load(self.k_tma, row, plane, full)
-                    + self
-                        .shared
-                        .v
-                        .tile(key_tile)
-                        .tma_load(self.v_tma, row, plane, full);
+                    + self.shared.v.tile(key_tile).tma_load(
+                        self.v_tma,
+                        values.row(row),
+                        values.plane,
+                        full,
+                    );
                 full.expect_tx(charge);
             }
         }
@@ -932,6 +961,7 @@ pub mod kernels {
                 let plane = item % self.planes;
                 let head = plane % self.h;
                 let batch = plane / self.h;
+                let values = Values::of(batch, head, self.t);
                 let query_base = query_block * QUERIES as u32;
                 let key_tiles = 2 * query_block + 2;
                 let first_masked = 2 * query_block;
@@ -983,7 +1013,7 @@ pub mod kernels {
                     full.expect_tx(charge);
                     let mut stage = 0u32;
                     while stage < BACKWARD_STAGES as u32 && stage < key_tiles {
-                        self.load_kv(stage, plane as i32);
+                        self.load_kv(stage, plane as i32, values);
                         stage += 1;
                     }
                     // Only the MMA reads these operands, so only the issuing
@@ -1016,7 +1046,7 @@ pub mod kernels {
                             let refill = key_tile + BACKWARD_STAGES as u32 - 1;
                             if key_tile > 0 && refill < key_tiles {
                                 self.shared.accumulated.wait(key_tile - 1);
-                                self.load_kv(refill, plane as i32);
+                                self.load_kv(refill, plane as i32, values);
                             }
                             // The next tile's scores are issued before this tile's
                             // register pass ends, so the tensor core is producing
@@ -1493,6 +1523,7 @@ pub mod kernels {
                 let plane = item % self.planes;
                 let head = plane % self.h;
                 let batch = plane / self.h;
+                let values = Values::of(batch, head, self.t);
                 let key_base = key_block * QUERIES as u32;
                 let steps = 2 * (self.tiles - key_block);
 
@@ -1521,14 +1552,14 @@ pub mod kernels {
                     ) + self.shared.v.tma_load_at::<TILE>(
                         self.v_tma,
                         0,
-                        key_base as i32,
-                        plane as i32,
+                        values.row(key_base as i32),
+                        values.plane,
                         full,
                     ) + self.shared.v.tma_load_at::<TILE>(
                         self.v_tma,
                         TILE,
-                        second,
-                        plane as i32,
+                        values.row(second),
+                        values.plane,
                         full,
                     );
                     full.expect_tx(charge);
@@ -1814,7 +1845,7 @@ pub mod kernels {
 
         /// Stage `key_tile`'s K and V panels, charging one barrier for both.
         #[inline(always)]
-        unsafe fn load_kv(&self, key_tile: u32, plane: i32) {
+        unsafe fn load_kv(&self, key_tile: u32, plane: i32, values: Values) {
             unsafe {
                 let row = (key_tile * TILE as u32) as i32;
                 let full = self.shared.kv_loaded.sem(key_tile);
@@ -1823,11 +1854,12 @@ pub mod kernels {
                     .k
                     .tile(key_tile)
                     .tma_load(self.k_tma, row, plane, full)
-                    + self
-                        .shared
-                        .v
-                        .tile(key_tile)
-                        .tma_load(self.v_tma, row, plane, full);
+                    + self.shared.v.tile(key_tile).tma_load(
+                        self.v_tma,
+                        values.row(row),
+                        values.plane,
+                        full,
+                    );
                 full.expect_tx(charge);
             }
         }
@@ -1878,6 +1910,7 @@ pub mod kernels {
                 let plane = item % self.planes;
                 let head = plane % self.h;
                 let batch = plane / self.h;
+                let values = Values::of(batch, head, self.t);
                 let query_base = query_tile * QUERIES as u32;
                 // A query block is two key tiles tall, and its last row attends
                 // to its own key: `2 * query_tile + 2` tiles, the last two of
@@ -1911,7 +1944,7 @@ pub mod kernels {
                     self.shared.q_loaded.expect_tx(charge);
                     let mut stage = 0u32;
                     while stage < FORWARD_STAGES as u32 && stage < key_tiles {
-                        self.load_kv(stage, plane as i32);
+                        self.load_kv(stage, plane as i32, values);
                         stage += 1;
                     }
                     // Only the MMA reads Q and K, so only the issuing thread
@@ -1944,7 +1977,7 @@ pub mod kernels {
                         let refill = key_tile + FORWARD_STAGES as u32 - 1;
                         if key_tile > 0 && refill < key_tiles {
                             self.shared.accumulated.wait(key_tile - 1);
-                            self.load_kv(refill, plane as i32);
+                            self.load_kv(refill, plane as i32, values);
                         }
                         // The next tile's scores are issued before this tile's
                         // softmax runs, so the tensor core and the warpgroup
