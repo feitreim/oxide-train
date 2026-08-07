@@ -14,7 +14,7 @@ tensor-core = { path = "../../crates/tensor-core" }
 tensor-cpu = { path = "../../crates/tensor-cpu" }
 nn = { path = "../../crates/nn" }
 bench-util = { path = "../bench-util" }
-kittens = { package = "ferro-kittens", git = "https://github.com/feitreim/ferro-kittens", rev = "3ae07a84671c4a19baafe5f0c720aaf63a544a88" }
+kittens = { package = "ferro-kittens", git = "https://github.com/feitreim/ferro-kittens", rev = "b589b8a1566cfb3534478d15254176215c06284d" }
 
 [profile.release]
 debug = false
