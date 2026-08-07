@@ -6584,6 +6584,9 @@ fn join_qkv_gradient<
     profiler: &mut P,
 ) -> Result<RowGradient<'a, N, 3, D>, DriverError> {
     let pairs = LaunchConfig::for_num_elems((N * D / 2) as u32);
+    // The packed arm owns `QUAD_LANES` rotated pairs per thread; the wide one
+    // owns one.
+    let pair_quads = LaunchConfig::for_num_elems((N * D / 2).div_ceil(QUAD_LANES) as u32);
     // SAFETY: the three gradients are [N, D] and either destination holds
     // N * 3 * D elements of its own width.
     match qkv_proj.packed_row_gradient(linear_scratch) {
@@ -6591,7 +6594,7 @@ fn join_qkv_gradient<
             profiler.measure(stream, "backward.qkv_proj.join", || unsafe {
                 dense.join_group3_rope_bf16(
                     stream,
-                    pairs,
+                    pair_quads,
                     dq.as_device_buffer(),
                     dk.as_device_buffer(),
                     dv.as_device_buffer(),

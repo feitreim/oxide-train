@@ -18,10 +18,10 @@ use device::{
     CLASSIFIER_THREADS, LOSS_TAIL_THREADS, MOE_ASSIGN_THREADS, MOE_AUX_TERMS_THREADS,
     MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS, MOE_ZERO_BINS_BLOCKS, MOE_ZERO_BINS_THREADS,
     NORM_BACKWARD_ROWS_PER_BLOCK, NORM_BACKWARD_TILE_CHUNK, NORM_THREADS, NORM_TILE_BLOCK_ROWS,
-    NORM_TILE_CHUNK, NORM_TILE_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN,
-    ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS,
-    ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, SWIGLU_TILE_BLOCK_ROWS,
-    SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS, kernels, rope_table,
+    NORM_TILE_CHUNK, NORM_TILE_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, QUAD_LANES, ROUTER_GEMM_BM,
+    ROUTER_GEMM_BN, ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS,
+    ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS,
+    SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS, kernels, rope_table,
 };
 use tensor_core::bf16;
 
@@ -1138,18 +1138,35 @@ fn check_moe_tie_routing(
     Ok(())
 }
 
+/// RoPE and the joins that carry it, at both of `join_group3_rope_bf16`'s
+/// arms.
+///
+/// A head narrower than a `QUAD_LANES` vector of rotated pairs takes the
+/// packed join's scalar arm, and `HD = 4` is the shape this check has always
+/// run; `HD = 8` is the vector arm the training shape takes, and without it
+/// the arm that ships would have no gate at all.
 fn check_rope(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    check_rope_case::<10, 5, 12, 3, 4>(stream, module, reference)?;
+    check_rope_case::<8, 4, 24, 3, 8>(stream, module, reference)
+}
+
+fn check_rope_case<
+    const N: usize,
+    const T: usize,
+    const D: usize,
+    const H: usize,
+    const HD: usize,
+>(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
     reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: all device buffers and launches use the same N/T/D/H/HD shape.
     unsafe {
-        const N: usize = 10;
-        const T: usize = 5;
-        const D: usize = 12;
-        const H: usize = 3;
-        const HD: usize = 4;
         let x = CpuTensor::<f32, Rank2<N, D>>::uniform(10);
         let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(11);
         let mut cpu = Rope::<N, T, D, H, HD>;
@@ -1246,9 +1263,10 @@ fn check_rope(
         // was one before — both backward GEMMs read the single quantized
         // buffer — so the bytes are equal, not merely close.
         let mut packed = DeviceBuffer::<u32>::zeroed(stream, N * 3 * D / 2)?;
+        // The packed join owns `QUAD_LANES` rotated pairs per thread.
         module.join_group3_rope_bf16(
             stream,
-            pairs,
+            LaunchConfig::for_num_elems((N * D / 2).div_ceil(QUAD_LANES) as u32),
             &dy_dev,
             &dk_dev,
             &dv_dev,
@@ -1832,9 +1850,13 @@ fn check_classifier_bf16(
     reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Odd real vocabulary exercises the packed tail; the second case covers a
-    // multi-iteration lane stride.
+    // multi-iteration lane stride. The third is the row stride that is not a
+    // whole number of `QUAD_LANES` vectors, which is what puts the whole row
+    // on the scalar walk — the arm the vector one left behind, and the one
+    // nothing else here would reach.
     check_classifier_bf16_case::<5, 13, 16>(stream, module, reference)?;
-    check_classifier_bf16_case::<3, 517, 520>(stream, module, reference)
+    check_classifier_bf16_case::<3, 517, 520>(stream, module, reference)?;
+    check_classifier_bf16_case::<4, 21, 26>(stream, module, reference)
 }
 
 fn check_classifier_bf16_case<const N: usize, const C: usize, const CP: usize>(
