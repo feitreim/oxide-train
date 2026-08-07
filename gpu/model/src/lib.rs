@@ -53,9 +53,9 @@ mod gemm_device;
 #[allow(dead_code)]
 pub mod tensor_device;
 
-pub use dense_device::NORM_THREADS;
 pub use dense_device::kernels as dense_kernels;
 pub use dense_device::reference::kernels as dense_reference_kernels;
+pub use dense_device::{NORM_THREADS, NORM_TILE_THREADS};
 use dense_device::{QUAD_LANES, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS};
 
 /// The tile-SwiGLU launch for a `rows x columns` rectangle, or `None` when the
@@ -215,6 +215,24 @@ fn norm_config<const N: usize>() -> LaunchConfig {
         block_dim: (dense_device::NORM_THREADS as u32, 1, 1),
         shared_mem_bytes: 0,
     }
+}
+
+/// The tile-RMSNorm launch for a `rows x columns` rectangle, or `None` when
+/// the shape does not divide the tile the way the kernels require.
+///
+/// The twin of [`swiglu_tiles`], and it exists for the same reason: the tile
+/// kernels bounds-check nothing, so this is where the divisibility is decided
+/// and the block-per-row kernels stay as the arm anything else takes. `chunk`
+/// is the caller's because the forward and the backward hold different numbers
+/// of columns in registers.
+fn norm_tiles(rows: usize, columns: usize, chunk: usize) -> Option<LaunchConfig> {
+    (rows.is_multiple_of(dense_device::NORM_TILE_BLOCK_ROWS) && columns.is_multiple_of(chunk)).then(
+        || LaunchConfig {
+            grid_dim: ((rows / dense_device::NORM_TILE_BLOCK_ROWS) as u32, 1, 1),
+            block_dim: (dense_device::NORM_TILE_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        },
+    )
 }
 
 /// Launch for the fused RMSNorm backward: one block per row chunk.
@@ -2701,9 +2719,13 @@ impl<const D: usize> GpuRmsNorm<D> {
     /// its scale and the weight product all stay fp32 in registers, so the
     /// only rounding is the one store.
     ///
-    /// There is no tile arm at this dtype — see `rms_norm_forward_fast_bf16`
-    /// for why the block-per-row kernel is the right one once the stream is
-    /// packed.
+    /// There is no tile arm at this dtype, and #124 measured why rather than
+    /// arguing it: a warp-per-band forward is **+7.8% same-container and +13.8%
+    /// across containers** on this span. The band buys loads in flight, and this
+    /// kernel was not short of them — at 24 registers it holds 8 blocks of 256
+    /// on an SM where the tile holds 8 of 128, so the rewrite halves the threads
+    /// hiding the latency to buy a lane more of it.
+    ///
     /// `YROWS` lets the output be taller than the input: the final norm writes
     /// the lm head's `[NP, D]` operand, whose padded tail rows were zeroed at
     /// allocation and must stay zero. The launch covers exactly `N` rows.
@@ -2790,24 +2812,44 @@ impl<const D: usize> GpuRmsNorm<D> {
         name: &'static str,
     ) -> Result<(), DriverError> {
         assert!(D <= dense_device::NORM_MAX_COLUMNS);
+        // The tile kernel has no `normalized` output: it is the arm for the
+        // call sites that kept the forward's result, which is every one the
+        // training step takes. A caller that wants the recompute gets the
+        // block-per-row kernel that can do it.
+        let recomputes = 2 * normalized.len() >= N * D;
         // SAFETY: every buffer holds N * D elements, D is even and inside the
-        // shared column partials, and `dw` holds the D accumulators the
-        // launch atomically updates.
+        // shared column partials, `dw` holds the D accumulators the launch
+        // atomically updates, and the tile arm is only taken at a shape
+        // `norm_tiles` accepted and with no recompute asked for.
         profiler.measure(stream, name, || unsafe {
-            kernels.rms_norm_backward_fused_bf16(
-                stream,
-                norm_backward_fused_config::<N>(),
-                x.as_device_buffer(),
-                self.w.as_device_buffer(),
-                dy.as_device_buffer(),
-                residual.as_device_buffer(),
-                self.eps,
-                N as u32,
-                D as u32,
-                dx.as_device_buffer_mut(),
-                self.dw.as_device_buffer_mut(),
-                normalized,
-            )
+            match norm_tiles(N, D, dense_device::NORM_BACKWARD_TILE_CHUNK).filter(|_| !recomputes) {
+                Some(tiles) => kernels.rms_norm_backward_fused_tile_bf16(
+                    stream,
+                    tiles,
+                    x.as_device_buffer(),
+                    self.w.as_device_buffer(),
+                    dy.as_device_buffer(),
+                    residual.as_device_buffer(),
+                    self.eps,
+                    D as u32,
+                    dx.as_device_buffer_mut(),
+                    self.dw.as_device_buffer_mut(),
+                ),
+                None => kernels.rms_norm_backward_fused_bf16(
+                    stream,
+                    norm_backward_fused_config::<N>(),
+                    x.as_device_buffer(),
+                    self.w.as_device_buffer(),
+                    dy.as_device_buffer(),
+                    residual.as_device_buffer(),
+                    self.eps,
+                    N as u32,
+                    D as u32,
+                    dx.as_device_buffer_mut(),
+                    self.dw.as_device_buffer_mut(),
+                    normalized,
+                ),
+            }
         })
     }
 
