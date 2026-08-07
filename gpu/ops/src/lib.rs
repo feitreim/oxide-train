@@ -87,8 +87,10 @@ pub const ROUTER_GEMM_THREADS: usize = ROUTER_GEMM_BM * ROUTER_GEMM_BN;
 /// **eight bytes a lane and 384 barriers a block** at the training shape, which
 /// is the whole of why this kernel measured 453 GB/s — 6% of HBM — while
 /// reading nothing but a `[N, D]` stream. 128 is 64 bytes a lane and 48
-/// barriers, and it costs 20.6 KiB of shared memory, which is still eight
-/// blocks an SM.
+/// barriers, and it costs 20.6 KiB of shared memory — which is not what bounds
+/// the residency: 20.6 KiB would hold eleven blocks an SM, and the 52 registers
+/// the tile costs hold four. Neither is the kernel's limit either; see
+/// [`router_logits_bf16`] for the port that is.
 pub const ROUTER_LOGITS_BK: usize = 128;
 
 /// Row stride of both router logits GEMM tiles, in `f32`.
@@ -2080,6 +2082,30 @@ pub mod kernels {
     /// of the inner product are one vector load. Neither staging load is
     /// predicated — the address is clamped and the *value* is selected — so the
     /// four of them issue back to back instead of down a chain of branches.
+    ///
+    /// **The four resident blocks are not what is left to win, and the pin says
+    /// four because ptxas would pick it anyway.** At 52 registers a 256-lane
+    /// block already divides the file 4.9 times, so the `(256, 4)` budget of 64
+    /// is slack, not a cap. `(256, 6)` narrows it to 42 and ptxas takes it
+    /// cleanly — 40 registers, no frame, 1536 threads/SM instead of 1024 — and
+    /// the span does not move: **+0.5% and +1.5% over two rounds against a
+    /// +0.8% untouched-span drift, for fifty percent more warps.**
+    ///
+    /// What sets the time is the shared-memory pipe. A lane holds one output,
+    /// so nothing it loads is reused: every four FMAs read one `x` vector and
+    /// one weight vector, **eight bytes of `LDS` per FMA**, and the whole
+    /// launch moves `N * E * dim * 8` = 4.83 GB through a 32-bank, 128 B/clk
+    /// port, with the staging stores another 6% on top. Over 148 SMs that is
+    /// ~140 us where the launch measures ~158, which is **~85% of the port** —
+    /// against 12% of HBM and 11% of the FMA pipe. Warps cannot widen a port
+    /// that is already open.
+    ///
+    /// The lever that would is reuse: a lane holding `R` token rows loads
+    /// `R + 1` vectors for `4R` FMAs, so `R = 2` is 6 bytes per FMA and a
+    /// quarter off the `LDS` bill, at `ROUTER_GEMM_THREADS / R` threads a block
+    /// to keep the 768-block grid. Staging `x` packed instead is not that
+    /// lever: it halves the `x` bytes and hands the same count back to the
+    /// widening, one instruction per FMA on a pipe with only 2x of headroom.
     #[kernel]
     #[launch_bounds(256, 4)]
     pub unsafe fn router_logits_bf16(
@@ -3363,6 +3389,21 @@ pub mod kernels {
     /// private to it: the shared tile would just be the same values with an
     /// `LDS` in the inner loop. Lane-major columns keep every `dx` store a full
     /// coalesced sector, which is what the write-bound tile is paced by.
+    ///
+    /// Every walk over `staged` carries `#[unroll]`, and that is what makes the
+    /// previous paragraph true. The bounds are compile-time constants, but NVVM
+    /// left both walks rolled, so `staged[slot][expert]` was a *dynamic* index
+    /// into a 32-element array — which is a **128-byte `.local` frame**, not a
+    /// register tile, and one `LDL` per FMA in the token sweep. Unrolled, the
+    /// indices fold to literals, SROA promotes the array, and the sweep reads
+    /// registers. This is the opposite verdict to
+    /// [`ROUTER_WGRAD_TOKENS`]' depot, and for the opposite reason: that depot
+    /// is written once and read once per staged token, so keeping it in L1 buys
+    /// the registers back as occupancy, where this one is read `E` times per
+    /// column per token — `ROUTER_INPUT_TOKENS * ROUTER_INPUT_COLUMNS *
+    /// ROUTER_MAX_EXPERTS` = 2048 local loads a lane, eight times the lane's
+    /// own `dx` traffic. A depot is a symptom; only its read count says whether
+    /// it is a bug.
     #[kernel]
     #[launch_bounds(256, 4)]
     pub unsafe fn router_backward_input(
@@ -3392,9 +3433,11 @@ pub mod kernels {
 
         let mut staged = [[0.0f32; ROUTER_MAX_EXPERTS]; ROUTER_INPUT_COLUMNS];
         let mut slot = 0usize;
+        #[unroll]
         while slot < ROUTER_INPUT_COLUMNS {
             let column = column_base + slot * ROUTER_INPUT_THREADS;
             let mut expert = 0usize;
+            #[unroll]
             while expert < ROUTER_MAX_EXPERTS {
                 staged[slot][expert] = if column < d && expert < e {
                     weight[column * e + expert]
@@ -3413,6 +3456,7 @@ pub mod kernels {
             // expert for the whole token, amortized over the register tile.
             let mut gates = [0.0f32; ROUTER_MAX_EXPERTS];
             let mut expert = 0usize;
+            #[unroll]
             while expert < ROUTER_MAX_EXPERTS {
                 gates[expert] = if expert < e {
                     dlogits[token * e + expert]
@@ -3424,11 +3468,13 @@ pub mod kernels {
 
             let row_base = token * d;
             let mut slot = 0usize;
+            #[unroll]
             while slot < ROUTER_INPUT_COLUMNS {
                 let column = column_base + slot * ROUTER_INPUT_THREADS;
                 if column < d {
                     let mut value = 0.0f32;
                     let mut expert = 0usize;
+                    #[unroll]
                     while expert < ROUTER_MAX_EXPERTS {
                         value += gates[expert] * staged[slot][expert];
                         expert += 1;
