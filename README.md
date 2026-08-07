@@ -105,6 +105,88 @@ arm that was running, and re-running it is not the remedy -- `--detach` is.
 `modal app logs <app-id>` re-attaches to a detached run, and
 `--show-timestamps` puts a clock on every line.
 
+### What a measurement costs, and what cannot be taken off it
+
+A `compare_train` A/B is 848-1509s of B200 (four healthy runs). Six trainer
+processes account for nearly all of it, and **a trainer process is almost
+entirely parameter initialization**: 119.5s of the 123.9s a three-step run
+takes, at `B=32`. Only the last few seconds of each process are the
+measurement. So ~76% of an A/B's GPU-seconds derive the same 4.39B parameters
+from the same seed, six times.
+
+The obvious economy is to derive them once and resume a step-0 checkpoint.
+**It was built, measured, and rejected** -- `modal run --detach
+modal_app.py::init_cache` is the measurement, kept so it can be redone:
+
+| storage | save | load | a run that resumes, vs fresh init's 123.9s |
+| --- | ---: | ---: | ---: |
+| wiki volume | 174.5s | 237.8s | **-30.3s** |
+| container disk | 35.4s | 139.0s | **-14.0s** |
+
+Resuming is *slower than initializing* on both tiers, and the second row says
+why it is not the filesystem's fault: the container's own disk takes the file
+at 1.18 GiB/s and gives it back at 300.8 MiB/s, so the read is bound by what
+`checkpoint::load` does with the bytes, not by fetching them. The cached
+artifact is bigger than the work it replaces. Of its 40.85 GiB, **80% is AdamW
+moments that are zero at step 0** -- and a fresh init never materializes those
+at all, because `GpuTensor::zeros` fills them on the device, over no bus. The
+cache trades ~119s of host RNG and an 8.8 GiB upload for a 40.85 GiB read, 4.39
+billion host bf16 widenings, and a 35 GiB upload of zeros.
+
+What would overturn this is the checkpoint format, not the storage: a step-0
+artifact that omitted the zero moments would be ~8.6 GiB. That is a checkpoint
+v6, and `init_cache` is kept so the day someone writes one, the claim is one
+container away from being re-measured. Until then the trainer's initialization
+is irreducible here, and the only other lever -- fewer trainer processes, by
+running an arm's rounds inside one process -- is the one thing the alternation
+control forbids, since alternating arms round by round is what puts a drift in
+clocks on both of them.
+
+`bin/init_ckpt` (behind the `init-ckpt` feature, so it is not a fourth device
+codegen every `cargo oxide build model` pays) and `train.rs`'s
+`TRAIN_CHECKPOINT_INIT` are the two halves of the apparatus. The second is
+independently useful: it starts a run from a checkpoint it will never write
+back to, which `TRAIN_CHECKPOINT` -- one path used as both resume source and
+save destination -- cannot express.
+
+### The trainer is not bit-identical to itself after step 1
+
+The same binary, the same shard, the same seed, two processes:
+
+| step | fresh run 1 | fresh run 2 | resumed from step-0 checkpoint |
+| ---: | --- | --- | --- |
+| 1 | 11.124607 | 11.124607 | 11.124607 |
+| 2 | 9.793599 | 9.793572 | 9.793576 |
+| 3 | 10.715647 | 10.715630 | 10.715669 |
+
+Step 1's loss is a pure function of the parameters and agrees to every printed
+digit, which is what says the resumed model *is* the initialized model. From
+step 2 the two fresh runs disagree with each other by as much as either
+disagrees with the resumed arm -- the embedding gradient accumulates
+atomically, and atomic order is not fixed across launches. So **step 1 is the
+last step at which a loss can be compared across processes at all**, and the
+bitwise form of the resume claim belongs where launch order is not a variable:
+`bin/model`'s checkpoint gate takes one training step from a resumed step-0
+checkpoint and from fresh initialization and requires the two saves to be
+byte-identical.
+
+### Build once, run many
+
+Both A/B entry points already build each arm once and then launch
+`target/release/train` directly for every round -- cargo is never in the round
+loop. What that assumption needs is a guard, since a build that silently did
+not happen leaves an older binary in place and the rounds measure the wrong
+tree: each arm prints its resolved commit, and `_built_here` refuses a binary
+older than any `.rs`/`.toml`/`.lock` beneath it before any round runs.
+
+Timeouts are sized at ~3x a measured baseline, with the baseline in a comment
+at each `@app.function`. Three are deliberately left open-ended and say so
+(`run_kernel` and `prepare_data` take unbounded `--steps`/`--limit-files`,
+`profile` replays every kernel once per metric pass); the rest came down --
+`compare_train` from 4h to 80 min against a 1509s worst case, `batch_sweep` to
+2h, `rebuild_stability` and `torch_versus_train` to 90 min, `dump_ptx` and
+`jit_probe` to 20 min, `tools_check` to 10.
+
 The external pair is `modal run --detach modal_app.py::versus --ref main --batch 32`,
 which alternates `bin/train` against the PyTorch baseline of
 `gpu/model/baselines/pytorch_baseline.py` the same way. It runs on `ab_image`
@@ -166,3 +248,10 @@ Model and batch shapes remain compile-time constants in
 step count, logging/checkpoint intervals, and AdamW scalars. Checkpoints include
 all parameters, AdamW moments/configuration, the global step, static shape
 metadata, and the next batch position; saves use atomic replacement.
+
+`TRAIN_CHECKPOINT` is one path used as both the resume source (with
+`TRAIN_RESUME=1`) and the save destination, which is what a run continuing its
+own trajectory wants. `TRAIN_CHECKPOINT_INIT` is the other shape: a starting
+state that is read and never written back, for a run that should not leave its
+final state over a file other runs read. The two are mutually exclusive and say
+so.

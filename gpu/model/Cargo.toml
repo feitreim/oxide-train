@@ -10,6 +10,19 @@ autolib = false
 
 [workspace]
 
+# Every binary in this crate includes `src/lib.rs`, so cuda-oxide compiles the
+# whole model's device code once per binary target. `init_ckpt` is needed only
+# when a measurement harness fills the step-0 checkpoint cache, and a plain
+# `cargo oxide build model` builds every target it can — so this one is kept
+# behind a feature rather than made a fourth codegen every diagnostic run pays.
+[features]
+init-ckpt = []
+
+[[bin]]
+name = "init_ckpt"
+path = "src/bin/init_ckpt.rs"
+required-features = ["init-ckpt"]
+
 [dependencies]
 bench-util = { path = "../bench-util" }
 # `src/lib.rs` includes flash-attn's host.rs by #[path]; its TMA maps and
