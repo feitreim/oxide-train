@@ -3427,8 +3427,27 @@ pub mod kernels {
     ///
     /// Same contract as [`router_backward_weight_split`], with `x` holding
     /// `tokens * dim / 2` packed words.
+    /// The one entry point in this module whose resident-block target is not
+    /// the module's 4. Declaring `.maxntid` at all moves this kernel: the
+    /// budget a *derived* 1024 gave it was 64 registers and ptxas took 32,
+    /// and the same 64-register budget under a declared 256 makes it take all
+    /// 64 — `.maxntid` is an input to the allocator's heuristics and not only
+    /// a divisor. Measured at the three targets a 256-thread block has, same
+    /// container, against `main`'s derived allocation:
+    ///
+    /// | target | regs | frame | blocks/SM | `backward.router.weight` |
+    /// |---|---:|---:|---:|---:|
+    /// | derived (`main`) | 32 | 0 | 8 | — |
+    /// | `(256, 4)` | 64 | 192 B | 4 | **+8.6%** |
+    /// | `(256, 8)` | 32 | 480 B | 8 | **+189%** |
+    /// | `(256, 6)` | see the gate's report | | | ships |
+    ///
+    /// 8 is the shape the doc above describes going wrong: capped at 32 the
+    /// allocator has to put the staged token depot in the frame *and* keep the
+    /// unrolling that a declared 256 bought it, which is the one arrangement
+    /// #111 measured as the slow one.
     #[kernel]
-    #[launch_bounds(256, 4)]
+    #[launch_bounds(256, 6)]
     pub unsafe fn router_backward_weight_split_bf16(
         x: &[u32],
         dlogits: &[f32],
