@@ -192,7 +192,7 @@ def _warn_unless_detached(entrypoint: str) -> None:
 HEARTBEAT_SECONDS = 30.0
 
 
-def _run(cmd: list[str], cwd: str) -> str:
+def _run(cmd: list[str], cwd: str, stamp: bool = False) -> str:
     """Run `cmd` to completion, echoing its output as it arrives, and return it.
 
     Callers that parse a number out of a run take it from the return value
@@ -207,6 +207,11 @@ def _run(cmd: list[str], cwd: str) -> str:
     prints nothing between its first instruction and the end of parameter
     initialization, which is minutes. A quiet window with a pulse in it is a
     run still working; a quiet window without one is the app being gone.
+
+    `stamp` puts the elapsed time on every echoed line, which is how a run's
+    internal phases get attributed -- the moment `training shard=` appears is
+    the moment initialization ended. The returned text is never stamped, so a
+    parser still sees exactly what the child printed.
     """
     print(f"$ {' '.join(cmd)}  (cwd={cwd})", flush=True)
     started = quiet_since = time.monotonic()
@@ -228,7 +233,8 @@ def _run(cmd: list[str], cwd: str) -> str:
     for line in process.stdout:
         quiet_since = time.monotonic()
         lines.append(line)
-        print(line, end="", flush=True)
+        prefix = f"[+{quiet_since - started:.0f}s] " if stamp else ""
+        print(prefix + line, end="", flush=True)
     finished.set()
     code = process.wait()
     print(f"[+{time.monotonic() - started:.0f}s] exit={code}", flush=True)
@@ -261,6 +267,50 @@ def _resolve_ref(clone: str, ref: str) -> str:
         if probe.returncode == 0:
             return candidate
     raise SystemExit(f"ref {ref} is neither a ref nor a branch on origin")
+
+
+def _sha(root: str) -> str:
+    probe = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True
+    )
+    return probe.stdout.strip() if probe.returncode == 0 else "unknown"
+
+
+def _built_here(root: str, binary: str, label: str) -> None:
+    """Name the commit a round is about to measure, and refuse a stale binary.
+
+    A harness that builds once and launches the binary many times is only
+    honest while the binary is the one that ref's sources produce. Nothing in
+    these entry points hands a binary between trees -- each arm builds in its
+    own worktree -- but "the binary is current" is the assumption every reused
+    launch rests on, so it is checked rather than assumed, and the commit is
+    printed so a number in a log can be traced to a tree later.
+
+    The check is the binary's mtime against the newest source under it. That
+    catches the failure that matters -- a build that silently did not happen,
+    leaving an older artifact in place -- which is exactly how a prebuilt-
+    binary shortcut turns a gate green on the wrong tree.
+    """
+    import os
+
+    path = os.path.join(root, binary)
+    if not os.path.isfile(path):
+        raise SystemExit(f"{label}: {binary} was never built")
+    built = os.path.getmtime(path)
+    newest, newest_at = None, 0.0
+    for directory, subdirectories, names in os.walk(root):
+        subdirectories[:] = [d for d in subdirectories if d not in ("target", ".git")]
+        for name in names:
+            if name.endswith((".rs", ".toml", ".lock")):
+                source = os.path.join(directory, name)
+                if (when := os.path.getmtime(source)) > newest_at:
+                    newest, newest_at = source, when
+    if newest_at > built:
+        raise SystemExit(
+            f"{label}: {binary} is older than {os.path.relpath(newest, root)} "
+            f"({built:.0f} < {newest_at:.0f}) -- it is not this tree's binary"
+        )
+    print(f"provenance {label}: sha={_sha(root)} {binary} built after every source", flush=True)
 
 
 def _prepare_gemm_ptx(root: str, oxide: list[str] | None = None) -> None:
@@ -309,6 +359,10 @@ def _prepare_flash_ptx(root: str, oxide: list[str] | None = None) -> None:
 
 @app.function(
     gpu=DEFAULT_GPU,
+    # Not right-sized, deliberately: `--steps` is open-ended, so this entry
+    # point has no baseline to be three times. The unit is measured -- 0.72s a
+    # step at B=32 behind a ~120s initialization -- and 4h is where that puts
+    # the step budget at ~19,000.
     timeout=4 * 3600,
     volumes={"/data": wiki_volume},
 )
@@ -374,7 +428,10 @@ def _set_train_batch(proj: str, batch: int) -> None:
 
 @app.function(
     gpu=DEFAULT_GPU,
-    timeout=4 * 3600,
+    # ~200s per batch measured (a ~60s build, then a trainer process whose
+    # 123.9s at three steps is almost all initialization). `--batches` sets how
+    # many, so the cap is on the list rather than on a baseline: 2h is ~36.
+    timeout=2 * 3600,
     volumes={"/data": wiki_volume},
 )
 def batch_sweep(batches: str, steps: int = 12, shard: str | None = None) -> None:
@@ -410,7 +467,103 @@ def batch_sweep(batches: str, steps: int = 12, shard: str | None = None) -> None
             print(f"train B={batch} failed: {e}", flush=True)
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=3600)
+# --------------------------------------------------------------------------
+# The step-0 init checkpoint cache: MEASURED AND REJECTED. Do not build it.
+#
+# Parameter initialization is deterministic (seed 42) and is the longest window
+# in a trainer process -- 119.5s of the 123.9s a three-step run takes. A
+# `compare_train` A/B pays it six times to reach the same bytes six times, so
+# the arithmetic says to derive it once and have every later run resume it,
+# and that arithmetic is wrong. `init_cache_probe` measured it, at B=32:
+#
+#              save        load     resume vs fresh init (123.9s)
+#   volume    174.5s      237.8s      -30.3s per run
+#   disk       35.4s      139.0s      -14.0s per run
+#
+# Resuming is slower than initializing on BOTH storage tiers, and the second
+# row is why: the container's own disk takes the file at 1.18 GiB/s and gives
+# it back at 300.8 MiB/s, so the read is not bound by the filesystem -- it is
+# bound by what `checkpoint::load` does with the bytes. The artifact is simply
+# bigger than the work it replaces. Of its 40.85 GiB, 80% is AdamW moments
+# that are ZERO at step 0 and that a fresh init never materializes at all:
+# `GpuTensor::zeros` fills them on the device, over no bus. So the cache trades
+# ~119s of host RNG and an 8.8 GiB upload for a 40.85 GiB read, 4.4B host bf16
+# widenings, and a 35 GiB upload of zeros.
+#
+# What would change the verdict is the format, not the storage: a step-0
+# artifact that omitted the zero moments would be ~8.6 GiB. That is a
+# checkpoint v6, and `init_cache_probe` is kept so the claim can be re-measured
+# the day someone writes one.
+INIT_CACHE_DIR = "/data/init-cache"
+
+# The compile-time shape of a trainer binary. Read out of the arm's own
+# `bin/train.rs`, imposed on `bin/init_ckpt.rs`, and hashed into the cache
+# filename -- so what derives an entry and what consumes it are the same
+# numbers, from the same file.
+SHAPE_CONSTS = ("B", "T", "N", "NP", "VOCAB", "VP", "D", "H", "HD", "FF", "E", "K", "C", "L")
+CONST_LINE = r"(?m)^const {}: usize = (.+);$"
+
+
+def _train_shape(proj: str) -> dict[str, str]:
+    source = Path(proj, "src/bin/train.rs").read_text()
+    shape = {}
+    for name in SHAPE_CONSTS:
+        found = re.search(CONST_LINE.format(name), source)
+        if found is None:
+            raise SystemExit(f"{proj}/src/bin/train.rs has no `const {name}: usize`")
+        shape[name] = found[1].strip()
+    return shape
+
+
+def _impose_train_shape(proj: str, shape: dict[str, str]) -> None:
+    """Give `bin/init_ckpt.rs` the shape of `bin/train.rs`.
+
+    The two carry the same constants and a copy is a thing that drifts, so the
+    copy is made at build time from the file that owns them. The guard behind
+    this one is the checkpoint header, which records N/T/VOCAB/D/H/HD/FF/E/K/
+    C/L and refuses a resume that disagrees -- drift costs a failed run, never
+    a wrong number.
+    """
+    source = Path(proj, "src/bin/init_ckpt.rs")
+    text = source.read_text()
+    for name, value in shape.items():
+        text, count = re.subn(
+            CONST_LINE.format(name), f"const {name}: usize = {value};", text
+        )
+        if count != 1:
+            raise SystemExit(f"expected one `const {name}: usize` in init_ckpt.rs, found {count}")
+    source.write_text(text)
+
+
+# What the checkpoint's contents depend on beyond the shape: the seed is fixed
+# at 42 in both binaries, and these are the AdamW scalars `train.rs` refuses to
+# resume across. Keyed on the values the harness actually imposes, so adding a
+# knob later cannot silently reuse an entry built without it.
+INIT_CACHE_CONFIG = {
+    "learning_rate": "3e-4",
+    "weight_decay": "0.1",
+    "aux_coefficient": "1e-2",
+    "aux_decay_horizon": "10000.0",
+}
+
+
+def _init_cache_entry(shape: dict[str, str]) -> tuple[str, str]:
+    """`(path, key)` for the cache entry a binary of this shape can resume."""
+    import hashlib
+
+    key = " ".join(
+        f"{name}={value}"
+        for name, value in [*shape.items(), *INIT_CACHE_CONFIG.items(), ("seed", "42")]
+    )
+    digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+    name = f"init-b{shape['B']}-t{shape['T']}-d{shape['D']}-l{shape['L']}-{digest}.ckpt"
+    return f"{INIT_CACHE_DIR}/{name}", key
+
+
+
+# 827s measured (ap-m8a6S3jJuk60uNdgIzCuPW): a clone, a baseline cargo-oxide
+# install, two builds and two profiled runs.
+@app.function(gpu=DEFAULT_GPU, timeout=45 * 60)
 def compare_profile(kernel: str, baseline_ref: str) -> None:
     """Build a retained git baseline and the mounted candidate, then profile
     both back-to-back in one container after each binary's equivalent warmups.
@@ -492,7 +645,10 @@ def compare_profile(kernel: str, baseline_ref: str) -> None:
 
 @app.function(
     gpu=DEFAULT_GPU,
-    timeout=4 * 3600,
+    # 848s / 1332s / 1413s / 1509s measured over four healthy runs at the
+    # default two rounds; 3x the slowest. The old 4h could not distinguish a
+    # wedged container from a long one, which is the whole job of a timeout.
+    timeout=80 * 60,
     volumes={"/data": wiki_volume},
 )
 def compare_train(
@@ -527,18 +683,24 @@ def compare_train(
         proj = f"{root}/gpu/model"
         if CUDA_OXIDE_REF not in Path(proj, "Cargo.toml").read_text():
             raise SystemExit(f"{name} ref {arm_ref} pins a cuda-oxide the image lacks")
-        arms.append((f"{name} {arm_ref}", proj))
+        print(f"arm {name}: ref={arm_ref} resolved={resolved} sha={_sha(root)}", flush=True)
+        arms.append((f"{name} {arm_ref}", root, proj))
 
     env = ["env", f"TRAIN_STEPS={steps}", "TRAIN_LOG_EVERY=100"]
     if shard:
         env.append(f"TRAIN_SHARD={shard}")
-    for _, proj in arms:
+    for _, _, proj in arms:
         _run([*env, "cargo", "oxide", "run", "model", "--bin", "train"], cwd=proj)
+    # Every round below launches `target/release/train` directly -- one build
+    # per arm, then `2 * rounds` launches of it, and cargo is never in the loop.
+    # These two lines are what makes that safe to say out loud.
+    for label, root, _ in arms:
+        _built_here(root, "gpu/model/target/release/train", label)
 
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
-    measured: dict[str, list[tuple[float, float]]] = {label: [] for label, _ in arms}
+    measured: dict[str, list[tuple[float, float]]] = {label: [] for label, _, _ in arms}
     for round_index in range(rounds):
-        for label, proj in arms:
+        for label, _, proj in arms:
             print(f"=== round {round_index} {label} ===", flush=True)
             output = _run([*env, "target/release/train"], cwd=proj)
             throughput = re.search(r"throughput=([\d.]+) tokens/s mfu=([\d.]+)%", output)
@@ -548,7 +710,7 @@ def compare_train(
 
     print("=== summary ===", flush=True)
     means = []
-    for label, _ in arms:
+    for label, _, _ in arms:
         tokens, mfu = zip(*measured[label])
         means.append(statistics.fmean(tokens))
         runs = " ".join(f"{value:.1f}" for value in tokens)
@@ -561,6 +723,152 @@ def compare_train(
     print(f"candidate/baseline={means[1] / means[0]:.4f}", flush=True)
 
 
+@app.function(
+    gpu=DEFAULT_GPU,
+    # Measured 1550s at the default arms; 3x, rounded.
+    timeout=80 * 60,
+    volumes={"/data": wiki_volume},
+)
+def init_cache_probe(steps: int = 3, shard: str | None = None, volume_arm: bool = False) -> None:
+    """Is resuming a step-0 checkpoint cheaper than deriving it, and is it the
+    same run?
+
+    Parameter initialization is the longest silent window in a trainer process
+    and a `compare_train` A/B pays it six times over to reach the same bytes
+    every time, so caching it is the obvious economy. This is the measurement
+    that says whether it is one, and the answer is in `README.md`'s spending
+    section. Two things have to hold and neither is arithmetic:
+
+    - **Cheaper.** A fresh init is host RNG plus an upload of the *masters*;
+      the AdamW moments it also needs are `GpuTensor::zeros`, filled on the
+      device and never sent over the bus at all. The checkpoint carries those
+      moments -- 80% of its 40.85 GiB -- as literal zeros that have to be read
+      back, widened, and uploaded. The cached artifact is therefore *larger
+      than the work it replaces*, and whether it still wins is a fact about the
+      filesystem it sits on. Hence two storage arms: the wiki volume (a network
+      filesystem, `--volume-arm`) and the container's own disk.
+    - **The same.** A resumed step 0 has to be fresh initialization, or every
+      number taken through the cache is taken on a different model. Loss
+      equality is the readable form of that -- but a trainer process is not
+      bit-identical to *itself* across runs (the embedding gradient accumulates
+      atomically, so its order varies), and a comparison without that control
+      would blame the resume for the hardware. So fresh runs *twice*, and the
+      resumed arm is judged against the agreement two fresh arms manage.
+
+    Everything runs from the mounted tree, one build, one GPU: this measures
+    the cache, not two refs.
+    """
+    import os
+    import shutil
+
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    proj = _proj("model")
+    shape = _train_shape(proj)
+    _impose_train_shape(proj, shape)
+
+    env = ["env", f"TRAIN_STEPS={steps}", "TRAIN_LOG_EVERY=1"]
+    if shard:
+        env.append(f"TRAIN_SHARD={shard}")
+    derive_env = [
+        f"TRAIN_{name.upper()}={value}" for name, value in INIT_CACHE_CONFIG.items()
+    ]
+
+    def timed(label: str, cmd: list[str], cwd: str = proj) -> tuple[float, str]:
+        print(f"=== {label} ===", flush=True)
+        started = time.monotonic()
+        output = _run(cmd, cwd, stamp=True)
+        return time.monotonic() - started, output
+
+    def losses(output: str) -> dict[int, str]:
+        return {int(step): value for step, value in re.findall(r"step=(\d+) loss=([\d.]+)", output)}
+
+    # One build for both binaries; `cargo oxide run`'s own run is discarded,
+    # exactly as `compare_train`'s warmup is, and every timed arm below then
+    # launches an already-built binary.
+    _run([*env, "cargo", "oxide", "run", "model", "--bin", "train"], cwd=proj)
+    _run(
+        ["env", "INIT_CKPT_MODE=shape",
+         "cargo", "oxide", "run", "model", "--bin", "init_ckpt", "--features", "init-ckpt"],
+        cwd=proj,
+    )
+
+    cost: list[tuple[str, float, str]] = []
+    arms: dict[str, dict[int, str]] = {}
+
+    first_seconds, first = timed("fresh init, run 1", [*env, "target/release/train"])
+    cost.append(("fresh init", first_seconds, "what the cache would replace"))
+    arms["fresh 1"] = losses(first)
+    second_seconds, second = timed("fresh init, run 2", [*env, "target/release/train"])
+    cost.append(("fresh init again", second_seconds, "the same binary, the same input"))
+    arms["fresh 2"] = losses(second)
+
+    stores = [("container disk", "/tmp/init-cache")]
+    if volume_arm:
+        stores.append(("wiki volume", INIT_CACHE_DIR))
+    for store, directory in stores:
+        os.makedirs(directory, exist_ok=True)
+        path, key = _init_cache_entry(shape)
+        path = f"{directory}/{Path(path).name}"
+        save_seconds, saved = timed(
+            f"derive onto {store}",
+            ["env", f"TRAIN_CHECKPOINT={path}", *derive_env, "target/release/init_ckpt"],
+        )
+        cost.append((f"derive onto {store}", save_seconds, "once, then reused"))
+        for line in saved.splitlines():
+            if line.startswith(("init_checkpoint=", "init_seconds=")):
+                print(f"  {line}", flush=True)
+        if directory == INIT_CACHE_DIR:
+            Path(f"{path}.key").write_text(f"{key}\n")
+            wiki_volume.commit()
+
+        load_seconds, loaded = timed(
+            f"load from {store}",
+            ["env", f"TRAIN_CHECKPOINT={path}", "INIT_CKPT_MODE=load", "target/release/init_ckpt"],
+        )
+        cost.append((f"load from {store}", load_seconds, "per run, in place of init"))
+        for line in loaded.splitlines():
+            if line.startswith("load_seconds="):
+                print(f"  {line}", flush=True)
+
+        resume_seconds, resumed = timed(
+            f"resume from {store}",
+            [*env, f"TRAIN_CHECKPOINT_INIT={path}", "target/release/train"],
+        )
+        cost.append((f"resume from {store}", resume_seconds, f"against fresh init's {first_seconds:.0f}s"))
+        arms[f"resumed ({store})"] = losses(resumed)
+        if directory != INIT_CACHE_DIR:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    print("=== cost, one trainer process ===", flush=True)
+    for label, seconds, note in cost:
+        print(f"  {label:<28} {seconds:8.1f}s   {note}", flush=True)
+    for store, _ in stores:
+        delta = first_seconds - dict((label, s) for label, s, _ in cost)[f"resume from {store}"]
+        verdict = "a saving" if delta > 0 else "a LOSS -- do not cache here"
+        print(f"  {store}: {delta:+.1f}s per run -- {verdict}", flush=True)
+
+    print("=== is it the same run? ===", flush=True)
+    names = list(arms)
+    print("  step  " + "  ".join(f"{name:>22}" for name in names), flush=True)
+    for step in sorted({step for values in arms.values() for step in values}):
+        print(
+            f"  {step:<5} " + "  ".join(f"{arms[name].get(step, '-'):>22}" for name in names),
+            flush=True,
+        )
+    control = arms["fresh 1"] == arms["fresh 2"]
+    print(
+        f"  two fresh runs agree at every step: {control}",
+        flush=True,
+    )
+    for name, values in arms.items():
+        if name.startswith("resumed"):
+            print(
+                f"  {name} vs fresh 1: {'identical' if values == arms['fresh 1'] else 'differs'}"
+                f" -- judge against the control above, not against zero",
+                flush=True,
+            )
+
+
 # Two-sided 95% critical values of Student's t, indexed by degrees of freedom.
 # Round counts here are small enough that the normal 1.96 would understate the
 # interval by a factor of two.
@@ -571,7 +879,11 @@ BASELINE_SCRIPT = "gpu/model/baselines/pytorch_baseline.py"
 @app.function(
     gpu=DEFAULT_GPU,
     image=ab_image,
-    timeout=4 * 3600,
+    # Derived, not measured -- no run of this one survives in Modal's log
+    # retention. From measured parts at the default three rounds: a ~90s build,
+    # a ~130s trainer warmup, torch's own compile warmup, and six rounds of
+    # ~130s is ~21 min. 90 min is ~4x that.
+    timeout=90 * 60,
     volumes={"/data": wiki_volume},
 )
 def torch_versus_train(
@@ -651,6 +963,10 @@ def torch_versus_train(
 
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     _run([*env, "cargo", "oxide", "run", "model", "--bin", "train"], cwd=proj)
+    # One build, then `rounds` direct launches of it -- and `_set_train_batch`
+    # rewrote train.rs above, so "the binary postdates its sources" is a live
+    # question here rather than a formality.
+    _built_here(roots["train"], "gpu/model/target/release/train", f"train {ref}")
     measure("warmup torch", torch_cmd, "/root")
 
     arms = (("train", train_cmd, proj), ("torch", torch_cmd, "/root"))
@@ -701,6 +1017,8 @@ def torch_versus_train(
     print(f"verdict: trainer is {verdict} at 95%", flush=True)
 
 
+# No baseline: each config is a fresh shape-specialized compile plus a
+# correctness run and a bench, and `--configs` sets how many. Left at 1h.
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
 def run_sweep(kernel: str, configs: str) -> None:
     """Bench several tuning configs in ONE container so they share a GPU and
@@ -751,6 +1069,7 @@ def run_sweep(kernel: str, configs: str) -> None:
                 break
 
 
+# One nvcc compile of a single .cu and one run of it.
 @app.function(gpu=DEFAULT_GPU, timeout=600)
 def run_baseline(kernel: str, name: str) -> None:
     """Compile and run a CUDA C++ baseline from gpu/<kernel>/baselines/.
@@ -774,6 +1093,9 @@ def run_baseline(kernel: str, name: str) -> None:
     _run([f"/tmp/{name}"], cwd="/")
 
 
+# Left at 1h: compute-sanitizer's instrumentation costs one to two orders of
+# magnitude over the uninstrumented binary, so a build's runtime says little
+# about this one's.
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
 def run_sanitizer(kernel: str, bin: str | None = None, tool: str = "memcheck") -> None:
     """Run a kernel binary under compute-sanitizer (memcheck / racecheck /
@@ -805,7 +1127,8 @@ def run_sanitizer(kernel: str, bin: str | None = None, tool: str = "memcheck") -
     _run(["compute-sanitizer", "--tool", tool, binary], cwd=proj)
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=3600)
+# A build and a file read. Builds measured 14-90s across these crates; 20 min.
+@app.function(gpu=DEFAULT_GPU, timeout=20 * 60)
 def dump_ptx(kernel: str) -> str:
     proj = _proj(kernel)
     # `build` does not auto-detect the GPU arch the way `run` does; without the
@@ -879,7 +1202,11 @@ def _ptx_functions(text: str) -> dict[str, str]:
     return functions
 
 
-@app.function(cpu=16, memory=32 * 1024, timeout=4 * 3600)
+# Derived: `rounds` clean builds (measured 48-90s for a crate of this size)
+# plus a ptxas pass each, so ~15 min at the default six. 90 min is ~6x, which
+# leaves room for a larger `--rounds` without leaving a wedged CPU container
+# to run for four hours.
+@app.function(cpu=16, memory=32 * 1024, timeout=90 * 60)
 def rebuild_stability(kernel: str = "gemm", rounds: int = 6, arch: str = "sm_100a") -> None:
     """Build ONE commit `rounds` times and ask whether the toolchain agrees
     with itself (oxide-train#122).
@@ -1013,7 +1340,8 @@ def rebuild_stability(kernel: str = "gemm", rounds: int = 6, arch: str = "sm_100
     subprocess.run("ptxas --version", shell=True)
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=3600)
+# A build, a ptxas report and one run: ~3 min. 20 min.
+@app.function(gpu=DEFAULT_GPU, timeout=20 * 60)
 def jit_probe(kernel: str = "gemm") -> None:
     """The other half of [`rebuild_stability`]: what the *driver* does with the
     PTX a build produced.
@@ -1066,6 +1394,9 @@ def jit(kernel: str = "gemm", gpu: str = "") -> None:
     fn.remote(kernel)
 
 
+# Left at 1h: `ncu --set full` replays every kernel once per metric pass and
+# this one also apt-installs Nsight Systems, so the profiled run is nothing
+# like the unprofiled one it was built from.
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
 def profile(kernel: str, bin: str | None = None, features: str | None = None) -> None:
     """Run a kernel binary under Nsight Compute.
@@ -1145,6 +1476,7 @@ def profile(kernel: str, bin: str | None = None, features: str | None = None) ->
         )
 
 
+# ~40s measured. 600s.
 @app.function(gpu=DEFAULT_GPU, timeout=600)
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
@@ -1154,6 +1486,8 @@ def doctor() -> None:
 @app.function(
     cpu=32,
     memory=64 * 1024,
+    # Not right-sized: `--limit-files` is open-ended and the full wikimedia
+    # dump is the intended input. Left at 20h.
     timeout=20 * 3600,
     volumes={"/data": wiki_volume},
 )
@@ -1188,6 +1522,19 @@ def prepare(limit_files: int = 0, limit_articles: int = 0) -> None:
 def sweep_batch(batches: str = "12,16,20", steps: int = 12, shard: str = "") -> None:
     """modal run modal_app.py::sweep_batch --batches 12,16,20"""
     batch_sweep.remote(batches, steps, shard or None)
+
+
+@app.local_entrypoint()
+def init_cache(steps: int = 3, shard: str = "", volume_arm: bool = False) -> None:
+    """modal run --detach modal_app.py::init_cache
+
+    What a step-0 init checkpoint costs to derive, to store, and to resume,
+    against deriving it fresh -- and whether a resumed run is the run it
+    replaces. `--volume-arm` adds the wiki volume beside the container disk.
+    Pass `--detach`: this is six trainer-sized processes.
+    """
+    _warn_unless_detached("init_cache")
+    init_cache_probe.remote(steps, shard or None, volume_arm)
 
 
 @app.local_entrypoint()
@@ -1292,7 +1639,8 @@ def main(
     )
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=1800)
+# `which` over six tools, three directory listings and an apt-cache search.
+@app.function(gpu=DEFAULT_GPU, timeout=600)
 def tools_check() -> None:
     """Is there a profiler in this image, and will the driver let it count?"""
     import shutil

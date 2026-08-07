@@ -85,6 +85,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint_every: usize = env_parse("TRAIN_CHECKPOINT_EVERY", 0);
     let checkpoint_path = env::var("TRAIN_CHECKPOINT").ok();
     let resume = env_flag("TRAIN_RESUME");
+    // A checkpoint to start from and never write back to. `TRAIN_CHECKPOINT`
+    // is one path used as both the resume source and the save destination,
+    // which is right for a training run continuing its own trajectory and
+    // wrong for a measurement run resuming a shared step-0 checkpoint: that
+    // one would save its final state over the file every later run reads, at
+    // tens of gigabytes a round. So the read-only source is its own variable.
+    let initial_checkpoint = env::var("TRAIN_CHECKPOINT_INIT").ok();
     assert!(max_steps > 0, "TRAIN_STEPS must be positive");
     assert!(log_every > 0, "TRAIN_LOG_EVERY must be positive");
     if checkpoint_every > 0 && checkpoint_path.is_none() {
@@ -92,6 +99,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if resume && checkpoint_path.is_none() {
         return Err("TRAIN_RESUME requires TRAIN_CHECKPOINT".into());
+    }
+    if resume && initial_checkpoint.is_some() {
+        return Err("TRAIN_RESUME and TRAIN_CHECKPOINT_INIT name two starting states".into());
     }
 
     let shard = TokenFile::open(&shard_path)?;
@@ -118,11 +128,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         decay_horizon: env_parse("TRAIN_AUX_DECAY_HORIZON", 10_000.0),
     };
     aux_schedule.validate();
-    let (mut gpu, mut optimizer, mut next_batch) = if resume {
+    let resume_from = if resume {
+        checkpoint_path.as_deref()
+    } else {
+        initial_checkpoint.as_deref()
+    };
+    let (mut gpu, mut optimizer, mut next_batch) = if let Some(source) = resume_from {
         let checkpoint = model::checkpoint::load::<N, NP, T, VOCAB, VP, D, H, HD, FF, E, K, C, L>(
-            checkpoint_path.as_deref().expect("validated above"),
-            &stream,
-            &tensor,
+            source, &stream, &tensor,
         )?;
         if checkpoint.optimizer.config() != config {
             return Err(format!(
@@ -141,8 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         println!(
-            "resumed {} at step={} next_batch={}",
-            checkpoint_path.as_deref().expect("validated above"),
+            "resumed {source} at step={} next_batch={}",
             checkpoint.optimizer.step(),
             checkpoint.next_batch
         );

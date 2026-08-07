@@ -1457,41 +1457,88 @@ fn moe_checkpoint_gate(
         GpuMoeWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC, CL>::new(stream)?;
     let tokens = [1, 5, 5, 2];
     let targets = [5, 5, 2, 7];
-    let coefficient = optimizer.aux_coefficient();
-    gpu.zero_grad(stream, tensor)?;
-    gpu.forward(
-        &tokens,
-        &targets,
-        coefficient,
-        &mut workspace,
-        stream,
-        tensor,
-        gemm,
-        gemm_bf16,
-        flash,
-        flash_bf16,
-        dense,
-    )?;
-    gpu.backward(
-        coefficient,
-        &mut workspace,
-        stream,
-        tensor,
-        gemm,
-        gemm_bf16,
-        flash,
-        flash_bf16,
-        dense,
-    )?;
-    optimizer.update(&mut gpu, stream, tensor)?;
 
     let base = std::env::temp_dir().join(format!("oxide-train-{}", std::process::id()));
     let checkpoint_path = base.with_extension("ckpt");
     let continued_path = base.with_extension("continued-a");
     let resumed_path = base.with_extension("continued-b");
+    let initial_path = base.with_extension("step0");
+    let initial_continued_path = base.with_extension("step0-continued");
     let tampered_path = base.with_extension("tampered");
     let legacy_path = base.with_extension("v4");
+
+    // Step zero, saved and resumed before anything has trained. This is the
+    // state the init-checkpoint cache distributes -- a measurement harness
+    // resumes it in place of re-deriving the parameters -- and it is the one
+    // corner the resume below cannot speak for: there the optimizer step is
+    // one and its moments are populated, here both are zero, and `next_batch`
+    // is zero rather than mid-shard. The claim to check is not that the file
+    // round-trips but that the *trajectory* does: the first training step
+    // taken from a resumed step zero has to be the first training step taken
+    // from fresh initialization, which is readable as bytes.
+    model::checkpoint::save(&initial_path, &gpu, &optimizer, 0, stream)?;
+    let initial = model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC, CL>(
+        &initial_path,
+        stream,
+        tensor,
+    )?;
+    assert_eq!(initial.next_batch, 0);
+    assert_eq!(initial.optimizer.step(), 0);
+    let mut initial_gpu = initial.model;
+    let mut initial_optimizer = initial.optimizer;
+    let mut initial_workspace =
+        GpuMoeWorkspace::<CN, NP, CT, VOCAB, VP, D, H, CFF, CE, CK, CC, CL>::new(stream)?;
+
+    for (candidate, candidate_optimizer, candidate_workspace) in [
+        (&mut gpu, &mut optimizer, &mut workspace),
+        (
+            &mut initial_gpu,
+            &mut initial_optimizer,
+            &mut initial_workspace,
+        ),
+    ] {
+        let coefficient = candidate_optimizer.aux_coefficient();
+        candidate.zero_grad(stream, tensor)?;
+        candidate.forward(
+            &tokens,
+            &targets,
+            coefficient,
+            candidate_workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            flash_bf16,
+            dense,
+        )?;
+        candidate.backward(
+            coefficient,
+            candidate_workspace,
+            stream,
+            tensor,
+            gemm,
+            gemm_bf16,
+            flash,
+            flash_bf16,
+            dense,
+        )?;
+        candidate_optimizer.update(candidate, stream, tensor)?;
+    }
     model::checkpoint::save(&checkpoint_path, &gpu, &optimizer, 7, stream)?;
+    model::checkpoint::save(
+        &initial_continued_path,
+        &initial_gpu,
+        &initial_optimizer,
+        7,
+        stream,
+    )?;
+    assert_eq!(
+        std::fs::read(&checkpoint_path)?,
+        std::fs::read(&initial_continued_path)?,
+        "a step taken from a resumed step-0 checkpoint diverged from fresh initialization"
+    );
+    drop((initial_gpu, initial_optimizer, initial_workspace));
     let loaded = model::checkpoint::load::<CN, NP, CT, VOCAB, VP, D, H, HD, CFF, CE, CK, CC, CL>(
         &checkpoint_path,
         stream,
@@ -1615,13 +1662,15 @@ fn moe_checkpoint_gate(
         checkpoint_path,
         continued_path,
         resumed_path,
+        initial_path,
+        initial_continued_path,
         tampered_path,
         legacy_path,
     ] {
         let _ = std::fs::remove_file(path);
     }
     println!(
-        "✓ checkpoint v5 (bf16 masters) resumes bit-identically, rejects v4, and rejects E/K/C/L or schedule mismatches"
+        "✓ checkpoint v5 (bf16 masters) resumes bit-identically from step 0 and mid-run, rejects v4, and rejects E/K/C/L or schedule mismatches"
     );
     Ok(())
 }
