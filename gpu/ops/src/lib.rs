@@ -1222,8 +1222,9 @@ pub mod kernels {
     }
 
     /// The panel row a packed interleaved SwiGLU thread owns, and its quad
-    /// within that row — **as 32-bit division**, which is where the whole cost
-    /// of these two kernels' index math is.
+    /// within that row — **as 32-bit division**, which is the whole of these
+    /// two kernels' index math and, on the evidence below, most of what they
+    /// were waiting on.
     ///
     /// Three shapes were measured on `swiglu_forward_interleaved_packed` at
     /// `24576 x 4096` in `bin/bench` before this one, all against the same
