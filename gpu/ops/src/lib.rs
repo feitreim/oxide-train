@@ -1226,11 +1226,8 @@ pub mod kernels {
     /// of these two kernels' index math is.
     ///
     /// Three shapes were measured on `swiglu_forward_interleaved_packed` at
-    /// `24576 x 4096` in `bin/bench` before this one. It reads 6 bytes an
-    /// element at 3550 GB/s where the *backward* beside it — same walk, same
-    /// row split, twice the bytes — reads 12 at 5665, so the fixed per-thread
-    /// cost is what separates them, and the two 64-bit divisions by a runtime
-    /// `ff / QUAD_LANES` were all of it:
+    /// `24576 x 4096` in `bin/bench` before this one, all against the same
+    /// `usize` baseline:
     ///
     /// | shape | GB/s | vs |
     /// |---|---:|---:|
@@ -1238,13 +1235,19 @@ pub mod kernels {
     /// | `[16, 32]` `BaseLdtm` register tiles | 2234 | 0.63x |
     /// | four quads a thread, grid-strided | 2889 | 0.81x |
     ///
-    /// Both alternatives bought *bytes in flight* — 4x and 4x — and both lost,
-    /// which is what says the kernel was never waiting on memory-level
-    /// parallelism. The tile pays #222's transaction-shape pole (a `BaseLdtm`
-    /// quad is 16 contiguous bytes and the next quad is a different row, so one
-    /// access instruction touches 8 rows and doubles the L1 requests for the
-    /// same DRAM traffic); the coarsened walk pays four times the index math
-    /// for four times the work and gains nothing.
+    /// Both alternatives bought *bytes in flight* — four times it, twice over —
+    /// and both lost, which is what says the kernel was never waiting on
+    /// memory-level parallelism. The tile pays ferro-kittens#222's
+    /// transaction-shape pole (a `BaseLdtm` quad is 16 contiguous bytes and the
+    /// next quad is a different row, so one access instruction touches 8 rows
+    /// and doubles the L1 requests for the same DRAM traffic); the coarsened
+    /// walk pays four times the index math for four times the work and gains
+    /// nothing.
+    ///
+    /// What is left is fixed per-thread cost, and the *backward* beside this
+    /// kernel is the evidence: same walk, same row split, twice the bytes an
+    /// element, and it reads them at 5665 GB/s. Halving the index math per byte
+    /// is the only difference between them.
     ///
     /// `i` is built from `blockIdx * blockDim + threadIdx` and `ff` from a
     /// launch that already fits `u32`, so nothing here needs 64 bits and
@@ -1306,7 +1309,7 @@ pub mod kernels {
     /// **relative error ≤ 7.7e-5, absolute error ≤ 1.9e-5** — the sigmoid
     /// *attenuates* `exp2_approx`'s own 7.5e-5 bound rather than amplifying it,
     /// since `σ_approx ≈ σ · (1 - δ(1-σ))`, and the absolute bound is that
-    /// times `max σ(1-σ) = ¼`. Both bounds are what `check_swiglu_tile_packed`
+    /// times `max σ(1-σ) = ¼`. Both bounds are what `check_swiglu_interleaved_tile`
     /// is set from, and the absolute one is the one that matters: `silu'` has
     /// a zero at `g = -1.2785` where no relative tolerance is finite.
     #[inline(always)]
