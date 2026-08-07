@@ -17,6 +17,9 @@ Local usage (see also ./run.sh):
 
 import re
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 import modal
@@ -123,13 +126,21 @@ kernel_toolchain = (
     )
 )
 
+MOUNT_IGNORE = ["**/target", "**/target/**", "**/__pycache__", "**/__pycache__/**"]
+
 image = (
     kernel_toolchain
     # Live mounts (re-read each run; edits need no image rebuild). crates/ is
     # mounted because gpu/bench-util path-depends on crates/tensor-core (shared
     # RNG for CPU/GPU parity).
-    .add_local_dir(str(Path(__file__).parent / "gpu"), f"{PROJECT_DIR}/gpu")
-    .add_local_dir(str(Path(__file__).parent / "crates"), f"{PROJECT_DIR}/crates")
+    #
+    # `ignore` is not an optimization. Nothing is excluded by default, so the
+    # mount is otherwise a gigabyte of local `target/` -- artifacts the
+    # container rebuilds anyway -- which the client must walk and hash on every
+    # run, and a local `cargo build` that writes into that tree while the walk
+    # is in progress aborts the run.
+    .add_local_dir(str(Path(__file__).parent / "gpu"), f"{PROJECT_DIR}/gpu", ignore=MOUNT_IGNORE)
+    .add_local_dir(str(Path(__file__).parent / "crates"), f"{PROJECT_DIR}/crates", ignore=MOUNT_IGNORE)
     # CPU reference crates inherit package metadata and workspace dependencies
     # from the root manifest. Mount it so GPU correctness binaries can depend
     # on `nn`/`tensor-cpu` while retaining standalone workspaces under gpu/.
@@ -159,9 +170,71 @@ app = modal.App("rust-trainer", image=image)
 wiki_volume = modal.Volume.from_name("rust-trainer-wiki", create_if_missing=True)
 
 
-def _run(cmd: list[str], cwd: str) -> None:
+def _warn_unless_detached(entrypoint: str) -> None:
+    """Say, before the GPU is spent, that this run dies with its client.
+
+    An attached `modal run` owns the container: when the client goes away the
+    input is cancelled and the app stops wherever it was, which in a log looks
+    like a round that started and never finished. The entrypoints that take
+    tens of minutes are the ones that lose to it, so they check the flag they
+    needed rather than leaving it to be remembered.
+    """
+    if not {"-d", "--detach"} & set(sys.argv):
+        print(
+            f"WARNING: run this detached -- `modal run --detach modal_app.py::{entrypoint} ...`.\n"
+            "  Attached, this container stops the moment the local client does, and the app's\n"
+            "  log ends mid-round with `Stopping app - local client disconnected`.\n"
+            "  Detached, `modal app logs <app-id>` re-attaches to a run already in progress.",
+            flush=True,
+        )
+
+
+HEARTBEAT_SECONDS = 30.0
+
+
+def _run(cmd: list[str], cwd: str) -> str:
+    """Run `cmd` to completion, echoing its output as it arrives, and return it.
+
+    Callers that parse a number out of a run take it from the return value
+    rather than from `capture_output=True`, because a captured run says nothing
+    at all until it exits: a training round holds its whole log in a pipe for
+    the minutes it takes, and if the app stops in that window -- a local `modal
+    run` client that dies takes the container with it -- the round's output is
+    lost with it. Echoed, every line is in the app's log the moment it is
+    printed, and the log outlives the client.
+
+    The heartbeat covers the one silence no child can report: `bin/train`
+    prints nothing between its first instruction and the end of parameter
+    initialization, which is minutes. A quiet window with a pulse in it is a
+    run still working; a quiet window without one is the app being gone.
+    """
     print(f"$ {' '.join(cmd)}  (cwd={cwd})", flush=True)
-    subprocess.run(cmd, cwd=cwd, check=True)
+    started = quiet_since = time.monotonic()
+    process = subprocess.Popen(
+        cmd, cwd=cwd, text=True, bufsize=1,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    finished = threading.Event()
+
+    def pulse() -> None:
+        while not finished.wait(HEARTBEAT_SECONDS):
+            now = time.monotonic()
+            if now - quiet_since >= HEARTBEAT_SECONDS:
+                print(f"[+{now - started:.0f}s] still running, no output for "
+                      f"{now - quiet_since:.0f}s", flush=True)
+
+    threading.Thread(target=pulse, daemon=True).start()
+    lines = []
+    for line in process.stdout:
+        quiet_since = time.monotonic()
+        lines.append(line)
+        print(line, end="", flush=True)
+    finished.set()
+    code = process.wait()
+    print(f"[+{time.monotonic() - started:.0f}s] exit={code}", flush=True)
+    if code != 0:
+        raise subprocess.CalledProcessError(code, cmd)
+    return "".join(lines)
 
 
 def _proj(kernel: str) -> str:
@@ -467,11 +540,7 @@ def compare_train(
     for round_index in range(rounds):
         for label, proj in arms:
             print(f"=== round {round_index} {label} ===", flush=True)
-            output = subprocess.run(
-                [*env, "target/release/train"],
-                cwd=proj, check=True, text=True, capture_output=True,
-            ).stdout
-            print(output, flush=True)
+            output = _run([*env, "target/release/train"], cwd=proj)
             throughput = re.search(r"throughput=([\d.]+) tokens/s mfu=([\d.]+)%", output)
             if throughput is None:
                 raise SystemExit(f"{label} round {round_index} reported no throughput")
@@ -569,8 +638,7 @@ def torch_versus_train(
 
     def measure(label: str, cmd: list[str], cwd: str) -> tuple[float, float]:
         print(f"=== {label} ===", flush=True)
-        output = subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=True).stdout
-        print(output, flush=True)
+        output = _run(cmd, cwd)
         reported = re.search(r"throughput=([\d.]+) tokens/s mfu=([\d.]+)%", output)
         if reported is None:
             raise SystemExit(f"{label} reported no throughput")
@@ -1126,7 +1194,18 @@ def sweep_batch(batches: str = "12,16,20", steps: int = 12, shard: str = "") -> 
 def train_ab(
     ref: str, baseline_ref: str = "main", steps: int = 12, rounds: int = 2, shard: str = ""
 ) -> None:
-    """modal run modal_app.py::train_ab --ref <pushed-branch>"""
+    """modal run --detach modal_app.py::train_ab --ref <pushed-branch>
+
+    Pass `--detach`. An A/B is a clone, two builds and `2 * rounds + 2` training
+    runs, tens of minutes at the operating points worth quoting, and an attached
+    `modal run` ties the container's life to the local client: when the client
+    goes away -- killed, timed out, or a dropped connection -- Modal cancels the
+    input and stops the app mid-round. What that leaves in the log is a banner
+    with nothing after it, which reads exactly like a hang and is not one.
+    Detached, the run finishes without a client and `modal app logs <app-id>`
+    re-attaches to it; `--show-timestamps` puts a clock on every line.
+    """
+    _warn_unless_detached("train_ab")
     compare_train.remote(ref, baseline_ref, steps, rounds, shard or None)
 
 
@@ -1140,12 +1219,15 @@ def versus(
     compile_mode: str = "default",
     shard: str = "",
 ) -> None:
-    """modal run modal_app.py::versus --ref main --batch 32
+    """modal run --detach modal_app.py::versus --ref main --batch 32
 
     The trainer against the PyTorch baseline in one container. `--compile-mode`
     is a `torch.compile` mode, empty meaning eager; the arm is rejected if
     inductor recorded CUDA graphs, since the trainer has none.
+
+    Pass `--detach`, for the reason `train_ab` gives: this one is longer still.
     """
+    _warn_unless_detached("versus")
     torch_versus_train.remote(ref, torch_ref, batch, steps, rounds, compile_mode, shard or None)
 
 
