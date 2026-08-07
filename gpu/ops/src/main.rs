@@ -15,13 +15,13 @@ use tensor_cpu::CpuTensor;
 mod device;
 use device::reference::kernels as reference_kernels;
 use device::{
-    CLASSIFIER_THREADS, LOSS_TAIL_THREADS, MOE_ASSIGN_THREADS, MOE_AUX_TERMS_THREADS,
-    MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS, MOE_ZERO_BINS_BLOCKS, MOE_ZERO_BINS_THREADS,
-    NORM_BACKWARD_ROWS_PER_BLOCK, NORM_BACKWARD_TILE_CHUNK, NORM_THREADS, NORM_TILE_BLOCK_ROWS,
-    NORM_TILE_CHUNK, NORM_TILE_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK, ROUTER_GEMM_BM, ROUTER_GEMM_BN,
-    ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS, ROUTER_INPUT_TOKENS,
-    ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS, SWIGLU_TILE_BLOCK_ROWS,
-    SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS, kernels, rope_table,
+    CLASSIFIER_THREADS, LOSS_TAIL_THREADS, MOE_ASSIGN_GROUP, MOE_ASSIGN_THREADS,
+    MOE_AUX_TERMS_THREADS, MOE_DROPPED_SLOT, MOE_SCATTER_DY_THREADS, MOE_ZERO_BINS_BLOCKS,
+    MOE_ZERO_BINS_THREADS, NORM_BACKWARD_ROWS_PER_BLOCK, NORM_BACKWARD_TILE_CHUNK, NORM_THREADS,
+    NORM_TILE_BLOCK_ROWS, NORM_TILE_CHUNK, NORM_TILE_THREADS, NORM_WEIGHT_ROWS_PER_BLOCK,
+    ROUTER_GEMM_BM, ROUTER_GEMM_BN, ROUTER_GEMM_THREADS, ROUTER_INPUT_BN, ROUTER_INPUT_THREADS,
+    ROUTER_INPUT_TOKENS, ROUTER_WGRAD_BM, ROUTER_WGRAD_SPLITS, ROUTER_WGRAD_THREADS,
+    SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS, kernels, rope_table,
 };
 use tensor_core::bf16;
 
@@ -70,6 +70,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_swiglu_tile(&stream, &reference)?;
     eprintln!("[ops] checking swiglu interleaved");
     check_swiglu_interleaved(&stream, &module, &reference)?;
+    eprintln!("[ops] checking swiglu interleaved tiles");
+    check_swiglu_interleaved_tile(&stream, &module, &reference)?;
     eprintln!("[ops] checking embedding");
     check_embedding(&stream, &module, &reference)?;
     eprintln!("[ops] checking cross_entropy");
@@ -86,6 +88,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_router_logits_bf16(&stream, &module, &reference)?;
     eprintln!("[ops] checking moe_routing");
     check_moe_routing(&stream, &module, &reference)?;
+    eprintln!("[ops] checking moe_bin_assign");
+    check_moe_bin_assign(&stream, &module, &reference)?;
     eprintln!("[ops] checking loss tail");
     check_loss_tail(&stream, &module)?;
 
@@ -890,6 +894,141 @@ fn check_moe_routing(
         check_moe_scatter_dy_rows(stream, module)?;
         Ok(())
     }
+}
+
+/// Deterministic capacity assignment at a shape whose lane ranges are longer
+/// than one vector group, and the relaxed kernel beside it.
+///
+/// `check_moe_routing`'s six tokens give every lane four pairs or none, which
+/// is the scalar tail alone: the vector walk that carries
+/// `MOE_ASSIGN_FLIGHT` loads in flight never runs there. 5000 pairs over 256
+/// lanes is 20 a lane — one whole group of [`MOE_ASSIGN_GROUP`] and a
+/// four-pair tail — so both walks and the boundary between them are covered,
+/// and `C` is under the mean load so the capacity drop is exercised too.
+///
+/// `moe_bin_assign_atomic` is checked for what it still promises and not for
+/// what it gave up: the same per-expert counts (a count is order-independent)
+/// and a slot set that is exactly the accepted prefix. **Its slots are
+/// deliberately not compared to the oracle's** — first-arrival order assigns
+/// different tokens to the same slots, which is the whole of the difference.
+fn check_moe_bin_assign(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: every launch below covers exactly the N/E/K/C rectangle its
+    // buffers are allocated from.
+    const N: usize = 2_500;
+    const E: usize = 5;
+    const K: usize = 2;
+    // 720 accepts four experts' whole load and overflows the fifth, so the
+    // capacity drop and the undropped path are both live in one launch.
+    const C: usize = 720;
+    const PAIRS: usize = N * K;
+    assert_eq!(
+        PAIRS.div_ceil(MOE_ASSIGN_THREADS * 4) * 4,
+        MOE_ASSIGN_GROUP + 4
+    );
+
+    // A routing whose experts are unevenly loaded, so the counts differ and
+    // some experts overflow `C` while others do not.
+    let selected: Vec<u32> = (0..PAIRS)
+        .map(|pair| ((pair * 7 + pair / 13 + pair % 3) % (E + 2)).min(E - 1) as u32)
+        .collect();
+    let selected_dev = DeviceBuffer::from_host(stream, &selected)?;
+
+    let mut serial_slots = DeviceBuffer::<u32>::zeroed(stream, PAIRS)?;
+    let mut serial_counts = DeviceBuffer::<u32>::zeroed(stream, E)?;
+    let mut parallel_slots = DeviceBuffer::<u32>::zeroed(stream, PAIRS)?;
+    let mut parallel_counts = DeviceBuffer::<u32>::zeroed(stream, E)?;
+    let mut atomic_slots = DeviceBuffer::<u32>::zeroed(stream, PAIRS)?;
+    let mut atomic_counts = DeviceBuffer::<u32>::zeroed(stream, E)?;
+    unsafe {
+        reference.moe_bin_assign(
+            stream,
+            LaunchConfig {
+                grid_dim: (E as u32, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &selected_dev,
+            N as u32,
+            E as u32,
+            K as u32,
+            C as u32,
+            &mut serial_slots,
+            &mut serial_counts,
+        )?;
+        module.moe_bin_assign_parallel(
+            stream,
+            LaunchConfig {
+                grid_dim: (E as u32, 1, 1),
+                block_dim: (MOE_ASSIGN_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &selected_dev,
+            N as u32,
+            E as u32,
+            K as u32,
+            C as u32,
+            &mut parallel_slots,
+            &mut parallel_counts,
+        )?;
+        module.moe_bin_assign_atomic(
+            stream,
+            LaunchConfig::for_num_elems(PAIRS as u32),
+            &selected_dev,
+            N as u32,
+            E as u32,
+            K as u32,
+            C as u32,
+            &mut atomic_slots,
+            &mut atomic_counts,
+        )?;
+    }
+
+    let serial_slots = serial_slots.to_host_vec(stream)?;
+    let serial_counts = serial_counts.to_host_vec(stream)?;
+    assert!(
+        serial_counts.iter().any(|&count| count > C as u32),
+        "this shape is supposed to overflow capacity somewhere"
+    );
+    assert_eq!(
+        parallel_slots.to_host_vec(stream)?,
+        serial_slots,
+        "deterministic MoE assignment must match the serial oracle bit for bit"
+    );
+    assert_eq!(
+        parallel_counts.to_host_vec(stream)?,
+        serial_counts,
+        "deterministic MoE assignment counts must match the serial oracle"
+    );
+
+    assert_eq!(
+        atomic_counts.to_host_vec(stream)?,
+        serial_counts,
+        "relaxed assignment gives up the order, not the counts"
+    );
+    let atomic_slots = atomic_slots.to_host_vec(stream)?;
+    for expert in 0..E {
+        let accepted = (serial_counts[expert] as usize).min(C);
+        let mut seen = vec![false; accepted];
+        for (pair, &slot) in atomic_slots.iter().enumerate() {
+            if selected[pair] as usize != expert || slot == MOE_DROPPED_SLOT {
+                continue;
+            }
+            assert!(
+                (slot as usize) < accepted && !seen[slot as usize],
+                "relaxed assignment gave expert {expert} slot {slot} twice or out of range"
+            );
+            seen[slot as usize] = true;
+        }
+        assert!(
+            seen.iter().all(|&taken| taken),
+            "relaxed assignment must fill expert {expert}'s accepted prefix"
+        );
+    }
+    Ok(())
 }
 
 /// Exercises the backward scatter row walks at a `D` the float4 path takes and
@@ -2176,6 +2315,169 @@ fn check_swiglu_interleaved_case<const ROWS: usize, const FF: usize>(
                 "packed interleaved swiglu backward must be the flat result rounded to bf16"
             );
         }
+        Ok(())
+    }
+}
+
+/// The tile interleaved-SwiGLU kernels against the flat fp32 reference — the
+/// one gate in this file that is *not* bit-exact, and the derivation of how
+/// far from bit-exact it is allowed to be.
+///
+/// The scalar interleaved kernels beside these compute their sigmoid with
+/// libdevice's `expf` and `check_swiglu_interleaved` compares them with `==`.
+/// The tile kernels cannot: a `RegTile`'s `exp` is kittens' `Exp`, which is
+/// `exp2_approx` — a clamped degree-3 minimax — and that is the whole reason
+/// this family had no tile arm. Loosening the comparison is the price of the
+/// tile, and the number below is what the loosening actually costs, measured
+/// rather than guessed.
+///
+/// **`rtol = 4.0e-3` is `2^-8 + 1e-4`, and both halves are earned:**
+///
+/// - `1e-4` is the transcendental. `exp2_approx`'s own bound is a relative
+///   7.5e-5; swept against `f64` over the whole ±125 the clamp admits, the
+///   sigmoid built on it, `silu` and `silu'` all come in at **7.7e-5**
+///   relative — the sigmoid attenuates rather than amplifies, since
+///   `σ_approx ≈ σ · (1 - δ(1-σ))`.
+/// - `2^-8 = 3.9e-3` is the bf16 store, and it dominates by a factor of fifty.
+///   These kernels round on the way out, so half an ulp of a significand whose
+///   mantissa can be as low as 1.0 is the floor *any* comparison against an
+///   fp32 oracle has here, tile or not.
+///
+/// **`atol = 2e-5` is the absolute bound, and it is the one that matters.**
+/// `silu'` has a zero at `g = -1.2785`, where no relative tolerance is finite;
+/// the same sweep puts the absolute error at **1.9e-5** everywhere, which is
+/// the 7.7e-5 times `max σ(1-σ) = ¼`. It also covers the far tail, where the
+/// ±125 clamp makes `exp2_approx` disagree with `expf` by any relative factor
+/// at all on numbers of order 1e-38.
+///
+/// The gate range is deliberately `±8` and not the panel's `±1`: it is the
+/// `silu'` zero, and the tail beyond it, that the absolute term is for.
+#[allow(unused_unsafe)]
+fn check_swiglu_interleaved_tile(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: ROWS is a multiple of SWIGLU_TILE_BLOCK_ROWS and FF of both
+    // SWIGLU_TILE_CHUNK and QUAD_LANES, and every launch covers exactly the
+    // ROWS x FF rectangle its buffers are allocated from.
+    unsafe {
+        const ROWS: usize = 128;
+        const FF: usize = 64;
+        const LEN: usize = ROWS * FF;
+        assert_eq!(ROWS % SWIGLU_TILE_BLOCK_ROWS, 0);
+        assert_eq!(FF % SWIGLU_TILE_CHUNK, 0);
+        let (atol, rtol) = (2e-5, 4.0e-3);
+
+        // The panel is bf16 in memory, so the fp32 oracle reads the same
+        // rounded values the tile kernels unpack and the only differences left
+        // are the transcendental and the output rounding.
+        let gate = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(31)
+            .scale(8.0)
+            .to_bf16()
+            .to_f32();
+        let up = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(32)
+            .to_bf16()
+            .to_f32();
+        let dy = CpuTensor::<f32, Rank2<ROWS, FF>>::uniform(33);
+        let mut interleaved = vec![0.0f32; ROWS * 2 * FF];
+        for row in 0..ROWS {
+            for column in 0..FF {
+                interleaved[row * 2 * FF + column] = gate.as_slice()[row * FF + column];
+                interleaved[row * 2 * FF + FF + column] = up.as_slice()[row * FF + column];
+            }
+        }
+        let packed: Vec<u32> = interleaved
+            .chunks(2)
+            .map(|pair| {
+                bf16::from_f32(pair[0]).to_bits() as u32
+                    | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
+            })
+            .collect();
+
+        let flat = LaunchConfig::for_num_elems(LEN as u32);
+        let tiles = LaunchConfig {
+            grid_dim: (
+                (ROWS / SWIGLU_TILE_BLOCK_ROWS) as u32,
+                (FF / SWIGLU_TILE_CHUNK) as u32,
+                1,
+            ),
+            block_dim: (SWIGLU_TILE_THREADS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let gate_dev = DeviceBuffer::from_host(stream, gate.as_slice())?;
+        let up_dev = DeviceBuffer::from_host(stream, up.as_slice())?;
+        let dy_dev = DeviceBuffer::from_host(stream, dy.as_slice())?;
+        let panel_dev = DeviceBuffer::from_host(stream, &packed)?;
+
+        let mut y_ref_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+        let mut dgate_ref_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+        let mut dup_ref_dev = DeviceBuffer::<f32>::zeroed(stream, LEN)?;
+        reference.swiglu_forward(stream, flat, &gate_dev, &up_dev, &mut y_ref_dev)?;
+        reference.swiglu_backward_gate(
+            stream,
+            flat,
+            &gate_dev,
+            &up_dev,
+            &dy_dev,
+            &mut dgate_ref_dev,
+        )?;
+        reference.swiglu_backward_up(stream, flat, &gate_dev, &dy_dev, &mut dup_ref_dev)?;
+
+        let unpack = |words: Vec<u32>| -> Vec<f32> {
+            words
+                .iter()
+                .flat_map(|&word| {
+                    [
+                        bf16::from_bits(word as u16).to_f32(),
+                        bf16::from_bits((word >> 16) as u16).to_f32(),
+                    ]
+                })
+                .collect()
+        };
+
+        let mut y_words = DeviceBuffer::<u32>::zeroed(stream, LEN / 2)?;
+        module.swiglu_forward_interleaved_tile(
+            stream,
+            tiles,
+            &panel_dev,
+            FF as u32,
+            &mut y_words,
+        )?;
+        assert_close(
+            "tile interleaved swiglu forward",
+            &unpack(y_words.to_host_vec(stream)?),
+            &y_ref_dev.to_host_vec(stream)?,
+            atol,
+            rtol,
+        );
+
+        let mut d_words = DeviceBuffer::<u32>::zeroed(stream, LEN)?;
+        module.swiglu_backward_interleaved_tile(
+            stream,
+            tiles,
+            &panel_dev,
+            &dy_dev,
+            FF as u32,
+            &mut d_words,
+        )?;
+        let d_interleaved = unpack(d_words.to_host_vec(stream)?);
+        let dgate_ref = dgate_ref_dev.to_host_vec(stream)?;
+        let dup_ref = dup_ref_dev.to_host_vec(stream)?;
+        let mut expected = vec![0.0f32; ROWS * 2 * FF];
+        for row in 0..ROWS {
+            for column in 0..FF {
+                expected[row * 2 * FF + column] = dgate_ref[row * FF + column];
+                expected[row * 2 * FF + FF + column] = dup_ref[row * FF + column];
+            }
+        }
+        assert_close(
+            "tile interleaved swiglu backward",
+            &d_interleaved,
+            &expected,
+            atol,
+            rtol,
+        );
         Ok(())
     }
 }
