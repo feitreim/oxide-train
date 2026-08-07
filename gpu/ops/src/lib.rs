@@ -428,7 +428,7 @@ pub mod kernels {
     /// (see [`rms_norm_forward_tile`]), and packing the stream doubles the
     /// elements each of these lanes already carries.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub fn rms_norm_forward_fast_bf16(
         x: &[u32],
         weight: &[f32],
@@ -503,7 +503,7 @@ pub mod kernels {
     /// backward temporaries and stay fp32, and both reductions still
     /// accumulate in fp32 registers.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub fn rms_norm_backward_x_fast_bf16(
         x: &[u32],
         weight: &[f32],
@@ -590,7 +590,7 @@ pub mod kernels {
     /// Same contract as [`rms_norm_backward_weight_fast`], and `dim` must be
     /// even so a row starts on a word boundary.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn rms_norm_backward_weight_fast_bf16(
         x: &[u32],
         dy: &[f32],
@@ -648,7 +648,7 @@ pub mod kernels {
     /// [`NORM_MAX_COLUMNS`] so the column partials fit; `dweight` must hold
     /// `dim` accumulators this launch may atomically update.
     #[kernel]
-    #[launch_bounds(256, 4)]
+    #[launch_bounds(256)]
     pub unsafe fn rms_norm_backward_fused_bf16(
         x: &[u32],
         weight: &[f32],
@@ -820,7 +820,7 @@ pub mod kernels {
     /// [`rms_norm_backward_fused_bf16`], `dweight` is accumulated into and the
     /// caller owes it a zeroed buffer.
     #[kernel]
-    #[launch_bounds(128, 6)]
+    #[launch_bounds(128)]
     pub unsafe fn rms_norm_backward_fused_tile_bf16(
         x: &[u32],
         weight: &[f32],
@@ -912,7 +912,7 @@ pub mod kernels {
     ///
     /// `dim` must be even and at most [`NORM_MAX_COLUMNS`].
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn rms_norm_forward_residual_bf16(
         stream_input: &[u32],
         projection: &[f32],
@@ -1009,7 +1009,7 @@ pub mod kernels {
     ///
     /// `dim` must be even and at most [`NORM_MAX_COLUMNS`].
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn embedding_forward_norm_bf16(
         table: &[u32],
         tokens: &[u32],
@@ -1099,7 +1099,7 @@ pub mod kernels {
     /// `[rows, 2, ff]` panel — the layout the fused gate/up GEMM writes — so
     /// no split pass ever copies the panel into separate gate/up buffers.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub fn swiglu_forward_interleaved(gate_up: &[f32], ff: u32, mut y: DisjointSlice<f32>) {
         let index = thread::index_1d();
         let i = index.get();
@@ -1132,7 +1132,7 @@ pub mod kernels {
     /// `ff` must be a multiple of [`QUAD_LANES`], which the tcgen05 alignment
     /// gate on packed panels already guarantees.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn swiglu_forward_interleaved_packed(
         gate_up: &[u32],
         ff: u32,
@@ -1174,7 +1174,7 @@ pub mod kernels {
     /// of the interleaved `[rows, 2, ff]` gradient, so the two separate
     /// gradient buffers and the join pass that merged them never exist.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn swiglu_backward_interleaved(
         gate_up: &[f32],
         dy: &[f32],
@@ -1214,7 +1214,7 @@ pub mod kernels {
     /// the forward stored, so the recomputed sigmoid is bit-identical to the
     /// one the packed forward used.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn swiglu_backward_interleaved_packed(
         gate_up: &[u32],
         dy: &[f32],
@@ -1263,7 +1263,7 @@ pub mod kernels {
     }
 
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub fn split_group3(
         input: &[f32],
         width: u32,
@@ -1304,7 +1304,7 @@ pub mod kernels {
     /// `dq`, `dk` and `dv` are `[N, heads * head_dim]` and `output` is
     /// `[N, 3 * heads * head_dim]`.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn join_group3_rope(
         dq: &[f32],
         dk: &[f32],
@@ -1372,7 +1372,7 @@ pub mod kernels {
     /// `dq`, `dk` and `dv` are `[N, heads * head_dim]` and `output` holds at
     /// least `N * 3 * heads * head_dim / 2` words.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn join_group3_rope_bf16(
         dq: &[f32],
         dk: &[f32],
@@ -1483,7 +1483,7 @@ pub mod kernels {
     /// after it, while the atomic only needs to serialize colliding tokens
     /// within this launch.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn embedding_backward_scatter(
         tokens: &[u32],
         dy: &[f32],
@@ -1543,7 +1543,7 @@ pub mod kernels {
     /// stride is not a whole number of vectors, which is where a row base
     /// stops being 16-byte aligned.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub fn fused_classifier_forward_bf16(
         logits: &[u32],
         targets: &[u32],
@@ -1665,7 +1665,7 @@ pub mod kernels {
     /// read-modify-write had two four-byte accesses in flight per lane where
     /// it can have two sixteen-byte ones, and this kernel reads the row twice.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub fn fused_classifier_backward_in_place_bf16(
         targets: &[u32],
         upstream: f32,
@@ -2117,7 +2117,7 @@ pub mod kernels {
     /// predicated — the address is clamped and the *value* is selected — so the
     /// four of them issue back to back instead of down a chain of branches.
     #[kernel]
-    #[launch_bounds(256, 5)]
+    #[launch_bounds(256)]
     pub unsafe fn router_logits_bf16(
         x: &[u32],
         weight: &[f32],
@@ -2233,7 +2233,7 @@ pub mod kernels {
     /// Per-token softmax, deterministic top-k, and selected-probability
     /// renormalization. Ties select the lower expert index.
     #[kernel]
-    #[launch_bounds(256, 6)]
+    #[launch_bounds(256)]
     pub unsafe fn router_softmax_topk(
         logits: &[f32],
         experts: u32,
@@ -2319,7 +2319,7 @@ pub mod kernels {
     /// count is its first slot, preserving the serial kernel's exact ordering,
     /// capacity-drop behavior, and assignment counts without atomic claims.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn moe_bin_assign_parallel(
         selected_experts: &[u32],
         tokens: u32,
@@ -2425,7 +2425,7 @@ pub mod kernels {
     /// auxiliary *gradient* never reads this: `router_backward` derives it from
     /// the assignment counts.
     #[kernel]
-    #[launch_bounds(1024, 2)]
+    #[launch_bounds(1024)]
     pub unsafe fn moe_aux_terms(
         probabilities: &[f32],
         assignment_counts: &[u32],
@@ -2498,7 +2498,7 @@ pub mod kernels {
     /// almost entirely their launch. A model without experts leaves `aux_terms`
     /// zero and gets the plain mean.
     #[kernel]
-    #[launch_bounds(1024, 2)]
+    #[launch_bounds(1024)]
     pub unsafe fn loss_mean_with_aux(
         losses: &[f32],
         tokens: u32,
@@ -2559,7 +2559,7 @@ pub mod kernels {
     /// one 8-byte copy per thread: it reads half the bytes of the fp32 twin
     /// and rounds nothing at all. `dim` must be a multiple of [`QUAD_LANES`].
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn moe_scatter_packed_quad(
         x: &[u32],
         selected_experts: &[u32],
@@ -2606,7 +2606,7 @@ pub mod kernels {
     /// shapes whose expert panels miss the tcgen05 contract and stay wide.
     /// The destination must be pre-zeroed.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn moe_scatter_packed_wide(
         x: &[u32],
         selected_experts: &[u32],
@@ -2650,7 +2650,7 @@ pub mod kernels {
     /// thread. The arm for a `dim` the quad twin's 16-byte accesses cannot
     /// cover; `dim` must still be even.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub fn moe_gather_combine_add_bf16(
         expert_output: &[f32],
         selected_experts: &[u32],
@@ -2710,7 +2710,7 @@ pub mod kernels {
     /// kernel because no shape can reach one. The combine still sums in fp32
     /// registers and the block boundary still rounds exactly once.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn moe_gather_combine_add_quad_packed(
         expert_output: &[u32],
         selected_experts: &[u32],
@@ -2776,7 +2776,7 @@ pub mod kernels {
     /// combine sums in fp32 registers either way, so the block boundary rounds
     /// exactly once.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn moe_gather_combine_add_quad_bf16(
         expert_output: &[f32],
         selected_experts: &[u32],
@@ -2848,7 +2848,7 @@ pub mod kernels {
     /// Rows the routing left unassigned are cleared by [`moe_zero_dead_bins`],
     /// not by this kernel.
     #[kernel]
-    #[launch_bounds(256, 6)]
+    #[launch_bounds(256)]
     pub unsafe fn moe_scatter_dy(
         expert_output: &[f32],
         dy: &[f32],
@@ -2972,7 +2972,7 @@ pub mod kernels {
     /// accumulates in fp32 over the same quads in the same lane order; only the
     /// stored and loaded values narrow.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn moe_scatter_dy_packed(
         expert_output: &[u32],
         dy: &[f32],
@@ -3106,7 +3106,7 @@ pub mod kernels {
     /// block reads its count once and then strides only dead slots; lanes
     /// stride the row.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn moe_zero_dead_bins(
         assignment_counts: &[u32],
         dim: u32,
@@ -3157,7 +3157,7 @@ pub mod kernels {
 
     /// [`moe_zero_dead_bins`] over a packed-bf16 gradient panel (#59).
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn moe_zero_dead_bins_bf16(
         assignment_counts: &[u32],
         dim: u32,
@@ -3212,7 +3212,7 @@ pub mod kernels {
     /// output element is `router_dx + Σ_k expert_input_gradient`, so the
     /// separate `[N, D]` combine pass and the intermediate it read never run.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub fn moe_gather_dx_add(
         expert_input_gradient: &[f32],
         selected_experts: &[u32],
@@ -3257,7 +3257,7 @@ pub mod kernels {
     /// [`moe_gather_dx_add`] moving one 16-byte quad per access. `dim` must
     /// be a multiple of [`QUAD_LANES`].
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn moe_gather_dx_add_quad(
         expert_input_gradient: &[f32],
         selected_experts: &[u32],
@@ -3315,7 +3315,7 @@ pub mod kernels {
     /// Backward through selected-probability renormalization and router
     /// softmax, including the Switch-style auxiliary loss gradient.
     #[kernel]
-    #[launch_bounds(256, 5)]
+    #[launch_bounds(256)]
     pub unsafe fn router_backward(
         probabilities: &[f32],
         selected_experts: &[u32],
@@ -3400,7 +3400,7 @@ pub mod kernels {
     /// `LDS` in the inner loop. Lane-major columns keep every `dx` store a full
     /// coalesced sector, which is what the write-bound tile is paced by.
     #[kernel]
-    #[launch_bounds(256, 4)]
+    #[launch_bounds(256)]
     pub unsafe fn router_backward_input(
         dlogits: &[f32],
         weight: &[f32],
@@ -3489,7 +3489,7 @@ pub mod kernels {
     /// Same contract as [`router_backward_weight_split`], with `x` holding
     /// `tokens * dim / 2` packed words.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn router_backward_weight_split_bf16(
         x: &[u32],
         dlogits: &[f32],
@@ -3576,7 +3576,7 @@ pub mod kernels {
     /// the wide read is coalesced; the narrow `dweight` update is not, and does
     /// not matter at `D*E` elements.
     #[kernel]
-    #[launch_bounds(256, 8)]
+    #[launch_bounds(256)]
     pub unsafe fn router_backward_weight_merge(
         partials: &[f32],
         experts: u32,
