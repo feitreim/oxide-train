@@ -55,7 +55,13 @@ pub mod tensor_device;
 
 pub use dense_device::kernels as dense_kernels;
 pub use dense_device::reference::kernels as dense_reference_kernels;
-pub use dense_device::{NORM_THREADS, NORM_TILE_THREADS};
+// `bin/profile` reports what ptxas gave every kernel this module launches at
+// the block it launches it in, so the blocks are part of the crate's surface.
+pub use dense_device::{
+    CLASSIFIER_THREADS, LOSS_TAIL_THREADS, MOE_ASSIGN_THREADS, MOE_AUX_TERMS_THREADS,
+    MOE_SCATTER_DY_THREADS, MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_TILE_THREADS,
+    ROUTER_GEMM_THREADS, ROUTER_INPUT_THREADS, ROUTER_WGRAD_THREADS,
+};
 use dense_device::{QUAD_LANES, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS};
 
 /// The tile-SwiGLU launch for a `rows x columns` rectangle, or `None` when the

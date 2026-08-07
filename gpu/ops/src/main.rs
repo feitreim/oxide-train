@@ -82,12 +82,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_attention(&stream, &module)?;
     eprintln!("[ops] checking group_split_join");
     check_group_split_join(&stream, &module, &reference)?;
+    eprintln!("[ops] checking router_logits_bf16");
+    check_router_logits_bf16(&stream, &module, &reference)?;
     eprintln!("[ops] checking moe_routing");
     check_moe_routing(&stream, &module, &reference)?;
     eprintln!("[ops] checking loss tail");
     check_loss_tail(&stream, &module)?;
 
     println!("✓ ops forward/backward parity checks passed");
+    Ok(())
+}
+
+/// The shipped router logits GEMM against the reference blocking.
+///
+/// `check_moe_routing` builds its logits with `reference.router_logits`, so
+/// before this the shipped kernel's only coverage was whole-model parity. Both
+/// arms see the *same* bf16-rounded values and sum them in the same ascending
+/// `dim` order, so what is left to differ is the tiling: a wrong stride, a
+/// missing barrier or a tile read that leaves its band shows up here as a
+/// number, not as a drifting loss curve twelve layers downstream.
+fn check_router_logits_bf16(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Whole tiles, then a shape ragged on every axis the kernel walks: token
+    // rows past the last full band, a `dim` tail shorter than one reduction
+    // tile, and fewer experts than the tile is wide.
+    check_router_logits_bf16_case(stream, module, reference, 64, 256, 8)?;
+    check_router_logits_bf16_case(stream, module, reference, 70, 132, 5)?;
+    Ok(())
+}
+
+fn check_router_logits_bf16_case(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
+    tokens: usize,
+    dim: usize,
+    experts: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let round = |value: f32| bf16::from_f32(value).to_f32();
+    let x: Vec<f32> = (0..tokens * dim)
+        .map(|i| round(((i % 37) as f32 - 18.0) / 23.0))
+        .collect();
+    let weight: Vec<f32> = (0..dim * experts)
+        .map(|i| ((i % 29) as f32 - 14.0) / 31.0)
+        .collect();
+    let packed: Vec<u32> = x
+        .chunks(2)
+        .map(|pair| {
+            bf16::from_f32(pair[0]).to_bits() as u32
+                | ((bf16::from_f32(pair[1]).to_bits() as u32) << 16)
+        })
+        .collect();
+
+    let launch = LaunchConfig {
+        grid_dim: (
+            (experts as u32).div_ceil(ROUTER_GEMM_BN as u32),
+            (tokens as u32).div_ceil(ROUTER_GEMM_BM as u32),
+            1,
+        ),
+        block_dim: (ROUTER_GEMM_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let x_dev = DeviceBuffer::from_host(stream, &x)?;
+    let packed_dev = DeviceBuffer::from_host(stream, &packed)?;
+    let weight_dev = DeviceBuffer::from_host(stream, &weight)?;
+    let mut expected = DeviceBuffer::<f32>::zeroed(stream, tokens * experts)?;
+    let mut actual = DeviceBuffer::<f32>::zeroed(stream, tokens * experts)?;
+    // SAFETY: both launches cover exactly the `[tokens, experts]` logit
+    // rectangle their grids are sized for, over operands of that shape.
+    unsafe {
+        reference.router_logits(
+            stream,
+            launch,
+            &x_dev,
+            &weight_dev,
+            dim as u32,
+            experts as u32,
+            &mut expected,
+        )?;
+        module.router_logits_bf16(
+            stream,
+            launch,
+            &packed_dev,
+            &weight_dev,
+            dim as u32,
+            experts as u32,
+            &mut actual,
+        )?;
+    }
+    assert_close(
+        &format!("router logits bf16 [{tokens},{dim}] x {experts}"),
+        &actual.to_host_vec(stream)?,
+        &expected.to_host_vec(stream)?,
+        5e-6,
+        5e-6,
+    );
     Ok(())
 }
 
@@ -1046,18 +1138,34 @@ fn check_moe_tie_routing(
     Ok(())
 }
 
+/// RoPE and the joins that carry it, at two head widths.
+///
+/// `HD = 4` is the shape this check has always run. `HD = 8` was added for a
+/// vector arm of `join_group3_rope_bf16` that measured worse and did not ship,
+/// and it stays: a head that is a whole number of `QUAD_LANES` vectors is the
+/// one the training shape has, and it was covered by nothing.
 fn check_rope(
+    stream: &std::sync::Arc<cuda_core::CudaStream>,
+    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    check_rope_case::<10, 5, 12, 3, 4>(stream, module, reference)?;
+    check_rope_case::<8, 4, 24, 3, 8>(stream, module, reference)
+}
+
+fn check_rope_case<
+    const N: usize,
+    const T: usize,
+    const D: usize,
+    const H: usize,
+    const HD: usize,
+>(
     stream: &std::sync::Arc<cuda_core::CudaStream>,
     module: &kernels::LoadedModule,
     reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: all device buffers and launches use the same N/T/D/H/HD shape.
     unsafe {
-        const N: usize = 10;
-        const T: usize = 5;
-        const D: usize = 12;
-        const H: usize = 3;
-        const HD: usize = 4;
         let x = CpuTensor::<f32, Rank2<N, D>>::uniform(10);
         let dy = CpuTensor::<f32, Rank2<N, D>>::uniform(11);
         let mut cpu = Rope::<N, T, D, H, HD>;
@@ -1740,9 +1848,13 @@ fn check_classifier_bf16(
     reference: &reference_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Odd real vocabulary exercises the packed tail; the second case covers a
-    // multi-iteration lane stride.
+    // multi-iteration lane stride. The third is the row stride that is not a
+    // whole number of `QUAD_LANES` vectors, which is what puts the whole row
+    // on the scalar walk — the arm the vector one left behind, and the one
+    // nothing else here would reach.
     check_classifier_bf16_case::<5, 13, 16>(stream, module, reference)?;
-    check_classifier_bf16_case::<3, 517, 520>(stream, module, reference)
+    check_classifier_bf16_case::<3, 517, 520>(stream, module, reference)?;
+    check_classifier_bf16_case::<4, 21, 26>(stream, module, reference)
 }
 
 fn check_classifier_bf16_case<const N: usize, const C: usize, const CP: usize>(

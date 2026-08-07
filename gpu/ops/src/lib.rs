@@ -12,7 +12,7 @@
 use cuda_device::{
     DisjointSlice, SharedArray,
     atomic::{AtomicOrdering, DeviceAtomicF32},
-    cuda_module, kernel, thread,
+    cuda_module, kernel, launch_bounds, thread,
 };
 
 use kittens::global::{GlobalRows, load_cols, load_rows, store_rows};
@@ -73,10 +73,48 @@ pub const ROUTER_GEMM_BM: usize = 32;
 /// Router logits GEMM CTA output columns. `8` matches the routed expert width,
 /// so the skinny expert dimension carries no tile padding.
 pub const ROUTER_GEMM_BN: usize = 8;
-/// Router logits GEMM reduction tile.
+/// Router logits GEMM reduction tile, in the [`reference`] kernel.
 pub const ROUTER_GEMM_BK: usize = 16;
 /// Threads in a router logits GEMM block: one lane per output element.
 pub const ROUTER_GEMM_THREADS: usize = ROUTER_GEMM_BM * ROUTER_GEMM_BN;
+
+/// Reduction tile of the *shipped* router logits GEMM.
+///
+/// This is the only thing that puts more than one `x` load in flight per lane.
+/// A block stages `ROUTER_GEMM_BM * ROUTER_LOGITS_BK` elements between two
+/// barriers, so a lane carries `BM * BK / THREADS` of them at once and the
+/// whole reduction costs `2 * dim / BK` barriers. At the reference's 16 that is
+/// **eight bytes a lane and 384 barriers a block** at the training shape, which
+/// is the whole of why this kernel measured 453 GB/s — 6% of HBM — while
+/// reading nothing but a `[N, D]` stream. 128 is 64 bytes a lane and 48
+/// barriers, and it costs 20.6 KiB of shared memory, which is still eight
+/// blocks an SM.
+pub const ROUTER_LOGITS_BK: usize = 128;
+
+/// Row stride of both router logits GEMM tiles, in `f32`.
+///
+/// The pad is what makes the tile reads conflict-free. A warp spans four token
+/// rows of the `x` tile and all eight expert columns of the weight tile, and
+/// both strides would otherwise be a multiple of the 32 banks — every one of
+/// those rows landing on the same four banks at a different address. One
+/// [`QUAD_LANES`] vector of pad rotates each successive row by four banks, so
+/// the four rows a warp reads cover sixteen distinct banks and the eight
+/// expert columns cover all thirty-two.
+pub const ROUTER_LOGITS_STRIDE: usize = ROUTER_LOGITS_BK + QUAD_LANES;
+
+/// Token rows one staging pass of the router logits GEMM covers.
+///
+/// The staging map is the transpose of the accumulating one: a warp covers one
+/// tile row, so its 32 vector loads are one contiguous 256-byte run of `x`,
+/// where the inner product wants a lane per expert.
+pub const ROUTER_LOGITS_STAGE_ROWS: usize = ROUTER_GEMM_THREADS * QUAD_LANES / ROUTER_LOGITS_BK;
+
+/// Staging passes one block makes over its `x` tile per reduction step.
+pub const ROUTER_LOGITS_STAGES: usize = ROUTER_GEMM_BM / ROUTER_LOGITS_STAGE_ROWS;
+
+/// Staging passes one block makes over its weight tile per reduction step.
+pub const ROUTER_LOGITS_WEIGHT_STAGES: usize =
+    ROUTER_LOGITS_BK * ROUTER_MAX_EXPERTS / ROUTER_GEMM_THREADS;
 
 /// Threads in one router input-backward block.
 pub const ROUTER_INPUT_THREADS: usize = 256;
@@ -274,6 +312,31 @@ type SwigluChunk = RegTile<SWIGLU_TILE_ROWS, SWIGLU_TILE_CHUNK, BaseLdtm>;
 /// compare the ones below against.
 pub mod reference;
 
+/// Resident blocks an SM every entry point below declares, beside its block
+/// width, in `#[launch_bounds]`.
+///
+/// The block width is #122's fix: an entry point that declares no `.maxntid`
+/// lets the driver's JIT *derive* the launchable block from whatever
+/// allocation it chose, and a derived block narrower than the launch is a
+/// `701` rather than a slow kernel. Every kernel here derived **1024**, which
+/// is safe today only by accident.
+///
+/// The second number is not optional, and that is what pass two measured. A
+/// declared `.maxntid` is an input to ptxas' heuristics and not only the
+/// register budget's divisor: at a bare `#[launch_bounds(256)]` the budget goes
+/// from the derived 1024's 64 registers to 255, and the allocator spends it —
+/// `router_backward_weight_split_bf16` went 32 registers and 8 resident blocks
+/// to **93 and 2**, and its span with it. So the count that ships is the one
+/// that hands ptxas back the budget the derived `.maxntid` gave it,
+/// `65536 / (threads * 64)`: 4 for a 256-thread block, 1 for 1024, 6 for the
+/// 128-thread tile norm. Every kernel keeps its unpinned allocation under it,
+/// with one exception: `router_backward_weight_split_bf16` loses at every
+/// target a 256-thread block has, and its own note carries the four
+/// measurements that say so.
+///
+/// Tighter is not better either: `(256, 8)` caps the budget at the 32 registers
+/// three of these kernels already used, and all three still acquired a local
+/// frame — the harder unrolling a declared 256 buys has to go somewhere.
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -346,6 +409,31 @@ pub mod kernels {
         ]
     }
 
+    /// One 16-byte vector load as the [`QUAD_LANES`] packed words it holds —
+    /// [`quad_lanes`] for a stream that stays packed rather than widening.
+    #[inline(always)]
+    fn quad_words(bits: u128) -> [u32; QUAD_LANES] {
+        [
+            bits as u32,
+            (bits >> 32) as u32,
+            (bits >> 64) as u32,
+            (bits >> 96) as u32,
+        ]
+    }
+
+    /// The inverse of [`quad_words`]: [`QUAD_LANES`] packed words as one
+    /// 16-byte vector store.
+    #[inline(always)]
+    fn quad_word_bits(words: [u32; QUAD_LANES]) -> u128 {
+        let mut bits = 0u128;
+        let mut lane = 0usize;
+        while lane < QUAD_LANES {
+            bits |= (words[lane] as u128) << (32 * lane);
+            lane += 1;
+        }
+        bits
+    }
+
     /// The inverse of [`bf16_quad`]: [`QUAD_LANES`] `f32` as one 8-byte store.
     #[inline(always)]
     fn bf16_quad_bits(lanes: [f32; QUAD_LANES]) -> u64 {
@@ -365,6 +453,7 @@ pub mod kernels {
     /// (see [`rms_norm_forward_tile`]), and packing the stream doubles the
     /// elements each of these lanes already carries.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn rms_norm_forward_fast_bf16(
         x: &[u32],
         weight: &[f32],
@@ -439,6 +528,7 @@ pub mod kernels {
     /// backward temporaries and stay fp32, and both reductions still
     /// accumulate in fp32 registers.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn rms_norm_backward_x_fast_bf16(
         x: &[u32],
         weight: &[f32],
@@ -525,6 +615,7 @@ pub mod kernels {
     /// Same contract as [`rms_norm_backward_weight_fast`], and `dim` must be
     /// even so a row starts on a word boundary.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn rms_norm_backward_weight_fast_bf16(
         x: &[u32],
         dy: &[f32],
@@ -582,6 +673,7 @@ pub mod kernels {
     /// [`NORM_MAX_COLUMNS`] so the column partials fit; `dweight` must hold
     /// `dim` accumulators this launch may atomically update.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn rms_norm_backward_fused_bf16(
         x: &[u32],
         weight: &[f32],
@@ -753,6 +845,7 @@ pub mod kernels {
     /// [`rms_norm_backward_fused_bf16`], `dweight` is accumulated into and the
     /// caller owes it a zeroed buffer.
     #[kernel]
+    #[launch_bounds(128, 6)]
     pub unsafe fn rms_norm_backward_fused_tile_bf16(
         x: &[u32],
         weight: &[f32],
@@ -844,6 +937,7 @@ pub mod kernels {
     ///
     /// `dim` must be even and at most [`NORM_MAX_COLUMNS`].
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn rms_norm_forward_residual_bf16(
         stream_input: &[u32],
         projection: &[f32],
@@ -940,6 +1034,7 @@ pub mod kernels {
     ///
     /// `dim` must be even and at most [`NORM_MAX_COLUMNS`].
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn embedding_forward_norm_bf16(
         table: &[u32],
         tokens: &[u32],
@@ -1029,6 +1124,7 @@ pub mod kernels {
     /// `[rows, 2, ff]` panel — the layout the fused gate/up GEMM writes — so
     /// no split pass ever copies the panel into separate gate/up buffers.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn swiglu_forward_interleaved(gate_up: &[f32], ff: u32, mut y: DisjointSlice<f32>) {
         let index = thread::index_1d();
         let i = index.get();
@@ -1061,6 +1157,7 @@ pub mod kernels {
     /// `ff` must be a multiple of [`QUAD_LANES`], which the tcgen05 alignment
     /// gate on packed panels already guarantees.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn swiglu_forward_interleaved_packed(
         gate_up: &[u32],
         ff: u32,
@@ -1102,6 +1199,7 @@ pub mod kernels {
     /// of the interleaved `[rows, 2, ff]` gradient, so the two separate
     /// gradient buffers and the join pass that merged them never exist.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn swiglu_backward_interleaved(
         gate_up: &[f32],
         dy: &[f32],
@@ -1141,6 +1239,7 @@ pub mod kernels {
     /// the forward stored, so the recomputed sigmoid is bit-identical to the
     /// one the packed forward used.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn swiglu_backward_interleaved_packed(
         gate_up: &[u32],
         dy: &[f32],
@@ -1189,6 +1288,7 @@ pub mod kernels {
     }
 
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn split_group3(
         input: &[f32],
         width: u32,
@@ -1229,6 +1329,7 @@ pub mod kernels {
     /// `dq`, `dk` and `dv` are `[N, heads * head_dim]` and `output` is
     /// `[N, 3 * heads * head_dim]`.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn join_group3_rope(
         dq: &[f32],
         dk: &[f32],
@@ -1277,11 +1378,34 @@ pub mod kernels {
     /// so the couple a thread owns is exactly the couple
     /// `convert_f32_to_bf16_pairs` would have packed into one word.
     ///
+    /// One thread owns one rotated pair. A [`QUAD_LANES`] arm was written for
+    /// this kernel and **measured worse twice**, and the note is worth more
+    /// than the arm was.
+    ///
+    /// The arithmetic that motivated it is real: the index math here is five
+    /// runtime 64-bit divisions — [`rope_angle`]'s three and this kernel's own
+    /// row split — for twelve bytes of output, and four pairs a thread pays
+    /// each of them once for four while widening every access from eight bytes
+    /// to sixteen. What it cost is the register file. The wide arm holds six
+    /// vectors of gradient and three of packed output live at once: 40
+    /// registers against 32, **176 bytes of local frame**, and six resident
+    /// blocks an SM against eight. At 2.9 TB/s over 1.36 GB a launch this
+    /// kernel is latency-bound with the same bytes either way, so the threads
+    /// hiding that latency were worth more than the divisions saved —
+    /// ferro-kittens#222's pole exactly, reached without a tile in sight.
+    ///
+    /// Measured `backward.qkv_proj.join`, against `main` in each arm's own
+    /// container: **+3.0% and +0.6%** relative to the untouched-span drift.
+    /// The lead that is still open is the divisions themselves: they are
+    /// `usize` and every operand fits `u32`, which is a third of the
+    /// instructions at no register cost at all.
+    ///
     /// # Safety
     ///
     /// `dq`, `dk` and `dv` are `[N, heads * head_dim]` and `output` holds at
     /// least `N * 3 * heads * head_dim / 2` words.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn join_group3_rope_bf16(
         dq: &[f32],
         dk: &[f32],
@@ -1323,6 +1447,7 @@ pub mod kernels {
     /// after it, while the atomic only needs to serialize colliding tokens
     /// within this launch.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn embedding_backward_scatter(
         tokens: &[u32],
         dy: &[f32],
@@ -1349,12 +1474,40 @@ pub mod kernels {
         slot.fetch_add(dy[i], AtomicOrdering::Relaxed);
     }
 
+    /// Whole [`QUAD_LANES`] vectors in a classifier row of `stride_words`
+    /// packed words, or zero when the row stride does not divide into them.
+    ///
+    /// A row base is `row * stride_words`, so an odd stride puts every other
+    /// row's base off a 16-byte boundary. Rather than carry a per-row head
+    /// alignment, a stride that does not divide gives the vector walk no work
+    /// and the scalar walk beside it covers the whole row — the arm every
+    /// shape but the padded vocabulary takes, and the one both kernels
+    /// already had.
+    #[inline(always)]
+    fn classifier_row_quads(stride_words: usize) -> usize {
+        if stride_words.is_multiple_of(QUAD_LANES) {
+            stride_words / QUAD_LANES
+        } else {
+            0
+        }
+    }
+
     /// [`fused_classifier_forward`] over packed-bf16 logits rows.
     ///
     /// Rows are `padded_classes` elements wide (packed two per word) but the
     /// softmax and loss only see the first `classes` columns; the padded tail
     /// holds the lm-head's zero-weight vocabulary columns.
+    ///
+    /// The row walk is a [`QUAD_LANES`] vector at a time because that is the
+    /// only thing putting more than four bytes in flight per lane: the trip
+    /// count is a runtime value NVVM will not unroll, and the online
+    /// `(max, sum)` is a serial dependence across the whole row, so a lane has
+    /// exactly one access outstanding and it is worth four times as much. The
+    /// scalar walk stays as the tail — and as the whole of the row when the
+    /// stride is not a whole number of vectors, which is where a row base
+    /// stops being 16-byte aligned.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn fused_classifier_forward_bf16(
         logits: &[u32],
         targets: &[u32],
@@ -1376,11 +1529,39 @@ pub mod kernels {
         }
 
         let c = classes as usize;
-        let base = row * padded_classes as usize / 2;
+        let stride_words = padded_classes as usize / 2;
+        let base = row * stride_words;
+        let quads = classifier_row_quads(stride_words);
         let mut running_max = f32::NEG_INFINITY;
         let mut running_sum = 0.0f32;
-        let mut pair = tid;
-        while 2 * pair < c {
+        let mut quad = tid;
+        while quad < quads {
+            // SAFETY: the row belongs to this block, `classifier_row_quads`
+            // is what makes `base + QUAD_LANES * quad` 16-byte aligned, and
+            // striding by the block width gives this lane the vector alone.
+            let words = quad_words(unsafe {
+                *(logits.as_ptr().add(base + QUAD_LANES * quad) as *const u128)
+            });
+            let mut lane = 0usize;
+            while lane < QUAD_LANES {
+                let mut half = 0;
+                while half < 2 {
+                    let col = 2 * (QUAD_LANES * quad + lane) + half;
+                    if col < c {
+                        let value = bf16_bits_to_f32((words[lane] >> (16 * half)) as u16);
+                        let next_max = running_max.max(value);
+                        running_sum =
+                            running_sum * (running_max - next_max).exp() + (value - next_max).exp();
+                        running_max = next_max;
+                    }
+                    half += 1;
+                }
+                lane += 1;
+            }
+            quad += CLASSIFIER_THREADS;
+        }
+        let mut pair = QUAD_LANES * quads + tid;
+        while pair < stride_words {
             let word = logits[base + pair];
             let mut half = 0;
             while half < 2 {
@@ -1442,7 +1623,13 @@ pub mod kernels {
     /// The recomputed softmax sees the first `classes` columns; the write-back
     /// covers the full `padded_classes` stride so padded vocabulary columns
     /// carry exactly-zero gradients into the weight GEMM.
+    ///
+    /// Both passes walk the row a [`QUAD_LANES`] vector at a time, for
+    /// [`fused_classifier_forward_bf16`]'s reason: the write-back's
+    /// read-modify-write had two four-byte accesses in flight per lane where
+    /// it can have two sixteen-byte ones, and this kernel reads the row twice.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn fused_classifier_backward_in_place_bf16(
         targets: &[u32],
         upstream: f32,
@@ -1466,10 +1653,37 @@ pub mod kernels {
         let c = classes as usize;
         let stride_words = padded_classes as usize / 2;
         let base = row * stride_words;
+        let quads = classifier_row_quads(stride_words);
         let mut running_max = f32::NEG_INFINITY;
         let mut running_sum = 0.0f32;
-        let mut pair = tid;
-        while 2 * pair < c {
+        let mut quad = tid;
+        while quad < quads {
+            // SAFETY: the row belongs to this block, `classifier_row_quads`
+            // is what makes `base + QUAD_LANES * quad` 16-byte aligned, and
+            // striding by the block width gives this lane the vector alone.
+            let words = quad_words(unsafe {
+                *(logits.as_mut_ptr().add(base + QUAD_LANES * quad) as *const u128)
+            });
+            let mut lane = 0usize;
+            while lane < QUAD_LANES {
+                let mut half = 0;
+                while half < 2 {
+                    let col = 2 * (QUAD_LANES * quad + lane) + half;
+                    if col < c {
+                        let value = bf16_bits_to_f32((words[lane] >> (16 * half)) as u16);
+                        let next_max = running_max.max(value);
+                        running_sum =
+                            running_sum * (running_max - next_max).exp() + (value - next_max).exp();
+                        running_max = next_max;
+                    }
+                    half += 1;
+                }
+                lane += 1;
+            }
+            quad += CLASSIFIER_THREADS;
+        }
+        let mut pair = QUAD_LANES * quads + tid;
+        while pair < stride_words {
             // SAFETY: the row belongs to this block and striding by the block
             // width gives each lane exclusive ownership of this word.
             let word = unsafe { *logits.get_unchecked_mut(base + pair) };
@@ -1522,7 +1736,36 @@ pub mod kernels {
         let inverse_sum = 1.0 / unsafe { SUMS[0] };
         let target = targets[row] as usize;
         let scale = upstream / rows as f32;
-        let mut pair = tid;
+        let mut quad = tid;
+        while quad < quads {
+            // SAFETY: this lane exclusively owns the vector for both the read
+            // and the in-place gradient write, at the alignment
+            // `classifier_row_quads` established.
+            let slot = unsafe { logits.as_mut_ptr().add(base + QUAD_LANES * quad) as *mut u128 };
+            let words = quad_words(unsafe { *slot });
+            let mut packed = [0u32; QUAD_LANES];
+            let mut lane = 0usize;
+            while lane < QUAD_LANES {
+                let mut half = 0;
+                while half < 2 {
+                    let col = 2 * (QUAD_LANES * quad + lane) + half;
+                    if col < c {
+                        let value = bf16_bits_to_f32((words[lane] >> (16 * half)) as u16);
+                        let probability = (value - row_max).exp() * inverse_sum;
+                        let indicator = if col == target { 1.0 } else { 0.0 };
+                        let gradient = scale * (probability - indicator);
+                        packed[lane] |= (f32_to_bf16_bits(gradient) as u32) << (16 * half);
+                    }
+                    half += 1;
+                }
+                lane += 1;
+            }
+            unsafe {
+                *slot = quad_word_bits(packed);
+            }
+            quad += CLASSIFIER_THREADS;
+        }
+        let mut pair = QUAD_LANES * quads + tid;
         while pair < stride_words {
             // SAFETY: this lane exclusively owns the word for both the read
             // and the in-place gradient write.
@@ -1566,6 +1809,7 @@ pub mod kernels {
     /// `y` and `x` hold the same element count and `table` is a
     /// [`rope_table`] for this `sequence_length` and `head_dim`.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn rope_forward(
         x: &[f32],
         table: &[f32],
@@ -1596,6 +1840,7 @@ pub mod kernels {
 
     /// Materialize causal softmax probabilities as `[N,H,T]`.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn attention_probabilities(
         q: &[f32],
         k: &[f32],
@@ -1650,6 +1895,7 @@ pub mod kernels {
     }
 
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn attention_output(
         probabilities: &[f32],
         v: &[f32],
@@ -1680,6 +1926,7 @@ pub mod kernels {
     }
 
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn attention_backward_q(
         q: &[f32],
         k: &[f32],
@@ -1730,6 +1977,7 @@ pub mod kernels {
     }
 
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn attention_backward_k(
         q: &[f32],
         v: &[f32],
@@ -1780,6 +2028,7 @@ pub mod kernels {
     }
 
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn attention_backward_v(
         probabilities: &[f32],
         dy: &[f32],
@@ -1809,115 +2058,146 @@ pub mod kernels {
         }
     }
 
-    /// [`router_gemm_impl`] with a packed-bf16 `A`.
-    ///
-    /// Only the token tile's staging load differs: it widens on the way into
-    /// shared memory, so the inner product and the accumulator are the fp32
-    /// ones the twin uses and the router's own arithmetic is unchanged.
-    #[inline(always)]
-    unsafe fn router_gemm_bf16_impl(
-        m: usize,
-        n: usize,
-        k: usize,
-        a: &[u32],
-        b: &[f32],
-        mut c: DisjointSlice<f32>,
-    ) {
-        static mut TILE_A: SharedArray<f32, { ROUTER_GEMM_BM * ROUTER_GEMM_BK }> =
-            SharedArray::UNINIT;
-        static mut TILE_B: SharedArray<f32, { ROUTER_GEMM_BK * ROUTER_GEMM_BN }> =
-            SharedArray::UNINIT;
-
-        let tid = thread::threadIdx_x() as usize;
-        if thread::blockDim_x() as usize != ROUTER_GEMM_THREADS {
-            return;
-        }
-        let thread_row = tid / ROUTER_GEMM_BN;
-        let thread_col = tid % ROUTER_GEMM_BN;
-        let block_row = thread::blockIdx_y() as usize * ROUTER_GEMM_BM;
-        let block_col = thread::blockIdx_x() as usize * ROUTER_GEMM_BN;
-        let mut accumulator = 0.0f32;
-
-        let mut k_base = 0usize;
-        while k_base < k {
-            let mut local = tid;
-            while local < ROUTER_GEMM_BM * ROUTER_GEMM_BK {
-                let tile_row = local / ROUTER_GEMM_BK;
-                let tile_col = local % ROUTER_GEMM_BK;
-                let global_row = block_row + tile_row;
-                let global_col = k_base + tile_col;
-                unsafe {
-                    TILE_A[tile_row * ROUTER_GEMM_BK + tile_col] =
-                        if global_row < m && global_col < k {
-                            bf16_at(a, global_row * k + global_col)
-                        } else {
-                            0.0
-                        };
-                }
-                local += ROUTER_GEMM_THREADS;
-            }
-
-            local = tid;
-            while local < ROUTER_GEMM_BK * ROUTER_GEMM_BN {
-                let tile_row = local / ROUTER_GEMM_BN;
-                let tile_col = local % ROUTER_GEMM_BN;
-                let global_row = k_base + tile_row;
-                let global_col = block_col + tile_col;
-                unsafe {
-                    TILE_B[tile_row * ROUTER_GEMM_BN + tile_col] =
-                        if global_row < k && global_col < n {
-                            b[global_row * n + global_col]
-                        } else {
-                            0.0
-                        };
-                }
-                local += ROUTER_GEMM_THREADS;
-            }
-            thread::sync_threads();
-
-            let mut inner = 0usize;
-            while inner < ROUTER_GEMM_BK {
-                unsafe {
-                    accumulator += TILE_A[thread_row * ROUTER_GEMM_BK + inner]
-                        * TILE_B[inner * ROUTER_GEMM_BN + thread_col];
-                }
-                inner += 1;
-            }
-            thread::sync_threads();
-            k_base += ROUTER_GEMM_BK;
-        }
-
-        let global_row = block_row + thread_row;
-        let global_col = block_col + thread_col;
-        if global_row < m && global_col < n {
-            unsafe {
-                *c.get_unchecked_mut(global_row * n + global_col) = accumulator;
-            }
-        }
-    }
-
     /// [`router_logits`] over a packed-bf16 token stream. The router weight
     /// and the logits stay fp32: the router is an fp32 parameter by design.
+    ///
+    /// A block owns a `[ROUTER_GEMM_BM, ROUTER_GEMM_BN]` logit tile and a lane
+    /// owns one element of it, which is the only mapping that fills the device:
+    /// the output is `N * E` elements and `E` is 8, so a lane per *token* would
+    /// leave an SM 166 threads and a lane per token pair would need a
+    /// cross-lane reduction of the `dim` axis.
+    ///
+    /// What the reference blocking gets wrong is not that mapping but
+    /// [`ROUTER_LOGITS_BK`]: at 16 a lane stages two `x` elements, waits on a
+    /// barrier, does sixteen FMAs and waits again, 192 times over. Eight bytes
+    /// in flight per lane is what 453 GB/s looks like. Here a lane stages
+    /// sixteen elements as four [`QUAD_LANES`] vectors and the block pays 48
+    /// barriers instead of 384.
+    ///
+    /// Both tiles are staged `f32`: `x` widens once per block on the way in
+    /// rather than once per lane that reads it, and the weight lands
+    /// *transposed*, so a lane's expert column is contiguous and both operands
+    /// of the inner product are one vector load. Neither staging load is
+    /// predicated — the address is clamped and the *value* is selected — so the
+    /// four of them issue back to back instead of down a chain of branches.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn router_logits_bf16(
         x: &[u32],
         weight: &[f32],
         dim: u32,
         experts: u32,
-        logits: DisjointSlice<f32>,
+        mut logits: DisjointSlice<f32>,
     ) {
+        static mut TILE_X: SharedArray<f32, { ROUTER_GEMM_BM * ROUTER_LOGITS_STRIDE }, 16> =
+            SharedArray::UNINIT;
+        static mut TILE_WEIGHT: SharedArray<
+            f32,
+            { ROUTER_MAX_EXPERTS * ROUTER_LOGITS_STRIDE },
+            16,
+        > = SharedArray::UNINIT;
+
         let d = dim as usize;
         let e = experts as usize;
-        if d == 0 || e == 0 || !(x.len() * 2).is_multiple_of(d) {
+        let tid = thread::threadIdx_x() as usize;
+        // Every bound the walks below rely on, paid once: the tile reads are
+        // whole `QUAD_LANES` vectors, so a partial vector must not exist.
+        if thread::blockDim_x() as usize != ROUTER_GEMM_THREADS
+            || d == 0
+            || e == 0
+            || e > ROUTER_MAX_EXPERTS
+            || !d.is_multiple_of(QUAD_LANES)
+            || !(x.len() * 2).is_multiple_of(d)
+            || d * e > weight.len()
+        {
             return;
         }
         let n = x.len() * 2 / d;
-        unsafe { router_gemm_bf16_impl(n, e, d, x, weight, logits) }
+        let block_row = thread::blockIdx_y() as usize * ROUTER_GEMM_BM;
+        if block_row >= n || n * e > logits.len() {
+            return;
+        }
+
+        let thread_row = tid / ROUTER_GEMM_BN;
+        let thread_col = tid % ROUTER_GEMM_BN;
+        let stage_row = tid / (ROUTER_LOGITS_BK / QUAD_LANES);
+        let stage_column = tid % (ROUTER_LOGITS_BK / QUAD_LANES) * QUAD_LANES;
+        let weight_depth = tid / ROUTER_MAX_EXPERTS;
+        let weight_expert = tid % ROUTER_MAX_EXPERTS;
+
+        let mut accumulator = 0.0f32;
+        let mut base = 0usize;
+        while base < d {
+            let mut stage = 0usize;
+            while stage < ROUTER_LOGITS_STAGES {
+                let tile_row = stage * ROUTER_LOGITS_STAGE_ROWS + stage_row;
+                let row = block_row + tile_row;
+                let column = base + stage_column;
+                let inside = row < n && column < d;
+                let word = if inside { (row * d + column) / 2 } else { 0 };
+                let quad = bf16_quad(unsafe { *(x.as_ptr().add(word) as *const u64) });
+                unsafe {
+                    *((&raw mut TILE_X as *mut f32)
+                        .add(tile_row * ROUTER_LOGITS_STRIDE + stage_column)
+                        as *mut u128) = quad_bits(if inside { quad } else { [0.0; QUAD_LANES] });
+                }
+                stage += 1;
+            }
+
+            let mut stage = 0usize;
+            while stage < ROUTER_LOGITS_WEIGHT_STAGES {
+                let depth = stage * (ROUTER_GEMM_THREADS / ROUTER_MAX_EXPERTS) + weight_depth;
+                let column = base + depth;
+                let inside = column < d && weight_expert < e;
+                let index = if inside {
+                    column * e + weight_expert
+                } else {
+                    0
+                };
+                let value = unsafe { *weight.as_ptr().add(index) };
+                unsafe {
+                    TILE_WEIGHT[weight_expert * ROUTER_LOGITS_STRIDE + depth] =
+                        if inside { value } else { 0.0 };
+                }
+                stage += 1;
+            }
+            thread::sync_threads();
+
+            let mut inner = 0usize;
+            while inner < ROUTER_LOGITS_BK {
+                let xs = quad_lanes(unsafe {
+                    *((&raw const TILE_X as *const f32)
+                        .add(thread_row * ROUTER_LOGITS_STRIDE + inner)
+                        as *const u128)
+                });
+                let ws = quad_lanes(unsafe {
+                    *((&raw const TILE_WEIGHT as *const f32)
+                        .add(thread_col * ROUTER_LOGITS_STRIDE + inner)
+                        as *const u128)
+                });
+                let mut lane = 0usize;
+                while lane < QUAD_LANES {
+                    accumulator += xs[lane] * ws[lane];
+                    lane += 1;
+                }
+                inner += QUAD_LANES;
+            }
+            thread::sync_threads();
+            base += ROUTER_LOGITS_BK;
+        }
+
+        let row = block_row + thread_row;
+        if row < n && thread_col < e {
+            unsafe {
+                *logits.get_unchecked_mut(row * e + thread_col) = accumulator;
+            }
+        }
     }
 
     /// Per-token softmax, deterministic top-k, and selected-probability
     /// renormalization. Ties select the lower expert index.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn router_softmax_topk(
         logits: &[f32],
         experts: u32,
@@ -2003,6 +2283,7 @@ pub mod kernels {
     /// count is its first slot, preserving the serial kernel's exact ordering,
     /// capacity-drop behavior, and assignment counts without atomic claims.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn moe_bin_assign_parallel(
         selected_experts: &[u32],
         tokens: u32,
@@ -2108,6 +2389,7 @@ pub mod kernels {
     /// auxiliary *gradient* never reads this: `router_backward` derives it from
     /// the assignment counts.
     #[kernel]
+    #[launch_bounds(1024, 1)]
     pub unsafe fn moe_aux_terms(
         probabilities: &[f32],
         assignment_counts: &[u32],
@@ -2180,6 +2462,7 @@ pub mod kernels {
     /// almost entirely their launch. A model without experts leaves `aux_terms`
     /// zero and gets the plain mean.
     #[kernel]
+    #[launch_bounds(1024, 1)]
     pub unsafe fn loss_mean_with_aux(
         losses: &[f32],
         tokens: u32,
@@ -2240,6 +2523,7 @@ pub mod kernels {
     /// one 8-byte copy per thread: it reads half the bytes of the fp32 twin
     /// and rounds nothing at all. `dim` must be a multiple of [`QUAD_LANES`].
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn moe_scatter_packed_quad(
         x: &[u32],
         selected_experts: &[u32],
@@ -2286,6 +2570,7 @@ pub mod kernels {
     /// shapes whose expert panels miss the tcgen05 contract and stay wide.
     /// The destination must be pre-zeroed.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn moe_scatter_packed_wide(
         x: &[u32],
         selected_experts: &[u32],
@@ -2329,6 +2614,7 @@ pub mod kernels {
     /// thread. The arm for a `dim` the quad twin's 16-byte accesses cannot
     /// cover; `dim` must still be even.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn moe_gather_combine_add_bf16(
         expert_output: &[f32],
         selected_experts: &[u32],
@@ -2388,6 +2674,7 @@ pub mod kernels {
     /// kernel because no shape can reach one. The combine still sums in fp32
     /// registers and the block boundary still rounds exactly once.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn moe_gather_combine_add_quad_packed(
         expert_output: &[u32],
         selected_experts: &[u32],
@@ -2453,6 +2740,7 @@ pub mod kernels {
     /// combine sums in fp32 registers either way, so the block boundary rounds
     /// exactly once.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn moe_gather_combine_add_quad_bf16(
         expert_output: &[f32],
         selected_experts: &[u32],
@@ -2524,6 +2812,7 @@ pub mod kernels {
     /// Rows the routing left unassigned are cleared by [`moe_zero_dead_bins`],
     /// not by this kernel.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn moe_scatter_dy(
         expert_output: &[f32],
         dy: &[f32],
@@ -2647,6 +2936,7 @@ pub mod kernels {
     /// accumulates in fp32 over the same quads in the same lane order; only the
     /// stored and loaded values narrow.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn moe_scatter_dy_packed(
         expert_output: &[u32],
         dy: &[f32],
@@ -2780,6 +3070,7 @@ pub mod kernels {
     /// block reads its count once and then strides only dead slots; lanes
     /// stride the row.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn moe_zero_dead_bins(
         assignment_counts: &[u32],
         dim: u32,
@@ -2830,6 +3121,7 @@ pub mod kernels {
 
     /// [`moe_zero_dead_bins`] over a packed-bf16 gradient panel (#59).
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn moe_zero_dead_bins_bf16(
         assignment_counts: &[u32],
         dim: u32,
@@ -2884,6 +3176,7 @@ pub mod kernels {
     /// output element is `router_dx + Σ_k expert_input_gradient`, so the
     /// separate `[N, D]` combine pass and the intermediate it read never run.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub fn moe_gather_dx_add(
         expert_input_gradient: &[f32],
         selected_experts: &[u32],
@@ -2928,6 +3221,7 @@ pub mod kernels {
     /// [`moe_gather_dx_add`] moving one 16-byte quad per access. `dim` must
     /// be a multiple of [`QUAD_LANES`].
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn moe_gather_dx_add_quad(
         expert_input_gradient: &[f32],
         selected_experts: &[u32],
@@ -2985,6 +3279,7 @@ pub mod kernels {
     /// Backward through selected-probability renormalization and router
     /// softmax, including the Switch-style auxiliary loss gradient.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn router_backward(
         probabilities: &[f32],
         selected_experts: &[u32],
@@ -3069,6 +3364,7 @@ pub mod kernels {
     /// `LDS` in the inner loop. Lane-major columns keep every `dx` store a full
     /// coalesced sector, which is what the write-bound tile is paced by.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn router_backward_input(
         dlogits: &[f32],
         weight: &[f32],
@@ -3156,6 +3452,31 @@ pub mod kernels {
     ///
     /// Same contract as [`router_backward_weight_split`], with `x` holding
     /// `tokens * dim / 2` packed words.
+    /// **The one entry point in this module that declares no block**, and the
+    /// measurement is the reason. `.maxntid` is an input to ptxas' heuristics
+    /// and not only the register budget's divisor, and this kernel reads those
+    /// heuristics harder than any other here: the note above is that the
+    /// staged token depot is *supposed* to be a `.local` one, L1-resident, and
+    /// that the registers it saves are what keep the warps hiding the loads
+    /// (#111). Declaring the block moves that balance, and every target a
+    /// 256-thread block has moves it the wrong way.
+    ///
+    /// `backward.router.weight`, same container, against `main`'s derived
+    /// allocation, both passes of `BASELINE_REF=main ./run.sh model profile`:
+    ///
+    /// | declaration | regs | frame | blocks/SM | span |
+    /// |---|---:|---:|---:|---:|
+    /// | none (ships) | 32 | 0 | 8 | — |
+    /// | `(256)` | 93 | 0 | **2** | +52% |
+    /// | `(256, 4)` | 64 | 192 B | 4 | +8.1% / +8.6% |
+    /// | `(256, 6)` | 40 | 408 B | 6 | +126% / +120% |
+    /// | `(256, 8)` | 32 | 480 B | 8 | +189% |
+    ///
+    /// Four targets, four losses, and the two that keep the occupancy are the
+    /// two that pay for it in frame. What #122 buys — a declared block instead
+    /// of one the driver derives — is not worth 8% of this span, and the
+    /// derived 1024 is in no danger of being narrower than the 256 it is
+    /// launched in. Pinned when there is a target that does not cost anything.
     #[kernel]
     pub unsafe fn router_backward_weight_split_bf16(
         x: &[u32],
@@ -3243,6 +3564,7 @@ pub mod kernels {
     /// the wide read is coalesced; the narrow `dweight` update is not, and does
     /// not matter at `D*E` elements.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn router_backward_weight_merge(
         partials: &[f32],
         experts: u32,

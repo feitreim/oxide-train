@@ -12,8 +12,10 @@ use optim::{AdamWConfig, AuxLossSchedule};
 #[path = "../lib.rs"]
 mod model;
 use model::{
-    GEMM_SHARED_BYTES, GEMM_THREADS, GpuDense, GpuDenseAdamW, GpuMoeWorkspace, NORM_THREADS,
-    NORM_TILE_THREADS,
+    CLASSIFIER_THREADS, GEMM_SHARED_BYTES, GEMM_THREADS, GpuDense, GpuDenseAdamW, GpuMoeWorkspace,
+    LOSS_TAIL_THREADS, MOE_ASSIGN_THREADS, MOE_AUX_TERMS_THREADS, MOE_SCATTER_DY_THREADS,
+    MOE_ZERO_BINS_THREADS, NORM_THREADS, NORM_TILE_THREADS, ROUTER_GEMM_THREADS,
+    ROUTER_INPUT_THREADS, ROUTER_WGRAD_THREADS,
 };
 
 const B: usize = 12;
@@ -53,49 +55,84 @@ fn print_vram(label: &str) {
     }
 }
 
-/// What ptxas gave the block-per-row RMSNorm kernels and how many blocks of
-/// one fit on an SM. Fusing raises liveness, and a fused kernel that crosses
-/// an occupancy step can lose despite the traffic it saves, so the numbers
-/// belong beside the timings rather than in a one-off run.
-fn report_norm_kernels(
+/// Every `gpu/ops` kernel the step launches, at the block it is launched in.
+///
+/// Occupancy is the axis these kernels are decided on — #124's reverted
+/// forward lost by halving threads/SM to buy a lane more loads — so the whole
+/// set belongs here rather than the RMSNorm family alone. `maxntid` is the
+/// column #122 is about: a kernel that declares none lets the driver's JIT
+/// *derive* the launchable block from whatever allocation it chose, and a
+/// zero in `blocks/SM` is a launch the driver will refuse outright (`701`).
+///
+/// `threads/SM` is the product, and it is what an A/B on any of these has to
+/// be read against.
+fn report_dense_kernels(
     dense: &model::dense_kernels::LoadedModule,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "rmsnorm kernels (registers/thread, spill bytes, blocks/SM at {NORM_THREADS} threads)"
-    );
-    for name in [
-        "rms_norm_forward_fast_bf16",
-        "rms_norm_forward_residual_bf16",
-        "embedding_forward_norm_bf16",
-        "rms_norm_backward_fused_bf16",
-        "rms_norm_backward_x_fast_bf16",
-        "rms_norm_backward_weight_fast_bf16",
-    ] {
-        let function = dense.as_cuda_module().load_function(name)?;
-        let profile = function_profile(&function)?;
-        let blocks = function.max_active_blocks_per_multiprocessor(NORM_THREADS as u32, 0)?;
-        println!(
-            "  {name:<38} {:>3} regs, {:>4} spill bytes, {blocks} blocks/SM",
-            profile.registers, profile.spill_bytes
-        );
-    }
+    // The block each kernel is launched in, from the `LaunchConfig` its call
+    // site builds. Everything the step launches through `for_num_elems` takes
+    // that helper's 256.
+    const LAUNCHES: &[(&str, u32)] = &[
+        ("rms_norm_forward_fast_bf16", NORM_THREADS as u32),
+        ("rms_norm_forward_residual_bf16", NORM_THREADS as u32),
+        ("embedding_forward_norm_bf16", NORM_THREADS as u32),
+        ("rms_norm_backward_fused_bf16", NORM_THREADS as u32),
+        ("rms_norm_backward_x_fast_bf16", NORM_THREADS as u32),
+        ("rms_norm_backward_weight_fast_bf16", NORM_THREADS as u32),
+        (
+            "rms_norm_backward_fused_tile_bf16",
+            NORM_TILE_THREADS as u32,
+        ),
+        ("embedding_backward_scatter", 256),
+        ("swiglu_forward_interleaved", 256),
+        ("swiglu_forward_interleaved_packed", 256),
+        ("swiglu_backward_interleaved", 256),
+        ("swiglu_backward_interleaved_packed", 256),
+        ("split_group3", 256),
+        ("join_group3_rope", 256),
+        ("join_group3_rope_bf16", 256),
+        ("fused_classifier_forward_bf16", CLASSIFIER_THREADS as u32),
+        (
+            "fused_classifier_backward_in_place_bf16",
+            CLASSIFIER_THREADS as u32,
+        ),
+        ("router_logits_bf16", ROUTER_GEMM_THREADS as u32),
+        ("router_softmax_topk", 256),
+        ("moe_bin_assign_parallel", MOE_ASSIGN_THREADS as u32),
+        ("moe_aux_terms", MOE_AUX_TERMS_THREADS as u32),
+        ("loss_mean_with_aux", LOSS_TAIL_THREADS as u32),
+        ("moe_scatter_packed_quad", 256),
+        ("moe_scatter_packed_wide", 256),
+        ("moe_gather_combine_add_bf16", 256),
+        ("moe_gather_combine_add_quad_packed", 256),
+        ("moe_gather_combine_add_quad_bf16", 256),
+        ("moe_scatter_dy", MOE_SCATTER_DY_THREADS as u32),
+        ("moe_scatter_dy_packed", MOE_SCATTER_DY_THREADS as u32),
+        ("moe_zero_dead_bins", MOE_ZERO_BINS_THREADS as u32),
+        ("moe_zero_dead_bins_bf16", MOE_ZERO_BINS_THREADS as u32),
+        ("moe_gather_dx_add", 256),
+        ("moe_gather_dx_add_quad", 256),
+        ("router_backward", 256),
+        ("router_backward_input", ROUTER_INPUT_THREADS as u32),
+        (
+            "router_backward_weight_split_bf16",
+            ROUTER_WGRAD_THREADS as u32,
+        ),
+        ("router_backward_weight_merge", 256),
+    ];
 
-    // The tile arm launches a narrower block, so its occupancy is a different
-    // question from the block-per-row kernels' above and gets its own header
-    // rather than a misleading column. It is the number the #124 conversion
-    // turns on: 6 blocks of 128 against the block-per-row 4 of 256 is a step
-    // down in threads per SM, which a neutral span has to be read against.
-    println!(
-        "rmsnorm tile kernels (registers/thread, spill bytes, blocks/SM at \
-         {NORM_TILE_THREADS} threads)"
-    );
-    for name in ["rms_norm_backward_fused_tile_bf16"] {
+    println!("gpu/ops kernels (registers/thread, spill bytes, maxntid, blocks/SM, threads/SM)");
+    for &(name, threads) in LAUNCHES {
         let function = dense.as_cuda_module().load_function(name)?;
         let profile = function_profile(&function)?;
-        let blocks = function.max_active_blocks_per_multiprocessor(NORM_TILE_THREADS as u32, 0)?;
+        let blocks = function.max_active_blocks_per_multiprocessor(threads, 0)?;
         println!(
-            "  {name:<38} {:>3} regs, {:>4} spill bytes, {blocks} blocks/SM",
-            profile.registers, profile.spill_bytes
+            "  {name:<39} {:>3} regs, {:>4} spill, maxntid {:>4}, {blocks:>2} x {threads:>4} = \
+             {:>4} threads/SM",
+            profile.registers,
+            profile.spill_bytes,
+            profile.max_threads,
+            blocks * threads,
         );
     }
     Ok(())
@@ -157,7 +194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flash_bf16 = model::Tcgen05Flash::load(&ctx)?;
     let flash = model::flash_kernels::load(&ctx)?;
     let dense = model::dense_kernels::load(&ctx)?;
-    report_norm_kernels(&dense)?;
+    report_dense_kernels(&dense)?;
     report_gemm_kernels(&gemm_bf16)?;
 
     let aux_schedule = AuxLossSchedule::default();
