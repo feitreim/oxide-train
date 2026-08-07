@@ -12,7 +12,7 @@
 use cuda_device::{
     DisjointSlice, SharedArray,
     atomic::{AtomicOrdering, DeviceAtomicF32},
-    cuda_module, kernel, thread,
+    cuda_module, kernel, launch_bounds, thread,
 };
 
 use kittens::global::{GlobalRows, load_cols, load_rows, store_rows};
@@ -73,10 +73,48 @@ pub const ROUTER_GEMM_BM: usize = 32;
 /// Router logits GEMM CTA output columns. `8` matches the routed expert width,
 /// so the skinny expert dimension carries no tile padding.
 pub const ROUTER_GEMM_BN: usize = 8;
-/// Router logits GEMM reduction tile.
+/// Router logits GEMM reduction tile, in the [`reference`] kernel.
 pub const ROUTER_GEMM_BK: usize = 16;
 /// Threads in a router logits GEMM block: one lane per output element.
 pub const ROUTER_GEMM_THREADS: usize = ROUTER_GEMM_BM * ROUTER_GEMM_BN;
+
+/// Reduction tile of the *shipped* router logits GEMM.
+///
+/// This is the only thing that puts more than one `x` load in flight per lane.
+/// A block stages `ROUTER_GEMM_BM * ROUTER_LOGITS_BK` elements between two
+/// barriers, so a lane carries `BM * BK / THREADS` of them at once and the
+/// whole reduction costs `2 * dim / BK` barriers. At the reference's 16 that is
+/// **eight bytes a lane and 384 barriers a block** at the training shape, which
+/// is the whole of why this kernel measured 453 GB/s — 6% of HBM — while
+/// reading nothing but a `[N, D]` stream. 128 is 64 bytes a lane and 48
+/// barriers, and it costs 20.6 KiB of shared memory, which is still eight
+/// blocks an SM.
+pub const ROUTER_LOGITS_BK: usize = 128;
+
+/// Row stride of both router logits GEMM tiles, in `f32`.
+///
+/// The pad is what makes the tile reads conflict-free. A warp spans four token
+/// rows of the `x` tile and all eight expert columns of the weight tile, and
+/// both strides would otherwise be a multiple of the 32 banks — every one of
+/// those rows landing on the same four banks at a different address. One
+/// [`QUAD_LANES`] vector of pad rotates each successive row by four banks, so
+/// the four rows a warp reads cover sixteen distinct banks and the eight
+/// expert columns cover all thirty-two.
+pub const ROUTER_LOGITS_STRIDE: usize = ROUTER_LOGITS_BK + QUAD_LANES;
+
+/// Token rows one staging pass of the router logits GEMM covers.
+///
+/// The staging map is the transpose of the accumulating one: a warp covers one
+/// tile row, so its 32 vector loads are one contiguous 256-byte run of `x`,
+/// where the inner product wants a lane per expert.
+pub const ROUTER_LOGITS_STAGE_ROWS: usize = ROUTER_GEMM_THREADS * QUAD_LANES / ROUTER_LOGITS_BK;
+
+/// Staging passes one block makes over its `x` tile per reduction step.
+pub const ROUTER_LOGITS_STAGES: usize = ROUTER_GEMM_BM / ROUTER_LOGITS_STAGE_ROWS;
+
+/// Staging passes one block makes over its weight tile per reduction step.
+pub const ROUTER_LOGITS_WEIGHT_STAGES: usize =
+    ROUTER_LOGITS_BK * ROUTER_MAX_EXPERTS / ROUTER_GEMM_THREADS;
 
 /// Threads in one router input-backward block.
 pub const ROUTER_INPUT_THREADS: usize = 256;
@@ -1809,110 +1847,140 @@ pub mod kernels {
         }
     }
 
-    /// [`router_gemm_impl`] with a packed-bf16 `A`.
-    ///
-    /// Only the token tile's staging load differs: it widens on the way into
-    /// shared memory, so the inner product and the accumulator are the fp32
-    /// ones the twin uses and the router's own arithmetic is unchanged.
-    #[inline(always)]
-    unsafe fn router_gemm_bf16_impl(
-        m: usize,
-        n: usize,
-        k: usize,
-        a: &[u32],
-        b: &[f32],
-        mut c: DisjointSlice<f32>,
-    ) {
-        static mut TILE_A: SharedArray<f32, { ROUTER_GEMM_BM * ROUTER_GEMM_BK }> =
-            SharedArray::UNINIT;
-        static mut TILE_B: SharedArray<f32, { ROUTER_GEMM_BK * ROUTER_GEMM_BN }> =
-            SharedArray::UNINIT;
-
-        let tid = thread::threadIdx_x() as usize;
-        if thread::blockDim_x() as usize != ROUTER_GEMM_THREADS {
-            return;
-        }
-        let thread_row = tid / ROUTER_GEMM_BN;
-        let thread_col = tid % ROUTER_GEMM_BN;
-        let block_row = thread::blockIdx_y() as usize * ROUTER_GEMM_BM;
-        let block_col = thread::blockIdx_x() as usize * ROUTER_GEMM_BN;
-        let mut accumulator = 0.0f32;
-
-        let mut k_base = 0usize;
-        while k_base < k {
-            let mut local = tid;
-            while local < ROUTER_GEMM_BM * ROUTER_GEMM_BK {
-                let tile_row = local / ROUTER_GEMM_BK;
-                let tile_col = local % ROUTER_GEMM_BK;
-                let global_row = block_row + tile_row;
-                let global_col = k_base + tile_col;
-                unsafe {
-                    TILE_A[tile_row * ROUTER_GEMM_BK + tile_col] =
-                        if global_row < m && global_col < k {
-                            bf16_at(a, global_row * k + global_col)
-                        } else {
-                            0.0
-                        };
-                }
-                local += ROUTER_GEMM_THREADS;
-            }
-
-            local = tid;
-            while local < ROUTER_GEMM_BK * ROUTER_GEMM_BN {
-                let tile_row = local / ROUTER_GEMM_BN;
-                let tile_col = local % ROUTER_GEMM_BN;
-                let global_row = k_base + tile_row;
-                let global_col = block_col + tile_col;
-                unsafe {
-                    TILE_B[tile_row * ROUTER_GEMM_BN + tile_col] =
-                        if global_row < k && global_col < n {
-                            b[global_row * n + global_col]
-                        } else {
-                            0.0
-                        };
-                }
-                local += ROUTER_GEMM_THREADS;
-            }
-            thread::sync_threads();
-
-            let mut inner = 0usize;
-            while inner < ROUTER_GEMM_BK {
-                unsafe {
-                    accumulator += TILE_A[thread_row * ROUTER_GEMM_BK + inner]
-                        * TILE_B[inner * ROUTER_GEMM_BN + thread_col];
-                }
-                inner += 1;
-            }
-            thread::sync_threads();
-            k_base += ROUTER_GEMM_BK;
-        }
-
-        let global_row = block_row + thread_row;
-        let global_col = block_col + thread_col;
-        if global_row < m && global_col < n {
-            unsafe {
-                *c.get_unchecked_mut(global_row * n + global_col) = accumulator;
-            }
-        }
-    }
-
     /// [`router_logits`] over a packed-bf16 token stream. The router weight
     /// and the logits stay fp32: the router is an fp32 parameter by design.
+    ///
+    /// A block owns a `[ROUTER_GEMM_BM, ROUTER_GEMM_BN]` logit tile and a lane
+    /// owns one element of it, which is the only mapping that fills the device:
+    /// the output is `N * E` elements and `E` is 8, so a lane per *token* would
+    /// leave an SM 166 threads and a lane per token pair would need a
+    /// cross-lane reduction of the `dim` axis.
+    ///
+    /// What the reference blocking gets wrong is not that mapping but
+    /// [`ROUTER_LOGITS_BK`]: at 16 a lane stages two `x` elements, waits on a
+    /// barrier, does sixteen FMAs and waits again, 192 times over. Eight bytes
+    /// in flight per lane is what 453 GB/s looks like. Here a lane stages
+    /// sixteen elements as four [`QUAD_LANES`] vectors and the block pays 48
+    /// barriers instead of 384.
+    ///
+    /// Both tiles are staged `f32`: `x` widens once per block on the way in
+    /// rather than once per lane that reads it, and the weight lands
+    /// *transposed*, so a lane's expert column is contiguous and both operands
+    /// of the inner product are one vector load. Neither staging load is
+    /// predicated — the address is clamped and the *value* is selected — so the
+    /// four of them issue back to back instead of down a chain of branches.
     #[kernel]
+    #[launch_bounds(256, 4)]
     pub unsafe fn router_logits_bf16(
         x: &[u32],
         weight: &[f32],
         dim: u32,
         experts: u32,
-        logits: DisjointSlice<f32>,
+        mut logits: DisjointSlice<f32>,
     ) {
+        static mut TILE_X: SharedArray<f32, { ROUTER_GEMM_BM * ROUTER_LOGITS_STRIDE }, 16> =
+            SharedArray::UNINIT;
+        static mut TILE_WEIGHT: SharedArray<
+            f32,
+            { ROUTER_MAX_EXPERTS * ROUTER_LOGITS_STRIDE },
+            16,
+        > = SharedArray::UNINIT;
+
         let d = dim as usize;
         let e = experts as usize;
-        if d == 0 || e == 0 || !(x.len() * 2).is_multiple_of(d) {
+        let tid = thread::threadIdx_x() as usize;
+        // Every bound the walks below rely on, paid once: the tile reads are
+        // whole `QUAD_LANES` vectors, so a partial vector must not exist.
+        if thread::blockDim_x() as usize != ROUTER_GEMM_THREADS
+            || d == 0
+            || e == 0
+            || e > ROUTER_MAX_EXPERTS
+            || !d.is_multiple_of(QUAD_LANES)
+            || !(x.len() * 2).is_multiple_of(d)
+            || d * e > weight.len()
+        {
             return;
         }
         let n = x.len() * 2 / d;
-        unsafe { router_gemm_bf16_impl(n, e, d, x, weight, logits) }
+        let block_row = thread::blockIdx_y() as usize * ROUTER_GEMM_BM;
+        if block_row >= n || n * e > logits.len() {
+            return;
+        }
+
+        let thread_row = tid / ROUTER_GEMM_BN;
+        let thread_col = tid % ROUTER_GEMM_BN;
+        let stage_row = tid / (ROUTER_LOGITS_BK / QUAD_LANES);
+        let stage_column = tid % (ROUTER_LOGITS_BK / QUAD_LANES) * QUAD_LANES;
+        let weight_depth = tid / ROUTER_MAX_EXPERTS;
+        let weight_expert = tid % ROUTER_MAX_EXPERTS;
+
+        let mut accumulator = 0.0f32;
+        let mut base = 0usize;
+        while base < d {
+            let mut stage = 0usize;
+            while stage < ROUTER_LOGITS_STAGES {
+                let tile_row = stage * ROUTER_LOGITS_STAGE_ROWS + stage_row;
+                let row = block_row + tile_row;
+                let column = base + stage_column;
+                let inside = row < n && column < d;
+                let word = if inside { (row * d + column) / 2 } else { 0 };
+                let quad = bf16_quad(unsafe { *(x.as_ptr().add(word) as *const u64) });
+                unsafe {
+                    *((&raw mut TILE_X as *mut f32)
+                        .add(tile_row * ROUTER_LOGITS_STRIDE + stage_column)
+                        as *mut u128) = quad_bits(if inside { quad } else { [0.0; QUAD_LANES] });
+                }
+                stage += 1;
+            }
+
+            let mut stage = 0usize;
+            while stage < ROUTER_LOGITS_WEIGHT_STAGES {
+                let depth = stage * (ROUTER_GEMM_THREADS / ROUTER_MAX_EXPERTS) + weight_depth;
+                let column = base + depth;
+                let inside = column < d && weight_expert < e;
+                let index = if inside {
+                    column * e + weight_expert
+                } else {
+                    0
+                };
+                let value = unsafe { *weight.as_ptr().add(index) };
+                unsafe {
+                    TILE_WEIGHT[weight_expert * ROUTER_LOGITS_STRIDE + depth] =
+                        if inside { value } else { 0.0 };
+                }
+                stage += 1;
+            }
+            thread::sync_threads();
+
+            let mut inner = 0usize;
+            while inner < ROUTER_LOGITS_BK {
+                let xs = quad_lanes(unsafe {
+                    *((&raw const TILE_X as *const f32)
+                        .add(thread_row * ROUTER_LOGITS_STRIDE + inner)
+                        as *const u128)
+                });
+                let ws = quad_lanes(unsafe {
+                    *((&raw const TILE_WEIGHT as *const f32)
+                        .add(thread_col * ROUTER_LOGITS_STRIDE + inner)
+                        as *const u128)
+                });
+                let mut lane = 0usize;
+                while lane < QUAD_LANES {
+                    accumulator += xs[lane] * ws[lane];
+                    lane += 1;
+                }
+                inner += QUAD_LANES;
+            }
+            thread::sync_threads();
+            base += ROUTER_LOGITS_BK;
+        }
+
+        let row = block_row + thread_row;
+        if row < n && thread_col < e {
+            unsafe {
+                *logits.get_unchecked_mut(row * e + thread_col) = accumulator;
+            }
+        }
     }
 
     /// Per-token softmax, deterministic top-k, and selected-probability
