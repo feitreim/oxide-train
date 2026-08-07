@@ -35,8 +35,12 @@
 use cuda_device::debug::globaltimer;
 use cuda_device::{DisjointSlice, cluster, thread};
 
+use cuda_device::tcgen05::{
+    tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_dealloc, tcgen05_dealloc_cg2,
+    tcgen05_relinquish_alloc_permit, tcgen05_relinquish_alloc_permit_cg2,
+};
 use kittens::plan::SharedPlan;
-use kittens::tmem::{alloc_block, alloc_cluster, dealloc_block, dealloc_cluster};
+use kittens::warp_id;
 
 /// `u64`s a CTA reports: its SM, its cluster, and the wall-clock interval it
 /// held that SM for.
@@ -48,6 +52,13 @@ pub const SLOTS: usize = 4;
 /// `columns` against *their own* SM's 512 — so the per-SM charge is the same
 /// either way, and the wider cluster takes the block-scoped form because a
 /// 4-CTA cluster is not a pair.
+///
+/// The count is a **runtime** value here, which `kittens::tmem`'s allocators
+/// stopped taking at ferro-kittens#203 — the whole point of this probe is a
+/// column count the host sweeps, and `bin/residency.rs` runs the four-CTA width
+/// at 256 and again at 128 to separate placement from tensor memory. So the two
+/// allocator bodies are written out below, exactly as ferro's own
+/// `tmem_ladder_runtime` writes `alloc_block`'s out for the same reason.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Columns {
     Pair(u32),
@@ -65,10 +76,27 @@ pub enum Columns {
 pub unsafe fn hold(out: &mut DisjointSlice<u64>, hold_ns: u64, columns: Columns) {
     unsafe {
         let (slot, _) = SharedPlan::attach().tmem_slot();
-        let address = match columns {
-            Columns::Pair(columns) => alloc_cluster(slot, columns),
-            Columns::Block(columns) => alloc_block(slot, columns),
-        };
+        let leader_warp = warp_id() == 0;
+        match columns {
+            Columns::Pair(columns) => {
+                if leader_warp {
+                    tcgen05_alloc_cg2(slot, columns);
+                }
+                thread::sync_threads();
+                cluster::cluster_sync();
+                if leader_warp {
+                    tcgen05_relinquish_alloc_permit_cg2();
+                }
+            }
+            Columns::Block(columns) => {
+                if leader_warp {
+                    tcgen05_alloc(slot, columns);
+                    tcgen05_relinquish_alloc_permit();
+                }
+                thread::sync_threads();
+            }
+        }
+        let address = *(slot as *const u32);
 
         // Entry is read after the allocation, so a CTA that had to *wait* for
         // tensor memory reports the interval it actually owned the SM's
@@ -93,9 +121,15 @@ pub unsafe fn hold(out: &mut DisjointSlice<u64>, hold_ns: u64, columns: Columns)
         match columns {
             Columns::Pair(columns) => {
                 cluster::cluster_sync();
-                dealloc_cluster(address, columns)
+                if leader_warp {
+                    tcgen05_dealloc_cg2(address, columns);
+                }
             }
-            Columns::Block(columns) => dealloc_block(address, columns),
+            Columns::Block(columns) => {
+                if leader_warp {
+                    tcgen05_dealloc(address, columns);
+                }
+            }
         }
     }
 }

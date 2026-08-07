@@ -213,7 +213,7 @@ use cuda_host::cuda_module;
 use kittens::epilogue::{StoreRing, Warp};
 use kittens::global::{GlobalRows, accumulate_shared_rows, store_rows, store_shared_rows};
 use kittens::ldst::{scatter_tile, store_tile_x4};
-use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
+use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline;
 use kittens::plan::SharedPlan;
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B, publish_to_async_proxy};
@@ -238,7 +238,7 @@ const SLOTS: u32 = 2;
 /// never could. It is also the term that pins [`CTAS_PER_SM`], and it agrees
 /// with the six-stage ring rather than fighting it — the two purchases the
 /// halving buys are exactly one CTA's worth of SM apiece.
-const ACCUM_COLS: u32 = SLOTS * BLOCK_N as u32;
+const ACCUM_COLS: usize = SLOTS as usize * BLOCK_N;
 /// One 128-byte swizzle atom of bf16, and the only width
 /// [`SharedTile::k_walk`] accepts — so `BLOCK_K` and [`STAGES`] are a
 /// factorization of the shared budget rather than two free axes.
@@ -352,7 +352,7 @@ const _: () = assert!(
 /// and a held wall interval, where `cuOccupancyMaxActiveClusters` says 74 for
 /// every kernel and every plan and is not a residency oracle.
 const SMS: u32 = 148;
-const CTAS_PER_SM: u32 = 512 / ACCUM_COLS;
+const CTAS_PER_SM: u32 = 512 / ACCUM_COLS as u32;
 pub const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / CLUSTER_RANKS;
 
 /// [`pipeline::grouped`]'s width, swept at this tile shape by ferro-kittens
@@ -898,13 +898,7 @@ impl<D: Drain> Tile<D> {
                     } else {
                         (a.k_walk(), b.k_walk())
                     };
-                    mma_walk_cg2::<Bf16, CHUNKS>(
-                        target.raw(),
-                        a_walk,
-                        b_walk,
-                        MmaShape::M256_N256,
-                        k > 0,
-                    );
+                    mma_walk_cg2::<Bf16, CHUNKS, _, _>(target, a_walk, b_walk, k > 0);
                     commit_multicast_cg2(self.free.sem(stage_index), PAIR);
                     k += 1;
                     stage_index += 1;
@@ -1082,7 +1076,7 @@ pub mod kernels {
                 free: shared.free,
                 a_map,
                 b_map,
-                accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, ACCUM_COLS)),
+                accumulator: Accumulator::from_raw(alloc_cluster::<ACCUM_COLS>(shared.tmem_slot)),
                 stage: run.tile(warp_id() % DRAIN_WARPS as u32),
                 out,
                 tiles_m,
@@ -1111,7 +1105,7 @@ pub mod kernels {
             // and never looped, and what keeps the accumulator's columns alive
             // until the last drain's reads retire.
             tile.retire();
-            dealloc_cluster(tile.accumulator.raw(), ACCUM_COLS);
+            dealloc_cluster::<ACCUM_COLS>(tile.accumulator.raw());
         }
     }
 

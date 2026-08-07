@@ -85,7 +85,7 @@ use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
 use kittens::global::{GlobalRows, load_col_vec, load_row_vec, store_row_vec, store_rows};
 use kittens::ldst::store_tile;
-use kittens::mma::{self, MmaShape, mma_ab, mma_abt};
+use kittens::mma::{self, mma_ab, mma_abt};
 use kittens::pipeline;
 use kittens::plan::SharedPlan;
 use kittens::reg::{
@@ -112,33 +112,6 @@ const HD: usize = 128;
 /// two stacked `TILE` blocks, so an `M128` accumulator's 128 rows are all real.
 /// The 64-query forward that filled half of one is what #68 removed.
 const QUERIES: usize = 2 * TILE;
-
-/// Shape of every score MMA — `S = Q·Kᵀ`, `dP = dY·Vᵀ`, and the key-parallel
-/// kernel's transposed twins. `N` is the streamed tile's `TILE` keys (or
-/// queries), which is 64, and that is the *only* reason it is 64: a `TILE` of
-/// 128 would make it `M128_N128` and cost the tensor core nothing extra.
-///
-/// It is 43% off the tensor core's rate and it is the roof kernel A sits on.
-/// The cadence probe (`src/bin/probe.rs`, issue #94) measures `M128_N64` at
-/// **55.7 ticks per `M128_N64_K16`-equivalent against `M128_N128`'s 32.0**, and
-/// the tile cannot widen: a 128-key visit needs 256 KiB of shared memory
-/// against `MAX_DYNAMIC_SMEM`'s 227, with the second dS slot as the binding
-/// term.
-const SCORE_SHAPE: MmaShape = MmaShape::M128_N64;
-/// Shape of every HD-wide accumulation — the forward's `O = P·V` and all three
-/// gradient MMAs. **One `N = HD` band, not two `N = 64` ones**: an MN-major B
-/// reaches its second stacked subtile through the descriptor's leading offset,
-/// so one instruction per K chunk covers the whole accumulator
-/// (ferro-kittens#194).
-///
-/// Same products in the same K order as the banded form it replaced, so it is
-/// the same sum bit for bit; what changes is that the tensor core runs at
-/// **32.1 ticks per unit instead of 48.2**, 1.50×, on the same cadence probe.
-const OUTPUT_SHAPE: MmaShape = MmaShape::M128_N128;
-const _: () = assert!(
-    OUTPUT_SHAPE.n as usize == HD && SCORE_SHAPE.n as usize == TILE,
-    "both shapes are the operands' own product: the accumulator is HD wide and a score band is one streamed tile"
-);
 
 /// One `[TILE, HD]` bf16 operand panel as a kittens tile — two stacked
 /// SWIZZLE_128B subtiles, the layout described above. Phase 1 of issue #61
@@ -172,10 +145,28 @@ const _: () = assert!(PairedPanel::SUBTILE_BYTES == TILE_BYTES);
 const _: () = assert!(PairedPTile::BYTES == 2 * SUBTILE_BYTES && PairedPTile::SUBTILES == 1);
 
 /// The `S = Q·Kᵀ` (and `dP = dY·Vᵀ`) score accumulator segment. Every kernel
-/// here fills all 128 of its `M128` rows.
+/// here fills all 128 of its `M128` rows, and its `[QUERIES, TILE]` *is* the
+/// `M128_N64` every score MMA issues (ferro-kittens#203 reads the shape off the
+/// accumulator, so no constant states it twice).
+///
+/// `N` is the streamed tile's `TILE` keys (or queries), which is 64, and that is
+/// the *only* reason it is 64: a `TILE` of 128 would make it `M128_N128` and
+/// cost the tensor core nothing extra. It is 43% off the tensor core's rate and
+/// it is the roof kernel A sits on. The cadence probe (`src/bin/probe.rs`, issue
+/// #94) measures `M128_N64` at **55.7 ticks per `M128_N64_K16`-equivalent
+/// against `M128_N128`'s 32.0**, and the tile cannot widen: a 128-key visit
+/// needs 256 KiB of shared memory against `MAX_DYNAMIC_SMEM`'s 227, with the
+/// second dS slot as the binding term.
 type STmem = TmemTile<QUERIES, TILE>;
-/// An HD-wide output/gradient accumulator segment (`O`, `dQ`, `dK`, `dV`) —
-/// two 64-column MMA bands side by side.
+/// An HD-wide output/gradient accumulator segment (`O`, `dQ`, `dK`, `dV`) — the
+/// `M128_N128` of the forward's `O = P·V` and all three gradient MMAs.
+///
+/// **One `N = HD` band, not two `N = 64` ones**: an MN-major B reaches its
+/// second stacked subtile through the descriptor's leading offset, so one
+/// instruction per K chunk covers the whole accumulator (ferro-kittens#194).
+/// Same products in the same K order as the banded form it replaced, so it is
+/// the same sum bit for bit; what changes is that the tensor core runs at
+/// **32.1 ticks per unit instead of 48.2**, 1.50×, on the same cadence probe.
 type AccTmem = TmemTile<QUERIES, HD>;
 
 /// Columns of a warp's score band that one pass of the softmax holds.
@@ -256,15 +247,16 @@ const _: () = assert!(FLASH_FORWARD_BLOCK == 128);
 /// Dynamic shared plan of the forward, as the plan itself computes it.
 pub const FLASH_FORWARD_SMEM: usize = forward_plan(SharedPlan::sizing()).plan.bytes();
 /// Columns of tensor memory the forward allocates: two `[QUERIES, TILE]` score
-/// segments plus the `[QUERIES, HD]` output beside them. `tcgen05.alloc` takes a
-/// power of two in `[32, 512]`, and 256 is exactly the sum.
-pub const FORWARD_TMEM_COLUMNS: u32 = 256;
+/// segments plus the `[QUERIES, HD]` output beside them, which is exactly 256.
+///
+/// `tcgen05.alloc`'s power-of-two-in-`[32, 512]` rule used to be asserted here
+/// too; `alloc_block` takes the count as a `const` parameter and carries that
+/// rule itself now (ferro-kittens#203), leaving this kernel's own half — that
+/// the allocation covers the segments laid out in it.
+pub const FORWARD_TMEM_COLUMNS: usize = 256;
 const _: () = assert!(
-    FORWARD_TMEM_COLUMNS as usize == 2 * TILE + HD
-        && FORWARD_TMEM_COLUMNS.is_power_of_two()
-        && FORWARD_TMEM_COLUMNS >= 32
-        && FORWARD_TMEM_COLUMNS <= 512,
-    "tcgen05.alloc takes a power of two in [32, 512] that covers the scores and the output"
+    FORWARD_TMEM_COLUMNS == 2 * TILE + HD,
+    "the allocation must cover both score segments and the output beside them"
 );
 
 /// Ring depth of each backward kernel's streamed operand — K/V in the
@@ -311,7 +303,11 @@ type Cols = ColVec<SCORE_CHUNK, BaseLdtm>;
 /// power of two, so both round to the same number and both pin an SM to one
 /// CTA. That is why neither plan below is written against a shared-memory
 /// budget the way the forward's is.
-pub const BACKWARD_TMEM_COLUMNS: u32 = 512;
+pub const BACKWARD_TMEM_COLUMNS: usize = 512;
+
+/// The transposed-B operand probe takes the whole allocation: it holds one
+/// score segment and measures nothing, so there is no reason to ask for less.
+const PROBE_TMEM_COLUMNS: usize = 512;
 
 /// The query-parallel backward's shared plan: the resident `[QUERIES, HD]`
 /// query and output-gradient blocks, the streamed K and V rings, the dS ring,
@@ -605,18 +601,18 @@ pub mod kernels {
     // mover in kittens::ldst. Same code, same bits — see their docs for the
     // libdevice discipline they encode.
 
-    /// Issue one `S = Q·Kᵀ` tile from the current leader thread — `M128_N64`,
-    /// eight chained K=16 MMAs walking the two stacked HD subtiles of both
-    /// operands; the caller owns the commit. `AR` is the A operand's row count,
-    /// `QUERIES` for the forward's paired query block and `TILE` for the
-    /// operand probe that only fills half the accumulator on purpose.
+    /// Issue one `S = Q·Kᵀ` tile from the current leader thread — eight chained
+    /// K=16 MMAs walking the two stacked HD subtiles of both operands; the
+    /// caller owns the commit. `AR` is the A operand's row count *and* the
+    /// accumulator's, which since ferro-kittens#203 is one statement: at
+    /// `QUERIES` the walk is the `M128_N64` every kernel here issues.
     #[inline(always)]
     unsafe fn score_mma<const AR: usize>(
-        s_tmem: u32,
+        s_tmem: TmemTile<AR, TILE>,
         q: SharedTile<Bf16, AR, HD, Swizzle128B>,
         k: Panel,
     ) {
-        unsafe { mma_abt(s_tmem, q, k, SCORE_SHAPE, false) }
+        unsafe { mma_abt(s_tmem, q, k, false) }
     }
 
     /// Elementwise `2^x` accuracy oracle for the standalone parity gate.
@@ -684,10 +680,17 @@ pub mod kernels {
 
     /// Validation kernel for the `S = Q·Kᵀ` operand path: one CTA computes
     /// `C[64, 64] = A[64, 64] · B[64, 64]` over the full 128-wide HD (two
-    /// stacked subtiles, K=128) through the real `score_mma` walk and the
-    /// `M128`-over-64-row accumulator, then drains rows 0..63 through the
-    /// decoded (row, column) fragment map. A failure here isolates the
-    /// operand descriptor / fragment map from the softmax and epilogue.
+    /// stacked subtiles, K=128) through the real `score_mma` walk, then drains
+    /// rows 0..63 through the decoded (row, column) fragment map. A failure
+    /// here isolates the operand descriptor / fragment map from the softmax and
+    /// epilogue.
+    ///
+    /// The staged panel is 64 rows and the walk is the shipped `M128` one, so
+    /// A is a [`PairedPanel`] with the panel loaded into *both* of its `TILE`
+    /// halves. Rows 64..127 of the accumulator are the duplicate and nobody
+    /// reads them; what they are not is the 64 rows of whatever followed a
+    /// `Panel` in shared memory, which is what an `M128` over a 64-row operand
+    /// used to read and what ferro-kittens#203 stopped being expressible.
     ///
     /// It is also the harness that settled why `M64_N64` is unusable, which is
     /// why every MMA in this module is `M128`: its shared-memory A operand
@@ -716,8 +719,8 @@ pub mod kernels {
             static mut MMA_BARRIER: Barrier = Barrier::UNINIT;
 
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let a = Panel::from_raw(smem);
-            let b = Panel::from_raw(smem.add(TILE_BYTES));
+            let a = PairedPanel::from_raw(smem);
+            let b = Panel::from_raw(smem.add(PairedPanel::BYTES));
 
             let tid = thread::threadIdx_x();
             let warp_id = warp::warp_id();
@@ -732,18 +735,24 @@ pub mod kernels {
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
-            let tmem = alloc_block(&raw mut TMEM_ADDRESS as *mut u32, 512);
+            let tmem = alloc_block::<PROBE_TMEM_COLUMNS>(&raw mut TMEM_ADDRESS as *mut u32);
             let c_tmem = STmem::from_raw(tmem);
 
             if is_leader {
-                let charge = a.tma_load(a_tma, 0, 0, tma) + b.tma_load(b_tma, 0, 0, tma);
+                // A is the forward's `PairedPanel`, both of whose `TILE` halves
+                // hold the probe's one staged panel: the drain reads the first
+                // half, and the second exists so the `M128` the accumulator
+                // names reads an operand rather than whatever follows it.
+                let charge = a.tma_load_at::<TILE>(a_tma, 0, 0, 0, tma)
+                    + a.tma_load_at::<TILE>(a_tma, TILE, 0, 0, tma)
+                    + b.tma_load(b_tma, 0, 0, tma);
                 tma.expect_tx(charge);
             }
             tma.wait(0);
             thread::sync_threads();
 
             if is_leader {
-                score_mma(c_tmem.raw(), a, b);
+                score_mma(c_tmem, a, b);
                 mma::commit(mma);
             }
             mma.wait(0);
@@ -774,7 +783,7 @@ pub mod kernels {
             }
 
             thread::sync_threads();
-            dealloc_block(tmem, 512);
+            dealloc_block::<PROBE_TMEM_COLUMNS>(tmem);
             if is_leader {
                 tma.inval();
                 mma.inval();
@@ -855,26 +864,23 @@ pub mod kernels {
         /// segment, and publish both on one arrival: the register pass reads
         /// them together and there is nothing it could do with one alone.
         ///
-        /// `SCORE_SHAPE`'s `N` is the streamed panel's `TILE` rows read
-        /// transposed — the one descriptor field no operand can supply. It is
-        /// also this kernel's roof: 64 is the width the tensor core is 43% off
-        /// its rate at, and the tile cannot widen (issue #94, and `probe`'s
+        /// [`STmem`]'s `N` is the streamed panel's `TILE` rows read transposed,
+        /// and it is this kernel's roof: 64 is the width the tensor core is 43%
+        /// off its rate at, and the tile cannot widen (issue #94, and `probe`'s
         /// cadence table is the measurement).
         #[inline(always)]
         unsafe fn score_mmas(&self, key_tile: u32) {
             unsafe {
                 mma_abt(
-                    self.buffer(self.scores, key_tile).raw(),
+                    self.buffer(self.scores, key_tile),
                     self.shared.q,
                     self.shared.k.tile(key_tile),
-                    SCORE_SHAPE,
                     false,
                 );
                 mma_abt(
-                    self.buffer(self.gradients, key_tile).raw(),
+                    self.buffer(self.gradients, key_tile),
                     self.shared.dy,
                     self.shared.v.tile(key_tile),
-                    SCORE_SHAPE,
                     false,
                 );
                 mma::commit(self.shared.scored.sem(key_tile));
@@ -1062,10 +1068,9 @@ pub mod kernels {
                         if lane == 0 {
                             tcgen05_fence_after_thread_sync();
                             mma_ab(
-                                self.accumulator.raw(),
+                                self.accumulator,
                                 self.shared.ds.tile(key_tile),
                                 self.shared.k.tile(key_tile),
-                                OUTPUT_SHAPE,
                                 key_tile != 0,
                             );
                             mma::commit(self.shared.accumulated.sem(key_tile));
@@ -1218,7 +1223,7 @@ pub mod kernels {
                 return;
             }
             let shared = backward_q_plan(SharedPlan::attach());
-            let tmem = alloc_block(shared.tmem_slot, BACKWARD_TMEM_COLUMNS);
+            let tmem = alloc_block::<BACKWARD_TMEM_COLUMNS>(shared.tmem_slot);
             // Two score segments at columns 0..128, two dP segments at
             // 128..256, the 128-column dQ accumulator at 256.
             let scores = STmem::from_raw(tmem);
@@ -1261,7 +1266,7 @@ pub mod kernels {
             job.drain(warp_lanes(), warp::warp_id() / DRAIN_WARPS, warp::lane_id());
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
+            dealloc_block::<BACKWARD_TMEM_COLUMNS>(tmem);
         }
     }
 
@@ -1474,17 +1479,15 @@ pub mod kernels {
         unsafe fn score_mmas(&self, step: u32) {
             unsafe {
                 mma_abt(
-                    self.buffer(self.scores, step).raw(),
+                    self.buffer(self.scores, step),
                     self.shared.k,
                     self.shared.q.tile(step),
-                    SCORE_SHAPE,
                     false,
                 );
                 mma_abt(
-                    self.buffer(self.gradients, step).raw(),
+                    self.buffer(self.gradients, step),
                     self.shared.v,
                     self.shared.dy.tile(step),
-                    SCORE_SHAPE,
                     false,
                 );
                 mma::commit(self.shared.scored.sem(step));
@@ -1600,17 +1603,15 @@ pub mod kernels {
                             tcgen05_fence_after_thread_sync();
                             let accumulate = step != 0;
                             mma_ab(
-                                self.dv_acc.raw(),
+                                self.dv_acc,
                                 self.shared.p.tile(step),
                                 self.shared.dy.tile(step),
-                                OUTPUT_SHAPE,
                                 accumulate,
                             );
                             mma_ab(
-                                self.dk_acc.raw(),
+                                self.dk_acc,
                                 self.shared.ds.tile(step),
                                 self.shared.q.tile(step),
-                                OUTPUT_SHAPE,
                                 accumulate,
                             );
                             mma::commit(self.shared.accumulated.sem(step));
@@ -1753,7 +1754,7 @@ pub mod kernels {
                 return;
             }
             let shared = backward_kv_plan(SharedPlan::attach());
-            let tmem = alloc_block(shared.tmem_slot, BACKWARD_TMEM_COLUMNS);
+            let tmem = alloc_block::<BACKWARD_TMEM_COLUMNS>(shared.tmem_slot);
             // Two `Sᵀ` segments at 0..128, two `dPᵀ` at 128..256, then the two
             // 128-column gradient accumulators — all 512 columns.
             let scores = STmem::from_raw(tmem);
@@ -1798,7 +1799,7 @@ pub mod kernels {
             job.drain(warp_lanes(), warp::warp_id() / DRAIN_WARPS, warp::lane_id());
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
+            dealloc_block::<BACKWARD_TMEM_COLUMNS>(tmem);
         }
     }
 
@@ -1951,11 +1952,7 @@ pub mod kernels {
                     // waits for them.
                     self.shared.q_loaded.wait(0);
                     self.shared.kv_loaded.wait(0);
-                    score_mma(
-                        self.score_segment(0).raw(),
-                        self.shared.q,
-                        self.shared.k.tile(0),
-                    );
+                    score_mma(self.score_segment(0), self.shared.q, self.shared.k.tile(0));
                     mma::commit(self.shared.scored.sem(0));
                 }
 
@@ -1986,7 +1983,7 @@ pub mod kernels {
                         if key_tile + 1 < key_tiles {
                             self.shared.kv_loaded.wait(key_tile + 1);
                             score_mma(
-                                self.score_segment(key_tile + 1).raw(),
+                                self.score_segment(key_tile + 1),
                                 self.shared.q,
                                 self.shared.k.tile(key_tile + 1),
                             );
@@ -2113,10 +2110,9 @@ pub mod kernels {
                     if leader {
                         tcgen05_fence_after_thread_sync();
                         mma_ab(
-                            self.accumulator.raw(),
+                            self.accumulator,
                             self.shared.p.tile(key_tile),
                             self.shared.v.tile(key_tile),
-                            OUTPUT_SHAPE,
                             key_tile != 0,
                         );
                         mma::commit(self.shared.accumulated.sem(key_tile));
@@ -2212,7 +2208,7 @@ pub mod kernels {
                 return;
             }
             let shared = forward_plan(SharedPlan::attach());
-            let tmem = alloc_block(shared.tmem_slot, FORWARD_TMEM_COLUMNS);
+            let tmem = alloc_block::<FORWARD_TMEM_COLUMNS>(shared.tmem_slot);
             // Two `[QUERIES, TILE]` score segments, then the `[QUERIES, HD]`
             // output beside them: 64 + 64 + 128 of the 256 columns.
             let scores = STmem::from_raw(tmem);
@@ -2239,7 +2235,7 @@ pub mod kernels {
                 corrections: &mut correction_counts,
             };
             pipeline::run(&mut job, tiles * planes);
-            dealloc_block(tmem, FORWARD_TMEM_COLUMNS);
+            dealloc_block::<FORWARD_TMEM_COLUMNS>(tmem);
         }
     }
 }
