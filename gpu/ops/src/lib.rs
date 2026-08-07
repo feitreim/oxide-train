@@ -312,6 +312,29 @@ type SwigluChunk = RegTile<SWIGLU_TILE_ROWS, SWIGLU_TILE_CHUNK, BaseLdtm>;
 /// compare the ones below against.
 pub mod reference;
 
+/// Resident blocks an SM every entry point below declares, beside its block
+/// width, in `#[launch_bounds]`.
+///
+/// The block width is #122's fix: an entry point that declares no `.maxntid`
+/// lets the driver's JIT *derive* the launchable block from whatever
+/// allocation it chose, and a derived block narrower than the launch is a
+/// `701` rather than a slow kernel. Every kernel here derived **1024**, which
+/// is safe today only by accident.
+///
+/// The second number is not optional, and that is what pass two measured. A
+/// declared `.maxntid` is an input to ptxas' heuristics and not only the
+/// register budget's divisor: at a bare `#[launch_bounds(256)]` the budget goes
+/// from the derived 1024's 64 registers to 255, and the allocator spends it —
+/// `router_backward_weight_split_bf16` went 32 registers and 8 resident blocks
+/// to **93 and 2**, and its span with it. So the count that ships is the one
+/// that hands ptxas back the budget the derived `.maxntid` gave it,
+/// `65536 / (threads * 64)`: 4 for a 256-thread block, 1 for 1024, 6 for the
+/// 128-thread tile norm. Every kernel keeps its unpinned allocation under it,
+/// with one exception that carries its own target and its own note.
+///
+/// Tighter is not better either: `(256, 8)` caps the budget at the 32 registers
+/// three of these kernels already used, and all three still acquired a local
+/// frame — the harder unrolling a declared 256 buys has to go somewhere.
 #[cuda_module]
 pub mod kernels {
     use super::*;
