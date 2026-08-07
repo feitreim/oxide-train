@@ -330,7 +330,9 @@ pub mod reference;
 /// that hands ptxas back the budget the derived `.maxntid` gave it,
 /// `65536 / (threads * 64)`: 4 for a 256-thread block, 1 for 1024, 6 for the
 /// 128-thread tile norm. Every kernel keeps its unpinned allocation under it,
-/// with one exception that carries its own target and its own note.
+/// with one exception: `router_backward_weight_split_bf16` loses at every
+/// target a 256-thread block has, and its own note carries the four
+/// measurements that say so.
 ///
 /// Tighter is not better either: `(256, 8)` caps the budget at the 32 registers
 /// three of these kernels already used, and all three still acquired a local
@@ -3450,27 +3452,32 @@ pub mod kernels {
     ///
     /// Same contract as [`router_backward_weight_split`], with `x` holding
     /// `tokens * dim / 2` packed words.
-    /// The one entry point in this module whose resident-block target is not
-    /// the module's 4. Declaring `.maxntid` at all moves this kernel: the
-    /// budget a *derived* 1024 gave it was 64 registers and ptxas took 32,
-    /// and the same 64-register budget under a declared 256 makes it take all
-    /// 64 — `.maxntid` is an input to the allocator's heuristics and not only
-    /// a divisor. Measured at the three targets a 256-thread block has, same
-    /// container, against `main`'s derived allocation:
+    /// **The one entry point in this module that declares no block**, and the
+    /// measurement is the reason. `.maxntid` is an input to ptxas' heuristics
+    /// and not only the register budget's divisor, and this kernel reads those
+    /// heuristics harder than any other here: the note above is that the
+    /// staged token depot is *supposed* to be a `.local` one, L1-resident, and
+    /// that the registers it saves are what keep the warps hiding the loads
+    /// (#111). Declaring the block moves that balance, and every target a
+    /// 256-thread block has moves it the wrong way.
     ///
-    /// | target | regs | frame | blocks/SM | `backward.router.weight` |
+    /// `backward.router.weight`, same container, against `main`'s derived
+    /// allocation, both passes of `BASELINE_REF=main ./run.sh model profile`:
+    ///
+    /// | declaration | regs | frame | blocks/SM | span |
     /// |---|---:|---:|---:|---:|
-    /// | derived (`main`) | 32 | 0 | 8 | — |
-    /// | `(256, 4)` | 64 | 192 B | 4 | **+8.6%** |
-    /// | `(256, 8)` | 32 | 480 B | 8 | **+189%** |
-    /// | `(256, 6)` | see the gate's report | | | ships |
+    /// | none (ships) | 32 | 0 | 8 | — |
+    /// | `(256)` | 93 | 0 | **2** | +52% |
+    /// | `(256, 4)` | 64 | 192 B | 4 | +8.1% / +8.6% |
+    /// | `(256, 6)` | 40 | 408 B | 6 | +126% / +120% |
+    /// | `(256, 8)` | 32 | 480 B | 8 | +189% |
     ///
-    /// 8 is the shape the doc above describes going wrong: capped at 32 the
-    /// allocator has to put the staged token depot in the frame *and* keep the
-    /// unrolling that a declared 256 bought it, which is the one arrangement
-    /// #111 measured as the slow one.
+    /// Four targets, four losses, and the two that keep the occupancy are the
+    /// two that pay for it in frame. What #122 buys — a declared block instead
+    /// of one the driver derives — is not worth 8% of this span, and the
+    /// derived 1024 is in no danger of being narrower than the 256 it is
+    /// launched in. Pinned when there is a target that does not cost anything.
     #[kernel]
-    #[launch_bounds(256, 6)]
     pub unsafe fn router_backward_weight_split_bf16(
         x: &[u32],
         dlogits: &[f32],
