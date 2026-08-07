@@ -2719,10 +2719,12 @@ impl<const D: usize> GpuRmsNorm<D> {
     /// its scale and the weight product all stay fp32 in registers, so the
     /// only rounding is the one store.
     ///
-    /// The tile arm is taken wherever the shape divides it; the block-per-row
-    /// kernel is what anything else takes. `rms_norm_forward_fast_bf16` used to
-    /// argue there was nothing to gain at this dtype — see the tile kernel's own
-    /// note for the arithmetic that says otherwise.
+    /// There is no tile arm at this dtype, and #124 measured why rather than
+    /// arguing it: a warp-per-band forward is **+7.8% same-container and +13.8%
+    /// across containers** on this span. The band buys loads in flight, and this
+    /// kernel was not short of them — at 24 registers it holds 8 blocks of 256
+    /// on an SM where the tile holds 8 of 128, so the rewrite halves the threads
+    /// hiding the latency to buy a lane more of it.
     ///
     /// `YROWS` lets the output be taller than the input: the final norm writes
     /// the lm head's `[NP, D]` operand, whose padded tail rows were zeroed at
@@ -2738,29 +2740,17 @@ impl<const D: usize> GpuRmsNorm<D> {
     ) -> Result<(), DriverError> {
         assert!(YROWS >= N, "a norm cannot write fewer rows than it reads");
         // SAFETY: the launch covers N rows of D columns, which both packed
-        // buffers hold, and the tile arm is only taken at a shape
-        // `norm_tiles` accepted.
+        // buffers hold.
         profiler.measure(stream, name, || unsafe {
-            match norm_tiles(N, D, dense_device::NORM_TILE_CHUNK) {
-                Some(tiles) => kernels.rms_norm_forward_tile_bf16(
-                    stream,
-                    tiles,
-                    x.as_device_buffer(),
-                    self.w.as_device_buffer(),
-                    self.eps,
-                    D as u32,
-                    y.as_device_buffer_mut(),
-                ),
-                None => kernels.rms_norm_forward_fast_bf16(
-                    stream,
-                    norm_config::<N>(),
-                    x.as_device_buffer(),
-                    self.w.as_device_buffer(),
-                    self.eps,
-                    D as u32,
-                    y.as_device_buffer_mut(),
-                ),
-            }
+            kernels.rms_norm_forward_fast_bf16(
+                stream,
+                norm_config::<N>(),
+                x.as_device_buffer(),
+                self.w.as_device_buffer(),
+                self.eps,
+                D as u32,
+                y.as_device_buffer_mut(),
+            )
         })
     }
 

@@ -433,65 +433,6 @@ pub mod kernels {
         }
     }
 
-    /// [`rms_norm_forward_fast_bf16`] on kittens register tiles.
-    ///
-    /// The bf16 twin of `reference::kernels::rms_norm_forward_tile`, which
-    /// measured 1.246x of the block-per-row kernel over the same buffers in
-    /// fp32. [`rms_norm_forward_fast_bf16`]'s own note argued this dtype had
-    /// nothing to gain — that packing the stream already doubles the elements a
-    /// lane carries — and the arithmetic does not support it: at `dim` 3072 the
-    /// block-per-row lane holds 6 words, twelve elements, and a
-    /// `[16, NORM_TILE_CHUNK]` band gives it 32. Loads in flight was the whole
-    /// of what that kernel was short of, and packing recovers a sixth of the
-    /// gap rather than closing it.
-    ///
-    /// # Safety
-    ///
-    /// As `reference::kernels::rms_norm_forward_tile`: [`NORM_TILE_THREADS`]
-    /// threads over exactly `rows / NORM_TILE_BLOCK_ROWS` blocks, `rows` a
-    /// multiple of [`NORM_TILE_BLOCK_ROWS`] and `dim` of [`NORM_TILE_CHUNK`],
-    /// both checked by the launcher because this kernel never bounds-checks.
-    #[kernel]
-    pub unsafe fn rms_norm_forward_tile_bf16(
-        x: &[u32],
-        weight: &[f32],
-        eps: f32,
-        dim: u32,
-        mut y: DisjointSlice<u32>,
-    ) {
-        unsafe {
-            let lane = lane();
-            let row = NORM_TILE_BLOCK_ROWS as u32 * thread::blockIdx_x()
-                + NORM_TILE_ROWS as u32 * warp_id();
-            let d = dim as usize;
-            // Both streams are packed pairs; the cursor names the bf16 element
-            // and the pair is the access the mover already makes of it.
-            let source = GlobalRows::<Bf16>::from_raw(x.as_ptr() as *mut u8, d);
-            let destination = GlobalRows::<Bf16>::from_raw(y.as_mut_ptr() as *mut u8, d);
-            let parameters = GlobalRows::<F32>::from_raw(weight.as_ptr() as *mut u8, 0);
-
-            let mut total = NormRows::splat(0.0);
-            let mut column = 0u32;
-            while column < dim {
-                let v: NormChunk = load_rows(source, row, column, lane);
-                total.add_assign(v.mul(v).row_sum());
-                column += NORM_TILE_CHUNK as u32;
-            }
-            let inv = total.scale(1.0 / dim as f32).shift(eps).rsqrt();
-
-            column = 0;
-            while column < dim {
-                let v: NormChunk = load_rows(source, row, column, lane);
-                let w: NormColumns = load_cols(parameters, 0, column, lane);
-                // The scale and the weight product stay fp32 and the store is
-                // the only rounding, exactly as the block-per-row kernel's
-                // `bf16_pair` was.
-                store_rows(destination, row, column, lane, v.mul_row(inv).mul_col(w));
-                column += NORM_TILE_CHUNK as u32;
-            }
-        }
-    }
-
     /// [`rms_norm_backward_x_fast`] reading its saved input packed.
     ///
     /// Only `x` changes dtype: the incoming and outgoing gradients are
