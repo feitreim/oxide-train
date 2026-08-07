@@ -92,12 +92,20 @@ invocations may land on different GPUs or clock states and do **not** satisfy
 the same-container measurement gate in `SPEC.md`.
 
 A throughput claim is quoted from `bin/train`, not from the profile, and gets
-its pair from `modal run modal_app.py::train_ab --ref <pushed-branch>`: two
-worktrees of two pushed refs (`--baseline-ref`, default `main`), each built
+its pair from `modal run --detach modal_app.py::train_ab --ref <pushed-branch>`:
+two worktrees of two pushed refs (`--baseline-ref`, default `main`), each built
 once and then alternated for `--rounds` rounds in one container, reporting
 tokens/s and MFU per run plus each arm's mean and spread.
 
-The external pair is `modal run modal_app.py::versus --ref main --batch 32`,
+**Run the two long entrypoints detached.** Without `--detach` the container
+lives only as long as the local `modal run` client: when the client dies or
+disconnects, Modal cancels the input and stops the app wherever it had got to,
+and the log ends with a banner and nothing under it. That is not a hang in the
+arm that was running, and re-running it is not the remedy -- `--detach` is.
+`modal app logs <app-id>` re-attaches to a detached run, and
+`--show-timestamps` puts a clock on every line.
+
+The external pair is `modal run --detach modal_app.py::versus --ref main --batch 32`,
 which alternates `bin/train` against the PyTorch baseline of
 `gpu/model/baselines/pytorch_baseline.py` the same way. It runs on `ab_image`
 -- the kernel toolchain plus torch, the only image that can hold both -- and
