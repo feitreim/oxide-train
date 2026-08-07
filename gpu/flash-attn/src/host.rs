@@ -20,8 +20,9 @@ pub const FLASH_HD: usize = 128;
 pub const FLASH_SUBTILE_HD: usize = 64;
 /// Bytes of one full-width `[TILE, HD]` bf16 panel (two stacked subtiles).
 const TILE_BYTES: usize = FLASH_TILE * FLASH_HD * 2;
-/// Dynamic shared bytes of the score_mma probe: A panel plus B panel.
-pub const PROBE_DYNAMIC_SMEM_BYTES: u32 = (2 * TILE_BYTES) as u32;
+/// Dynamic shared bytes of the score_mma probe: the paired `[QUERIES, HD]` A
+/// operand the `M128` accumulator names, plus the B panel.
+pub const PROBE_DYNAMIC_SMEM_BYTES: u32 = (3 * TILE_BYTES) as u32;
 /// Dynamic shared bytes of the MMA cadence probe: its `[128, HD]` A panel and
 /// the `[256, HD]` B panel the three widths are read out of.
 pub const CADENCE_SMEM_BYTES: u32 = super::tcgen05::phase_probe::CADENCE_SMEM as u32;

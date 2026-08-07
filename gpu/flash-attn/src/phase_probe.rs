@@ -66,7 +66,7 @@ use cuda_device::tcgen05::{
 };
 use kittens::global::{GlobalRows, load_col_vec, load_row_vec, store_rows};
 use kittens::ldst::store_tile;
-use kittens::mma::{self, mma_ab, mma_abt};
+use kittens::mma::{self, MmaShape, mma_ab, mma_abt};
 use kittens::pipeline;
 use kittens::plan::SharedPlan;
 use kittens::reg::Exp2Hw;
@@ -372,17 +372,15 @@ impl BackwardQProbe {
     unsafe fn score_mmas(&self, key_tile: u32) {
         unsafe {
             mma_abt(
-                self.buffer(self.scores, key_tile).raw(),
+                self.buffer(self.scores, key_tile),
                 self.shared.q,
                 self.shared.k.tile(key_tile),
-                SCORE_SHAPE,
                 false,
             );
             mma_abt(
-                self.buffer(self.gradients, key_tile).raw(),
+                self.buffer(self.gradients, key_tile),
                 self.shared.dy,
                 self.shared.v.tile(key_tile),
-                SCORE_SHAPE,
                 false,
             );
             mma::commit(self.shared.scored.sem(key_tile));
@@ -509,10 +507,9 @@ impl pipeline::Job for BackwardQProbe {
                     if lane == 0 {
                         tcgen05_fence_after_thread_sync();
                         mma_ab(
-                            self.accumulator.raw(),
+                            self.accumulator,
                             self.shared.ds.tile(key_tile),
                             self.shared.k.tile(key_tile),
-                            OUTPUT_SHAPE,
                             key_tile != 0,
                         );
                         mma::commit(self.shared.accumulated.sem(key_tile));
@@ -642,7 +639,7 @@ pub unsafe fn backward_q(
             return;
         }
         let shared = backward_q_plan(SharedPlan::attach());
-        let tmem = alloc_block(shared.tmem_slot, BACKWARD_TMEM_COLUMNS);
+        let tmem = alloc_block::<BACKWARD_TMEM_COLUMNS>(shared.tmem_slot);
         let scores = STmem::from_raw(tmem);
         let gradients = STmem::from_raw(tmem + 2 * TILE as u32);
         let accumulator = AccTmem::from_raw(tmem + 4 * TILE as u32);
@@ -686,7 +683,7 @@ pub unsafe fn backward_q(
         report(clocks, &job.sums, span, job.warp_id, job.lane);
         tcgen05_fence_before_thread_sync();
         thread::sync_threads();
-        dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
+        dealloc_block::<BACKWARD_TMEM_COLUMNS>(tmem);
     }
 }
 
@@ -777,17 +774,15 @@ impl BackwardKvProbe {
     unsafe fn score_mmas(&self, step: u32) {
         unsafe {
             mma_abt(
-                self.buffer(self.scores, step).raw(),
+                self.buffer(self.scores, step),
                 self.shared.k,
                 self.shared.q.tile(step),
-                SCORE_SHAPE,
                 false,
             );
             mma_abt(
-                self.buffer(self.gradients, step).raw(),
+                self.buffer(self.gradients, step),
                 self.shared.v,
                 self.shared.dy.tile(step),
-                SCORE_SHAPE,
                 false,
             );
             mma::commit(self.shared.scored.sem(step));
@@ -912,17 +907,15 @@ impl pipeline::Job for BackwardKvProbe {
                         tcgen05_fence_after_thread_sync();
                         let accumulate = step != 0;
                         mma_ab(
-                            self.dv_acc.raw(),
+                            self.dv_acc,
                             self.shared.p.tile(step),
                             self.shared.dy.tile(step),
-                            OUTPUT_SHAPE,
                             accumulate,
                         );
                         mma_ab(
-                            self.dk_acc.raw(),
+                            self.dk_acc,
                             self.shared.ds.tile(step),
                             self.shared.q.tile(step),
-                            OUTPUT_SHAPE,
                             accumulate,
                         );
                         mma::commit(self.shared.accumulated.sem(step));
@@ -1069,7 +1062,7 @@ pub unsafe fn backward_kv(
             return;
         }
         let shared = backward_kv_plan(SharedPlan::attach());
-        let tmem = alloc_block(shared.tmem_slot, BACKWARD_TMEM_COLUMNS);
+        let tmem = alloc_block::<BACKWARD_TMEM_COLUMNS>(shared.tmem_slot);
         let scores = STmem::from_raw(tmem);
         let gradients = STmem::from_raw(tmem + 2 * TILE as u32);
         let dv_acc = AccTmem::from_raw(tmem + 4 * TILE as u32);
@@ -1116,7 +1109,7 @@ pub unsafe fn backward_kv(
         report(clocks, &job.sums, span, job.warp_id, job.lane);
         tcgen05_fence_before_thread_sync();
         thread::sync_threads();
-        dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
+        dealloc_block::<BACKWARD_TMEM_COLUMNS>(tmem);
     }
 }
 
@@ -1196,12 +1189,14 @@ pub const CADENCE_SMEM: usize = QUERIES * HD * 2 + 256 * HD * 2 + 1024;
 ///
 /// Kept here, and only here, because the cadence table's point is the
 /// *comparison* — the shipped walk is the wide one now, and a table with one
-/// row is not a measurement of anything.
+/// row is not a measurement of anything. It is also the one MMA in this tree
+/// that still names its own `MmaShape`: a band is not the accumulator, which is
+/// exactly what ferro-kittens#203 stopped a typed walk from being able to say.
 ///
 /// # Safety
 ///
-/// As `kittens::mma::mma_ab`, plus: `shape` is `M128_N64` and `tmem` owns
-/// `64 * B::SUBTILES` fp32 columns.
+/// As `kittens::mma::mma_ab`, plus: `tmem` owns `64 * B::SUBTILES` fp32
+/// columns, of which each band writes its own 64.
 #[inline(always)]
 unsafe fn gradient_mma_banded<const AR: usize, const K: usize, const N: usize>(
     tmem: u32,
@@ -1305,7 +1300,7 @@ pub unsafe fn mma_cadence(rounds: u32, clocks: &mut DisjointSlice<u64>) {
             i += 32;
         }
 
-        let tmem = alloc_block(tmem_slot, BACKWARD_TMEM_COLUMNS);
+        let tmem = alloc_block::<BACKWARD_TMEM_COLUMNS>(tmem_slot);
         if thread::threadIdx_x() == 0 {
             sem.init_all(1);
         }
@@ -1318,33 +1313,16 @@ pub unsafe fn mma_cadence(rounds: u32, clocks: &mut DisjointSlice<u64>) {
             // and the accumulator band move.
             let b64 = SharedTile::<Bf16, TILE, HD, Swizzle128B>::from_raw(b.base());
             let b128 = SharedTile::<Bf16, QUERIES, HD, Swizzle128B>::from_raw(b.base());
-            time_walk!(
-                clocks,
-                0,
-                8,
-                rounds,
-                sem,
-                0,
-                mma_abt(tmem, a, b64, MmaShape::M128_N64, true)
-            );
-            time_walk!(
-                clocks,
-                1,
-                8,
-                rounds,
-                sem,
-                2,
-                mma_abt(tmem, a, b128, MmaShape::M128_N128, true)
-            );
-            time_walk!(
-                clocks,
-                2,
-                8,
-                rounds,
-                sem,
-                4,
-                mma_abt(tmem, a, b, MmaShape::M128_N256, true)
-            );
+            // The three accumulator bands are the three shapes: `mma_abt`
+            // reads `M128_N{64,128,256}` off `[QUERIES, N]` (ferro-kittens#203)
+            // where the walk used to be handed one. Same base — the variants
+            // are timed one after another and nothing reads what they wrote.
+            let acc64 = STmem::from_raw(tmem);
+            let acc128 = AccTmem::from_raw(tmem);
+            let acc256 = TmemTile::<QUERIES, 256>::from_raw(tmem);
+            time_walk!(clocks, 0, 8, rounds, sem, 0, mma_abt(acc64, a, b64, true));
+            time_walk!(clocks, 1, 8, rounds, sem, 2, mma_abt(acc128, a, b128, true));
+            time_walk!(clocks, 2, 8, rounds, sem, 4, mma_abt(acc256, a, b, true));
 
             // The gradient MMA's shape both ways — `[QUERIES, TILE]` dS
             // against a `[TILE, HD]` K panel — as two `N = 64` bands and as
@@ -1361,20 +1339,12 @@ pub unsafe fn mma_cadence(rounds: u32, clocks: &mut DisjointSlice<u64>) {
                 6,
                 gradient_mma_banded(tmem, ds, k, true)
             );
-            time_walk!(
-                clocks,
-                4,
-                4,
-                rounds,
-                sem,
-                8,
-                mma_ab(tmem, ds, k, MmaShape::M128_N128, true)
-            );
+            time_walk!(clocks, 4, 4, rounds, sem, 8, mma_ab(acc128, ds, k, true));
         }
 
         tcgen05_fence_before_thread_sync();
         thread::sync_threads();
-        dealloc_block(tmem, BACKWARD_TMEM_COLUMNS);
+        dealloc_block::<BACKWARD_TMEM_COLUMNS>(tmem);
         if thread::threadIdx_x() == 0 {
             sem.inval_all();
         }
