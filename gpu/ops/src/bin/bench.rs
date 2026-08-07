@@ -23,8 +23,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 mod device;
 use device::reference::kernels as reference_kernels;
 use device::{
-    CLASSIFIER_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_THREADS,
-    SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_THREADS, kernels, rope_table,
+    CLASSIFIER_THREADS, MOE_ASSIGN_THREADS, NORM_THREADS, NORM_TILE_BLOCK_ROWS, NORM_TILE_THREADS,
+    SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU_TILE_THREADS, kernels, rope_table,
 };
 
 /// Rows the norms are timed at — the training config's `B * T`.
@@ -102,7 +102,216 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bench_rms_norm(&stream, &reference)?;
     bench_classifier(&stream, &module)?;
     bench_swiglu(&stream, &reference)?;
+    bench_swiglu_interleaved(&stream, &module)?;
     bench_rope(&stream, &module)?;
+    bench_moe_bin_assign(&stream, &module, &reference)?;
+    Ok(())
+}
+
+/// The interleaved packed-bf16 SwiGLU pair — the arm the MoE expert path
+/// takes — scalar against tiles.
+///
+/// This is the row #70 recorded as 0.70x and left there, on a tile arm that
+/// predates ferro-kittens#180's unrolled mover walks. The scalar kernel's
+/// accesses are already the ideal *shape*, so what a tile changes here is one
+/// number: bytes outstanding per thread, 16 to 64 in the forward and 24 to 192
+/// in the backward. If that does not move the row, nothing about `exp` was
+/// going to.
+fn bench_swiglu_interleaved(
+    stream: &std::sync::Arc<CudaStream>,
+    module: &kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let len = N * FF;
+    let panel = DeviceBuffer::<u32>::zeroed(stream, len)?;
+    let dy = DeviceBuffer::from_host(stream, &uniform_vec(len, 9))?;
+    let mut y = DeviceBuffer::<u32>::zeroed(stream, len / 2)?;
+    let mut d_panel = DeviceBuffer::<u32>::zeroed(stream, len)?;
+
+    let flat = LaunchConfig::for_num_elems((len / 4) as u32);
+    let tiles = LaunchConfig {
+        grid_dim: (
+            (N / SWIGLU_TILE_BLOCK_ROWS) as u32,
+            (FF / SWIGLU_TILE_CHUNK) as u32,
+            1,
+        ),
+        block_dim: (SWIGLU_TILE_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // SAFETY (all four): the panel is N x 2FF bf16 in `len` words, `y` is
+    // N x FF bf16, `dy` is N x FF fp32, and every launch covers exactly that
+    // rectangle at the geometry its kernel documents.
+    let forward = time_gpu_iters(stream, WARMUP, ITERS, || {
+        unsafe {
+            module.swiglu_forward_interleaved_packed(stream, flat, &panel, FF as u32, &mut y)?
+        };
+        Ok(())
+    })?;
+    let forward_tile = time_gpu_iters(stream, WARMUP, ITERS, || {
+        unsafe {
+            module.swiglu_forward_interleaved_tile(stream, tiles, &panel, FF as u32, &mut y)?
+        };
+        Ok(())
+    })?;
+    // gate + up read, one bf16 written.
+    report(
+        "swiglu forward interleaved",
+        len as f64 * 6.0,
+        forward,
+        forward_tile,
+    );
+
+    let backward = time_gpu_iters(stream, WARMUP, ITERS, || {
+        unsafe {
+            module.swiglu_backward_interleaved_packed(
+                stream,
+                flat,
+                &panel,
+                &dy,
+                FF as u32,
+                &mut d_panel,
+            )?
+        };
+        Ok(())
+    })?;
+    let backward_tile = time_gpu_iters(stream, WARMUP, ITERS, || {
+        unsafe {
+            module.swiglu_backward_interleaved_tile(
+                stream,
+                tiles,
+                &panel,
+                &dy,
+                FF as u32,
+                &mut d_panel,
+            )?
+        };
+        Ok(())
+    })?;
+    // gate + up read, fp32 gradient read, both gradient halves written.
+    report(
+        "swiglu backward interleaved",
+        len as f64 * 12.0,
+        backward,
+        backward_tile,
+    );
+    Ok(())
+}
+
+/// What relaxing the deterministic-ordering contract on MoE capacity
+/// assignment would buy, as three rows over one routing.
+///
+/// `moe_bin_assign` is the serial oracle — one thread an expert. The
+/// deterministic parallel kernel keeps its exact ordering (bit-identical
+/// slots, checked in `main.rs`) and is what ships. `moe_bin_assign_atomic`
+/// gives the ordering up entirely: `pairs / 256` blocks, one atomic increment
+/// per pair, first-arrival order. **That row is the ceiling and not a
+/// candidate** — it changes which tokens the capacity drops, so it moves the
+/// loss curve and breaks bit-identical resume.
+///
+/// Traffic is the one pass over the pair array the relaxed kernel makes; the
+/// deterministic kernels re-read it once per expert, which is why their `GB/s`
+/// is against a denominator they beat by `E`. At 192 KiB nothing here is
+/// bandwidth-bound — the number that matters is the millisecond.
+fn bench_moe_bin_assign(
+    stream: &std::sync::Arc<CudaStream>,
+    module: &kernels::LoadedModule,
+    reference: &reference_kernels::LoadedModule,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const E: usize = 8;
+    const K: usize = 2;
+    const C: usize = 6_144;
+    let pairs = N * K;
+
+    let selected = DeviceBuffer::from_host(
+        stream,
+        &(0..pairs)
+            .map(|pair| ((pair * 7 + pair / 13 + pair % 3) % E) as u32)
+            .collect::<Vec<_>>(),
+    )?;
+    let mut slots = DeviceBuffer::<u32>::zeroed(stream, pairs)?;
+    let mut counts = DeviceBuffer::<u32>::zeroed(stream, E)?;
+
+    let expert_grid = LaunchConfig {
+        grid_dim: (E as u32, 1, 1),
+        block_dim: (MOE_ASSIGN_THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // SAFETY (all three): `selected` and `slots` are `N * K` long, `counts` is
+    // `E`, and each launch is the geometry its kernel documents.
+    let serial = time_gpu_iters(stream, WARMUP, ITERS, || {
+        unsafe {
+            reference.moe_bin_assign(
+                stream,
+                LaunchConfig {
+                    grid_dim: (E as u32, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &selected,
+                N as u32,
+                E as u32,
+                K as u32,
+                C as u32,
+                &mut slots,
+                &mut counts,
+            )?
+        };
+        Ok(())
+    })?;
+    let deterministic = time_gpu_iters(stream, WARMUP, ITERS, || {
+        unsafe {
+            module.moe_bin_assign_parallel(
+                stream,
+                expert_grid,
+                &selected,
+                N as u32,
+                E as u32,
+                K as u32,
+                C as u32,
+                &mut slots,
+                &mut counts,
+            )?
+        };
+        Ok(())
+    })?;
+    // The counters are not re-zeroed between iterations, so after the first
+    // one every pair is over capacity and takes the dropped-slot arm. That is
+    // a register select on the same store and the same atomic — what this row
+    // measures is the contention, and re-zeroing would put a launch inside the
+    // timed region to hide it.
+    let relaxed = time_gpu_iters(stream, WARMUP, ITERS, || {
+        unsafe {
+            module.moe_bin_assign_atomic(
+                stream,
+                LaunchConfig::for_num_elems(pairs as u32),
+                &selected,
+                N as u32,
+                E as u32,
+                K as u32,
+                C as u32,
+                &mut slots,
+                &mut counts,
+            )?
+        };
+        Ok(())
+    })?;
+
+    let bytes = (pairs * 2 * 4) as f64;
+    let gbs = |ms: f64| bytes / (ms / 1_000.0) / 1e9;
+    println!("moe_bin_assign  ({:.2} MB of pair traffic)", bytes / 1e6);
+    println!(
+        "  serial (1 thread/expert):     {serial:8.4} ms  {:8.1} GB/s",
+        gbs(serial)
+    );
+    println!(
+        "  deterministic (E blocks):     {deterministic:8.4} ms  {:8.1} GB/s  {:.2}x serial",
+        gbs(deterministic),
+        serial / deterministic
+    );
+    println!(
+        "  relaxed atomics (ceiling):    {relaxed:8.4} ms  {:8.1} GB/s  {:.2}x deterministic",
+        gbs(relaxed),
+        deterministic / relaxed
+    );
     Ok(())
 }
 

@@ -11,8 +11,8 @@
 
 use cuda_device::{
     DisjointSlice, SharedArray,
-    atomic::{AtomicOrdering, DeviceAtomicF32},
-    cuda_module, kernel, launch_bounds, thread,
+    atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicU32},
+    cuda_module, kernel, launch_bounds, thread, warp,
 };
 
 use kittens::global::{GlobalRows, load_cols, load_rows, store_rows};
@@ -63,6 +63,30 @@ pub const NORM_MAX_COLUMNS: usize = 4096;
 /// Each lane owns one contiguous range of token/rank pairs. A block-wide
 /// prefix sum then gives every range its exact token-order starting slot.
 pub const MOE_ASSIGN_THREADS: usize = 256;
+
+/// Lanes in a warp, for the warp-level scans that replace a shared-memory
+/// tree over a whole block.
+pub const WARP_LANES: usize = 32;
+
+/// [`QUAD_LANES`] vectors of token/rank pairs one deterministic-binning lane
+/// holds in flight at once — so `MOE_ASSIGN_FLIGHT * QUAD_LANES` pairs, and
+/// `4 * MOE_ASSIGN_FLIGHT * QUAD_LANES` bytes outstanding per thread.
+///
+/// The grid is `E` blocks and nothing makes it wider without giving up the
+/// ordering contract, so this kernel never has warps to hide a load behind:
+/// **what a lane has outstanding is the whole of its bandwidth.** The walk it
+/// replaces was one scalar load at a runtime trip count — four bytes a lane,
+/// 2048 threads on a 148-SM device, which is 8 KiB in flight for the entire
+/// launch and the 21 GB/s that measures. At 4 this is 64 bytes a lane and the
+/// same total in sixteen times fewer round trips.
+pub const MOE_ASSIGN_FLIGHT: usize = 4;
+
+/// Pairs one group of a deterministic-binning walk covers.
+pub const MOE_ASSIGN_GROUP: usize = MOE_ASSIGN_FLIGHT * QUAD_LANES;
+
+/// Warps in a deterministic-binning block, and so the shared slots its scan of
+/// the warp totals needs — 8, where the block-wide tree it replaces needed 256.
+pub const MOE_ASSIGN_WARPS: usize = MOE_ASSIGN_THREADS / WARP_LANES;
 
 /// Upper bound on routed experts, sizing the shared broadcast tiles.
 pub const ROUTER_MAX_EXPERTS: usize = 8;
@@ -1156,6 +1180,10 @@ pub mod kernels {
     /// itself is unchanged: gate, sigmoid and product are fp32 registers, and
     /// only the store rounds.
     ///
+    /// The row split is [`swiglu_packed_row`]'s, in 32 bits — see there for the
+    /// three shapes this kernel was measured in before that turned out to be
+    /// the one that mattered.
+    ///
     /// `ff` must be a multiple of [`QUAD_LANES`], which the tcgen05 alignment
     /// gate on packed panels already guarantees.
     #[kernel]
@@ -1170,12 +1198,9 @@ pub mod kernels {
         if ff == 0 || !ff.is_multiple_of(QUAD_LANES) {
             return;
         }
-        let row_quads = ff / QUAD_LANES;
-        let row = i / row_quads;
-        let quad = i % row_quads;
         // The packed row holds `ff` words: this thread's two gate words start
         // at `gate_word` and its two up words `ff / 2` words later.
-        let gate_word = row * ff + 2 * quad;
+        let gate_word = swiglu_packed_row(i, ff) * ff + 2 * swiglu_packed_quad(i, ff);
         if gate_word + ff / 2 + 1 >= gate_up.len() || 2 * i + 1 >= y.len() {
             return;
         }
@@ -1194,6 +1219,47 @@ pub mod kernels {
         unsafe {
             *(y.as_mut_ptr() as *mut u64).add(i) = bf16_quad_bits(activated);
         }
+    }
+
+    /// The panel row a packed interleaved SwiGLU thread owns, and its quad
+    /// within that row — **as 32-bit division**, which is where the whole cost
+    /// of these two kernels' index math is.
+    ///
+    /// Three shapes were measured on `swiglu_forward_interleaved_packed` at
+    /// `24576 x 4096` in `bin/bench` before this one. It reads 6 bytes an
+    /// element at 3550 GB/s where the *backward* beside it — same walk, same
+    /// row split, twice the bytes — reads 12 at 5665, so the fixed per-thread
+    /// cost is what separates them, and the two 64-bit divisions by a runtime
+    /// `ff / QUAD_LANES` were all of it:
+    ///
+    /// | shape | GB/s | vs |
+    /// |---|---:|---:|
+    /// | one quad a thread, `usize` divisions | 3550 | — |
+    /// | `[16, 32]` `BaseLdtm` register tiles | 2234 | 0.63x |
+    /// | four quads a thread, grid-strided | 2889 | 0.81x |
+    ///
+    /// Both alternatives bought *bytes in flight* — 4x and 4x — and both lost,
+    /// which is what says the kernel was never waiting on memory-level
+    /// parallelism. The tile pays #222's transaction-shape pole (a `BaseLdtm`
+    /// quad is 16 contiguous bytes and the next quad is a different row, so one
+    /// access instruction touches 8 rows and doubles the L1 requests for the
+    /// same DRAM traffic); the coarsened walk pays four times the index math
+    /// for four times the work and gains nothing.
+    ///
+    /// `i` is built from `blockIdx * blockDim + threadIdx` and `ff` from a
+    /// launch that already fits `u32`, so nothing here needs 64 bits and
+    /// #125's `join_group3_rope` lead — "they are `usize` and every operand
+    /// fits `u32`, about a third of the instructions at no register cost at
+    /// all" — applies verbatim.
+    #[inline(always)]
+    fn swiglu_packed_row(i: usize, ff: usize) -> usize {
+        (i as u32 / (ff / QUAD_LANES) as u32) as usize
+    }
+
+    /// The quad within [`swiglu_packed_row`]'s row; see there.
+    #[inline(always)]
+    fn swiglu_packed_quad(i: usize, ff: usize) -> usize {
+        (i as u32 % (ff / QUAD_LANES) as u32) as usize
     }
 
     /// Fused [`swiglu_backward_gate`] + [`swiglu_backward_up`]: reads the
@@ -1231,6 +1297,144 @@ pub mod kernels {
         }
     }
 
+    /// `sigmoid(x)`, as a tile map — the twin of the sigmoid every scalar
+    /// kernel above spells `1.0 / (1.0 + (-gate).exp())`, and **not** the same
+    /// number: `RegTile::exp` is kittens' `Exp`, a clamped degree-3 minimax on
+    /// `exp2` rather than libdevice's `expf`.
+    ///
+    /// Measured over the whole ±125 range the clamp admits, against `f64`:
+    /// **relative error ≤ 7.7e-5, absolute error ≤ 1.9e-5** — the sigmoid
+    /// *attenuates* `exp2_approx`'s own 7.5e-5 bound rather than amplifying it,
+    /// since `σ_approx ≈ σ · (1 - δ(1-σ))`, and the absolute bound is that
+    /// times `max σ(1-σ) = ¼`. Both bounds are what `check_swiglu_tile_packed`
+    /// is set from, and the absolute one is the one that matters: `silu'` has
+    /// a zero at `g = -1.2785` where no relative tolerance is finite.
+    #[inline(always)]
+    fn tile_sigmoid(x: SwigluChunk) -> SwigluChunk {
+        x.neg().exp().shift(1.0).recip()
+    }
+
+    /// The `[SWIGLU_TILE_ROWS, SWIGLU_TILE_CHUNK]` rectangle this warp owns of
+    /// a `[rows, 2 * ff]` interleaved panel or a `[rows, ff]` gradient, as the
+    /// `(row, column)` origin the movers take.
+    ///
+    /// The grid is two-dimensional — row bands by column chunks — so a block
+    /// owns exactly one rectangle and there is no walk over the row at all.
+    /// That is deliberate: `ff` is a runtime value, so a column loop is a
+    /// rolled walk (ferro-kittens#166), and it would buy nothing here anyway.
+    /// The whole shape argument for these kernels is bytes in flight per
+    /// thread, and one tile is already all of a lane's registers' worth.
+    #[inline(always)]
+    fn swiglu_tile_origin() -> (u32, u32) {
+        (
+            SWIGLU_TILE_BLOCK_ROWS as u32 * thread::blockIdx_x()
+                + SWIGLU_TILE_ROWS as u32 * warp_id(),
+            SWIGLU_TILE_CHUNK as u32 * thread::blockIdx_y(),
+        )
+    }
+
+    /// [`swiglu_forward_interleaved_packed`] over register tiles.
+    ///
+    /// **Measured 0.63x of the scalar kernel and not launched by anything** —
+    /// it is here as the arm `bin/bench` reports and `main.rs` gates, because
+    /// what it establishes is worth more than the row: a `RegTile` was the one
+    /// way to reach `exp2_approx` on this family, and reaching it does not pay.
+    ///
+    /// The scalar kernel's access is already perfect in *shape* — two 8-byte
+    /// loads and one 8-byte store a thread, a warp's 32 lanes covering 256
+    /// contiguous bytes with every sector used. A `[16, 32]` `BaseLdtm` tile
+    /// gives a lane 16 elements of each operand instead of 4, so **64 bytes in
+    /// flight a thread rather than 16** — and it loses anyway, on the
+    /// transaction shape: a `BaseLdtm` quad covers 8 contiguous bf16 (16 bytes)
+    /// and the next quad is a *different row*, so one access instruction
+    /// touches 8 rows and uses half of each 32-byte sector where the scalar
+    /// kernel's touches one contiguous 256-byte run. The other half of every
+    /// sector is the *next* value pair of the same row, so the DRAM traffic is
+    /// unchanged and only the L1 request count doubles — ferro-kittens#222's
+    /// pole, and 1.59x of it is exactly the 3550 → 2234 GB/s measured.
+    ///
+    /// Four times the bytes outstanding against twice the requests was the
+    /// trade, stated before it was measured (#124's revert is why), and the
+    /// requests won.
+    ///
+    /// # Safety
+    ///
+    /// Launch with [`SWIGLU_TILE_THREADS`] threads over a
+    /// `(rows / SWIGLU_TILE_BLOCK_ROWS, ff / SWIGLU_TILE_CHUNK)` grid: `rows`
+    /// must be a multiple of [`SWIGLU_TILE_BLOCK_ROWS`] and `ff` of
+    /// [`SWIGLU_TILE_CHUNK`], both the launcher's to check, since this kernel
+    /// bounds-checks nothing.
+    #[kernel]
+    #[launch_bounds(128, 8)]
+    pub unsafe fn swiglu_forward_interleaved_tile(
+        gate_up: &[u32],
+        ff: u32,
+        mut y: DisjointSlice<u32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let ff = ff as usize;
+            let (row, column) = swiglu_tile_origin();
+            // Both cursors name bf16 *elements*, so the panel's stride is its
+            // `2 * ff` interleaved values and the up half is `ff` columns along
+            // the same rows — no second buffer, and no second base address.
+            // The storage word is `u32` on both sides, which is why these are
+            // `from_raw` and not `from_slice`: the slice constructor asserts
+            // the word and the element are the same width.
+            let panel = GlobalRows::<Bf16>::from_raw(gate_up.as_ptr() as *mut u8, 2 * ff);
+            let destination = GlobalRows::<Bf16>::from_raw(y.as_mut_ptr() as *mut u8, ff);
+
+            let g: SwigluChunk = load_rows(panel, row, column, lane);
+            let u: SwigluChunk = load_rows(panel, row, column + ff as u32, lane);
+            store_rows(
+                destination,
+                row,
+                column,
+                lane,
+                g.mul(tile_sigmoid(g)).mul(u),
+            );
+        }
+    }
+
+    /// [`swiglu_backward_interleaved_packed`] over register tiles.
+    ///
+    /// Three bands where the forward carries two — the panel's two halves and
+    /// the fp32 upstream gradient — and two stores. The gradient is the one
+    /// operand that is not bf16, so it is 64 bytes a lane on its own and the
+    /// launch has 192 in flight.
+    ///
+    /// # Safety
+    ///
+    /// As [`swiglu_forward_interleaved_tile`], over a `dy` and a `d_gate_up`
+    /// of the same rectangle.
+    #[kernel]
+    #[launch_bounds(128, 6)]
+    pub unsafe fn swiglu_backward_interleaved_tile(
+        gate_up: &[u32],
+        dy: &[f32],
+        ff: u32,
+        mut d_gate_up: DisjointSlice<u32>,
+    ) {
+        unsafe {
+            let lane = lane();
+            let ff = ff as usize;
+            let (row, column) = swiglu_tile_origin();
+            let panel = GlobalRows::<Bf16>::from_raw(gate_up.as_ptr() as *mut u8, 2 * ff);
+            let upstream = GlobalRows::<F32>::from_raw(dy.as_ptr() as *mut u8, ff);
+            let destination =
+                GlobalRows::<Bf16>::from_raw(d_gate_up.as_mut_ptr() as *mut u8, 2 * ff);
+
+            let g: SwigluChunk = load_rows(panel, row, column, lane);
+            let u: SwigluChunk = load_rows(panel, row, column + ff as u32, lane);
+            let d: SwigluChunk = load_rows(upstream, row, column, lane);
+            let s = tile_sigmoid(g);
+            // silu'(g) = s * (1 + g * (1 - s)), the scalar kernel's `dsilu`.
+            let dsilu = s.mul(g.mul(s.neg().shift(1.0)).shift(1.0));
+            store_rows(destination, row, column, lane, d.mul(u).mul(dsilu));
+            store_rows(destination, row, column + ff as u32, lane, d.mul(g).mul(s));
+        }
+    }
+
     /// [`swiglu_backward_interleaved`] reading a packed gate/up panel and
     /// storing packed pairs (every reader of the gate/up gradient panel is a
     /// tcgen05 operand, #59, and its saved activation is now packed too).
@@ -1253,9 +1457,9 @@ pub mod kernels {
         if ff == 0 || !ff.is_multiple_of(QUAD_LANES) {
             return;
         }
-        let row_quads = ff / QUAD_LANES;
-        let row = i / row_quads;
-        let quad = i % row_quads;
+        // 32-bit, as the forward's; see [`swiglu_packed_row`].
+        let row = swiglu_packed_row(i, ff);
+        let quad = swiglu_packed_quad(i, ff);
         let dy_base = row * ff + QUAD_LANES * quad;
         // Panel and gradient share a layout: this thread's two gate words start
         // at `gate_word` and its two up words `ff / 2` words later, in both.
@@ -2302,12 +2506,60 @@ pub mod kernels {
         }
     }
 
+    /// The contiguous run of pairs at `base` as one group of
+    /// [`MOE_ASSIGN_FLIGHT`] vector loads, every one of them issued before any
+    /// is read.
+    ///
+    /// Both walks of [`moe_bin_assign_parallel`] are a chain of `==` tests on
+    /// values that are not in registers yet, and a scalar walk at a runtime
+    /// trip count is one four-byte load deep. Widening the load and fixing the
+    /// group size are the same fix twice: `QUAD_LANES` pairs arrive per
+    /// instruction, and a const-bounded group is what lets the compiler put
+    /// [`MOE_ASSIGN_FLIGHT`] of those instructions in flight at once.
+    ///
+    /// # Safety
+    ///
+    /// `base` is a multiple of [`QUAD_LANES`] and
+    /// `base + MOE_ASSIGN_FLIGHT * QUAD_LANES <= pairs.len()`.
+    #[inline(always)]
+    unsafe fn assign_group(pairs: &[u32], base: usize) -> [u32; MOE_ASSIGN_GROUP] {
+        let mut group = [0u32; MOE_ASSIGN_GROUP];
+        let mut vector = 0usize;
+        while vector < MOE_ASSIGN_FLIGHT {
+            // SAFETY: `base` is `QUAD_LANES`-aligned and the caller's bound
+            // covers every vector of the group, so each read is a 16-byte
+            // aligned access inside the slice.
+            let words = quad_words(unsafe {
+                *(pairs.as_ptr().add(base + vector * QUAD_LANES) as *const u128)
+            });
+            let mut lane = 0usize;
+            while lane < QUAD_LANES {
+                group[vector * QUAD_LANES + lane] = words[lane];
+                lane += 1;
+            }
+            vector += 1;
+        }
+        group
+    }
+
     /// Block-parallel deterministic capacity assignment.
     ///
     /// One block owns an expert and partitions the flattened token/rank order
     /// into contiguous lane ranges. The exclusive prefix of each range's match
     /// count is its first slot, preserving the serial kernel's exact ordering,
     /// capacity-drop behavior, and assignment counts without atomic claims.
+    ///
+    /// The ordering contract is routing semantics and not only numerics:
+    /// capacity slots are first-come-first-served in flattened `(token, rank)`
+    /// order, so the order slots are handed out in decides *which* tokens the
+    /// capacity drops. It is also, exactly, a prefix sum — which is why this
+    /// kernel can be as parallel as its memory system without giving anything
+    /// up. What it cannot be is *wider*: the grid is `E` blocks because a
+    /// block's scan is what carries the order, and only a multi-launch
+    /// (count / scan / scatter) decomposition breaks that. Measured, the
+    /// launch's whole input is 192 KiB at the training shape — it can never be
+    /// bandwidth-bound, only latency-bound — so the depth of the walk is the
+    /// only lever, and [`MOE_ASSIGN_FLIGHT`] is it.
     #[kernel]
     #[launch_bounds(256, 4)]
     pub unsafe fn moe_bin_assign_parallel(
@@ -2319,7 +2571,7 @@ pub mod kernels {
         mut slots: DisjointSlice<u32>,
         mut assignment_counts: DisjointSlice<u32>,
     ) {
-        static mut RANGE_COUNTS: SharedArray<u32, MOE_ASSIGN_THREADS> = SharedArray::UNINIT;
+        static mut WARP_COUNTS: SharedArray<u32, MOE_ASSIGN_WARPS> = SharedArray::UNINIT;
 
         let tid = thread::threadIdx_x() as usize;
         if thread::blockDim_x() as usize != MOE_ASSIGN_THREADS {
@@ -2339,62 +2591,166 @@ pub mod kernels {
             return;
         }
 
-        let pairs_per_lane = pairs.div_ceil(MOE_ASSIGN_THREADS);
+        // A lane's range is rounded up to whole vectors so that `start` is
+        // `QUAD_LANES`-aligned and the vector walk needs no per-lane head. The
+        // ranges stay contiguous and still cover every pair, which is all the
+        // ordering asks of them.
+        let pairs_per_lane = pairs.div_ceil(MOE_ASSIGN_THREADS * QUAD_LANES) * QUAD_LANES;
         let start = (tid * pairs_per_lane).min(pairs);
         let end = (start + pairs_per_lane).min(pairs);
+
         let mut range_count = 0u32;
-        for pair in start..end {
+        let mut pair = start;
+        while pair + MOE_ASSIGN_GROUP <= end {
+            // SAFETY: `start` is `QUAD_LANES`-aligned, the group is a whole
+            // number of vectors, and the loop condition keeps it inside `end`.
+            let group = unsafe { assign_group(selected_experts, pair) };
+            let mut slot = 0usize;
+            while slot < MOE_ASSIGN_GROUP {
+                if group[slot] as usize == expert {
+                    range_count += 1;
+                }
+                slot += 1;
+            }
+            pair += MOE_ASSIGN_GROUP;
+        }
+        while pair < end {
             if selected_experts[pair] as usize == expert {
                 range_count += 1;
             }
+            pair += 1;
         }
-        unsafe {
-            RANGE_COUNTS[tid] = range_count;
+
+        // Inclusive scan of the lane counts, in two stages: a shuffle scan
+        // inside each warp, then the eight warp totals summed by every lane out
+        // of shared memory. One barrier, where the Hillis-Steele tree over 256
+        // shared slots needed sixteen — and this kernel's own note says the
+        // grid gives it nothing to hide a barrier behind.
+        let lane = tid % WARP_LANES;
+        let warp = tid / WARP_LANES;
+        let mut scanned = range_count;
+        let mut delta = 1u32;
+        while delta < WARP_LANES as u32 {
+            let carried = warp::shuffle_up(scanned, delta);
+            if lane as u32 >= delta {
+                scanned += carried;
+            }
+            delta *= 2;
+        }
+        if lane == WARP_LANES - 1 {
+            unsafe {
+                WARP_COUNTS[warp] = scanned;
+            }
         }
         thread::sync_threads();
 
-        // Inclusive Hillis-Steele scan. The barrier before each write keeps
-        // every lane's read on the previous iteration's shared-memory state.
-        let mut offset = 1usize;
-        while offset < MOE_ASSIGN_THREADS {
-            let preceding = if tid >= offset {
-                unsafe { RANGE_COUNTS[tid - offset] }
-            } else {
-                0
-            };
-            thread::sync_threads();
-            if tid >= offset {
-                unsafe {
-                    RANGE_COUNTS[tid] += preceding;
-                }
+        let mut preceding = 0u32;
+        let mut total = 0u32;
+        let mut other = 0usize;
+        while other < MOE_ASSIGN_WARPS {
+            let count = unsafe { WARP_COUNTS[other] };
+            if other < warp {
+                preceding += count;
             }
-            thread::sync_threads();
-            offset *= 2;
+            total += count;
+            other += 1;
         }
+        let range_start = preceding + scanned - range_count;
 
-        let range_start = if tid == 0 {
-            0
-        } else {
-            unsafe { RANGE_COUNTS[tid - 1] }
-        };
         let mut local_count = 0u32;
-        for pair in start..end {
+        let mut pair = start;
+        while pair + MOE_ASSIGN_GROUP <= end {
+            // SAFETY: as the counting walk above, over the same range.
+            let group = unsafe { assign_group(selected_experts, pair) };
+            let mut slot = 0usize;
+            while slot < MOE_ASSIGN_GROUP {
+                if group[slot] as usize == expert {
+                    let claimed = range_start + local_count;
+                    unsafe {
+                        *slots.get_unchecked_mut(pair + slot) = if claimed < c as u32 {
+                            claimed
+                        } else {
+                            MOE_DROPPED_SLOT
+                        };
+                    }
+                    local_count += 1;
+                }
+                slot += 1;
+            }
+            pair += MOE_ASSIGN_GROUP;
+        }
+        while pair < end {
             if selected_experts[pair] as usize == expert {
-                let slot = range_start + local_count;
+                let claimed = range_start + local_count;
                 unsafe {
-                    *slots.get_unchecked_mut(pair) = if slot < c as u32 {
-                        slot
+                    *slots.get_unchecked_mut(pair) = if claimed < c as u32 {
+                        claimed
                     } else {
                         MOE_DROPPED_SLOT
                     };
                 }
                 local_count += 1;
             }
+            pair += 1;
         }
         if tid == 0 {
             unsafe {
-                *assignment_counts.get_unchecked_mut(expert) = RANGE_COUNTS[MOE_ASSIGN_THREADS - 1];
+                *assignment_counts.get_unchecked_mut(expert) = total;
             }
+        }
+    }
+
+    /// [`moe_bin_assign_parallel`] with the ordering contract dropped: a thread
+    /// per pair claims its slot with one atomic increment on its expert's
+    /// counter, in whatever order the threads arrive.
+    ///
+    /// **Not launched by the trainer, and it must not be without a decision to
+    /// change the model.** First-arrival order is a different routing: at
+    /// capacity it drops a different set of tokens than token order does, so
+    /// the loss curve moves and a checkpoint no longer resumes bit-identically.
+    /// This exists to answer what the determinism costs — it is the ceiling the
+    /// deterministic kernel is measured against in `bin/bench`, and the whole
+    /// of the parallelism relaxing the contract would unlock.
+    ///
+    /// The grid is `pairs / 256` blocks where the deterministic kernel's is
+    /// `E`, so this is the maximally parallel formulation, and every one of
+    /// those threads lands on one of `E` counters.
+    ///
+    /// # Safety
+    ///
+    /// `assignment_counts` must be zeroed before the launch; this kernel only
+    /// increments it.
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    pub unsafe fn moe_bin_assign_atomic(
+        selected_experts: &[u32],
+        tokens: u32,
+        experts: u32,
+        top_k: u32,
+        capacity: u32,
+        mut slots: DisjointSlice<u32>,
+        mut assignment_counts: DisjointSlice<u32>,
+    ) {
+        let pair = thread::index_1d().get();
+        let pairs = tokens as usize * top_k as usize;
+        if pair >= pairs || pairs > selected_experts.len() || pairs > slots.len() {
+            return;
+        }
+        let expert = selected_experts[pair] as usize;
+        if expert >= experts as usize || expert >= assignment_counts.len() {
+            return;
+        }
+        // SAFETY: `expert` was bounds-checked, and every access to a counter in
+        // this kernel is atomic — which is the whole of what it gives up.
+        let counter =
+            unsafe { DeviceAtomicU32::from_ptr(assignment_counts.as_mut_ptr().add(expert)) };
+        let claimed = counter.fetch_add(1, AtomicOrdering::Relaxed);
+        unsafe {
+            *slots.get_unchecked_mut(pair) = if claimed < capacity {
+                claimed
+            } else {
+                MOE_DROPPED_SLOT
+            };
         }
     }
 

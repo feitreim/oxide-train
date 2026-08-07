@@ -71,9 +71,10 @@ use dense_device::{QUAD_LANES, SWIGLU_TILE_BLOCK_ROWS, SWIGLU_TILE_CHUNK, SWIGLU
 /// decided; every training shape in `bin/train.rs` divides, and the flat
 /// kernels stay as the arm anything else takes. The bf16 forward has no tile
 /// arm on purpose — it measured 0.70x of the flat one, which already stores a
-/// packed pair per thread (#70). Only the dense (non-MoE) FFN takes this
-/// launch now: the expert path reads its gate/up activation interleaved and
-/// its fused kernels size their own flat launches.
+/// packed pair per thread (#70), and the interleaved pair re-measured on
+/// ferro-kittens#180's unrolled movers is 0.63x and 0.55x. Only the dense
+/// (non-MoE) FFN takes this launch now: the expert path reads its gate/up
+/// activation interleaved and its fused kernels size their own flat launches.
 fn swiglu_tiles(rows: usize, columns: usize) -> Option<LaunchConfig> {
     (rows.is_multiple_of(SWIGLU_TILE_BLOCK_ROWS) && columns.is_multiple_of(SWIGLU_TILE_CHUNK)).then(
         || LaunchConfig {
